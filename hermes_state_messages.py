@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from agent.compression_marker import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY)
-from agent.memory_manager import sanitize_context
+from agent.memory_context import sanitize_context
 from agent.message_metadata import (
     CANONICAL_ROW, DB_ROW_SNAPSHOT, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS,
     index_tool_call_uids, message_uid_or_none, resolve_tool_call_uid, mint_uid, stamp_message_uid)
