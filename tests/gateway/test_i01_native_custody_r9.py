@@ -104,6 +104,7 @@ async def test_generic_joinable_scheduler_none_result_releases_its_own_lease(tmp
 @pytest.mark.asyncio
 async def test_teams_recovery_refuses_without_authority_or_profile_ownership(tmp_path):
     """Production bind does not claim a durable Teams job without both authority and lock custody."""
+    import json
     from gateway.config import GatewayConfig, Platform
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
@@ -155,6 +156,8 @@ async def test_teams_recovery_refuses_without_authority_or_profile_ownership(tmp
     runner._teams_pipeline_runtime_error = None
     try:
         assert runtime_module.bind_gateway_runtime(runner) is False
-        assert store.get_job("r9-unowned").get("runtime_claim") is None
+        assert store._closed is True
+        persisted = json.loads(store.path.read_text(encoding="utf-8-sig"))
+        assert persisted["jobs"]["r9-unowned"].get("runtime_claim") is None
     finally:
         authority.db.close()

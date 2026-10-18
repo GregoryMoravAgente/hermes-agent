@@ -10,6 +10,7 @@ from gateway.config import Platform
 from gateway.session_authority import SchedulerTaskHandoff
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
+from plugins.teams_pipeline.store_ownership import TeamsStoreOwner
 from plugins.teams_pipeline.subscriptions import build_graph_client
 
 logger = logging.getLogger(__name__)
@@ -60,10 +61,25 @@ def build_pipeline_runtime(gateway: Any) -> TeamsMeetingPipeline:
             logger.debug("TeamsSummaryWriter unavailable; Teams outbound delivery remains disabled until the adapter layer is present.")
         else:
             teams_sender = TeamsSummaryWriter(platform_config=teams_config)
-    return TeamsMeetingPipeline(
-        graph_client=build_graph_client(), store=TeamsPipelineStore(resolve_teams_pipeline_store_path()),
-        config=pipeline_config, teams_sender=teams_sender,
-    )
+    store_path = resolve_teams_pipeline_store_path()
+    store_kwargs: dict[str, Any] = {}
+    from gateway.session_authorities import active_authority
+    authority = active_authority(gateway)
+    if authority is not None:
+        store_kwargs = {
+            "owner": TeamsStoreOwner.for_authority(
+                authority, owner_id=_teams_owner_id(gateway)),
+            "lock": True,
+        }
+    store = TeamsPipelineStore(store_path, **store_kwargs)
+    try:
+        return TeamsMeetingPipeline(
+            graph_client=build_graph_client(), store=store,
+            config=pipeline_config, teams_sender=teams_sender,
+        )
+    except BaseException:
+        store.close()
+        raise
 
 
 def _teams_owner_id(gateway: Any) -> str:
@@ -72,6 +88,43 @@ def _teams_owner_id(gateway: Any) -> str:
     if not instance_id:
         raise RuntimeError("Teams pipeline recovery requires a published runtime instance")
     return f"teams:{instance_id}"
+
+
+def _runtime_tasks(runtime: Any) -> set[asyncio.Task]:
+    tasks = getattr(runtime, "_teams_pipeline_tasks", None)
+    if tasks is None:
+        tasks = runtime._teams_pipeline_tasks = set()
+    return tasks
+
+
+def _track_runtime_task(runtime: Any, task: asyncio.Task) -> None:
+    tasks = _runtime_tasks(runtime)
+    tasks.add(task)
+    loop = task.get_loop()
+
+    def _discard_after_source_callbacks(done: asyncio.Task) -> None:
+        # asyncio runs every callback already attached to the completed task in this loop turn.
+        # Defer removal one callback turn so authority/store finalizers still see the task as
+        # owned, even when the task itself is already done.
+        loop.call_soon(tasks.discard, done)
+
+    task.add_done_callback(_discard_after_source_callbacks)
+
+
+def _close_pipeline_runtime(runtime: Any) -> bool:
+    # A completed task can still have its authority/store finalizer callback queued in this loop
+    # turn.  The tracking set is the source callback barrier; only an empty set is closeable.
+    if _runtime_tasks(runtime):
+        return False
+    store = getattr(runtime, "store", None)
+    close = getattr(store, "close", None)
+    if not callable(close):
+        return True
+    try:
+        result = close()
+    except (OSError, RuntimeError):
+        return False
+    return result is not False
 
 
 def _adopt_recoverable_jobs(gateway: Any, runtime: TeamsMeetingPipeline) -> list[asyncio.Task]:
@@ -88,25 +141,45 @@ def _adopt_recoverable_jobs(gateway: Any, runtime: TeamsMeetingPipeline) -> list
         "downloading_recording", "transcribing_audio", "summarizing",
         "writing_notion", "writing_linear", "sending_teams", "retry_scheduled",
     }
+    from gateway.session_authorities import active_authority
+    authority = active_authority(gateway)
+    if authority is None:
+        raise RuntimeError("Teams pipeline recovery has no active session authority")
+    descriptor = getattr(gateway, "session_runtime_descriptor", None) or {}
+    descriptor_instance = str(descriptor.get("instance_id") or "").strip()
+    if not descriptor_instance:
+        raise RuntimeError("Teams pipeline recovery requires a published runtime instance")
+    if descriptor_instance != str(authority.instance_id):
+        raise RuntimeError("Teams pipeline recovery runtime instance mismatch")
+    descriptor_epoch = str(descriptor.get("authority_epoch") or "").strip()
+    if descriptor_epoch and descriptor_epoch != str(authority.epoch):
+        raise RuntimeError("Teams pipeline recovery runtime epoch mismatch")
+    if getattr(store, "owner_required", False) and descriptor_epoch != str(authority.epoch):
+        raise RuntimeError("Teams pipeline recovery requires a published runtime epoch")
+    from pathlib import Path
+    from gateway.runtime_ownership import process_ownership
+    authority_db = getattr(getattr(authority, "db", None), "db_path", None)
+    if authority_db is None or not process_ownership.owns(Path(authority_db).resolve().parent):
+        raise RuntimeError("Teams pipeline recovery requires profile ownership")
+    owner_id = _teams_owner_id(gateway)
+    claim_kwargs: dict[str, Any] = {}
+    if getattr(store, "owner_required", False):
+        store.assert_runtime_owner(
+            profile_id=authority.profile_id, authority_epoch=authority.epoch,
+            instance_id=authority.instance_id, owner_id=owner_id,
+        )
+        claim_kwargs = {
+            "profile_id": authority.profile_id,
+            "authority_epoch": authority.epoch,
+            "instance_id": authority.instance_id,
+        }
     snapshot = list_jobs()
     if not isinstance(snapshot, dict) or not any(
         isinstance(record, dict) and record.get("status") in recoverable
         for record in snapshot.values()
     ):
         return []
-    from gateway.session_authorities import active_authority
-    authority = active_authority(gateway)
-    if authority is None:
-        raise RuntimeError("Teams pipeline recovery has no active session authority")
-    descriptor = getattr(gateway, "session_runtime_descriptor", None) or {}
-    if not str(descriptor.get("instance_id") or "").strip():
-        raise RuntimeError("Teams pipeline recovery requires a published runtime instance")
-    from pathlib import Path
-    from gateway.runtime_ownership import process_ownership
-    authority_db = getattr(getattr(authority, "db", None), "db_path", None)
-    if authority_db is None or not process_ownership.owns(Path(authority_db).resolve().parent):
-        raise RuntimeError("Teams pipeline recovery requires profile ownership")
-    records = claim(_teams_owner_id(gateway))
+    records = claim(owner_id, **claim_kwargs)
     if not records:
         return []
     active_jobs = getattr(gateway, "_teams_pipeline_active_jobs", None)
@@ -123,6 +196,7 @@ def _adopt_recoverable_jobs(gateway: Any, runtime: TeamsMeetingPipeline) -> list
         task = asyncio.create_task(runtime.run_job(job_id))
         active_jobs.add(job_id)
         background.add(task)
+        _track_runtime_task(runtime, task)
         task.add_done_callback(background.discard)
         task.add_done_callback(lambda _task, key=job_id: active_jobs.discard(key))
         task.add_done_callback(
@@ -144,12 +218,19 @@ def bind_gateway_runtime(gateway: Any) -> bool:
     adapter = gateway.adapters.get(Platform.MSGRAPH_WEBHOOK)
     if adapter is None:
         return False
+    from gateway.session_authorities import active_authority
+    if active_authority(gateway) is None:
+        gateway._teams_pipeline_runtime_error = "Teams pipeline runtime requires an active profile authority"
+        _install_runtime_refusal(adapter)
+        return False
     existing = getattr(gateway, "_teams_pipeline_runtime", None)
     runtime = existing
     if runtime is not None:
         try:
             _adopt_recoverable_jobs(gateway, runtime)
         except Exception as exc:  # health: allow BLE001 -- binding/recovery is an opaque persistence boundary; refusal preserves retry and custody
+            if _close_pipeline_runtime(runtime):
+                gateway._teams_pipeline_runtime = None
             gateway._teams_pipeline_runtime_error = str(exc)
             _install_runtime_refusal(adapter)
             return False
@@ -171,6 +252,8 @@ def bind_gateway_runtime(gateway: Any) -> bool:
         try:
             _adopt_recoverable_jobs(gateway, runtime)
         except Exception as exc:  # health: allow BLE001 -- durable recovery observation failure retains retryable ingress and exact custody
+            if _close_pipeline_runtime(runtime):
+                gateway._teams_pipeline_runtime = None
             gateway._teams_pipeline_runtime_error = str(exc)
             logger.warning("Teams pipeline durable recovery unavailable: %s", exc)
             _install_runtime_refusal(adapter)
@@ -195,6 +278,7 @@ def bind_gateway_runtime(gateway: Any) -> bool:
         scheduled.add(job.job_id)
         task = asyncio.create_task(runtime.run_job(job.job_id))
         background.add(task)
+        _track_runtime_task(runtime, task)
         task.add_done_callback(background.discard)
         task.add_done_callback(lambda _task: scheduled.discard(job.job_id))
         # The adapter owns the I01 root until this real pipeline task settles. Return a typed

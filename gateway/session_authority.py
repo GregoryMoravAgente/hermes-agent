@@ -305,9 +305,10 @@ class SessionAuthority(PreservationOperationsMixin):
         # record so a provider callback cannot claim terminal custody before the JSON store persists it.
         runtime = getattr(self.runner, '_teams_pipeline_runtime', None)
         store = getattr(runtime, 'store', None) if runtime is not None else None
+        from plugins.teams_pipeline.store_ownership import TeamsStoreOwnershipError
         try:
             persisted = None if store is None else store.get_job(expected_job_id)
-        except (OSError, ValueError, KeyError, TypeError):
+        except (OSError, ValueError, KeyError, TypeError, TeamsStoreOwnershipError):
             persisted = None
         if not isinstance(persisted, dict) or persisted.get('status') != status:
             coordinator.mark_unknown(handle, 'read_failed')
