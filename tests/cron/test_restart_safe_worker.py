@@ -15,6 +15,30 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from tests.waiting import wait_until
+
+
+def _run_payload_with_parent_acceptance(scheduler, payload, ack):
+    """Drive the real payload runner through its required parent acceptance file."""
+    from cron.scheduler_worker_identity import write_worker_acceptance
+
+    accept = ack.with_suffix(".accept")
+    outcome = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            scheduler._run_external_worker_payload(payload, ack, accept)),
+        daemon=True,
+    )
+    worker.start()
+    wait_until(lambda: ack.exists(), timeout=5, what="external worker ACK")
+    acknowledgement = json.loads(ack.read_text(encoding="utf-8"))
+    write_worker_acceptance(
+        accept, acknowledgement,
+        expected_generation=acknowledgement.get("custody_generation"),
+    )
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    return outcome[0]
 
 
 @pytest.fixture
@@ -144,6 +168,10 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
         json.dumps({
             "job": {"id": "job-1", "execution_id": "exec-1"},
             "profile_home": str(tmp_path / "profile"),
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+            "scope_control_group": None,
+            "custody_generation": None,
         }),
         encoding="utf-8",
     )
@@ -153,7 +181,11 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     adopted = Mock(
         side_effect=lambda execution_id: (
             observed_homes.append(get_hermes_home().resolve())
-            or {"id": execution_id, "status": "running"}
+            or {
+                "id": execution_id,
+                "status": "running",
+                "process_started_at": 9876,
+            }
         )
     )
     run = Mock(
@@ -162,9 +194,20 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
         )
     )
     monkeypatch.setattr("cron.executions.adopt_claimed_execution", adopted)
+    monkeypatch.setattr(
+        "cron.executions.get_execution",
+        lambda _execution_id: {
+            "id": "exec-1",
+            "job_id": "job-1",
+            "status": "running",
+            "handoff_pending": 0,
+            "pid": os.getpid(),
+            "process_started_at": 9876,
+        },
+    )
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert _run_payload_with_parent_acceptance(scheduler, payload, ack) is True
 
     adopted.assert_called_once_with("exec-1")
     run.assert_called_once()
@@ -176,6 +219,74 @@ def test_external_worker_adopts_execution_and_runs_payload_once(
     # Post-ack the worker owns the stderr capture: a gateway that restarted mid-run
     # would otherwise leave one orphan per surviving run.
     assert not stderr_capture.exists()
+
+
+def test_external_worker_waits_for_exact_parent_acceptance_before_side_effects(
+    tmp_path, monkeypatch
+):
+    """The real payload runner must not discover plugins, register hooks, or run a job before
+    the parent accepts the exact adopted ACK.  The thread stands in for a real child entrypoint;
+    the separate identity test exercises the same protocol over a real subprocess."""
+    from cron import scheduler
+    from cron.scheduler_worker_identity import write_worker_acceptance
+
+    payload = tmp_path / "payload.json"
+    ack = tmp_path / "exec-accept.ready"
+    accept = tmp_path / "exec-accept.accept"
+    payload.write_text(
+        json.dumps({
+            "job": {"id": "job-accept", "execution_id": "exec-accept"},
+            "profile_home": str(tmp_path / "profile"),
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+            "scope_control_group": None,
+            "custody_generation": None,
+        }),
+        encoding="utf-8",
+    )
+    adopted = Mock(return_value={
+        "id": "exec-accept",
+        "job_id": "job-accept",
+        "status": "running",
+        "pid": os.getpid(),
+        "process_started_at": 123,
+        "handoff_pending": 0,
+    })
+    run = Mock(return_value=True)
+    monkeypatch.setattr("cron.executions.adopt_claimed_execution", adopted)
+    monkeypatch.setattr("cron.executions.get_execution", adopted)
+    monkeypatch.setattr(scheduler, "run_one_job", run)
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr("hermes_cli.env_loader.hydrate_profile_secret_sources", lambda _home: None)
+    monkeypatch.setattr("agent.secret_scope.build_profile_secret_scope", lambda _home: {})
+    monkeypatch.setattr("agent.secret_scope.set_secret_scope", lambda *_a, **_k: object())
+    monkeypatch.setattr("agent.secret_scope.reset_secret_scope", lambda _token: None)
+    monkeypatch.setattr(
+        "gateway.run_startup.GatewayStartupMixin._register_config_hooks",
+        lambda *_a, **_k: None,
+    )
+
+    outcome = []
+    worker = threading.Thread(
+        target=lambda: outcome.append(
+            scheduler._run_external_worker_payload(payload, ack, accept)),
+        daemon=True,
+    )
+    worker.start()
+    deadline = time.monotonic() + 2
+    while not ack.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ack.exists()
+    assert not run.called
+    acknowledgement = json.loads(ack.read_text(encoding="utf-8"))
+    write_worker_acceptance(
+        accept, acknowledgement,
+        expected_generation=None,
+    )
+    worker.join(timeout=3)
+    assert not worker.is_alive()
+    assert outcome == [True]
+    run.assert_called_once()
 
 
 def test_external_worker_ack_is_never_observable_half_written(tmp_path, monkeypatch):
@@ -190,25 +301,46 @@ def test_external_worker_ack_is_never_observable_half_written(tmp_path, monkeypa
         json.dumps({
             "job": {"id": "job-1", "execution_id": "exec-1"},
             "profile_home": str(tmp_path / "profile"),
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+            "scope_control_group": None,
+            "custody_generation": None,
         }),
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cron.executions.adopt_claimed_execution",
-        lambda execution_id: {"id": execution_id, "status": "running"})
+        lambda execution_id: {
+            "id": execution_id,
+            "status": "running",
+            "process_started_at": 9876,
+        })
+    monkeypatch.setattr(
+        "cron.executions.get_execution",
+        lambda _execution_id: {
+            "id": "exec-1",
+            "job_id": "job-1",
+            "status": "running",
+            "handoff_pending": 0,
+            "pid": os.getpid(),
+            "process_started_at": 9876,
+        },
+    )
     monkeypatch.setattr(scheduler, "run_one_job", lambda *_a, **_k: True)
+    from cron import scheduler_worker_identity
 
-    real_dump = json.dump
+    real_dump = scheduler_worker_identity.json.dump
     visible_while_writing = []
 
     def spying_dump(obj, fp, *args, **kwargs):
         # The body is being produced right now: a reader must not be able to see the ack yet.
-        visible_while_writing.append(ack.exists())
+        if list(ack.parent.glob(f"{ack.name}.tmp*")):
+            visible_while_writing.append(ack.exists())
         return real_dump(obj, fp, *args, **kwargs)
 
-    monkeypatch.setattr(scheduler.json, "dump", spying_dump)
+    monkeypatch.setattr(scheduler_worker_identity.json, "dump", spying_dump)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is True
+    assert _run_payload_with_parent_acceptance(scheduler, payload, ack) is True
 
     assert visible_while_writing == [False]
     assert json.loads(ack.read_text(encoding="utf-8"))["execution_id"] == "exec-1"
@@ -226,6 +358,10 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
         json.dumps({
             "job": {"id": "job-1", "execution_id": "exec-1"},
             "profile_home": str(tmp_path / "profile"),
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+            "scope_control_group": None,
+            "custody_generation": None,
         }),
         encoding="utf-8",
     )
@@ -233,7 +369,8 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
     run = Mock()
     monkeypatch.setattr(scheduler, "run_one_job", run)
 
-    assert scheduler._run_external_worker_payload(payload, ack) is False
+    assert scheduler._run_external_worker_payload(
+        payload, ack, tmp_path / "accept") is False
 
     run.assert_not_called()
     assert not ack.exists()
@@ -298,7 +435,16 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
         payloads.append(json.loads(Path(command[payload_index]).read_text()))
         ack_index = command.index("--ack-file") + 1
         Path(command[ack_index]).write_text(
-            json.dumps({"pid": 4321, "execution_id": "exec-1"}),
+            json.dumps({
+                "pid": 4321,
+                "process_started_at": 1,
+                "execution_id": "exec-1",
+                "dispatch_mode": "direct",
+                "scope_unit": None,
+                "scope_control_group": None,
+                "handoff_nonce": "stub-handoff-nonce",
+                "custody_generation": None,
+            }),
             encoding="utf-8",
         )
         return FakeProcess()
@@ -526,7 +672,16 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
             self.now += seconds
             if self.now >= ack_at and not ack_path.exists():
                 ack_path.write_text(
-                    json.dumps({"pid": 4321, "execution_id": "exec-cold"}),
+                    json.dumps({
+                        "pid": 4321,
+                        "process_started_at": 1,
+                        "execution_id": "exec-cold",
+                        "dispatch_mode": "scoped",
+                        "scope_unit": "cron-job-1.scope",
+                        "scope_control_group": "/user.slice/cron-job-1.scope",
+                        "handoff_nonce": "cold-handoff-nonce",
+                        "custody_generation": None,
+                    }),
                     encoding="utf-8",
                 )
 
@@ -911,8 +1066,10 @@ pm.environments.activate_dependencies = lambda root: None
 import hermes_cli._early_recovery as early_recovery
 import hermes_cli.venv_sync as venv_sync
 
-payload, ack, record, marker = Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), sys.argv[4]
-if sys.argv[5] == "source_update":
+payload, ack, accept, record, marker = (
+    Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]), sys.argv[5]
+)
+if sys.argv[6] == "source_update":
     venv_sync.prepare_launch = lambda root, argv: Path(sys.executable)
 else:
     venv_sync.prepare_launch = lambda root, argv: None
@@ -921,7 +1078,7 @@ else:
 
 def relaunch(*args):
     record.write_text(json.dumps({
-        "payload": payload.exists(), "ack": ack.exists(),
+        "payload": payload.exists(), "ack": ack.exists(), "accept": accept.exists(),
         "marker": os.environ.get(marker), "command": args[-1],
     }))
     raise SystemExit(0)
@@ -929,7 +1086,10 @@ def relaunch(*args):
 
 os.execv = relaunch
 subprocess.call = relaunch
-sys.argv = ["cron.scheduler", "--external-worker-file", str(payload), "--ack-file", str(ack)]
+sys.argv = [
+    "cron.scheduler", "--external-worker-file", str(payload),
+    "--ack-file", str(ack), "--accept-file", str(accept),
+]
 runpy.run_module("cron.scheduler", run_name="__main__", alter_sys=True)
 """
 
@@ -950,18 +1110,22 @@ def test_relaunch_replays_the_worker_before_its_ack(tmp_path, cause):
         "job": {"id": "job-1", "execution_id": "exec-1"},
         "profile_home": str(tmp_path / "profile"),
     }), encoding="utf-8")
-    ack, record = tmp_path / "exec-1.ready", tmp_path / "relaunch.json"
+    ack = tmp_path / "exec-1.ready"
+    accept = tmp_path / "exec-1.accept"
+    record = tmp_path / "relaunch.json"
     env = dict(os.environ, PYTHONPATH=str(repo_root))
     env[worker_bootstrap.WORKER_MARKER] = "1"
     child = subprocess.run(
-        [sys.executable, "-c", _RELAUNCH_PROBE, str(payload), str(ack), str(record),
-         worker_bootstrap.WORKER_MARKER, cause],
+        [sys.executable, "-c", _RELAUNCH_PROBE, str(payload), str(ack), str(accept),
+         str(record), worker_bootstrap.WORKER_MARKER, cause],
         cwd=repo_root, env=env, capture_output=True, text=True, timeout=120,
         check=False,
     )
     assert record.exists(), f"worker never relaunched (exit {child.returncode}): {child.stderr}"
     seen = json.loads(record.read_text())
-    assert (seen["payload"], seen["ack"], seen["marker"]) == (True, False, "1")
+    assert (seen["payload"], seen["ack"], seen["accept"], seen["marker"]) == (
+        True, False, False, "1")
+    assert any("--accept-file" in item for item in seen["command"])
     if cause == "source_update":
         assert "runpy.run_module('cron.scheduler', run_name='__main__'" in seen["command"][-1]
     else:

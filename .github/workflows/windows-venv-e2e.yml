@@ -185,6 +185,12 @@ jobs:
             tests/cron/test_restart_safe_worker.py \
             tests/cron/test_scheduler_provider.py \
             tests/cron/test_cron_owner_custody.py \
+            tests/cron/test_worker_windows_identity.py \
+            tests/cron/test_external_worker_acceptance.py \
+            tests/cron/test_restart_safe_worker_death_evidence.py \
+            tests/cron/test_external_worker_secret_sources.py \
+            tests/cron/test_external_worker_config_hooks.py \
+            tests/cron/test_scheduled_occurrence.py \
             tests/gateway/test_cron_fire_custody.py \
             -- --tb=short
 

@@ -17,6 +17,7 @@ import subprocess
 import sys
 from cron import jobs, scheduler
 from cron.scheduler_provider import InProcessCronScheduler
+from tests.waiting import wait_until
 if sys.argv[1] == 'builtin':
     scheduler.tick(verbose=False, sync=True)
 else:
@@ -33,11 +34,36 @@ else:
         home = Path(os.environ['HERMES_HOME'])
         payload = home / (claim['execution_id'] + '.json')
         ack = home / (claim['execution_id'] + '.ready')
-        payload.write_text(json.dumps({'job': claim, 'profile_home': str(home),
-                                       'multiplex_active': False}))
-        subprocess.run([sys.executable, '-m', 'cron.scheduler',
-                        '--external-worker-file', str(payload), '--ack-file', str(ack)],
-                       stdin=subprocess.DEVNULL, check=True, timeout=60)
+        accept = home / (claim['execution_id'] + '.accept')
+        payload.write_text(json.dumps({
+            'job': claim,
+            'profile_home': str(home),
+            'multiplex_active': False,
+            'dispatch_mode': 'direct',
+            'scope_unit': None,
+            'custody_generation': None,
+        }))
+        process = subprocess.Popen(
+            [sys.executable, '-m', 'cron.scheduler',
+             '--external-worker-file', str(payload), '--ack-file', str(ack),
+             '--accept-file', str(accept)],
+            stdin=subprocess.DEVNULL,
+        )
+        try:
+            wait_until(lambda: ack.exists(), timeout=60, what='external worker ACK')
+            from cron.scheduler_worker_identity import write_worker_acceptance
+
+            acknowledgement = json.loads(ack.read_text())
+            write_worker_acceptance(
+                accept,
+                acknowledgement,
+                expected_generation=acknowledgement.get('custody_generation'),
+            )
+            assert process.wait(timeout=60) == 0
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=30)
         assert json.loads(ack.read_text())['pid'] != os.getpid()
 """
 

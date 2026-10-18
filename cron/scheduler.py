@@ -3714,8 +3714,9 @@ def _wait_for_external_cron_worker(
 
 def _await_external_worker_handoff(
     process: subprocess.Popen, *, execution_id: str, job_id: str,
-    payload_path: Path, ack_path: Path, stderr_path: Path, worker_custody,
+    payload_path: Path, ack_path: Path, accept_path: Path, stderr_path: Path, worker_custody,
     dispatch, worker_env: dict[str, str], scope_unit: Optional[str] = None,
+    custody_generation: Any = None,
 ) -> bool:
     """Authenticate one external worker or preserve the exact uncertain-owner lane."""
     # Same window the dead-owner recovery ledger grants a pending handoff: a cold
@@ -3737,7 +3738,7 @@ def _await_external_worker_handoff(
                     process,
                     execution_id=execution_id,
                     job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
+                    handoff_files=(payload_path, accept_path, stderr_path),
                     stderr_path=stderr_path,
                     custody=worker_custody,
                     dispatch_mode=dispatch.mode,
@@ -3757,7 +3758,23 @@ def _await_external_worker_handoff(
                     process,
                     execution_id=execution_id,
                     job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
+                    handoff_files=(payload_path, accept_path, stderr_path),
+                    stderr_path=stderr_path,
+                    custody=worker_custody,
+                    dispatch_mode=dispatch.mode,
+                )
+            from cron.scheduler_worker_identity import worker_ack_matches_generation
+            if not worker_ack_matches_generation(acknowledgement, custody_generation):
+                logger.error(
+                    "Cron external worker acknowledgement generation mismatch for %s; "
+                    "treating handoff as ownership-uncertain",
+                    execution_id,
+                )
+                return _wait_for_external_cron_worker(
+                    process,
+                    execution_id=execution_id,
+                    job_id=job_id,
+                    handoff_files=(payload_path, accept_path, stderr_path),
                     stderr_path=stderr_path,
                     custody=worker_custody,
                     dispatch_mode=dispatch.mode,
@@ -3773,11 +3790,30 @@ def _await_external_worker_handoff(
                         process,
                         execution_id=execution_id,
                         job_id=job_id,
-                        handoff_files=(payload_path, stderr_path),
+                        handoff_files=(payload_path, accept_path, stderr_path),
                         stderr_path=stderr_path,
                         custody=worker_custody,
                         dispatch_mode=dispatch.mode,
                     )
+            from cron.scheduler_worker_identity import write_worker_acceptance
+            try:
+                write_worker_acceptance(
+                    accept_path,
+                    acknowledgement,
+                    expected_generation=custody_generation,
+                )
+            except (OSError, RuntimeError, TypeError, ValueError):
+                # The child has a durable claim but no parent decision. Keep its exact custody in
+                # the post-handoff lane; no in-process fallback is safe here.
+                return _wait_for_external_cron_worker(
+                    process,
+                    execution_id=execution_id,
+                    job_id=job_id,
+                    handoff_files=(payload_path, accept_path, stderr_path),
+                    stderr_path=stderr_path,
+                    custody=worker_custody,
+                    dispatch_mode=dispatch.mode,
+                )
             logger.info(
                 "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
                 job_id,
@@ -3794,7 +3830,7 @@ def _await_external_worker_handoff(
                 process,
                 execution_id=execution_id,
                 job_id=job_id,
-                handoff_files=(payload_path, stderr_path),
+                handoff_files=(payload_path, accept_path, stderr_path),
                 stderr_path=stderr_path,
                 custody=worker_custody,
                 dispatch_mode=dispatch.mode,
@@ -3811,7 +3847,7 @@ def _await_external_worker_handoff(
             if reconciliation == "terminalized":
                 return _wait_for_external_cron_worker(
                     process, execution_id=execution_id, job_id=job_id,
-                    handoff_files=(payload_path, stderr_path), stderr_path=stderr_path,
+                    handoff_files=(payload_path, accept_path, stderr_path), stderr_path=stderr_path,
                     custody=worker_custody, dispatch_mode=dispatch.mode)
             if reconciliation == "unknown":
                 # The row may have been adopted or side effects may have started even though the
@@ -3852,7 +3888,7 @@ def _await_external_worker_handoff(
         process,
         execution_id=execution_id,
         job_id=job_id,
-        handoff_files=(payload_path, ack_path, stderr_path),
+        handoff_files=(payload_path, ack_path, accept_path, stderr_path),
         stderr_path=stderr_path,
         custody=worker_custody,
         dispatch_mode=dispatch.mode,
@@ -3879,6 +3915,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
     handoff_dir = _get_hermes_home() / "cron" / "external-workers"
     payload_path = handoff_dir / f"{execution_id}.json"
     ack_path = handoff_dir / f"{execution_id}.ready"
+    accept_path = handoff_dir / f"{execution_id}.accept"
     # Captured so a worker that dies before its acknowledgement can name the cause (#112729).
     stderr_path = handoff_dir / f"{execution_id}.stderr"
     command = [
@@ -3889,6 +3926,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
         str(payload_path),
         "--ack-file",
         str(ack_path),
+        "--accept-file",
+        str(accept_path),
     ]
 
     from agent.secret_scope import is_multiplex_active
@@ -3940,6 +3979,12 @@ def _launch_external_cron_worker(job: dict) -> bool:
         if custody_required() or managed_runtime_available():
             raise RuntimeError("cron external worker custody unavailable")
 
+    from cron.scheduler_worker_identity import worker_custody_generation
+    custody_generation = (
+        worker_custody_generation(worker_custody.handle)
+        if worker_custody is not None else None
+    )
+
     if mark_execution_handoff_pending(execution_id) is None:
         if worker_custody is not None:
             worker_custody.cancel_unactivated_child()
@@ -3965,6 +4010,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     "multiplex_active": multiplex_active,
                     "dispatch_mode": dispatch.mode,
                     "scope_unit": scope_unit,
+                    "custody_generation": custody_generation,
                 },
                 payload_file,
             )
@@ -4053,12 +4099,15 @@ def _launch_external_cron_worker(job: dict) -> bool:
 
     return _await_external_worker_handoff(
         process, execution_id=execution_id, job_id=job_id,
-        payload_path=payload_path, ack_path=ack_path, stderr_path=stderr_path,
+        payload_path=payload_path, ack_path=ack_path, accept_path=accept_path,
+        stderr_path=stderr_path,
         worker_custody=worker_custody, dispatch=dispatch, worker_env=worker_env,
-        scope_unit=scope_unit,
+        scope_unit=scope_unit, custody_generation=custody_generation,
     )
 
-def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
+def _run_external_worker_payload(
+    payload_path: Path, ack_path: Path, accept_path: Path,
+) -> bool:
     """Adopt and execute one gateway-dispatched cron payload.
 
     The execution row is created by the gateway before spawn, then transferred
@@ -4095,27 +4144,35 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
 
     previous_multiplex = is_multiplex_active()
     home_token = secret_token = None
+    acknowledgement = None
+    accept_path = Path(accept_path)
+    handoff_nonce = None
+    custody_generation = payload.get("custody_generation")
     try:
         home_token = set_hermes_home_override(profile_home)
         multiplex_active = bool(payload.get("multiplex_active", False))
         set_multiplex_active(multiplex_active)
-        # Plugin secret sources (``ctx.register_secret_source()``) only exist after plugin
-        # discovery; this process starts with the builtin registry alone, so hydrating without it
-        # silently dropped every plugin-sourced credential (#121929). Runs under the home override
-        # so a multiplexed worker loads the OWNING profile's plugins, not the launch profile's.
-        from hermes_cli.plugins import discover_plugins
+        def prepare_profile_runtime() -> None:
+            nonlocal secret_token
+            # Plugin secret sources (``ctx.register_secret_source()``) only exist after plugin
+            # discovery; this process starts with the builtin registry alone, so hydrating without it
+            # silently dropped every plugin-sourced credential (#121929). Runs under the home override
+            # so a multiplexed worker loads the OWNING profile's plugins, not the launch profile's.
+            from hermes_cli.plugins import discover_plugins
 
-        discover_plugins()
-        hydrate_profile_secret_sources(profile_home)
-        secret_token = set_secret_scope(build_profile_secret_scope(profile_home), profile_home=str(profile_home))
-        # This process never ran gateway startup, so the OWNING profile's ``hooks:`` block (shell
-        # hooks + ``hooks.outbound``) was never registered and cron sessions silently lost it
-        # (#131764). Same helper the gateway uses per profile; it must run inside the secret scope
-        # because ``secret_env`` targets resolve through ``get_secret`` (raises unscoped under multiplex).
-        from gateway.run_startup import GatewayStartupMixin
+            discover_plugins()
+            hydrate_profile_secret_sources(profile_home)
+            secret_token = set_secret_scope(
+                build_profile_secret_scope(profile_home), profile_home=str(profile_home))
+            # This process never ran gateway startup, so the OWNING profile's ``hooks:`` block (shell
+            # hooks + ``hooks.outbound``) was never registered and cron sessions silently lost it
+            # (#131764). Same helper the gateway uses per profile; it must run inside the secret scope
+            # because ``secret_env`` targets resolve through ``get_secret`` (raises unscoped under multiplex).
+            from gateway.run_startup import GatewayStartupMixin
 
-        GatewayStartupMixin._register_config_hooks(
-            "Cron external worker: config hook registration failed", level=logging.WARNING)
+            GatewayStartupMixin._register_config_hooks(
+                "Cron external worker: config hook registration failed", level=logging.WARNING)
+
         with use_cron_store(profile_home):
             adopted = adopt_claimed_execution(execution_id)
             if adopted is None:
@@ -4127,6 +4184,9 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 return False
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
+                from cron.scheduler_worker_identity import new_handoff_nonce
+
+                handoff_nonce = new_handoff_nonce()
                 scope_control_group = None
                 if payload.get("dispatch_mode") == "scoped" and sys.platform == "linux":
                     try:
@@ -4147,33 +4207,59 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 # written, occasionally handing it a 0-byte file and a JSONDecodeError.
                 # os.replace() is a single atomic syscall on the same filesystem, so
                 # readers only ever see the file fully absent or fully written.
-                ack_tmp_path = ack_path.with_name(f"{ack_path.name}.tmp{os.getpid()}")
-                fd = os.open(ack_tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-                try:
-                    with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
-                        json.dump(
-                            {
-                                "pid": os.getpid(),
-                                "process_started_at": adopted.get("process_started_at"),
-                                "execution_id": execution_id,
-                                "dispatch_mode": payload.get("dispatch_mode"),
-                                "scope_unit": payload.get("scope_unit"),
-                                "scope_control_group": scope_control_group,
-                            },
-                            ack_file,
-                        )
-                        ack_file.flush()
-                        os.fsync(ack_file.fileno())
-                    os.replace(ack_tmp_path, ack_path)
-                except BaseException:
-                    ack_tmp_path.unlink(missing_ok=True)
-                    raise
+                from cron.scheduler_worker_identity import write_worker_ack
+
+                acknowledgement = write_worker_ack(
+                    ack_path,
+                    execution_id=execution_id,
+                    process_started_at=adopted.get("process_started_at"),
+                    dispatch_mode=payload.get("dispatch_mode"),
+                    scope_unit=payload.get("scope_unit"),
+                    scope_control_group=scope_control_group,
+                    handoff_nonce=handoff_nonce,
+                    custody_generation=custody_generation,
+                )
             except Exception:
                 logger.exception(
                     "Cron external worker could not publish ready acknowledgement for %s",
                     execution_id,
                 )
                 return False
+            from cron.scheduler_worker_identity import wait_for_worker_acceptance
+
+            if not wait_for_worker_acceptance(
+                accept_path,
+                acknowledgement,
+                timeout=HANDOFF_ADOPTION_GRACE_SECONDS,
+            ):
+                logger.error(
+                    "Cron external worker %s did not receive its exact parent acceptance",
+                    execution_id,
+                )
+                return False
+            from cron.executions import get_execution
+
+            current = get_execution(execution_id)
+            expected_source = job.get("source")
+            if (
+                not isinstance(current, dict)
+                or current.get("id") != execution_id
+                or current.get("job_id") != str(job.get("id"))
+                or (
+                    expected_source is not None
+                    and current.get("source") != expected_source
+                )
+                or current.get("status") != "running"
+                or bool(current.get("handoff_pending"))
+                or current.get("pid") != os.getpid()
+                or current.get("process_started_at") != adopted.get("process_started_at")
+            ):
+                logger.error(
+                    "Cron external worker %s lost its authenticated running row before execution",
+                    execution_id,
+                )
+                return False
+            prepare_profile_runtime()
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
@@ -4671,6 +4757,7 @@ if __name__ == "__main__":
         parser = argparse.ArgumentParser(add_help=False)
         parser.add_argument("--external-worker-file", type=Path, required=True)
         parser.add_argument("--ack-file", type=Path, required=True)
+        parser.add_argument("--accept-file", type=Path, required=True)
         args = parser.parse_args()
         # The gateway spawns this worker with stdout on DEVNULL and stderr on a
         # capture file it only reads back if we die before the ack; without a
@@ -4683,6 +4770,7 @@ if __name__ == "__main__":
         except Exception:
             pass
         raise SystemExit(
-            0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
+            0 if _run_external_worker_payload(
+                args.external_worker_file, args.ack_file, args.accept_file) else 1
         )
     tick(verbose=True, headless=True)

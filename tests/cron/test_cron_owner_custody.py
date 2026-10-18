@@ -17,6 +17,16 @@ from gateway.runtime_custody import RuntimeCustodyCoordinator
 from hermes_cli.backend_retirement import RetirementFence
 
 
+def _spawn_external_test_worker(command, **kwargs):
+    """Use the real owned Windows Job for worker-positive scenarios."""
+    if sys.platform == "win32":
+        from hermes_cli.local_runtime.processes import spawn_server
+        from tui_gateway.windows_owner_recovery import new_windows_job_name
+
+        return spawn_server(command, owner_job_name=new_windows_job_name(), **kwargs)
+    return subprocess.Popen(command, **kwargs), None
+
+
 @pytest.fixture
 def custody_runtime(monkeypatch, tmp_path):
     from cron import executions
@@ -159,16 +169,23 @@ def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(cust
         from pathlib import Path
         import cron.executions as e
         e.EXECUTIONS_FILE = Path({str(db)!r})
-        assert e.adopt_claimed_execution({binding.execution_id!r}) is not None
-        print(json.dumps({{"execution_id": {binding.execution_id!r}, "pid": os.getpid()}}), flush=True)
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        ack = {{"execution_id": {binding.execution_id!r}, "pid": os.getpid(),
+                "process_started_at": adopted["process_started_at"],
+                "dispatch_mode": "direct"}}
+        if os.name == "nt":
+            from tui_gateway.windows_producer_identity import current_process_creation_filetime
+            ack["process_creation_filetime"] = current_process_creation_filetime()
+        print(json.dumps(ack), flush=True)
         assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
         assert sys.stdin.read(1) == "x"
         """
     )
-    process = subprocess.Popen(
+    process, native_job = _spawn_external_test_worker(
         [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True)
-    worker.bind_process(process)
+    worker.bind_process(process, native_job=native_job)
     assert process.stdout is not None
     acknowledgement = json.loads(process.stdout.readline())
     worker.activate_external_worker(acknowledgement, process)
@@ -187,7 +204,7 @@ def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(cust
 
 
 def test_i13_terminal_row_before_ready_ack_keeps_exact_worker_identity(custody_runtime):
-    """A real child may commit its terminal row before its ready file is consumed."""
+    """A real child commits its terminal row before ACK consumption while capture is gated."""
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
 
@@ -209,25 +226,33 @@ def test_i13_terminal_row_before_ready_ack_keeps_exact_worker_identity(custody_r
         adopted = e.adopt_claimed_execution({binding.execution_id!r})
         assert adopted is not None
         assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
-        print(json.dumps({{
+        ack = {{
             "execution_id": {binding.execution_id!r},
             "pid": os.getpid(),
             "process_started_at": adopted["process_started_at"],
             "dispatch_mode": "direct",
-        }}), flush=True)
+        }}
+        if os.name == "nt":
+            from tui_gateway.windows_producer_identity import current_process_creation_filetime
+            ack["process_creation_filetime"] = current_process_creation_filetime()
+        print(json.dumps(ack), flush=True)
+        assert sys.stdin.read(1) == "x"
         """
     )
-    process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+    process, native_job = _spawn_external_test_worker(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True)
-    worker.bind_process(process)
+    worker.bind_process(process, native_job=native_job)
     try:
         assert process.stdout is not None
         acknowledgement = json.loads(process.stdout.readline())
-        # The child has already committed its terminal row and exited. Activation must use the
-        # Popen identity captured before exit; a fresh live-PID probe would reject this ordering.
-        process.wait(timeout=5)
+        # The child is blocked after publishing the terminal row and ACK. This proves the parent
+        # captures the native handle while the exact producer is still in the owned Job.
         worker.activate_external_worker(acknowledgement, process, dispatch_mode="direct")
+        assert process.stdin is not None
+        process.stdin.write("x")
+        process.stdin.close()
+        process.wait(timeout=5)
         from cron.scheduler_detached_worker import reap_terminal_worker_in_background
 
         reaper = reap_terminal_worker_in_background(process)
@@ -241,6 +266,8 @@ def test_i13_terminal_row_before_ready_ack_keeps_exact_worker_identity(custody_r
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+        if native_job is not None:
+            native_job.close()
 
 
 def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runtime):
@@ -267,10 +294,10 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
         assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
         """
     )
-    process = subprocess.Popen(
+    process, native_job = _spawn_external_test_worker(
         [sys.executable, "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-    worker.bind_process(process)
+    worker.bind_process(process, native_job=native_job)
     try:
         assert process.stdout is not None
         assert process.stdout.readline().strip() == "ready"
@@ -278,6 +305,11 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
         process.stdin.write("x")
         process.stdin.close()
         process.wait(timeout=5)
+        if sys.platform == "win32":
+            # A completed row plus a newly opened PID/Job query is not an authenticated receipt.
+            # Windows must retain unknown custody until the worker has published its native ACK.
+            assert worker.reconcile_unacknowledged(process, dispatch_mode="direct") == "unknown"
+            return
         assert worker.reconcile_unacknowledged(process, dispatch_mode="direct") == "terminalized"
         from cron.scheduler_detached_worker import reap_terminal_worker_in_background
 
@@ -302,10 +334,12 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=5)
+        if native_job is not None:
+            native_job.close()
 
 
 @pytest.mark.platforms("windows")
-def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
+def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime, monkeypatch):
     """Windows qualification uses the existing native Job helper, never a PID census or mock."""
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
@@ -321,12 +355,130 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
     assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
     script = textwrap.dedent(
         f"""
+        import json
+        import os
         import sys
         from pathlib import Path
         import cron.executions as e
         e.EXECUTIONS_FILE = Path({str(db)!r})
-        assert e.adopt_claimed_execution({binding.execution_id!r}) is not None
-        print("ready", flush=True)
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        ack = {{
+            "execution_id": {binding.execution_id!r},
+            "pid": os.getpid(),
+            "process_started_at": adopted["process_started_at"],
+            "dispatch_mode": "direct",
+        }}
+        if os.name == "nt":
+            from tui_gateway.windows_producer_identity import current_process_creation_filetime
+            ack["process_creation_filetime"] = current_process_creation_filetime()
+        print(json.dumps(ack), flush=True)
+        assert sys.stdin.read(1) == "x"
+        assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
+        """
+    )
+    process, native_job = spawn_server(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        owner_job_name=new_windows_job_name())
+    worker.bind_process(process, native_job=native_job)
+    retained_worker_handle = None
+    retained_close = None
+    try:
+        assert process.stdout is not None
+        acknowledgement = json.loads(process.stdout.readline())
+        worker.activate_external_worker(acknowledgement, process, dispatch_mode="direct")
+        retained_worker_handle = worker._worker_process_handle
+        assert retained_worker_handle is not None
+        # An identical delivery retry revalidates the retained handle/Job and is idempotent;
+        # malformed or foreign receipts remain fail-closed in the separate identity tests.
+        worker.activate_external_worker(acknowledgement, process, dispatch_mode="direct")
+        assert worker._worker_process_handle is retained_worker_handle
+        assert process.stdin is not None
+        process.stdin.write("x")
+        process.stdin.close()
+        process.wait(timeout=5)
+        from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+        reaper = reap_terminal_worker_in_background(process)
+        worker.bind_reaper(reaper)
+        reaper.join(timeout=5)
+        assert not reaper.is_alive()
+        retained_close = retained_worker_handle.close
+        close_attempts = []
+
+        def fail_first_native_close():
+            close_attempts.append(True)
+            if len(close_attempts) == 1:
+                raise OSError("injected native worker-handle close failure")
+            return retained_close()
+
+        # Keep the real WindowsProducerHandle and Job objects. The seam only makes the first
+        # close operation fail so observe_terminal must retain and retry that exact handle.
+        monkeypatch.setattr(retained_worker_handle, "close", fail_first_native_close)
+        retained_creation_filetime = worker._worker_creation_filetime
+        assert not worker.observe_terminal()
+        assert worker._worker_process_handle is retained_worker_handle
+        assert worker._worker_creation_filetime == retained_creation_filetime
+        assert worker._native_job is None
+        assert worker._native_job_closed is True
+        assert not worker.settled
+        assert not binding.settled
+        assert worker._cleanup_retryable is True
+        assert worker.observe_terminal()
+        assert worker._worker_process_handle is None
+        assert binding.observe_terminal()
+        assert binding.settled
+        assert len(close_attempts) == 2
+        assert worker._native_job_proven is True
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=5)
+        if (
+            retained_worker_handle is not None
+            and retained_close is not None
+            and retained_worker_handle.is_open
+        ):
+            retained_close()
+        if native_job is not None:
+            native_job.close()
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_wrong_start_refuses_real_job_adoption(custody_runtime):
+    """A real owned Job cannot make a durable-row birth mismatch admissible."""
+    _coordinator, executions, db = custody_runtime
+    from cron.runtime_custody import CronCustodyRefused, reserve_execution
+    from hermes_cli.local_runtime.processes import spawn_server
+    from tui_gateway.windows_owner_recovery import new_windows_job_name
+
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-wrong-start", source="builtin", required=True)
+    record = executions.create_execution(
+        "job-wrong-start", source="builtin", execution_id=binding.owner_id)
+    binding.bind_execution_record(record)
+    worker = binding.reserve_external_worker()
+    assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        from pathlib import Path
+        import cron.executions as e
+        e.EXECUTIONS_FILE = Path({str(db)!r})
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        ack = {{
+            "execution_id": {binding.execution_id!r},
+            "pid": os.getpid(),
+            "process_started_at": adopted["process_started_at"],
+            "dispatch_mode": "direct",
+        }}
+        from tui_gateway.windows_producer_identity import current_process_creation_filetime
+        ack["process_creation_filetime"] = current_process_creation_filetime()
+        print(json.dumps(ack), flush=True)
         assert sys.stdin.read(1) == "x"
         assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
         """
@@ -338,28 +490,71 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
     worker.bind_process(process, native_job=native_job)
     try:
         assert process.stdout is not None
-        assert process.stdout.readline().strip() == "ready"
-        assert process.stdin is not None
-        process.stdin.write("x")
-        process.stdin.close()
-        process.wait(timeout=5)
-        assert worker.reconcile_unacknowledged(process, dispatch_mode="direct") == "terminalized"
-        from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-        reaper = reap_terminal_worker_in_background(process)
-        worker.bind_reaper(reaper)
-        reaper.join(timeout=5)
-        assert not reaper.is_alive()
-        assert worker.observe_terminal()
-        assert binding.observe_terminal()
-        assert binding.settled
-        assert worker._native_job_proven is True
+        acknowledgement = json.loads(process.stdout.readline())
+        acknowledgement["process_started_at"] += 1
+        with pytest.raises(CronCustodyRefused) as refused:
+            worker.activate_external_worker(acknowledgement, process, dispatch_mode="direct")
+        assert refused.value.code == "worker_execution_not_adopted"
+        assert worker._unknown is True
+        assert worker._worker_process_handle is None
+        assert worker._native_job is native_job
     finally:
         if process.poll() is None:
-            process.terminate()
+            assert process.stdin is not None
+            process.stdin.write("x")
+            process.stdin.close()
             process.wait(timeout=5)
+        if process.stdout is not None:
+            process.stdout.close()
         if native_job is not None:
             native_job.close()
+
+
+def test_i13_worker_handle_close_failure_retains_exact_custody(custody_runtime):
+    """Native cleanup retries the same Job/worker handles before releasing the lease."""
+    _coordinator, executions, _db = custody_runtime
+    from cron.runtime_custody import reserve_execution
+
+    class RetryClose:
+        def __init__(self):
+            self.close_calls = 0
+            self.is_open = True
+
+        def close(self):
+            self.close_calls += 1
+            if self.close_calls == 1:
+                raise OSError("synthetic native close failure")
+            self.is_open = False
+
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-close-failure", source="builtin", required=True)
+    _claimed(binding, executions, "job-close-failure")
+    assert executions.finish_execution(
+        binding.execution_id, success=True, delivery_outcome="delivered") is not None
+    handle = RetryClose()
+    native_job = RetryClose()
+    binding._worker_process_handle = handle
+    binding._worker_creation_filetime = 134367929582396490
+    binding._native_job = native_job
+    binding._native_job_proven = True
+
+    # This test exercises the terminal consumer while keeping the platform-neutral fixture
+    # independent of a real Windows Job query. The native marked test above covers the actual
+    # Job/FILETIME/handle path; this one covers a close failure followed by the real retry.
+    binding._wait_for_native_ownership_to_drain = lambda: True
+
+    assert binding._close_worker_process_handle() is False
+    assert binding._worker_process_handle is handle
+    assert binding._worker_creation_filetime == 134367929582396490
+    assert binding._unknown is False
+    assert binding._cleanup_retryable is True
+    assert not binding.observe_terminal()
+    assert binding._worker_process_handle is handle
+    assert not binding.settled
+    assert binding.observe_terminal()
+    assert binding.settled
+    assert handle.close_calls == 2
+    assert native_job.close_calls == 2
 
 
 def test_i13_birth_fingerprint_mismatch_refuses_worker_adoption(custody_runtime, monkeypatch):
@@ -457,6 +652,37 @@ def test_i13_adopted_child_without_ready_ack_is_unknown(custody_runtime):
     assert worker.reconcile_unacknowledged() == "unknown"
     assert not worker.settled
     assert not parent.settled
+
+
+def test_i13_durable_worker_record_requires_exact_execution_job_source_and_start(custody_runtime):
+    _coordinator, executions, _db = custody_runtime
+    from cron.runtime_custody import reserve_execution
+
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-exact", source="builtin", required=True)
+    record = executions.create_execution(
+        "job-exact", source="builtin", execution_id=binding.owner_id)
+    binding.bind_execution_record(record)
+    record = executions.mark_execution_running(binding.execution_id)
+    assert record is not None
+    assert type(record["pid"]) is int
+    assert type(record["process_started_at"]) is int
+    assert binding._external_worker_record_matches(
+        record, record["pid"], "direct", record["process_started_at"])
+
+    for field, value in (
+        ("id", "foreign-execution"),
+        ("job_id", "foreign-job"),
+        ("source", "foreign-source"),
+        ("process_started_at", record["process_started_at"] + 1),
+        ("pid", record["pid"] + 1),
+        ("pid", True),
+        ("status", "claimed"),
+    ):
+        candidate = dict(record)
+        candidate[field] = value
+        assert not binding._external_worker_record_matches(
+            candidate, record["pid"], "direct", record["process_started_at"])
 
 
 def test_i13_script_descendant_writer_is_owned_until_real_pipe_close(
@@ -780,6 +1006,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         },
         "ack": {
             "pid": None, "start": None, "start_known": False, "execution_id_present": False,
+            "creation_filetime": None, "creation_filetime_known": False,
             "dispatch_mode": "unknown", "scope_fields_present": False,
         },
         "durable_row": {
@@ -793,6 +1020,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         },
         "comparisons": {
             "pid_equal": False, "start_equal": False,
+            "creation_filetime_equal": False,
             "popen_job_membership": "unknown", "child_job_membership": "unknown",
             "identity_predicate": False,
         },
@@ -878,11 +1106,17 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
                 acknowledgement.get("process_started_at")
                 if isinstance(acknowledgement, dict) else None
             )
+            ack_creation = (
+                acknowledgement.get("process_creation_filetime")
+                if isinstance(acknowledgement, dict) else None
+            )
             ack_mode = acknowledgement.get("dispatch_mode") if isinstance(acknowledgement, dict) else None
             receipt["ack"].update({
                 "pid": ack_pid if type(ack_pid) is int else None,
                 "start": ack_start if type(ack_start) is int else None,
                 "start_known": type(ack_start) is int,
+                "creation_filetime": ack_creation if type(ack_creation) is int else None,
+                "creation_filetime_known": type(ack_creation) is int,
                 "execution_id_present": (
                     isinstance(acknowledgement, dict)
                     and acknowledgement.get("execution_id") == self.execution_id
@@ -924,6 +1158,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
                     receipt["launcher"]["popen_start"] == ack_start
                     and type(ack_start) is int
                 ),
+                "creation_filetime_equal": False,
                 "popen_job_membership": receipt["launcher"]["popen_in_exact_job"],
             })
             child_handle = None
@@ -957,10 +1192,17 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
                     })
             receipt["comparisons"]["child_job_membership"] = receipt["native_child"][
                 "in_exact_job_by_handle"]
+            receipt["comparisons"]["creation_filetime_equal"] = (
+                receipt["ack"]["creation_filetime"] is not None
+                and receipt["ack"]["creation_filetime"] == receipt["native_child"]["creation_filetime"]
+            )
             receipt["comparisons"]["identity_predicate"] = bool(
-                receipt["comparisons"]["pid_equal"]
-                and receipt["comparisons"]["start_equal"]
+                receipt["ack"]["pid"] == receipt["durable_row"]["pid"]
+                and receipt["ack"]["start"] == receipt["durable_row"]["start"]
                 and receipt["durable_row"]["matches_ack"]
+                and receipt["ack"]["creation_filetime_known"]
+                and receipt["comparisons"]["creation_filetime_equal"]
+                and receipt["comparisons"]["child_job_membership"] is True
             )
         try:
             result = real_activate(

@@ -210,6 +210,11 @@ class CronOwnerBinding:
         self._reaper_expected = False
         self._worker_pid = None
         self._worker_started_at = None
+        # Windows ``spawn_server`` returns the launcher Popen, while the durable row/ACK belong
+        # to the adopted worker.  Keep the separately authenticated worker handle until native
+        # Job and delivery settlement finish; a PID or later Job census is never a substitute.
+        self._worker_process_handle = None
+        self._worker_creation_filetime = None
         self._bound_process_pid = None
         self._bound_process_started_at = None
         self._dispatch_mode = None
@@ -218,6 +223,10 @@ class CronOwnerBinding:
         self._scope_proof = None
         self._native_job = None
         self._native_job_proven = False
+        self._native_job_closed = False
+        self._worker_process_handle_closed = False
+        self._cleanup_retryable = False
+        self._cleanup_failure_reason = None
         # In-process script writers are tracked separately from detached worker processes.
         # A process exit alone is insufficient while stdout/stderr writers may still hold the
         # completion pipe; the runner records an explicit post-exit pipe-close observation.
@@ -248,9 +257,12 @@ class CronOwnerBinding:
     def bind_execution_record(self, record: dict[str, Any]) -> None:
         if (
             not isinstance(record, dict)
-            or str(record.get("id")) != self.owner_id
-            or str(record.get("job_id")) != self.job_id
-            or str(record.get("source")) != self.source
+            or type(record.get("id")) is not str
+            or record.get("id") != self.owner_id
+            or type(record.get("job_id")) is not str
+            or record.get("job_id") != self.job_id
+            or type(record.get("source")) is not str
+            or record.get("source") != self.source
         ):
             self.mark_unknown("read_failed")
             raise CronCustodyRefused("execution_identity_mismatch")
@@ -469,8 +481,13 @@ class CronOwnerBinding:
         with self._lock:
             scope_proof = dict(self._scope_proof) if self._scope_proof is not None else None
             native_job = self._native_job
+            native_job_closed = self._native_job_closed
         if scope_proof is None and native_job is None:
             return True
+        if scope_proof is not None and scope_proof.get("kind") == "windows_job" and native_job is None:
+            # The exact owned Job was already closed successfully.  Keep the historical proof
+            # and retry the retained worker handle, rather than querying a released Job again.
+            return native_job_closed
         while True:
             if scope_proof is not None and scope_proof.get("kind") == "windows_job":
                 # Windows custody is proved by the retained kernel Job handle.  The proof is
@@ -499,24 +516,104 @@ class CronOwnerBinding:
     def _close_native_job(self) -> bool:
         with self._lock:
             native_job = self._native_job
+            if self._native_job_closed:
+                return True
         if native_job is None:
             return True
         try:
             native_job.close()
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-            self.mark_unknown("worker_scope_unproven")
+            # A close failure is retryable custody, not an identity refusal.  Do not mark the
+            # coordinator unknown: a later observation must be able to retry the same Job.
+            self._mark_cleanup_retryable("worker_scope_unproven")
             return False
+        with self._lock:
+            if self._native_job is native_job:
+                self._native_job = None
+                self._native_job_closed = True
         return True
 
-    def _worker_identity_matches(self, record: dict[str, Any], process: Any, dispatch_mode: Optional[str]) -> bool:
+    def _close_worker_process_handle(self) -> bool:
+        """Close the authenticated Windows worker handle only after Job drain succeeds."""
+        with self._lock:
+            process_handle = self._worker_process_handle
+        if process_handle is None:
+            return True
         try:
-            record_pid = int(record.get("pid", -1))
-            record_started_at = record.get("process_started_at")
-        except (TypeError, ValueError):
+            process_handle.close()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            # Keep the exact handle and identity for a later retry; clearing it would turn a
+            # native cleanup failure into an untracked process-owner loss.
+            self._mark_cleanup_retryable("worker_scope_unproven")
             return False
-        if record_pid <= 0 or type(record_started_at) is not int:
+        with self._lock:
+            if self._worker_process_handle is process_handle:
+                self._worker_process_handle = None
+                self._worker_creation_filetime = None
+                self._worker_process_handle_closed = True
+        return True
+
+    def _mark_cleanup_retryable(self, reason: str) -> None:
+        """Retain exact native custody after a close error without poisoning the lease."""
+        with self._lock:
+            if self._settled or self._unknown:
+                return
+            self._cleanup_retryable = True
+            self._cleanup_failure_reason = reason
+
+    def _worker_identity_matches(
+        self, record: dict[str, Any], process: Any, dispatch_mode: Optional[str],
+        *, worker_receipt: Any = None,
+    ) -> bool:
+        if not isinstance(record, dict):
+            return False
+        record_pid = record.get("pid")
+        record_started_at = record.get("process_started_at")
+        if type(record_pid) is not int or record_pid <= 0 or type(record_started_at) is not int:
             return False
         if dispatch_mode != "scoped":
+            if sys.platform == "win32":
+                with self._lock:
+                    retained_receipt = worker_receipt
+                    retained_handle = (
+                        worker_receipt.process_handle
+                        if worker_receipt is not None
+                        else self._worker_process_handle
+                    )
+                    retained_pid = (
+                        worker_receipt.pid if worker_receipt is not None
+                        else self._worker_pid
+                    )
+                    retained_started_at = (
+                        worker_receipt.process_started_at
+                        if worker_receipt is not None else self._worker_started_at
+                    )
+                    retained_creation_filetime = (
+                        worker_receipt.creation_filetime
+                        if worker_receipt is not None else self._worker_creation_filetime
+                    )
+                # The Windows worker is the process that adopted the durable row, not the
+                # venv/Popen launcher returned by spawn_server.  A retained process handle and
+                # its creation FILETIME are required; without an authenticated receipt the
+                # terminal-before-ACK path remains unknown.
+                if retained_receipt is not None:
+                    from cron.scheduler_worker_identity import worker_receipt_matches_record
+
+                    if not worker_receipt_matches_record(retained_receipt, record):
+                        return False
+                handle_open = getattr(retained_handle, "is_open", None)
+                return (
+                    retained_receipt is not None or retained_handle is not None
+                ) and (
+                    type(handle_open) is bool
+                    and handle_open is True
+                    and type(retained_pid) is int
+                    and record_pid == retained_pid
+                    and type(retained_started_at) is int
+                    and record_started_at == retained_started_at
+                    and type(retained_creation_filetime) is int
+                    and retained_creation_filetime > 0
+                )
             with self._lock:
                 bound_pid = self._bound_process_pid
                 bound_started_at = self._bound_process_started_at
@@ -562,13 +659,65 @@ class CronOwnerBinding:
         with self._lock:
             self._scope_unit = scope_unit
 
+    def _external_worker_record_matches(
+        self, record: Any, pid: int, dispatch_mode: Optional[str],
+        acknowledged_started_at: Any,
+    ) -> bool:
+        record_pid = record.get("pid") if isinstance(record, dict) else None
+        return (
+            isinstance(record, dict)
+            and type(record.get("id")) is str
+            and record.get("id") == self.execution_id
+            and type(record.get("job_id")) is str
+            and record.get("job_id") == self.job_id
+            and type(record.get("source")) is str
+            and record.get("source") == self.source
+            and record.get("status") in {"running", "completed", "failed"}
+            and type(record_pid) is int
+            and record_pid == pid
+            and (
+                dispatch_mode is None
+                or record.get("process_started_at") == acknowledged_started_at
+            )
+        )
+
+    def _validate_external_worker_startup(
+        self, acknowledgement: dict[str, Any], pid: int,
+        dispatch_mode: Optional[str], scope_unit: Optional[str],
+    ) -> Optional[dict[str, Any]]:
+        if dispatch_mode != "scoped":
+            return None
+        control_group = acknowledgement.get("scope_control_group")
+        if not isinstance(control_group, str):
+            self.mark_unknown("foreign_custody")
+            raise CronCustodyRefused("worker_scope_identity_unproven")
+        with self._lock:
+            expected_scope = self._scope_unit
+        scope_proof = self._capture_scope_proof(
+            scope_unit, pid, acknowledgement.get("process_started_at"), control_group)
+        if expected_scope != scope_unit or scope_proof is None:
+            self.mark_unknown("foreign_custody")
+            raise CronCustodyRefused("worker_scope_identity_unproven")
+        with self._lock:
+            self._scope_proof = dict(scope_proof)
+        return scope_proof
+
     def activate_external_worker(
         self, acknowledgement: Any, process: Any, *, dispatch_mode: Optional[str] = None,
         scope_unit: Optional[str] = None,
     ) -> None:
         if self.owner_class != "I13_external_cron_worker":
             raise CronCustodyRefused("invalid_external_owner")
-        if not isinstance(acknowledgement, dict) or acknowledgement.get("execution_id") != self.execution_id:
+        with self._lock:
+            if self._unknown:
+                raise CronCustodyRefused("custody_unknown")
+            if self._settled:
+                raise CronCustodyRefused("custody_already_settled")
+        if (
+            not isinstance(acknowledgement, dict)
+            or type(acknowledgement.get("execution_id")) is not str
+            or acknowledgement.get("execution_id") != self.execution_id
+        ):
             self.mark_unknown("foreign_custody")
             raise CronCustodyRefused("worker_ack_mismatch")
         pid = acknowledgement.get("pid")
@@ -577,7 +726,6 @@ class CronOwnerBinding:
             raise CronCustodyRefused("worker_pid_mismatch")
         acknowledged_started_at = acknowledgement.get("process_started_at")
         acknowledged_scope = acknowledgement.get("scope_unit")
-        acknowledged_control_group = acknowledgement.get("scope_control_group")
         if dispatch_mode is not None and (
             acknowledgement.get("dispatch_mode") != dispatch_mode
             or type(acknowledged_started_at) is not int
@@ -586,20 +734,8 @@ class CronOwnerBinding:
         ):
             self.mark_unknown("foreign_custody")
             raise CronCustodyRefused("worker_startup_identity_mismatch")
-        with self._lock:
-            expected_scope = self._scope_unit
-        scope_proof = None
-        if dispatch_mode == "scoped":
-            if not isinstance(acknowledged_control_group, str):
-                self.mark_unknown("foreign_custody")
-                raise CronCustodyRefused("worker_scope_identity_unproven")
-            scope_proof = self._capture_scope_proof(
-                scope_unit, pid, acknowledged_started_at, acknowledged_control_group)
-            if expected_scope != scope_unit or scope_proof is None:
-                self.mark_unknown("foreign_custody")
-                raise CronCustodyRefused("worker_scope_identity_unproven")
-            with self._lock:
-                self._scope_proof = dict(scope_proof)
+        scope_proof = self._validate_external_worker_startup(
+            acknowledgement, pid, dispatch_mode, scope_unit)
         from cron.executions import get_execution
 
         try:
@@ -607,38 +743,94 @@ class CronOwnerBinding:
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
             self.mark_unknown("read_failed")
             raise CronCustodyRefused("worker_execution_read_failed")
-        try:
-            record_pid = int(record.get("pid", -1)) if record else -1
-        except (TypeError, ValueError):
-            record_pid = -1
-        if (
-            not isinstance(record, dict)
-            or str(record.get("id")) != self.execution_id
-            or str(record.get("job_id")) != self.job_id
-            or record.get("source") != self.source
-            or record.get("status") not in {"running", "completed", "failed"}
-            or record_pid != pid
-            or (
-                dispatch_mode is not None
-                and record.get("process_started_at") != acknowledged_started_at
-            )
-            or not self._worker_identity_matches(record, process, dispatch_mode)
-        ):
-            self.mark_unknown("foreign_custody")
-            raise CronCustodyRefused("worker_execution_not_adopted")
+        record_pid = record.get("pid") if isinstance(record, dict) else None
+        record_valid = self._external_worker_record_matches(
+            record, pid, dispatch_mode, acknowledged_started_at)
         with self._lock:
             native_job = self._native_job
             native_job_proven = self._native_job_proven
         if native_job is not None and native_job_proven is not True:
             self.mark_unknown("worker_scope_unproven")
             raise CronCustodyRefused("worker_job_membership_unproven")
+        if (
+            sys.platform == "win32"
+            and dispatch_mode != "scoped"
+            and native_job is None
+        ):
+            # A Windows ACK without the exact Job handle cannot be adopted.  A raw Popen child
+            # may be the venv launcher or an unrelated process with a reusable PID.
+            self.mark_unknown("worker_scope_unproven")
+            raise CronCustodyRefused("worker_job_membership_unproven")
+
+        worker_receipt = None
+        if record_valid and sys.platform == "win32" and dispatch_mode != "scoped":
+            from cron.scheduler_worker_identity import (
+                WorkerIdentityUnavailable,
+                reuse_or_capture_windows_worker_receipt,
+            )
+
+            with self._lock:
+                retained_handle = self._worker_process_handle
+                retained_pid = self._worker_pid
+                retained_started_at = self._worker_started_at
+                retained_creation_filetime = self._worker_creation_filetime
+                job_closed = self._native_job_closed
+                already_active = not hasattr(self.handle, "reservation")
+            try:
+                worker_receipt, already_active = reuse_or_capture_windows_worker_receipt(
+                    acknowledgement,
+                    record,
+                    native_job,
+                    retained_handle=retained_handle,
+                    retained_pid=retained_pid,
+                    retained_started_at=retained_started_at,
+                    retained_creation_filetime=retained_creation_filetime,
+                    job_closed=job_closed,
+                    already_active=already_active,
+                )
+            except WorkerIdentityUnavailable as exc:
+                already_active = False
+                if exc.retained_handle is not None:
+                    with self._lock:
+                        self._worker_process_handle = exc.retained_handle
+                        self._worker_creation_filetime = getattr(
+                            exc.retained_handle, "creation_filetime", None)
+                        self._worker_pid = pid
+                        self._worker_started_at = acknowledged_started_at
+                        self._worker_process_handle_closed = False
+                refused_code = exc.code
+            if already_active:
+                return
+            if worker_receipt is not None and retained_handle is None:
+                # Retain the authenticated child handle before any coordinator activation can
+                # refuse. A later cleanup/retry must never reopen the row PID as proof, and a
+                # concurrent capture cannot overwrite it.
+                with self._lock:
+                    self._worker_process_handle = worker_receipt.process_handle
+                    self._worker_creation_filetime = worker_receipt.creation_filetime
+                    self._worker_pid = worker_receipt.pid
+                    self._worker_started_at = worker_receipt.process_started_at
+                    self._worker_process_handle_closed = False
+                refused_code = None
+            if worker_receipt is None:
+                self.mark_unknown("worker_scope_unproven")
+                raise CronCustodyRefused(refused_code or "worker_scope_unproven")
+
+        if not record_valid or not self._worker_identity_matches(
+            record, process, dispatch_mode, worker_receipt=worker_receipt):
+            self.mark_unknown("foreign_custody")
+            raise CronCustodyRefused("worker_execution_not_adopted")
         self._activate_child(
             process, dispatch_mode,
             scope_proven=dispatch_mode == "scoped" or native_job is not None,
             scope_proof=scope_proof,
         )
         with self._lock:
-            self._worker_started_at = record.get("process_started_at")
+            if worker_receipt is not None:
+                self._worker_pid = worker_receipt.pid
+                self._worker_started_at = worker_receipt.process_started_at
+            else:
+                self._worker_started_at = record.get("process_started_at")
             if native_job is not None and scope_proof is None:
                 self._scope_proof = {
                     "kind": "windows_job",
@@ -661,6 +853,7 @@ class CronOwnerBinding:
             self._bound_process_pid = pid
             self._bound_process_started_at = started_at
             self._native_job = native_job
+            self._native_job_closed = False
             self._reaper_expected = True
             self._native_job_proven = (
                 native_job is None
@@ -715,10 +908,7 @@ class CronOwnerBinding:
             # The durable handoff never adopted; releasing this reservation is proven safe.
             self.cancel_unactivated_child()
             return "unadopted" if self.settled else "unknown"
-        try:
-            record_pid = int(record.get("pid", -1)) if record else -1
-        except (TypeError, ValueError):
-            record_pid = -1
+        record_pid = record.get("pid") if isinstance(record, dict) else None
         if (
             process is not None
             and isinstance(record, dict)
@@ -727,10 +917,17 @@ class CronOwnerBinding:
         ):
             scope_proof = None
             with self._lock:
-                already_active = (
-                    self._worker_pid == getattr(process, "pid", None)
-                    and self._worker_started_at == record.get("process_started_at")
-                )
+                if sys.platform == "win32":
+                    already_active = (
+                        self._worker_process_handle is not None
+                        and self._worker_pid == record.get("pid")
+                        and self._worker_started_at == record.get("process_started_at")
+                    )
+                else:
+                    already_active = (
+                        self._worker_pid == getattr(process, "pid", None)
+                        and self._worker_started_at == record.get("process_started_at")
+                    )
             if already_active:
                 return "terminalized"
             if dispatch_mode == "scoped":
@@ -961,8 +1158,10 @@ class CronOwnerBinding:
     def observe_terminal(self) -> bool:
         """Release only after ledger, delivery, child, process-group and reaper evidence agree."""
         with self._lock:
-            if self._settled or self._unknown:
-                return self._settled
+            if self._settled:
+                return True
+            if self._unknown:
+                return False
             child = self.child
         if child is not None and not child.observe_terminal():
             return False
@@ -974,9 +1173,13 @@ class CronOwnerBinding:
             return False
         if not self._close_native_job():
             return False
+        if not self._close_worker_process_handle():
+            return False
         with self._lock:
             if self._settled or self._unknown:
                 return self._settled
+            self._cleanup_retryable = False
+            self._cleanup_failure_reason = None
         finalizer_id = f"cron:{self.owner_class}:{self.owner_id}:terminal"
         refusal = self.coordinator.mark_finalizing(self.handle, finalizer_id)
         if refusal is not None:

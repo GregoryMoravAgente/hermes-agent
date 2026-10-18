@@ -12,11 +12,37 @@ allowlist / env — this process has no TTY).
 from __future__ import annotations
 
 import json
+import os
+from threading import Thread
 
 import pytest
+from tests.waiting import wait_until
 
 HOOK_CMD = "echo cron-hook-fired"
 OUTBOUND_URL = "https://hooks.example.test/cron"
+
+
+def _run_payload_with_parent_acceptance(scheduler, payload, ack):
+    """Drive the direct helper through the same parent acceptance protocol as the CLI."""
+    from cron.scheduler_worker_identity import write_worker_acceptance
+
+    accept = ack.with_suffix(".accept")
+    outcome = []
+    worker = Thread(
+        target=lambda: outcome.append(
+            scheduler._run_external_worker_payload(payload, ack, accept)),
+        daemon=True,
+    )
+    worker.start()
+    wait_until(lambda: ack.exists(), timeout=5, what="external worker ACK")
+    acknowledgement = json.loads(ack.read_text(encoding="utf-8"))
+    write_worker_acceptance(
+        accept, acknowledgement,
+        expected_generation=acknowledgement.get("custody_generation"),
+    )
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    return outcome[0]
 
 
 @pytest.fixture
@@ -60,17 +86,40 @@ def test_worker_registers_owning_profile_config_hooks(homes, tmp_path, monkeypat
 
     payload = tmp_path / "payload.json"
     payload.write_text(
-        json.dumps({"job": {"id": "job-1", "execution_id": "exec-1"},
-                    "profile_home": str(profile), "multiplex_active": True}),
+        json.dumps({
+            "job": {"id": "job-1", "execution_id": "exec-1"},
+            "profile_home": str(profile),
+            "multiplex_active": True,
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+            "scope_control_group": None,
+            "custody_generation": None,
+        }),
         encoding="utf-8",
     )
     monkeypatch.setattr(
         "cron.executions.adopt_claimed_execution",
-        lambda execution_id: {"id": execution_id, "status": "running"},
+        lambda execution_id: {
+            "id": execution_id,
+            "status": "running",
+            "process_started_at": 9876,
+        },
+    )
+    monkeypatch.setattr(
+        "cron.executions.get_execution",
+        lambda _execution_id: {
+            "id": "exec-1",
+            "job_id": "job-1",
+            "status": "running",
+            "handoff_pending": 0,
+            "pid": os.getpid(),
+            "process_started_at": 9876,
+        },
     )
     monkeypatch.setattr(scheduler, "run_one_job", lambda *a, **k: True)
 
-    assert scheduler._run_external_worker_payload(payload, tmp_path / "exec-1.ready") is True
+    assert _run_payload_with_parent_acceptance(
+        scheduler, payload, tmp_path / "exec-1.ready") is True
     # Registered under the OWNING profile's home key, not the launch home's.
     profile_key = hermes_home_key(profile)
     assert any(home == profile_key and event == "on_session_start" and command == HOOK_CMD

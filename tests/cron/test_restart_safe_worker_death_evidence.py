@@ -65,17 +65,32 @@ import cron.executions as executions
 args = sys.argv
 payload = Path(args[args.index("--external-worker-file") + 1])
 ack = Path(args[args.index("--ack-file") + 1])
+accept = Path(args[args.index("--accept-file") + 1])
 def fail(*args, **kwargs):
     time.sleep(2)
     raise RuntimeError("worker-probe-startup-sentinel")
 if DEATH == "payload_exception":
     scheduler.run_one_job = fail
-    scheduler._run_external_worker_payload(payload, ack)
+    scheduler._run_external_worker_payload(payload, ack, accept)
 else:
     data = json.loads(payload.read_text())
     eid = data["job"]["execution_id"]
-    assert executions.adopt_claimed_execution(eid)
-    ack.write_text(json.dumps({"pid": os.getpid(), "execution_id": eid}))
+    adopted = executions.adopt_claimed_execution(eid)
+    assert adopted
+    from cron.scheduler_worker_identity import (
+        new_handoff_nonce, wait_for_worker_acceptance, write_worker_ack,
+    )
+    acknowledgement = write_worker_ack(
+        ack,
+        execution_id=eid,
+        process_started_at=adopted["process_started_at"],
+        dispatch_mode=data.get("dispatch_mode"),
+        scope_unit=data.get("scope_unit"),
+        scope_control_group=None,
+        handoff_nonce=new_handoff_nonce(),
+        custody_generation=data.get("custody_generation"),
+    )
+    assert wait_for_worker_acceptance(accept, acknowledgement, timeout=30)
     time.sleep(2)
     sys.stderr.write("worker-probe-startup-sentinel\\n")
     sys.stderr.flush()
