@@ -128,7 +128,14 @@ def test_append_log_record_single_write_lines(tmp_path):
 
 def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     registry = tmp_path / "dashboard-compute-host.json"
-    registry.write_text(json.dumps({"host_pid": os.getpid(), "boot_id": "stale"}), encoding="utf-8")
+    from tui_gateway.windows_owner_recovery import persist_owner_record
+
+    persist_owner_record(
+        registry_path=registry,
+        owner_identity=(1, "stale", os.getpid()),
+        owner_kind="unowned", build_sha="", argv=[sys.executable, "-c", "pass"],
+        owner_job_name=None,
+    )
 
     killed: list[int] = []
     supervisor = HostSupervisor(registry_path=registry, argv=[sys.executable, "-c", ""], autostart=False)
@@ -140,6 +147,22 @@ def test_supervisor_startup_reconcile_pid_reuse_guard(tmp_path, monkeypatch):
     assert result == "pid-reuse-ignored"
     assert killed == []
     assert not registry.exists()
+
+
+def test_supervisor_malformed_owner_record_keeps_live_pid_and_registry(tmp_path, monkeypatch):
+    registry = tmp_path / "dashboard-compute-host.json"
+    original = json.dumps({"host_pid": os.getpid(), "boot_id": "stale"}).encode("utf-8")
+    registry.write_bytes(original)
+    killed: list[int] = []
+    supervisor = HostSupervisor(registry_path=registry, argv=[sys.executable, "-c", ""], autostart=False)
+    monkeypatch.setattr(supervisor, "_pid_matches_compute_host", lambda _pid: False)
+    monkeypatch.setattr(supervisor, "_terminate_pid", lambda pid, **_kw: killed.append(pid))
+    try:
+        assert supervisor.reconcile_startup_orphan() == "owner-unavailable"
+        assert killed == []
+        assert registry.read_bytes() == original
+    finally:
+        assert supervisor._release_registry_lease() is True
 
 
 def _make_compress_host_session(events: list) -> dict:

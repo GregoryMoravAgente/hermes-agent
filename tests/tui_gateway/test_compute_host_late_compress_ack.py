@@ -73,8 +73,15 @@ def test_control_timeout_without_handler_still_drops_late_ack():
     sup, sent = _supervisor()
     with pytest.raises(queue.Empty):
         sup.control("sid", route_name="session.compress", wait=True, timeout=0.05)
+    request_id = sent[0]["request_id"]
+    assert request_id not in sup._pending_controls
+    assert request_id in sup._late_control_handlers
+    assert sup._late_control_handlers[request_id][1] is None
+    sup._handle_host_frame({"type": "control.ack", "request_id": request_id})
     assert sup._late_control_handlers == {}
-    sup._handle_host_frame({"type": "control.ack", "request_id": sent[0]["request_id"]})
+    # A duplicate late ACK has no callback and creates no new custody.
+    sup._handle_host_frame({"type": "control.ack", "request_id": request_id})
+    assert sup._late_control_handlers == {}
 
 
 def test_late_control_error_and_bare_error_frames_fire_handler():
