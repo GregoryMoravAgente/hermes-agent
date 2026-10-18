@@ -201,6 +201,10 @@ class CronOwnerBinding:
         self.parent = parent
         self.child: Optional[CronOwnerBinding] = None
         self._future = None
+        # A split-fire provider claim is a durable boundary before the detached fire future
+        # exists. Keep that real asyncio task visible until the API path either hands its exact
+        # receipt to ``bind_future`` or proves the claim was unaccepted.
+        self._claim_future = None
         self._process = None
         self._reaper = None
         self._reaper_expected = False
@@ -811,6 +815,17 @@ class CronOwnerBinding:
         if hasattr(future, "add_done_callback"):
             future.add_done_callback(lambda _future: self.observe_terminal())
 
+    def bind_claim_future(self, future: Any) -> None:
+        """Retain the provider's real pre-detach claim task without treating it as terminal work."""
+        with self._lock:
+            self._claim_future = future
+
+    def clear_claim_future(self, future: Any = None) -> None:
+        """Drop the claim-task reference only after its outcome has been handed off or released."""
+        with self._lock:
+            if future is None or self._claim_future is future:
+                self._claim_future = None
+
     def attach_child(self, child: CronOwnerBinding) -> None:
         if child.parent is not self:
             self.mark_unknown("foreign_custody")
@@ -914,9 +929,12 @@ class CronOwnerBinding:
         if hasattr(self.handle, "reservation"):
             return False
         with self._lock:
-            future, process, reaper = self._future, self._process, self._reaper
+            future, claim_future, process, reaper = (
+                self._future, self._claim_future, self._process, self._reaper)
             reaper_expected = self._reaper_expected
             script_process, script_pipes_closed = self._script_process, self._script_pipes_closed
+        if claim_future is not None:
+            return False
         if reaper_expected and reaper is None:
             return False
         if future is not None and not future.done():

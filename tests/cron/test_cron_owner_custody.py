@@ -5,7 +5,6 @@ import json
 import subprocess
 import sys
 import textwrap
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
@@ -265,12 +264,13 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
             process.wait(timeout=5)
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="requires a real Windows Job Object")
+@pytest.mark.platforms("windows")
 def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
     """Windows qualification uses the existing native Job helper, never a PID census or mock."""
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
     from hermes_cli.local_runtime.processes import spawn_server
+    from tui_gateway.windows_owner_recovery import new_windows_job_name
 
     binding = reserve_execution(
         owner_class="I12_cron_fire", job_id="job-windows", source="builtin", required=True)
@@ -294,7 +294,7 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
     process, native_job = spawn_server(
         [sys.executable, "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-        owner_job_name=f"Local\\AgenteDesktop.Cron.{uuid.uuid4().hex}")
+        owner_job_name=new_windows_job_name())
     worker.bind_process(process, native_job=native_job)
     try:
         assert process.stdout is not None
@@ -495,3 +495,55 @@ def test_i12_provider_claim_fire_returns_real_execution_receipt(custody_runtime,
     assert executions.finish_execution(
         binding.execution_id, success=True, delivery_outcome="delivered") is not None
     assert binding.observe_terminal()
+
+@pytest.mark.platforms("windows")
+def test_i13_direct_popen_identity_probe():
+    """Diagnostic only: compare real child identity with the parent Popen receipt."""
+    script = textwrap.dedent(
+        """
+        import json
+        import os
+        import sys
+
+        from gateway.status import get_process_start_time
+
+        print(json.dumps({
+            "pid": os.getpid(),
+            "process_started_at": get_process_start_time(os.getpid()),
+        }), flush=True)
+        assert sys.stdin.read(1) == "x"
+        """
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", script], stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        from gateway.status import get_process_start_time
+
+        parent_identity = {
+            "pid": process.pid,
+            "process_started_at": get_process_start_time(process.pid),
+        }
+        assert process.stdout is not None
+        child_identity = json.loads(process.stdout.readline())
+        assert child_identity["pid"] == parent_identity["pid"], (
+            "real-child PID differs from Popen PID; inspect the Windows launcher boundary: "
+            f"child={child_identity['pid']} parent={parent_identity['pid']}"
+        )
+        assert type(child_identity["process_started_at"]) is int, child_identity
+        assert type(parent_identity["process_started_at"]) is int, parent_identity
+        assert child_identity["process_started_at"] == parent_identity["process_started_at"], (
+            "real-child and parent start fingerprints differ: "
+            f"child={child_identity['process_started_at']} "
+            f"parent={parent_identity['process_started_at']}"
+        )
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.write("x")
+                process.stdin.flush()
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
+        process.wait(timeout=5)
+

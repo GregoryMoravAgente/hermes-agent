@@ -4011,6 +4011,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
         try:
             if sys.platform == "win32":
                 from hermes_cli.local_runtime.processes import spawn_server
+                from tui_gateway.windows_owner_recovery import new_windows_job_name
 
                 process, native_job = spawn_server(
                     dispatch.argv,
@@ -4021,7 +4022,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                     stderr=stderr_fd,
                     start_new_session=True,
                     creationflags=windows_hide_flags(),
-                    owner_job_name=f"Local\\AgenteDesktop.Cron.{uuid.uuid4().hex}",
+                    owner_job_name=new_windows_job_name(),
                 )
             else:
                 native_job = None

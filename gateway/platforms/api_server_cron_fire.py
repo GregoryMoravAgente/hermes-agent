@@ -140,6 +140,7 @@ def _detach_fire(
         raise
     if api_custody is not None:
         api_custody.bind_future(task)
+        api_custody.clear_claim_future()
     if fire_binding is not None:
         fire_binding.bind_future(task)
     reservation["detached"] = True
@@ -147,6 +148,114 @@ def _detach_fire(
         lambda _task: _finish_detached(adapter, reservation, api_custody, fire_binding))
     adapter._track_background_task(task, tolerate_missing=True)
     return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
+
+
+def _start_split_claim(provider: Any, job_id: str, api_custody: Any):
+    from cron.runtime_custody import require_cron_custody
+
+    def _claim_with_custody():
+        with (require_cron_custody(api_custody) if api_custody is not None else nullcontext()):
+            return provider.claim_fire(job_id)
+
+    work = asyncio.to_thread(_claim_with_custody)
+    try:
+        task = asyncio.create_task(work)
+    except (RuntimeError, TypeError, ValueError):
+        work.close()
+        if api_custody is not None:
+            api_custody.mark_unknown("read_failed")
+        raise
+    if api_custody is not None:
+        api_custody.bind_claim_future(task)
+    return task
+
+
+async def _await_split_claim(task: Any, api_custody: Any, job_id: str):
+    try:
+        return await asyncio.shield(task), None
+    except asyncio.CancelledError:
+        # The provider thread is still the authority for whether a durable claim committed. Keep
+        # the exact task bound and let the cancellation continuation reconcile its real result;
+        # marking the coordinator unknown here would make a later proven ``None`` impossible to
+        # release and would also poison a valid claimed receipt before detach.
+        raise
+    except Exception:  # health: allow BLE001 -- provider failure is an opaque retryable boundary
+        if api_custody is not None:
+            api_custody.mark_unknown("read_failed")
+        logger.exception("cron fire admission failed")
+        return None, web.json_response(
+            {"error": "cron fire admission failed", "job_id": job_id}, status=503)
+
+
+def _release_cancelled_pending(adapter: Any, reservation: dict[str, Any]) -> None:
+    from gateway.platforms.api_server import _release_pending_api_work
+
+    _release_pending_api_work(adapter, reservation)
+
+
+def _finish_cancelled_split_continuation(
+    task: asyncio.Task, adapter: Any, reservation: dict[str, Any], api_custody: Any,
+) -> None:
+    """Release only API bookkeeping when shutdown cancels before continuation code starts.
+
+    The claim task remains attached to the exact custody binding; an early-cancelled continuation
+    has no opportunity to await or reconcile that task, so the binding stays sticky unknown.
+    """
+    if not task.cancelled():
+        return
+    try:
+        if api_custody is not None:
+            api_custody.mark_unknown("claim_cancelled")
+    finally:
+        _release_cancelled_pending(adapter, reservation)
+
+
+async def _continue_cancelled_split_fire(
+    adapter: Any,
+    reservation: dict[str, Any],
+    api_custody: Any,
+    claim_task: Any,
+    provider: Any,
+    job_id: str,
+    adapters: Any,
+    loop: Any,
+) -> None:
+    """Finish a claim whose request task was cancelled, retaining the exact receipt or task."""
+    try:
+        claimed_job, claim_error = await _await_split_claim(claim_task, api_custody, job_id)
+        if claim_error is not None:
+            if api_custody is not None:
+                api_custody.clear_claim_future(claim_task)
+            _release_cancelled_pending(adapter, reservation)
+            return
+        if claimed_job is None:
+            if api_custody is not None:
+                api_custody.clear_claim_future(claim_task)
+                api_custody.release_unaccepted()
+            _release_cancelled_pending(adapter, reservation)
+            return
+        fire_binding, claim_error = _validate_claimed_fire(api_custody, job_id, claimed_job)
+        if claim_error is not None:
+            if api_custody is not None:
+                api_custody.clear_claim_future(claim_task)
+            _release_cancelled_pending(adapter, reservation)
+            return
+        _detach_fire(
+            adapter, reservation, api_custody, fire_binding, provider.fire_claimed, claimed_job,
+            adapters=adapters, loop=loop, job_id=job_id)
+    except asyncio.CancelledError:
+        # The claim task remains bound to ``api_custody``. A cancellation of this continuation is
+        # itself ambiguous and therefore sticky; the original claim task is intentionally not
+        # cancelled or released.
+        if api_custody is not None:
+            api_custody.mark_unknown("claim_cancelled")
+        _release_cancelled_pending(adapter, reservation)
+    except Exception:  # health: allow BLE001 -- retain ambiguous handoff custody; release only API bookkeeping
+        if api_custody is not None:
+            api_custody.mark_unknown("read_failed")
+            api_custody.clear_claim_future(claim_task)
+        _release_cancelled_pending(adapter, reservation)
+        logger.exception("cron fire cancelled-claim continuation failed")
 
 
 async def _dispatch_split_fire(
@@ -163,8 +272,13 @@ async def _dispatch_split_fire(
     from gateway.platforms.api_server_fire_startup import live_adapters_once_started
     from cron.scheduler_provider import provider_supports_split_fire
 
-    refusal, adapters = await live_adapters_once_started(
-        adapter, request, job_id, received_at=received_at)
+    try:
+        refusal, adapters = await live_adapters_once_started(
+            adapter, request, job_id, received_at=received_at)
+    except asyncio.CancelledError:
+        if api_custody is not None:
+            api_custody.release_unaccepted()
+        raise
     if refusal is not None:
         if api_custody is not None:
             api_custody.release_unaccepted()
@@ -174,36 +288,40 @@ async def _dispatch_split_fire(
             adapter, reservation, api_custody, None, provider.fire_due, job_id,
             adapters=adapters, loop=loop, job_id=job_id)
 
-    claimed_job, claim_error = await _claim_split_fire(provider, job_id, api_custody)
+    claim_task = _start_split_claim(provider, job_id, api_custody)
+    try:
+        claimed_job, claim_error = await _await_split_claim(claim_task, api_custody, job_id)
+    except asyncio.CancelledError:
+        try:
+            continuation = asyncio.create_task(_continue_cancelled_split_fire(
+                adapter, reservation, api_custody, claim_task, provider, job_id, adapters, loop))
+        except (RuntimeError, TypeError, ValueError):
+            if api_custody is not None:
+                api_custody.mark_unknown("read_failed")
+            raise
+        reservation["detached"] = True
+        continuation.add_done_callback(
+            lambda task: _finish_cancelled_split_continuation(
+                task, adapter, reservation, api_custody))
+        adapter._track_background_task(continuation, tolerate_missing=True)
+        raise
     if claim_error is not None:
+        if api_custody is not None:
+            api_custody.clear_claim_future(claim_task)
         return claim_error
     if claimed_job is None:
         if api_custody is not None:
+            api_custody.clear_claim_future(claim_task)
             api_custody.release_unaccepted()
         return web.json_response({"status": "duplicate", "job_id": job_id}, status=200)
     fire_binding, claim_error = _validate_claimed_fire(api_custody, job_id, claimed_job)
     if claim_error is not None:
+        if api_custody is not None:
+            api_custody.clear_claim_future(claim_task)
         return claim_error
     return _detach_fire(
         adapter, reservation, api_custody, fire_binding, provider.fire_claimed, claimed_job,
         adapters=adapters, loop=loop, job_id=job_id)
-
-
-async def _claim_split_fire(provider: Any, job_id: str, api_custody: Any):
-    from cron.runtime_custody import require_cron_custody
-
-    try:
-        def _claim_with_custody():
-            with (require_cron_custody(api_custody) if api_custody is not None else nullcontext()):
-                return provider.claim_fire(job_id)
-
-        return await asyncio.to_thread(_claim_with_custody), None
-    except Exception:  # health: allow BLE001 -- provider failure is an opaque retryable boundary
-        if api_custody is not None:
-            api_custody.mark_unknown("read_failed")
-        logger.exception("cron fire admission failed")
-        return None, web.json_response(
-            {"error": "cron fire admission failed", "job_id": job_id}, status=503)
 
 
 def _validate_claimed_fire(api_custody: Any, job_id: str, claimed_job: Any):
