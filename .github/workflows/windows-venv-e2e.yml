@@ -1,3 +1,5 @@
+# OWN-FORK PROOF-BRANCH ONLY: hosted runner and pinned official checkout.
+# Feature PR excludes this file; all existing genuine Windows tests retained.
 name: Windows venv-holder live E2E
 
 # ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
@@ -42,11 +44,11 @@ concurrency:
 jobs:
   venv-holder-e2e:
     name: venv-holder live E2E (windows-latest)
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           # The stable caller dispatches on the candidate tag; github.sha is
           # the exact candidate commit there and the head SHA everywhere else.
