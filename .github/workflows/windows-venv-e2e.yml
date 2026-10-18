@@ -152,6 +152,17 @@ jobs:
             --junitxml=native-cron-identity.xml --tb=short \
             -o junit_logging=all -o junit_log_passing_tests=true
 
+      - name: Retain native identity receipt
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agc1663-native-owner-identity-${{ github.sha }}
+          path: |
+            native-owner-identity.xml
+            native-cron-identity.xml
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run changed Graph and cron custody integration on native Windows
         if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
         shell: bash
@@ -176,17 +187,6 @@ jobs:
             tests/cron/test_cron_owner_custody.py \
             tests/gateway/test_cron_fire_custody.py \
             -- --tb=short
-
-      - name: Retain native identity receipt
-        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: agc1663-native-owner-identity-${{ github.sha }}
-          path: |
-            native-owner-identity.xml
-            native-cron-identity.xml
-          if-no-files-found: warn
-          retention-days: 14
 
       - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
         shell: bash

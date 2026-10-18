@@ -624,6 +624,35 @@ def test_i13_diagnostic_classifier_uses_traceback_order_and_redacts_unknown_text
     assert "opaque_dep" not in encoded
 
 
+def test_i13_diagnostic_preserves_forced_redacted_worker_traceback(tmp_path):
+    """The real bounded stderr seam exposes diagnosis only after the shared redactor scrubs it."""
+    from agent.redact import redact_sensitive_text
+    from cron import scheduler_diagnostics
+
+    raw = (
+        "Traceback (most recent call last):\n"
+        "  File \"worker.py\", line 1, in boot\n"
+        "postgresql://synthetic-user:synthetic-password@example.test/db\n"
+        "https://synthetic-token@example.test/worker\n"
+        "sk-synthetic-key-0123456789\n"
+        "RuntimeError: synthetic bootstrap failure"
+    )
+    expected = redact_sensitive_text(raw, force=True, redact_url_credentials=True)
+    assert expected != raw
+    assert "synthetic-password" not in expected
+    assert "synthetic-token" not in expected
+    assert "sk-synthetic-key-0123456789" not in expected
+
+    path = tmp_path / "worker.stderr"
+    path.write_text(raw, encoding="utf-8")
+    observed = scheduler_diagnostics.external_worker_stderr_tail(path)
+    assert observed == f"; worker stderr: {expected}"
+    assert len(observed) <= 1600
+    assert "synthetic-password" not in observed
+    assert "synthetic-token" not in observed
+    assert "sk-synthetic-key-0123456789" not in observed
+
+
 def _i13_start_time(pid, get_process_start_time):
     if type(pid) is not int or pid <= 0:
         return None
@@ -733,6 +762,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         "child_exception_class": "not_observed",
         "constant_reason": None,
         "stderr_stage": "not_observed",
+        "stderr_tail": "",
     }
     cleanup_state = {
         "forced_termination": False,
@@ -743,12 +773,13 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     real_stderr_tail = scheduler_diagnostics.external_worker_stderr_tail
 
     def capture_stderr_tail(path):
-        # The production seam deletes the file immediately after reading it. Keep only a
-        # constant stage; never retain or print the redacted text, argv, paths, or credentials.
+        # Keep the existing production seam's bounded, force-redacted traceback suffix so the
+        # native diagnostic can identify a bootstrap failure. Never read or retain the raw file.
         tail = real_stderr_tail(path)
+        launch_state["stderr_tail"] = tail
         launch_state["stderr_stage"] = _i13_stderr_stage(tail)
         launch_state["child_exception_class"] = _i13_child_exception_class(tail)
-        return ""
+        return tail
 
     monkeypatch.setattr(
         scheduler_diagnostics, "external_worker_stderr_tail", capture_stderr_tail)
@@ -974,6 +1005,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         "child_exception_class": launch_state["child_exception_class"],
         "constant_reason": launch_state["constant_reason"],
         "stderr_stage": launch_state["stderr_stage"],
+        "stderr_tail": launch_state["stderr_tail"],
         "exit_code": exit_code if type(exit_code) is int else None,
         "script_started": started.exists(),
         "release_sent": release.exists(),
@@ -981,6 +1013,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     receipt["cleanup"] = cleanup_state
     print("I13_WINDOWS_EXTERNAL_DIAGNOSTIC=" + json.dumps(receipt, sort_keys=True))
     assert receipt["launch"]["stderr_stage"] in _I13_ALLOWED_STDERR_STAGES
+    assert len(receipt["launch"]["stderr_tail"]) <= 1600
     assert spawn_observed, json.dumps(receipt, sort_keys=True)
     assert activation_observed, json.dumps(receipt, sort_keys=True)
     assert receipt["launch"]["script_started"], json.dumps(receipt, sort_keys=True)

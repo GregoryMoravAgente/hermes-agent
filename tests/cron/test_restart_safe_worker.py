@@ -329,6 +329,7 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
     return spawned, payloads, handoff, get
 
 
+@pytest.mark.platforms("linux")
 def test_scoped_wrapper_exit_without_user_bus_names_the_cause_and_invalidates_probe(
     tmp_path, monkeypatch
 ):
@@ -531,9 +532,22 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
 
     clock = FakeClock()
 
+    class FakeHandle:
+        def Close(self):
+            return None
+
+    class FakeStream:
+        def close(self):
+            return None
+
     class FakeProcess:
-        pid = 999
-        returncode = None
+        def __init__(self):
+            self.pid = 999
+            self.returncode = None
+            self._handle = FakeHandle()
+            self.stdin = FakeStream()
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
 
         def poll(self):
             return self.returncode
@@ -541,9 +555,35 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
         def wait(self, timeout=None):
             raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
 
-    monkeypatch.setattr(
-        scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
-    )
+    class FakeOwner:
+        def __init__(self, name):
+            self.name = name
+
+        def contains_process_handle(self, _process):
+            return True
+
+        def empty(self):
+            return True
+
+        def close(self):
+            return None
+
+    def fake_spawn_server(command, **kwargs):
+        from hermes_cli.local_runtime.processes import _valid_windows_job_name
+
+        owner_job_name = kwargs.get("owner_job_name")
+        assert _valid_windows_job_name(owner_job_name)
+        return FakeProcess(), FakeOwner(owner_job_name)
+
+    if sys.platform == "win32":
+        from hermes_cli.local_runtime import processes as local_processes
+
+        # This unit test exercises the handoff/adoption clock, not native Job creation.
+        monkeypatch.setattr(local_processes, "spawn_server", fake_spawn_server)
+    else:
+        monkeypatch.setattr(
+            scheduler.subprocess, "Popen", lambda *_args, **_kwargs: FakeProcess()
+        )
     monkeypatch.setattr(
         scheduler,
         "get_execution",
