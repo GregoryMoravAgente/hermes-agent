@@ -22871,12 +22871,16 @@ def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, t
     st = cfg.stat()
     other = tmp_path / "other.yaml"
     other.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
-    # ctime ticks at the kernel's coarse clock (~4 ms): an in-place rewrite inside the tick of the
-    # cached read leaves every stat field equal. Wait until the fs clock has passed that ctime.
-    while other.stat().st_ctime_ns <= st.st_ctime_ns:
-        os.utime(other)
+    # A real atomic replacement changes file identity even when size and
+    # mtime are pinned. Windows ctime is creation time: utime cannot advance
+    # it, so waiting for it here can spin forever within one filesystem tick.
+    assert other.stat().st_size == st.st_size
     os.replace(other, cfg)
     os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
+    replaced = cfg.stat()
+    assert replaced.st_size == st.st_size
+    assert replaced.st_mtime_ns == st.st_mtime_ns
+    assert server.file_signature(replaced) != server.file_signature(st)
     assert server._load_cfg_raw()["model"]["default"] == "aaaa-route"
 
 
