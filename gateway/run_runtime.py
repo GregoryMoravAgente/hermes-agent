@@ -238,34 +238,57 @@ _INTEGRATED_PRESERVATION_OWNER_CLASSES = (
 
 
 def _seal_integrated_preservation_owners(runner, coordinator, receipt):
-    """Seal only the source consumers whose durable terminal paths are wired here.
+    """Seal source consumers whose durable terminal paths are wired here.
 
-    The source hooks report quiescence per served authority after the natural drain. This does not
-    census the other 17 owner classes, including cross-process and lifecycle owners: their
-    coordinator state remains ``unwired`` and therefore blocks handoff until their actual
-    source/process seams provide their own evidence.
+    Per-authority hooks retain I01/I02/I04 readiness. Cron uses its ledger, process and pipe
+    evidence independently, even without session authorities. Every other class stays unwired
+    until its own source seam proves readiness.
     """
     authorities = _authorities(runner)
-    if not authorities:
-        return
     from gateway.runtime_custody import OWNER_SPECS
     descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
-    for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
-        try:
-            if not all(authority.preservation_owner_ready(owner_class) for authority in authorities):
+    if authorities:
+        for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
+            try:
+                if not all(authority.preservation_owner_ready(owner_class) for authority in authorities):
+                    continue
+            except BaseException:  # health: allow BLE001 -- opaque owner custody query failure marks that owner unknown and withholds handoff
+                coordinator.mark_owner_unknown(owner_class, 'read_failed')
                 continue
-        except BaseException:  # health: allow BLE001 -- opaque owner custody query failure marks that owner unknown and withholds handoff
+            evidence = {
+                'source': OWNER_SPECS[owner_class].source,
+                'process_instance': receipt.process_instance,
+                'authority_epoch': receipt.authority_epoch,
+                'close_generation': receipt.close_generation,
+                'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
+                'observed': True,
+            }
+            refusal = coordinator.seal_owner(owner_class, evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+
+    try:
+        from cron.runtime_custody import preservation_owner_evidence
+        for owner_class in (
+            'I12_cron_fire', 'I13_external_cron_worker', 'I14_api_detached_cron',
+        ):
+            evidence = preservation_owner_evidence(
+                owner_class,
+                process_instance=receipt.process_instance,
+                authority_epoch=receipt.authority_epoch,
+                close_generation=receipt.close_generation,
+                owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
+            )
+            if evidence is None:
+                continue
+            refusal = coordinator.seal_owner(owner_class, evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        for owner_class in (
+            'I12_cron_fire', 'I13_external_cron_worker', 'I14_api_detached_cron',
+        ):
             coordinator.mark_owner_unknown(owner_class, 'read_failed')
-            continue
-        evidence = {
-            'source': OWNER_SPECS[owner_class].source,
-            'process_instance': receipt.process_instance,
-            'authority_epoch': receipt.authority_epoch,
-            'close_generation': receipt.close_generation,
-            'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
-            'observed': True,
-        }
-        coordinator.seal_owner(owner_class, evidence)
 
 
 async def begin_preservation_drain(runner, params, peer_subject):

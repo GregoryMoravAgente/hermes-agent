@@ -3948,85 +3948,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
 
     async def _handle_cron_fire(self, request: web.Request) -> web.Response:
-        """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
-        NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
-        a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
-        # Startup-wait budget starts here so a slow JWKS fetch cannot outlast the forwarder timeout.
-        received_at = asyncio.get_running_loop().time()
-        from hermes_cli.config import cfg_get, load_config
-        from plugins.cron_providers.chronos.verify import get_fire_verifier
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-        cfg = load_config()
-        verifier = get_fire_verifier()
-        verify_kwargs = dict(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None)
-        try:
-            claims = await _call_verifier(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire.
-            logger.exception("cron fire: verifier crashed; rejecting token")
-            claims = None
-        if claims is None:
-            logger.warning("cron fire: rejected invalid token: %s", self._request_audit_log_suffix(request))
-            return web.json_response({"error": "invalid fire token"}, status=401)
-        draining = self._draining_response()
-        if draining is not None:
-            return draining
-        with _reserve_pending_api_work(self) as reservation:
-            body = {}
-            with suppress(Exception):
-                body = await request.json()
-            job_id = (body or {}).get("job_id")
-            if not job_id:
-                return web.json_response({"error": "missing job_id"}, status=400)
-            # `hermes pause` ESTOP: refuse the fire and ask NAS to retry later.
-            # Placed after JWT verify (don't leak pause state to unauth callers)
-            # and after the drain check (drain is transient shutdown, ESTOP is
-            # operator override). 503 + Retry-After reschedules the job via NAS
-            # retry or the misfire backstop rather than silently dropping it —
-            # matches _CRON_FIRE_RETRY_AFTER_SECONDS in web_routers/cron.py.
-            with suppress(ImportError):
-                from agent.estop import check_paused as _estop_check_paused
-                if _estop_check_paused("cron-webhook", logger):
-                    return web.json_response(
-                        {"error": "hermes is paused (ESTOP)", "job_id": job_id},
-                        status=503,
-                        headers={"Retry-After": str(60)},
-                    )
-            from cron.scheduler_provider import provider_supports_split_fire, resolve_cron_scheduler
-            provider = resolve_cron_scheduler()
-            loop = asyncio.get_running_loop()
-            from gateway.platforms.api_server_fire_startup import live_adapters_once_started
-            refusal, adapters = await live_adapters_once_started(self, request, job_id, received_at=received_at)
-            if refusal is not None:
-                return refusal
+        """POST /api/cron/fire — Chronos fire webhook admission seam."""
+        from gateway.platforms.api_server_cron_fire import handle_cron_fire
 
-            def _detach_fire(fire_fn, *fire_args) -> web.Response:
-                # The done callback owns the reservation once the task is detached.
-                task = asyncio.create_task(asyncio.to_thread(fire_fn, *fire_args, adapters=adapters, loop=loop))
-                reservation["detached"] = True
-                task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
-                self._track_background_task(task, tolerate_missing=True)
-                return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
-
-            if not provider_supports_split_fire(provider):
-                # A legacy single-phase provider overrides ``fire_due`` but inherits the base
-                # ``claim_fire``; the split path would silently bypass that override.
-                return _detach_fire(provider.fire_due, job_id)
-            # Persist the attempt + exact store owner before acknowledging NAS; a failure here
-            # is retryable and the reservation remains attached.
-            try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
-            except Exception as exc:
-                logger.error("cron fire admission failed for %s: %s", job_id, exc)
-                return web.json_response({"error": "cron fire admission failed", "job_id": job_id}, status=503)
-            if claimed_job is None:
-                return web.json_response({"status": "duplicate", "job_id": job_id}, status=200)
-            return _detach_fire(provider.fire_claimed, claimed_job)
+        return await handle_cron_fire(self, request)
 
     # -- Agent execution --------------------------------------------------------------
 

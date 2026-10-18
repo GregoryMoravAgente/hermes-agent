@@ -21,6 +21,13 @@ _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60
 DEFAULT_MISFIRE_GRACE_MINUTES = 10
 
 
+def _create_provider_execution(create_execution, job_id: str, source: str, binding):
+    """Preserve unmanaged providers' historical call shape while binding managed receipts."""
+    if binding is None:
+        return create_execution(job_id, source=source)
+    return create_execution(job_id, source=source, execution_id=binding.owner_id)
+
+
 # Cap for the exponential tick backoff applied while consecutive ticks fail with fd exhaustion
 # (EMFILE/ENFILE, #87644). Base is the tick interval (60s by default); each consecutive EMFILE failure
 # doubles the wait, capped here so a still-alive-but-exhausted gateway never sleeps longer than this between
@@ -197,13 +204,35 @@ class CronScheduler(ABC):
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
-        """Durably claim one fire + create its audit attempt. Transports call this synchronously
-        before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
+    def claim_fire(
+        self, job_id: str, *, force: bool = False, manual: bool = False,
+        custody_parent: Any = None,
+    ) -> dict | None:
+        """Durably claim one fire + create its audit attempt.
+
+        When the managed gateway has a custody parent, the exact execution id is reserved before
+        this ledger transaction and carried through the returned snapshot.  Legacy direct callers
+        keep the additive no-coordinator path; authenticated detached API callers set the context
+        requirement and refuse a provider that does not return this receipt.
+        """
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
         from cron.jobs import claim_job_for_fire
+        from cron.runtime_custody import (
+            custody_parent as current_custody_parent, custody_required, reserve_execution)
 
-        execution = create_execution(job_id, source=self.name)
+        parent = custody_parent if custody_parent is not None else current_custody_parent()
+        binding = reserve_execution(
+            owner_class="I12_cron_fire", job_id=job_id, source=self.name, parent=parent,
+            required=custody_required())
+        try:
+            execution = _create_provider_execution(
+                create_execution, job_id, self.name, binding)
+            if binding is not None:
+                binding.bind_execution_record(execution)
+        except BaseException:
+            if binding is not None:
+                binding.mark_unknown("read_failed")
+            raise
         claim_kwargs = {"return_job": True}
         if force:
             claim_kwargs["force"] = True
@@ -218,11 +247,17 @@ class CronScheduler(ABC):
                 execution["id"], success=False,
                 error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
             )
+            if binding is not None:
+                binding.observe_terminal()
             raise
         if not isinstance(claimed_job, dict):
             finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+            if binding is not None:
+                binding.observe_terminal()
             return None
         claimed_job["execution_id"] = execution["id"]
+        if binding is not None:
+            claimed_job["_cron_custody"] = binding
         return claimed_job
 
     def fire_claimed(
