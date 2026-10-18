@@ -147,3 +147,18 @@ async def join_authority_work(authority, timeout):
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError('Profile workers did not stop; ownership retained')
         await asyncio.sleep(.05)
+
+
+async def await_authority_work(authority, timeout):
+    """Wait for naturally accepted authority work without sending Stop or killing a turn.
+
+    Preservation close uses this path.  A missed deadline raises and leaves the exact owner
+    custody live; it is never converted into a successful zero result.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout))
+    while True:
+        if not list(physical_workers(authority)) and not list(executing_sessions(authority)) and not mutation_tasks(authority):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError('Profile workers remain in preservation custody')
+        await asyncio.sleep(.05)

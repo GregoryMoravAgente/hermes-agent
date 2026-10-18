@@ -26,14 +26,19 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
-    if not retirement.acquire():
+    lease = retirement.acquire(
+        owner_kind="tui-session-worker",
+        owner_id=str((session or {}).get("session_key") or name),
+        profile_id=(session or {}).get("profile_home"),
+    )
+    if lease is None:
         return None
 
     def run():
         try:
             target()
         finally:
-            retirement.release()
+            retirement.release(lease)
 
     try:
         thread = spawn_context_thread(run, name=name)
@@ -42,7 +47,7 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
         thread.start()
         return thread
     except BaseException:
-        retirement.release()
+        retirement.release(lease)
         raise
 
 
@@ -635,15 +640,23 @@ def _settle_isolated_turn_before_close(session: dict) -> None:
     completion callback releases it on the correlated turn.end/turn.error (child death fails pending turns
     the same way). The RPC close is bounded; ownership ends with the child's last write, never with the
     grace timer, else a second backend acquires the stored session while the child is still writing."""
-    if not session.get("_compute_host_turn_id") or not _session_uses_compute_host(session):
+    if (not session.get("_compute_host_turn_id")
+            and not session.get("_compute_host_terminalizing_turn")
+            and not session.get("_compute_host_admission_pending")) or not _session_uses_compute_host(session):
         return
     with contextlib.suppress(Exception):
         _interrupt_session_turn(_lifecycle_own_sid(session), session)
     deadline = time.monotonic() + _TURN_SETTLE_BEFORE_CLOSE_SECONDS
-    while session.get("_compute_host_turn_id") and time.monotonic() < deadline:
+    while (session.get("_compute_host_turn_id")
+           or session.get("_compute_host_terminalizing_turn")
+           or session.get("_compute_host_admission_pending")) \
+            and time.monotonic() < deadline:
         time.sleep(0.05)
     with session["history_lock"]:
-        if not session.get("_compute_host_turn_id") or (lease := session.pop("active_session_lease", None)) is None:
+        if (not session.get("_compute_host_turn_id")
+                and not session.get("_compute_host_terminalizing_turn")
+                and not session.get("_compute_host_admission_pending")) \
+                or (lease := session.pop("active_session_lease", None)) is None:
             return
         session["_deferred_active_session_lease"] = lease
         _deferred_active_session_leases[str(lease.lease_id)] = lease
@@ -652,51 +665,53 @@ def _settle_isolated_turn_before_close(session: dict) -> None:
                    _TURN_SETTLE_BEFORE_CLOSE_SECONDS, session.get("session_key"))
 
 
-# A deferred lease is released by the compute-host turn's completion callback
-# (_on_compute_host_turn_done → _release_deferred_active_session_lease). If that callback
-# is lost — supervisor restart/reload, a child killed without failing its pending turns,
-# a dropped completion — the lease sits in the registry FOREVER: _own_live_lease_ids
-# vouches for it, so the orphan sweep never reclaims it, and the concurrency cap treats
-# the dead session as active (#62823 zombie slot). A deferred lease past this generous
-# ceiling (the longest legitimate isolated turn is the compression ceiling, minutes) is
-# force-released by the reaper tick instead of leaking the slot until process exit.
+# A deferred lease is released only by the compute-host turn's authenticated completion
+# callback (_on_compute_host_turn_done → _release_deferred_active_session_lease). If that
+# callback is lost, age is diagnostic only: the lease remains held as unknown custody.
+# Releasing it by TTL would make an unobserved child/descendant look settled and would let a
+# replacement backend write the same session while the original producer may still be alive.
 _DEFERRED_ACTIVE_SESSION_LEASE_TTL_SECONDS = 1800.0
 _deferred_active_session_lease_ages: dict[str, float] = {}
+_deferred_active_session_lease_warnings: set[str] = set()
 
 
 def _reap_stale_deferred_leases(now: float | None = None) -> int:
-    """Force-release deferred leases whose settlement callback never arrived. Returns the count."""
+    """Report aged deferred leases while retaining them until authenticated settlement."""
     now = time.time() if now is None else now
     stale = [
         lease_id for lease_id, deferred_at in list(_deferred_active_session_lease_ages.items())
         if now - deferred_at > _DEFERRED_ACTIVE_SESSION_LEASE_TTL_SECONDS
     ]
-    reaped = 0
     for lease_id in stale:
-        _deferred_active_session_lease_ages.pop(lease_id, None)
-        lease = _deferred_active_session_leases.pop(lease_id, None)
+        lease = _deferred_active_session_leases.get(lease_id)
         if lease is None:
+            _deferred_active_session_lease_ages.pop(lease_id, None)
             continue
-        if (err := _lease_retry(3, lease.release)) is not None:
-            logger.warning("Failed to force-release stale deferred active session lease %s", lease_id,
-                           exc_info=err)
-            continue
-        logger.warning("Force-released deferred active session lease %s held past %.0fs without a "
-                       "compute-host settlement (zombie concurrency slot, #62823)",
-                       lease_id, _DEFERRED_ACTIVE_SESSION_LEASE_TTL_SECONDS)
-        reaped += 1
-    return reaped
+        if lease_id not in _deferred_active_session_lease_warnings:
+            logger.warning(
+                "Deferred active session lease %s has unknown compute-host custody after %.0fs; "
+                "retaining it until an authenticated terminal receipt",
+                lease_id, _DEFERRED_ACTIVE_SESSION_LEASE_TTL_SECONDS)
+            _deferred_active_session_lease_warnings.add(lease_id)
+    return 0
 
 
-def _release_deferred_active_session_lease(session: dict) -> None:
+def _release_deferred_active_session_lease(session: dict) -> bool:
     """Settlement half of ``_settle_isolated_turn_before_close``; a no-op for sessions that never deferred."""
-    lease = session.pop("_deferred_active_session_lease", None)
+    lease = session.get("_deferred_active_session_lease")
     if lease is None:
-        return
-    _deferred_active_session_leases.pop(str(lease.lease_id), None)
-    _deferred_active_session_lease_ages.pop(str(lease.lease_id), None)
+        return True
     if (err := _lease_retry(3, lease.release)) is not None:
         logger.warning("Failed to release deferred active session slot", exc_info=err)
+        return False
+    if not (getattr(lease, "released", True) or not getattr(lease, "enabled", True)):
+        logger.warning("Deferred active session lease did not report release; retaining unknown custody")
+        return False
+    session.pop("_deferred_active_session_lease", None)
+    _deferred_active_session_leases.pop(str(lease.lease_id), None)
+    _deferred_active_session_lease_ages.pop(str(lease.lease_id), None)
+    _deferred_active_session_lease_warnings.discard(str(lease.lease_id))
+    return True
 
 
 def _close_session_by_id(

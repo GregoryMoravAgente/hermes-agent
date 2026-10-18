@@ -12,6 +12,7 @@ if __name__ == "__main__":
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -25,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection
 
 from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
+from tui_gateway.windows_producer_identity import build_producer_startup_record
 
 
 def now_ns() -> int:
@@ -55,6 +57,36 @@ _FLUSH_RESERVE_SECS = 1.0
 # Fallback control.error text when a routed server method returns an error without a message.
 _CONTROL_FAILURES = {
     "session.save": "session save failed", "session.compress": "session compression failed"}
+_PRODUCER_COMPLETION_ENV = "HERMES_COMPUTE_HOST_PRODUCER_COMPLETION_FD"
+_PRODUCER_COMPLETION_TYPE = "producer.complete"
+_PRODUCER_COMPLETION_SCHEMA = 1
+_PRODUCER_COMPLETION_MAX_BYTES = 4096
+_PRODUCER_COMPLETION_KEYS = frozenset({
+    "type", "schema", "host_pid", "host_boot_id", "sid", "request_id", "turn_id",
+    "session_key", "origin_session_key", "profile_home", "terminal_sha256",
+})
+_EXCEPTION_PRODUCER_JOIN_SECS = 1.0
+
+
+def _terminal_digest(terminal: dict[str, Any]) -> str:
+    """Digest the complete finalized terminal wire object with stable key ordering."""
+    encoded = json.dumps(
+        terminal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_completion_bytes(
+    fd: int, data: bytes, *, write_fn: Callable[[int, Any], int] | None = None,
+) -> None:
+    """Write one bounded completion record, refusing short/zero/non-progress writes."""
+    writer = write_fn or os.write
+    view = memoryview(data)
+    while view:
+        written = writer(fd, view)
+        if type(written) is not int or written <= 0 or written > len(view):
+            raise OSError("producer completion pipe made no progress")
+        view = view[written:]
 
 
 class ComputeHost:
@@ -66,12 +98,26 @@ class ComputeHost:
 
     def __init__(
         self, *, stdout: Any = None, max_workers: int | None = None,
-        heartbeat_secs: float | None = None) -> None:
+        heartbeat_secs: float | None = None, completion_fd: int | None = None) -> None:
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
+        self._completion_fd = completion_fd
+        self._completion_lock = threading.Lock()
+        self._completion_close_requested = threading.Event()
+        self._completion_closed = threading.Event()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers or _default_workers(), thread_name_prefix="compute-host-turn")
         self._closed = threading.Event()
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_complete = threading.Event()
+        # A parsed turn can already be inside the admission handler when a
+        # signal/orphan shutdown wins the lifecycle lock. Keep that handler alive
+        # until its typed refusal and source-bound receipt have been published.
+        self._turn_admission_condition = threading.Condition()
+        self._turn_admissions = 0
+        self._turn_admission_closed = False
+        self._turn_admission_expired = False
         self._parent_pid = os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
@@ -97,31 +143,114 @@ class ComputeHost:
 
     def _reply(self, kind: str, sid: str, request_id: Any, **extra: Any) -> None:
         """Emit a per-session frame keyed by the request it answers."""
-        self.emit({"type": kind, "sid": sid, "request_id": request_id, **extra})
+        self.emit({"type": kind, "sid": sid, "request_id": request_id,
+                   "host_boot_id": self._boot_id, **extra})
 
-    def close(self) -> None:
+    def _reply_and_complete(
+        self, kind: str, sid: str, request_id: Any, **extra: Any,
+    ) -> None:
+        """Emit a terminal frame, then mark the joined producer boundary."""
+        self._reply_terminal(kind, sid, request_id, producer_complete=True, **extra)
+
+    def _reply_terminal(
+        self, kind: str, sid: str, request_id: Any, *, producer_complete: bool,
+        **extra: Any,
+    ) -> None:
+        """Emit one finalized terminal object and optionally publish its producer receipt."""
+        terminal = {
+            "type": kind, "sid": sid, "request_id": request_id,
+            "host_boot_id": self._boot_id, **extra,
+        }
+        terminal.setdefault("host_ns", now_ns())
+        self.emit(terminal)
+        if producer_complete:
+            self._emit_producer_completion(terminal)
+
+    def _emit_producer_completion(self, terminal: dict[str, Any]) -> None:
+        """Record the real producer boundary after terminal-frame finalization.
+
+        This channel is a child-owned control handle passed only to this
+        ComputeHost. It is closed before tool/descendant creation, so a late
+        inherited stdout writer cannot forge this receipt. A failed write leaves
+        the parent in its existing unknown-custody state.
+        """
+        record = {
+            "type": _PRODUCER_COMPLETION_TYPE,
+            "schema": _PRODUCER_COMPLETION_SCHEMA,
+            "host_pid": os.getpid(),
+            "host_boot_id": self._boot_id,
+            "sid": str(terminal.get("sid") or ""),
+            "request_id": str(terminal.get("request_id") or ""),
+            "turn_id": str(terminal.get("turn_id") or terminal.get("request_id") or ""),
+            "session_key": str(terminal.get("session_key") or ""),
+            "origin_session_key": str(terminal.get("origin_session_key") or ""),
+            "profile_home": str(terminal.get("profile_home") or ""),
+            "terminal_sha256": _terminal_digest(terminal),
+        }
+        data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        if len(data) > _PRODUCER_COMPLETION_MAX_BYTES:
+            logging.getLogger(__name__).warning("compute host producer completion record too large")
+            return
+        try:
+            with self._completion_lock:
+                fd = self._completion_fd
+                if fd is None or self._completion_closed.is_set():
+                    return
+                _write_completion_bytes(fd, data)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "compute host producer completion write failed")
+
+    def _emit_producer_startup(self) -> None:
+        """Bind the real child PID/boot before public hello or tool imports."""
+        record = build_producer_startup_record(pid=os.getpid(), boot_id=self._boot_id)
+        data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        try:
+            with self._completion_lock:
+                fd = self._completion_fd
+                if fd is None or self._completion_closed.is_set():
+                    return
+                _write_completion_bytes(fd, data)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "compute host producer startup write failed")
+
+    def close(self, *, deadline: float | None = None) -> bool:
+        """Close transport after a bounded admission seal.
+
+        A direct close has no lifecycle budget and therefore uses an immediate
+        deadline.  It must never wait forever for a reader that may be stuck in
+        a terminal/refusal path; an expired seal leaves custody unresolved.
+        """
+        self._shutdown_requested.set()
         self._closed.set()
+        admissions_settled = self._seal_turn_admissions(deadline=deadline)
         self._executor.shutdown(wait=False, cancel_futures=True)
-        # Every caller hard-exits next (os._exit skips atexit): a foreground command still
-        # running in its own process group would outlive the host.
+        self._completion_close_requested.set()
+        with self._completion_lock:
+            fd, self._completion_fd = self._completion_fd, None
+            self._completion_closed.set()
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+        # A foreground command in its own process group would outlive the closing host.
         with contextlib.suppress(Exception):
             from tools.environments.base import kill_live_foreground_processes
             kill_live_foreground_processes()
+        self._shutdown_complete.set()
+        return admissions_settled
 
-    def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
-        """Drain in-flight turns, then finalize every session.
-
-        ``_finalize_session`` is a one-shot latch, so finalizing before the drain would spend
-        it mid-turn and release the lease. ``_FLUSH_RESERVE_SECS`` (at most half of ``wait``)
-        is withheld from the drain so the flush still runs when turns outlast the window.
-        Sessions still running at the deadline are skipped (unfinalized keeps them
-        recoverable; atexit ``server._shutdown_sessions`` may re-finalize them).
-        """
-        self._closed.set()
+    def _drain_and_flush(
+        self, *, reason: str, wait: float, deadline: float | None = None,
+    ) -> bool:
+        """Drain accepted turns and flush idle sessions without closing the host transport."""
         budget = max(0.0, wait)
-        deadline = time.monotonic() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        reserve = min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        drain_deadline = time.monotonic() + budget - reserve
+        if deadline is not None:
+            drain_deadline = min(drain_deadline, deadline - reserve)
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = drain_deadline - time.monotonic()
             if remaining <= 0 or not self._live_turns():
                 break
             # Bounded by ``remaining``: a flat sleep would eat the reserve it protects.
@@ -129,7 +258,31 @@ class ComputeHost:
         with self._turn_futures_lock:
             live_sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
         self.flush_all_sessions(reason=reason, skip_sids=live_sids)
-        self.close()
+        return not self._live_turns()
+
+    def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
+        """Drain in-flight turns, then close the host for non-command shutdown paths.
+
+        The explicit shutdown command uses ``_drain_and_flush`` first so its ACK can be
+        serialized while the host and completion transport are still alive. Signal, orphan,
+        and stdin-EOF paths retain the existing closed-before-drain behavior. The same
+        monotonic deadline bounds admission sealing; expiry leaves custody unknown.
+        """
+        deadline = time.monotonic() + max(0.0, wait)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self._shutdown_requested.set()
+            self._closed.set()
+        # Let a reader that already entered turn admission acquire the lifecycle
+        # lock, observe the shutdown boundary, and publish its refusal. Waiting
+        # while holding that lock would deadlock the reader before it can write.
+        self._drain_and_flush(reason=reason, wait=wait, deadline=deadline)
+        self._seal_turn_admissions(deadline=deadline)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self.close(deadline=deadline)
 
     def flush_all_sessions(
         self, *, reason: str = "shutdown", skip_sids: Collection[str] | None = None) -> None:
@@ -153,12 +306,79 @@ class ComputeHost:
                 "type": "error", "request_id": frame.get("request_id"),
                 "message": f"unknown frame type: {kind}"})
         else:
-            getattr(self, handler)(frame)
+            if kind == "turn.start":
+                # A frame that entered before shutdown remains counted even while
+                # it waits on the admission RLock. If the barrier was already
+                # sealed, drop it: stdout alone must never become an authenticated
+                # terminal or release a parent lease.
+                if not self._begin_turn_admission():
+                    return
+                try:
+                    getattr(self, handler)(frame)
+                finally:
+                    self._end_turn_admission()
+            else:
+                getattr(self, handler)(frame)
 
     def _handle_shutdown(self, frame: dict[str, Any]) -> None:
-        self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
-        # Explicit shutdown is a clean close; SIGTERM and orphan paths do the durability flush.
-        self.close()
+        # The exact ACK must be serialized before close marks the host terminal or closes
+        # the completion channel. The parent refuses clean capture unless this receipt is
+        # observed and matches the current process identity. An expired admission seal
+        # deliberately emits no ACK, leaving the parent in unknown custody.
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self._shutdown_requested.set()
+            self._closed.set()
+        deadline = time.monotonic() + 10.0
+        drained = self._drain_and_flush(reason="shutdown", wait=10.0, deadline=deadline)
+        admissions_settled = self._seal_turn_admissions(deadline=deadline)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            try:
+                if admissions_settled:
+                    self.emit({
+                        "type": "shutdown.ack", "request_id": frame.get("request_id"),
+                        "host_pid": os.getpid(), "host_boot_id": self._boot_id,
+                        "drained": drained,
+                    })
+            finally:
+                self.close(deadline=deadline)
+
+    def _begin_turn_admission(self) -> bool:
+        """Register a parsed turn until its terminal/refusal path returns."""
+        with self._turn_admission_condition:
+            if self._turn_admission_closed:
+                return False
+            self._turn_admissions += 1
+            return True
+
+    def _end_turn_admission(self) -> None:
+        with self._turn_admission_condition:
+            self._turn_admissions -= 1
+            if self._turn_admissions == 0:
+                self._turn_admission_condition.notify_all()
+
+    def _seal_turn_admissions(self, *, deadline: float | None = None) -> bool:
+        """Bound the parsed-turn admission/refusal wait before closing custody."""
+        if deadline is None:
+            # A direct close has no caller-owned lifecycle budget.  Fail closed
+            # immediately rather than inventing an unbounded grace period.
+            deadline = time.monotonic()
+        with self._turn_admission_condition:
+            if self._turn_admission_expired:
+                self._turn_admission_closed = True
+                return False
+            while self._turn_admissions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._turn_admission_closed = True
+                    self._turn_admission_expired = True
+                    return False
+                self._turn_admission_condition.wait(timeout=remaining)
+            self._turn_admission_closed = True
+            return True
 
     def _track_turn_future(self, future: concurrent.futures.Future, sid: str) -> None:
         """Track an in-flight turn; the done callback pops it or the map grows forever."""
@@ -171,8 +391,40 @@ class ComputeHost:
             self._turn_futures.pop(future, None)
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
-        future = self._executor.submit(self._run_real_turn, dict(frame))
-        self._track_turn_future(future, str(frame.get("sid") or ""))
+        sid = str(frame.get("sid") or "")
+        request_id = frame.get("request_id")
+        refused_by_shutdown = False
+        submit_error: str | None = None
+        # The child reader and signal/orphan shutdown share this boundary.  Hold it
+        # only through submit+track: response/interrupt handlers remain outside the
+        # lock so already-accepted work can drain and publish its terminal frame.
+        with self._shutdown_lock:
+            if self._shutdown_requested.is_set() or self._closed.is_set():
+                refused_by_shutdown = True
+            else:
+                try:
+                    future = self._executor.submit(self._run_real_turn, dict(frame))
+                except RuntimeError as exc:
+                    submit_error = str(exc)
+                else:
+                    self._track_turn_future(future, sid)
+        if refused_by_shutdown:
+            self._reply_and_complete(
+                "turn.error", sid, request_id,
+                turn_id=str(frame.get("turn_id") or request_id or ""),
+                session_key=str(frame.get("session_key") or ""),
+                profile_home=str(frame.get("profile_home") or ""),
+                origin_session_key=str(frame.get("session_key") or ""),
+                reason="shutdown_requested", message="compute host is shutting down")
+            return
+        if submit_error is not None:
+            self._reply_and_complete(
+                "turn.error", sid, request_id,
+                turn_id=str(frame.get("turn_id") or request_id or ""),
+                session_key=str(frame.get("session_key") or ""),
+                profile_home=str(frame.get("profile_home") or ""),
+                origin_session_key=str(frame.get("session_key") or ""),
+                reason="submit_refused", message=submit_error)
 
     def _guarded(
         self, frame: dict[str, Any], error_kind: str, body: Callable, *,
@@ -228,12 +480,27 @@ class ComputeHost:
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        turn_id = str(frame.get("turn_id") or request_id)
+        session_key = str(frame.get("session_key") or "")
+        origin_session_key = session_key
+        profile_home = str(frame.get("profile_home") or "")
+        session: dict[str, Any] | None = None
+        run_thread: Any = None
+        dispatch_started = False
+        server_module: Any = None
         if not sid:
-            self._reply("turn.error", sid, request_id, message="sid required")
+            self._reply_and_complete(
+                "turn.error", sid, request_id, turn_id=turn_id,
+                session_key=session_key, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                reason="invalid_request", message="sid required")
             return
         try:
             from tui_gateway import server
+            server_module = server
             session = self._ensure_server_session(server, frame)
+            session_key = str(session.get("session_key") or session_key)
+            profile_home = str(session.get("profile_home") or profile_home)
             # #101416: the parent already holds this session's active-session lease (claimed in
             # prompt.submit before routing here). Install the inert borrow BEFORE the turn runs, or
             # _admit_prompt_turn re-claims from this child pid and is fenced out by the parent's own
@@ -246,15 +513,26 @@ class ComputeHost:
                 queued_gen = frame.get("queued_prompt_generation")
                 current_gen = int(session.get("_queued_prompt_generation", 0))
                 if queued_gen is not None and current_gen != int(queued_gen):
-                    self._reply("turn.end", sid, request_id, interrupted=True, ended_ns=now_ns())
+                    self._reply_and_complete(
+                        "turn.end", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        interrupted=True, ended_ns=now_ns())
                     return
                 if session.get("running"):
-                    self._reply("turn.error", sid, request_id, message="session busy")
+                    self._reply_and_complete(
+                        "turn.error", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        reason="session_busy", message="session busy")
                     return
                 session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
                 server._start_inflight_turn(session, inflight)
                 turn_started_at = time.time()
-            self._reply("turn.started", sid, request_id, started_ns=now_ns())
+            self._reply("turn.started", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        started_ns=now_ns())
             with contextlib.suppress(Exception):
                 server._ensure_session_db_row(session)
                 # #85303: the parent's prompt.submit reopened this row before dispatching here (or
@@ -269,10 +547,19 @@ class ComputeHost:
                 hermes_undo.on_user_message_appended(session["session_key"])
             with contextlib.suppress(Exception):
                 server._persist_branch_seed(session)
-            server._run_prompt_submit(
+            dispatch_started = True
+            accepted = server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None))
+            if not accepted:
+                # No worker was admitted; the parent must receive a refused turn.
+                self._reply_and_complete(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="dispatch_refused", message="prompt dispatch refused")
+                return
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
@@ -285,18 +572,118 @@ class ComputeHost:
             session_info = server._session_info(session.get("agent"), session)
             with self._progress_lock:
                 self._progress_counter += 1
-            self._reply(
-                "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
+            self._reply_and_complete(
+                "turn.end", sid, request_id, turn_id=turn_id, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                **meta, interrupted=interrupted, ended_ns=now_ns(),
                 session_info=session_info, session_info_emitted=True)
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                from tui_gateway import server
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
-            self._reply("turn.error", sid, request_id, reason="exception", message=str(exc))
+            # Keep the exact accepted session and worker references. The lifecycle may have
+            # popped this session from ``server._sessions`` while the worker is still running;
+            # looking it up again can otherwise turn a live worker into a false completion.
+            owned_session = session
+            if owned_session is not None and run_thread is None:
+                run_thread = owned_session.get("_run_thread")
+            joined = not dispatch_started
+            worker_live = False
+            if dispatch_started:
+                if run_thread is not None and hasattr(run_thread, "join"):
+                    try:
+                        if run_thread is not threading.current_thread():
+                            run_thread.join(timeout=_EXCEPTION_PRODUCER_JOIN_SECS)
+                            worker_live = bool(run_thread.is_alive())
+                            joined = not worker_live
+                    except Exception:  # health: allow BLE001 -- an opaque worker cannot prove join; preserve unknown custody
+                        logging.getLogger(__name__).warning(
+                            "compute host worker join failed; retaining unknown custody"
+                        )
+                        joined = False
+                        worker_live = False
+                else:
+                    joined = False
+            if joined and owned_session is not None and server_module is not None:
+                try:
+                    with owned_session.get("history_lock", threading.Lock()):
+                        owned_session["running"] = False
+                        server_module._clear_inflight_turn(owned_session)
+                except Exception:  # health: allow BLE001 -- cleanup can be session/provider-specific; failure keeps custody unknown
+                    logging.getLogger(__name__).warning(
+                        "compute host inflight cleanup failed; retaining unknown custody"
+                    )
+                    joined = False
+            if joined:
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=True)
+            elif worker_live and owned_session is not None and server_module is not None:
+                # Publish one bounded public observation while the accepted worker is
+                # still live. This is only an unknown-custody candidate: it must not
+                # invoke the callback, publish the private producer receipt, or release
+                # the exact turn lease. The watcher retains the original session/thread
+                # references and is the only path that may later publish producer_complete.
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=False)
+                if self._watch_exception_worker(
+                    server_module, owned_session, run_thread, sid=sid, request_id=request_id,
+                    turn_id=turn_id, session_key=session_key,
+                    origin_session_key=origin_session_key, profile_home=profile_home,
+                    message=str(exc),
+                ):
+                    return
+                # The bounded unknown frame above is already the public observation.
+                # If watcher startup fails, leave custody pending rather than emitting
+                # a duplicate frame or manufacturing a settled receipt.
+            else:
+                # No positive proof of a completed worker exists. Keep the parent in
+                # its existing unknown-custody path rather than publishing a receipt.
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=False)
+
+    def _watch_exception_worker(
+        self, server: Any, session: dict[str, Any], run_thread: Any, *, sid: str,
+        request_id: str, turn_id: str, session_key: str, origin_session_key: str,
+        profile_home: str, message: str,
+    ) -> bool:
+        """Publish the exception receipt only after the accepted worker actually exits."""
+        def wait_for_worker() -> None:
+            try:
+                run_thread.join()
+                if run_thread.is_alive():
+                    raise RuntimeError("producer worker remained live after join")
+                with session.get("history_lock", threading.Lock()):
+                    session["running"] = False
+                    server._clear_inflight_turn(session)
+            except Exception:  # health: allow BLE001 -- worker join and session cleanup are opaque custody boundaries; failure keeps the lease unresolved
+                logging.getLogger(__name__).warning(
+                    "compute host exception worker cleanup failed; retaining unknown custody")
+                # The live-worker branch already emitted the single bounded
+                # producer_complete=false observation before starting this watcher.
+                # Keep that candidate and the exact lease pending on join/cleanup
+                # failure; a second frame would create a distinct digest and could
+                # obscure which custody state is still unresolved.
+                return
+            self._reply_terminal(
+                "turn.error", sid, request_id, turn_id=turn_id,
+                session_key=session_key, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                reason="exception", message=message, producer_complete=True)
+
+        from agent.memory_provider import spawn_context_thread
+        try:
+            spawn_context_thread(
+                wait_for_worker, name="compute-host-exception-worker",
+            ).start()
+        except RuntimeError:
+            return False
+        return True
 
     def _emit_turn_activity(self, sid: str, session: dict, turn_id: str, started_at: float) -> None:
         # Observe the agent clock, never the host heartbeat. A reused agent's last
@@ -505,6 +892,8 @@ class ComputeHost:
 
     def _heartbeat_loop(self) -> None:
         while not self._closed.wait(self._heartbeat_secs):
+            if self._shutdown_requested.is_set():
+                return
             active_turns = len(self._live_turns())
             with self._progress_lock:
                 counter = self._progress_counter
@@ -514,6 +903,8 @@ class ComputeHost:
 
     def _parent_guard_loop(self) -> None:
         while not self._closed.wait(1.0):
+            if self._shutdown_requested.is_set():
+                return
             ppid = os.getppid()
             if ppid in {0, 1} or (self._parent_pid and ppid != self._parent_pid):
                 self.emit({"type": "orphan", "old_ppid": self._parent_pid, "ppid": ppid})
@@ -546,11 +937,55 @@ def _default_workers() -> int:
         return 8
 
 
+def _open_producer_completion_fd() -> int | None:
+    """Claim the one inherited completion handle before importing tool/server code."""
+    raw = os.environ.pop(_PRODUCER_COMPLETION_ENV, "")
+    if not raw:
+        return None
+    fd: int | None = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle = int(raw)
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+            assert fd is not None
+            try:
+                os.set_handle_inheritable(handle, False)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
+                raise
+            return fd
+        fd = int(raw)
+        assert fd is not None
+        try:
+            os.set_inheritable(fd, False)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+            raise
+        return fd
+    except (AssertionError, OSError, ValueError):
+        logging.getLogger(__name__).warning(
+            "compute host producer completion handle setup failed")
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        return None
+
+
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     # JSONL framing is byte-oriented; avoid text-stream read-ahead on Windows pipes.
     stdin = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)
-    host = ComputeHost(stdout=stdout or sys.stdout)
+    completion_fd = _open_producer_completion_fd()
+    host = ComputeHost(stdout=stdout or sys.stdout, completion_fd=completion_fd)
+    # This is the only source-authenticated startup identity. It must precede
+    # public hello and the server/tool import path, whose output is untrusted.
+    host._emit_producer_startup()
     shutting_down = threading.Event()
     # No client is connected to this process: session-less broadcasts (``broadcast_plugin_event``
     # from a plugin tool/hook running in the isolated turn) ride the host pipe to the parent
@@ -572,6 +1007,8 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         "build_sha": _build_sha(), "cwd": os.getcwd(),
         "hermes_home": os.environ.get("HERMES_HOME", "")})
 
+    shutdown_command_started = threading.Event()
+
     def _reader() -> None:
         for raw in stdin:
             if host._closed.is_set():
@@ -584,9 +1021,14 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if not isinstance(frame, dict):
                 host.emit({"type": "error", "message": "frame must be an object"})
                 continue
+            is_shutdown = frame.get("type") == "shutdown"
+            if is_shutdown:
+                shutdown_command_started.set()
             host.handle_frame(frame)
-            if frame.get("type") == "shutdown":
-                os._exit(0)
+            if is_shutdown:
+                # The handler has emitted and flushed the ACK before close(). The main
+                # thread joins this reader before running any fallback finalizer.
+                return
             if host._closed.is_set():
                 break
     reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
@@ -596,8 +1038,13 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if not reader.is_alive():
                 break
     finally:
+        if shutdown_command_started.is_set():
+            # A command handler owns the shutdown lock and has a bounded drain. Joining
+            # here prevents the main thread from exiting while the ACK write is in flight.
+            reader.join()
         server.unregister_live_transport(host._transport)
-        host.shutdown(reason="stdin_closed", wait=2.0)
+        if not host._shutdown_complete.is_set():
+            host.shutdown(reason="stdin_closed", wait=2.0)
 
 
 def main(argv: list[str] | None = None) -> int:

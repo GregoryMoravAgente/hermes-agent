@@ -874,18 +874,34 @@ def _dispatch_admitted(
             logger.exception(f"Async delegation{label} %s crashed", delegation_id)
             result = crash_result(f"{type(exc).__name__}: {exc}", round(time.time() - dispatched_at, 2))
         finally:
-            _finalize(delegation_id, result, status)
+            # The callable's finally is the producer terminal boundary. It
+            # protects retirement custody even when record finalization raises;
+            # Future.done is only used below for cancellation before start.
+            retirement.run_with_lease(worker_lease, _finalize, delegation_id, result, status)
 
     from hermes_cli.backend_retirement import retirement
 
     # The outer dispatch reservation prevents a freeze during this handoff. Retain a worker
     # reservation too: the stall monitor may finalize its registry record before it really exits.
-    retirement.acquire()
+    worker_lease = retirement.acquire(
+        owner_kind="async-delegation-worker",
+        owner_id=delegation_id,
+        profile_id=session_key,
+    )
+    if worker_lease is None:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        if remote := worker_ledger():
+            remote.unscheduled(delegation_id)
+        else:
+            with _DB_LOCK, _transaction() as conn:
+                conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
+        return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: backend is retiring"}
     try:
         future = executor.submit(propagate_context_to_thread(_worker))
-        future.add_done_callback(lambda _: retirement.release())
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
-        retirement.release()
+        # No Future was returned, so no accepted worker exists.
+        retirement.release(worker_lease)
         with _records_lock:
             _records.pop(delegation_id, None)
         if remote := worker_ledger():
@@ -894,6 +910,20 @@ def _dispatch_admitted(
             with _DB_LOCK, _transaction() as conn:
                 conn.execute("DELETE FROM async_delegations WHERE delegation_id=?", (delegation_id,))
         return {"status": "rejected", "error": f"Failed to schedule async delegation{label}: {exc}"}
+
+    def finalize_cancelled():
+        _finalize(delegation_id, crash_result("Worker cancelled before start", 0), "interrupted")
+
+    if not retirement.observe_future_cancellation(
+        future, worker_lease, on_cancel=finalize_cancelled
+    ):
+        # The Future was accepted. Keep its record and exact lease even when a
+        # cancellation observer could not be attached; a worker that starts will
+        # release from its callable finally, while an unobservable queued cancel
+        # remains explicitly held rather than being treated as submit refusal.
+        logger.error(
+            "Accepted async delegation Future has no cancellation observer; retaining retirement custody"
+        )
     if progress_fn is not None:
         _ensure_stale_monitor()
     return {"status": "dispatched", "delegation_id": delegation_id}

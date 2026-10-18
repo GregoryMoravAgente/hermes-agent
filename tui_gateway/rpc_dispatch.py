@@ -64,7 +64,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         from hermes_cli.backend_retirement import retirement
 
         # Reserve BEFORE enqueueing: a queued handler has accepted work even though no worker runs yet.
-        if not retirement.acquire():
+        lease = retirement.acquire(
+            owner_kind="tui-rpc-worker",
+            owner_id=str(normalized[0]),
+        )
+        if lease is None:
             return _err(req.get("id"), 5035, "backend is retiring; reconnect to continue")
         try:
             ctx = contextvars.copy_context()  # the pool worker must see the bound transport
@@ -72,19 +76,34 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             if normalized[1] in _CONNECTOR_RPC_METHODS and isinstance(owner, dict) and owner.get("type") == "session":
                 ctx.run(_capture_connector_rpc_owner, normalized[2])
 
-            def run():
+            def run_body():
                 try:
                     resp = _handle_admitted_request(req)
                 except Exception as exc:
                     resp = _err(req.get("id"), -32000, f"handler error: {exc}")
                 if resp is not None:
                     t.write(resp)
-            future = _pool.submit(lambda: ctx.run(run))
+
+            def run():
+                # Callable completion, including response-write cleanup, is the
+                # producer's terminal boundary. The Future callback below only
+                # covers cancellation before this callable starts.
+                return retirement.run_with_lease(lease, ctx.run, run_body)
+
+            future = _pool.submit(run)
         except BaseException:
-            retirement.release()
+            # No Future was returned, so the reservation was never accepted.
+            retirement.release(lease)
             raise
-        # Also releases cancelled queued futures; the worker's own finally would never execute.
-        future.add_done_callback(lambda _: retirement.release())
+        if not retirement.observe_future_cancellation(future, lease):
+            # An accepted Future remains owned by its callable-finally path. If
+            # this Future is later cancelled before starting, no terminal observer
+            # exists; keep the exact lease held rather than misreporting refusal
+            # or drain. The executor owner must provide a cancellation observer
+            # before this path can claim complete custody.
+            logger.error(
+                "Accepted RPC Future has no cancellation observer; retaining retirement custody"
+            )
         return None
     finally:
         reset_transport(token)
