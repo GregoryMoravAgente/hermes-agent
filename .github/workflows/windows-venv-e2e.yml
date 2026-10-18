@@ -1,109 +1,123 @@
-name: Windows venv-holder live E2E
-
-# ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
-#
-# Runs the live venv-holder E2E suite on a real windows-latest runner:
-# spawns actual processes with realistic Hermes argv shapes and drives the
-# REAL detection/classification/exemption code against the live process
-# table — the coverage that cannot exist on the Linux lanes and that the
-# maintainer cannot exercise locally before the work reaches main.
-#
-# Deliberately NOT wired to pull_request/main: it fires only on pushes to
-# wine2e/** working branches, so it costs nothing on normal PRs. Delete or
-# keep dormant after the venv-holder work lands.
+# OWN-FORK PROOF-BRANCH TEMPLATE ONLY.
+# This file is the first of exactly one transport commit above the public
+# candidate. Materialize the manifest source hashes before committing it to a
+# wine2e/agc1718/** branch. Do not add it to the upstream PR or release train.
+name: AGC-1718 profile fencing native Windows proof
 
 on:
   push:
-    branches:
-      - 'wine2e/**'
-  workflow_call:
-    inputs:
-      commit:
-        description: Commit to test and build. Empty keeps the triggering commit.
-        type: string
-        default: ''
-      release:
-        description: 'Stable-release candidate run. Unused by the jobs; the caller passes it for a uniform callable surface.'
-        required: false
-        type: boolean
-        default: false
+    branches: ['wine2e/agc1718/**']
 
 permissions:
   contents: read
 
-# A workflow_call run (stable release) shares the caller's commit; its group
-# includes github.run_id so a rerun of the parent gets a fresh group instead
-# of cancelling this child mid-flight. wine2e push runs keep ref-scoped
-# collapse as before.
 concurrency:
-  group: windows-venv-e2e-${{ inputs.release == true && github.run_id || github.ref }}
-  cancel-in-progress: ${{ inputs.release != true }}
+  group: agc1718-native-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  venv-holder-e2e:
-    name: venv-holder live E2E (windows-latest)
-    runs-on: blacksmith-32vcpu-windows-2025
+  profile-fencing-native:
+    name: profile fencing native Windows (own fork)
+    runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      HERMES_TEST_FILE_RETRIES: '0'
     steps:
-      - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
-        with:
-          # The stable caller dispatches on the candidate tag; github.sha is
-          # the exact candidate commit there and the head SHA everywhere else.
-          ref: ${{ inputs.commit || github.sha }}
+      - name: Prepare long paths and Git checkout semantics
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+          $longPaths = (Get-ItemProperty `
+            'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
+          if ($longPaths -ne 1) { throw 'LongPathsEnabled was not set to 1' }
+          if ((git config --global --get core.autocrlf) -ne 'false') {
+            throw 'core.autocrlf is not false before checkout'
+          }
 
-      - name: Set up locked Python and test dependencies
+      - name: Checkout proof commit and its public parent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+
+      - name: Build the official locked PM test environment
+        id: setup_pm
         uses: ./.github/actions/setup-pm
         with:
           extras: '["messaging"]'
           test-environment: 'true'
           prune-python-cache: true
 
-      - name: Run venv-holder live E2E
-        # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
-        # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
-        # isolation. The live files are host-marked windows-only, so the
-        # runner collects them on this runner instead of skipping them.
+      - name: Verify proof commit and executable candidate bytes before tests
+        id: source_guard_before
+        shell: bash
+        run: |
+          set -euo pipefail
+          python .github/proof/agc1718_profile_source_guard.py \
+            --manifest .github/proof/agc1718_profile_native_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase before \
+            --receipt "$RUNNER_TEMP/agc1718/source-before.json"
+
+      - name: Run the ten-file profile fencing bank on actual Windows
+        id: focused_bank
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
           set -uo pipefail
-          bash scripts/run_tests.sh \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/pm/test_held_entry_windows_live.py
+          out="$RUNNER_TEMP/agc1718"
+          mkdir -p "$out"
+          files=(
+            tests/tui_gateway/test_compute_host_profile_fencing.py
+            tests/tui_gateway/test_compute_host_profile_ownership.py
+            tests/tui_gateway/test_compute_host.py
+            tests/tui_gateway/test_compute_host_turn_protocol.py
+            tests/tui_gateway/test_compute_host_late_compress_ack.py
+            tests/tui_gateway/test_interrupt_dead_compute_host.py
+            tests/tui_gateway/test_served_profile_child_env.py
+            tests/tui_gateway/test_served_profile_child_env_authority.py
+            tests/tui_gateway/test_compute_host_borrowed_lease.py
+            tests/tui_gateway/test_tui_gateway_server.py
+          )
+          rc=0
+          : > "$out/runner.log"
+          for file in "${files[@]}"; do
+            stem="${file##*/}"
+            stem="${stem%.py}"
+            set +e
+            bash scripts/run_tests.sh -j 1 --file-retries 0 "$file" \
+              -- --tb=short --junitxml="$out/${stem}.xml" \
+              >> "$out/runner.log" 2>&1
+            file_rc=$?
+            set -e
+            printf '%s exit=%s\n' "$file" "$file_rc" >> "$out/file-status.log"
+            if [ "$file_rc" -ne 0 ]; then rc=1; fi
+          done
+          printf '{"exit_code":%s,"files":10,"file_retries":0}\n' "$rc" > "$out/bank-result.json"
+          exit "$rc"
 
-      - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
+      - name: Verify proof commit and executable candidate bytes after tests
+        id: source_guard_after
+        if: ${{ always() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/gateway/test_telegram_closewait_windows_live.py
+          set -euo pipefail
+          python .github/proof/agc1718_profile_source_guard.py \
+            --manifest .github/proof/agc1718_profile_native_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase after \
+            --receipt "$RUNNER_TEMP/agc1718/source-after.json"
 
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
-
-      - name: Turn Windows long paths off for later steps (#130242)
-        # The runner image turns LongPathsEnabled on; 0 is the Windows default
-        # most users have. A process reads the value when it starts, so only
-        # later steps see it. Keep this step after every lane that expects the
-        # image's setting. It does not depend on those lanes passing.
-        id: long_paths_off
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          reg add 'HKLM\SYSTEM\CurrentControlSet\Control\FileSystem' /v LongPathsEnabled /t REG_DWORD /d 0 /f
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
-
-      - name: Run PM long-path live E2E with long paths off (#130242)
-        # The test first asserts RtlAreLongPathsEnabled() is false in its own
-        # process, so this step cannot pass if the step above did not take.
-        # ``-m`` replaces pyproject's addopts, which deselect ``integration``.
-        if: ${{ !cancelled() && steps.long_paths_off.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/pm/test_long_paths_windows_live.py -- -m "platforms and integration" -v
+      - name: Retain native profile fencing receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agc1718-profile-fencing-native-${{ github.sha }}
+          path: ${{ runner.temp }}/agc1718/
+          if-no-files-found: error
+          retention-days: 14
