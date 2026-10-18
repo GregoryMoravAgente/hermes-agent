@@ -21,6 +21,8 @@ from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
 from tests._fixtures.thread_shim import ImmediateThread as _ImmediateThread
 
+_REAL_THREAD = threading.Thread
+
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
     """Run one RPC to completion synchronously, regardless of pool routing.
@@ -3615,6 +3617,7 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
 
 
 def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
+    trace = {"test_enter_ns": time.monotonic_ns()}
     history_started = threading.Event()
     release_history = threading.Event()
     build_started = threading.Event()
@@ -3635,8 +3638,29 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
 
         def get_resume_conversations(self, target):
             history_calls.append(("resume", target))
+            worker = threading.current_thread()
+            worker_type = type(worker)
+            trace.update(
+                history_worker_enter_ns=time.monotonic_ns(),
+                history_worker_class=(
+                    f"{worker_type.__module__}.{worker_type.__qualname__}"
+                ),
+                history_worker_is_main=worker is threading.main_thread(),
+                history_worker_is_captured_real=worker_type is _REAL_THREAD,
+            )
             history_started.set()
-            assert release_history.wait(timeout=2.0)
+            trace["history_worker_wait_enter_ns"] = time.monotonic_ns()
+            wait_succeeded = False
+            try:
+                wait_succeeded = release_history.wait(timeout=2.0)
+            finally:
+                trace["history_worker_wait_exit_ns"] = time.monotonic_ns()
+                trace["history_worker_wait_succeeded"] = wait_succeeded
+            if "first_return_ns" in trace:
+                trace["first_return_before_worker_wait_exit"] = (
+                    trace["first_return_ns"] < trace["history_worker_wait_exit_ns"]
+                )
+            assert wait_succeeded
             return [loaded], [ancestor, loaded]
 
         def get_ancestor_display_prefix(self, target):
@@ -3668,23 +3692,30 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
                 "defer_history": True,
             },
         )
+        trace["first_return_ns"] = time.monotonic_ns()
 
         assert first["result"]["hydrating"] is True
         assert first["result"]["messages"] == []
         assert first["result"]["message_count"] == 1200
         assert history_started.wait(timeout=1.0)
+        trace["history_started_observed_ns"] = time.monotonic_ns()
 
+        trace["second_call_enter_ns"] = time.monotonic_ns()
         second = server._methods["session.resume"](
             "r2",
             {"session_id": "large-session", "defer_history": True},
         )
-        assert second["result"]["session_id"] == first["result"]["session_id"]
+        trace["second_return_ns"] = time.monotonic_ns()
+        assert second["result"]["session_id"] == first["result"]["session_id"], trace
         assert second["result"]["hydrating"] is True
         assert second["result"]["messages"] == []
 
+        trace["release_before_ns"] = time.monotonic_ns()
         release_history.set()
+        trace["release_after_ns"] = time.monotonic_ns()
         sid = first["result"]["session_id"]
         assert server._sessions[sid]["resume_history_ready"].wait(timeout=1.0)
+        trace["resume_history_ready_observed_ns"] = time.monotonic_ns()
         assert build_started.wait(timeout=1.0)
         assert history_calls == [
             ("resume", "large-session"),
@@ -3702,6 +3733,8 @@ def test_session_resume_deferred_history_acknowledges_and_reuses(monkeypatch):
                 if lease is not None:
                     lease.release()
                 server._sessions.pop(sid, None)
+        trace["cleanup_complete_ns"] = time.monotonic_ns()
+        print("AGC1721_DEFERRED_HISTORY_TRACE=" + json.dumps(dict(trace), sort_keys=True))
 
 
 def test_session_resume_deferred_history_failure_can_retry(monkeypatch):
