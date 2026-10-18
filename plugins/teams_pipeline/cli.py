@@ -14,6 +14,7 @@ from plugins.teams_pipeline.meetings import (
     enrich_meeting_with_call_record, fetch_preferred_transcript_text, list_recording_artifacts, resolve_meeting_reference)
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
+from plugins.teams_pipeline.store_ownership import TeamsStoreOwner, TeamsStoreOwnershipError
 from plugins.teams_pipeline.subscriptions import (
     build_graph_client, maintain_graph_subscriptions, sync_graph_subscription_record, utc_timestamp)
 from tools.microsoft_graph_auth import MicrosoftGraphConfigError, MicrosoftGraphTokenProvider
@@ -47,6 +48,9 @@ def teams_pipeline_command(args: argparse.Namespace) -> int:
     except MicrosoftGraphConfigError:
         print(_graph_setup_hint())
         return 1
+    except TeamsStoreOwnershipError as exc:
+        print(f"Teams pipeline store unavailable: {exc}")
+        return 1
 
 
 def _text(args: argparse.Namespace, name: str) -> str:
@@ -59,7 +63,10 @@ def _int_arg(args: argparse.Namespace, name: str, default: int) -> int:
 
 
 def _open_store(args: argparse.Namespace) -> TeamsPipelineStore:
-    return TeamsPipelineStore(resolve_teams_pipeline_store_path(getattr(args, "store_path", None)))
+    return TeamsPipelineStore(
+        resolve_teams_pipeline_store_path(getattr(args, "store_path", None)),
+        owner=TeamsStoreOwner.for_cli(), lock=True,
+    )
 
 
 def _print_json(payload: Any) -> None:

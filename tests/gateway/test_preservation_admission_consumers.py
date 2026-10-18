@@ -207,8 +207,8 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
 
     The provider is bounded, but admission, native waiter registration, FIFO execution, terminal
     settlement, adapter delivery, and ledger finalization all use production code.  This replaces the
-    R3 synthetic ``marker_adopters``/``Event.set`` shortcut and leaves I01 unwired until this causal
-    proof is independently accepted by the root execution.
+    R3 synthetic ``marker_adopters``/``Event.set`` shortcut and supplies the source-backed I01
+    evidence used by preservation handoff.
     """
     from gateway import delivery_ledger as dl, run_runtime
     from gateway.config import GatewayConfig, Platform, PlatformConfig
@@ -330,15 +330,75 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
     assert coordinator.status()['active_owner_classes'] == []
     prepared = await run_runtime.prepare_preservation_handoff(
         owner.runner, {'receipt': receipt}, 'test-peer')
-    assert prepared == {'status': 'refused', 'reason': 'unknown_owner', 'owner_class': 'I01_native_inbound'}
+    assert prepared == {'status': 'refused', 'reason': 'unknown_owner', 'owner_class': 'I03_api_run_direct'}
     states = coordinator.status()['owner_states']
-    assert states['I01_native_inbound'] == 'unwired'
+    assert states['I01_native_inbound'] == 'sealed'
     assert states['I02_api_session_turn'] == 'sealed'
     assert states['I04_fifo_turn_execution'] == 'sealed'
-    assert sum(state == 'unwired' for state in states.values()) == 18
+    assert sum(state == 'unwired' for state in states.values()) == 17
     reopened = await run_runtime.abort_preservation_drain(
         owner.runner, {'receipt': receipt}, 'test-peer')
     assert reopened['status'] == 'open'
+
+
+@pytest.mark.asyncio
+async def test_webhook_producer_reserves_i01_before_payload_preparation(tmp_path, monkeypatch):
+    """The receipt-only webhook producer owns I01 before its real preparation await.
+
+    This is the causal boundary the direct native path already had: a close beginning while
+    ``prepare_native`` is fetching/retaining payload media must see the exact producer root as
+    accepted custody, and a later durable admission must bind that same root rather than minting a
+    second lease after preparation.
+    """
+    import hashlib
+    import hmac
+    import json
+
+    from aiohttp import web
+    from aiohttp.test_utils import TestClient, TestServer
+
+    import gateway.platforms.webhook_ingress as ingress
+    from gateway.config import PlatformConfig
+    from gateway.platforms.webhook import WebhookAdapter
+    from tests.gateway.fixtures.webhook_route_authority import mount_authority
+
+    adapter = WebhookAdapter(PlatformConfig(enabled=True, extra={
+        'secret': 'owned-secret', 'routes': {'fixture': {'prompt': '{text}'}}}))
+    app = web.Application()
+    mount_authority(app, adapter)
+    app.router.add_post('/webhooks/{route_name}', adapter._handle_webhook)
+    entered, release = asyncio.Event(), asyncio.Event()
+    snapshots = []
+    original_prepare = ingress._prepared
+
+    async def paused_prepare(authority, event):
+        snapshots.append(authority.runner.runtime_custody.status())
+        entered.set()
+        await release.wait()
+        return await original_prepare(authority, event)
+
+    monkeypatch.setattr(ingress, '_prepared', paused_prepare)
+    async with TestClient(TestServer(app)) as client:
+        authority = adapter._message_handler.__self__.session_authority
+        _install_custody(authority)
+        # The route fixture's observer is unrelated to this producer-boundary proof; keep the
+        # production authority wrapper, which accepts the private handle transfer.
+        adapter.__dict__.pop('handle_message', None)
+        body = json.dumps({'text': 'webhook preservation'}).encode()
+        headers = {'X-GitHub-Delivery': 'i01-webhook-1', 'X-Hub-Signature-256':
+                   'sha256=' + hmac.new(b'owned-secret', body, hashlib.sha256).hexdigest()}
+        task = asyncio.create_task(client.post('/webhooks/fixture', data=body, headers=headers))
+        await asyncio.wait_for(entered.wait(), 5)
+        assert snapshots[-1]['active_owner_classes'] == ['I01_native_inbound']
+        assert snapshots[-1]['unwired_owner_classes']
+        release.set()
+        response = await asyncio.wait_for(task, 10)
+        assert response.status == 202, await response.text()
+        rows = authority.db._read_all('SELECT * FROM session_admissions')
+        assert len(rows) == 1
+        row = rows[0]
+        assert row is not None and row['status'] == 'queued'
+        assert authority._preservation_handles[row['admission_id']].owner_class == 'I01_native_inbound'
 
 
 @pytest.mark.asyncio

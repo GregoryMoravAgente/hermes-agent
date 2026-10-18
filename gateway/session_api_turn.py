@@ -191,7 +191,8 @@ def admit_api_steps(adapter, **kwargs):
     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
     preservation_handle = authority._preservation_root(
         'I02_api_session_turn', f'api:{request_id}')
-    authority._preservation_pending_root(request_id, preservation_handle)
+    authority._preservation_pending_root(
+        request_id, preservation_handle, principal_id='api', session_id=sid)
     try:
         settings = {key: kwargs.get(key) for key in _SETTING_KEYS}
         # Route credentials remain in the server's configuration, never admission JSON.
@@ -232,7 +233,9 @@ def admit_api_steps(adapter, **kwargs):
             # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
             payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
         if not isinstance(kwargs['user_message'], list):
-            return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))
+            return (yield from _admit_api_payload(
+                authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                preservation_handle))
         from gateway.session_api_media import commit_api_images
         from gateway.session_ingress_media import capture_lease, drop_capture_lease, release_unheld_media
         # Content-addressed bytes another admission may name are held from capture until this one
@@ -244,7 +247,9 @@ def admit_api_steps(adapter, **kwargs):
             # another admission holds them.
             release = partial(release_unheld_media, authority.db, payload['api_turn_v1']['media'])
             try:
-                admitted = yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs)
+                admitted = yield from _admit_api_payload(
+                    authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                    preservation_handle)
             except BaseException:
                 drop_capture_lease()
                 yield release
@@ -256,9 +261,9 @@ def admit_api_steps(adapter, **kwargs):
         raise
 
 
-def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs):
+def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                       preservation_handle):
     from hermes_state_terminal import retry_terminal_admission
-    preservation_handle = authority._preservation_pop_pending_root(request_id)
     row = retry_terminal_admission(authority.db, epoch=authority.epoch, principal_id='api',
         session_id=sid, request_id=request_id, payload=payload)
     if row is not None:

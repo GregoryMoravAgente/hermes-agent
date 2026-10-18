@@ -27,8 +27,8 @@ def mount_authority(app, adapter):
         # committed FIFO untouched; execution is covered by test_webhook_authority.
         authority._schedule = lambda ref: None
         original = authority.admit_native
-        async def capture(event):
-            receipt = await original(event)
+        async def capture(event, **kwargs):
+            receipt = await original(event, **kwargs)
             observer = adapter.__dict__.get('handle_message')
             if observer is not None:
                 await observer(event)
