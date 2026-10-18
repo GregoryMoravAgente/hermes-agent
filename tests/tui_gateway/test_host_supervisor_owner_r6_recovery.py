@@ -107,6 +107,7 @@ def test_dead_recorded_host_with_live_named_job_refuses_without_kill(tmp_path: P
         [sys.executable, "-c", "import time; time.sleep(30)"],
         creationflags=0x00000004,  # CREATE_SUSPENDED: assign before user code runs
     )
+    supervisor = None
     try:
         owner.assign(child)
         psutil.Process(child.pid).resume()
@@ -121,6 +122,13 @@ def test_dead_recorded_host_with_live_named_job_refuses_without_kill(tmp_path: P
         assert registry.exists()
         assert child.poll() is None
     finally:
-        owner.close()
-        child.wait(timeout=10)
+        # Recovery intentionally retains its own handle to this test's live Job. Close that
+        # exact retained handle too, so the last test-owned Job close can settle its child.
+        try:
+            recovery_owner = getattr(supervisor, "_recovery_owner", None)
+            if recovery_owner is not None:
+                recovery_owner.close()
+        finally:
+            owner.close()
+            child.wait(timeout=10)
 

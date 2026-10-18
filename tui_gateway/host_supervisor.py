@@ -721,8 +721,9 @@ class HostSupervisor:
             pending_turns=pending_turns, pending_controls=pending_controls,
             late_controls=late_controls, late_control_uncertain=late_control_uncertain,
         )
-        if result["clean"]:
-            with self._lock:
+        with self._lock:
+            result["admission_closed"] = self._shutdown_admission_closed
+            if result["clean"]:
                 # The process/owner identity must still be the one observed by all
                 # readers; otherwise this receipt is stale and cannot be acknowledged.
                 if self._proc is proc and self._owner_identity == (
@@ -733,7 +734,6 @@ class HostSupervisor:
                     result["clean"] = False
                     result["ack_required"] = False
                     result["status"] = "stale_identity"
-        result["admission_closed"] = self._shutdown_admission_closed
         return result
 
     def acknowledge_clean_stop(self, receipt: dict[str, Any]) -> bool:
