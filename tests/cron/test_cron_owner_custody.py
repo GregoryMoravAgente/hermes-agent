@@ -8,7 +8,7 @@ import textwrap
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 
@@ -496,54 +496,356 @@ def test_i12_provider_claim_fire_returns_real_execution_receipt(custody_runtime,
         binding.execution_id, success=True, delivery_outcome="delivered") is not None
     assert binding.observe_terminal()
 
-@pytest.mark.platforms("windows")
-def test_i13_direct_popen_identity_probe():
-    """Diagnostic only: compare real child identity with the parent Popen receipt."""
-    script = textwrap.dedent(
-        """
-        import json
-        import os
-        import sys
 
-        from gateway.status import get_process_start_time
 
-        print(json.dumps({
-            "pid": os.getpid(),
-            "process_started_at": get_process_start_time(os.getpid()),
-        }), flush=True)
-        assert sys.stdin.read(1) == "x"
-        """
-    )
-    process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+def _i13_constant_reason(error):
+    allowed = {
+        "worker_ack_mismatch",
+        "worker_execution_not_adopted",
+        "worker_execution_read_failed",
+        "worker_job_membership_unproven",
+        "worker_scope_identity_unproven",
+        "worker_startup_identity_mismatch",
+        "foreign_custody",
+    }
+    detail = str(error)
+    return detail if detail in allowed else type(error).__name__
+
+
+def _i13_start_time(pid, get_process_start_time):
+    if type(pid) is not int or pid <= 0:
+        return None
     try:
-        from gateway.status import get_process_start_time
+        value = get_process_start_time(pid)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    return value if type(value) is int else None
 
-        parent_identity = {
-            "pid": process.pid,
-            "process_started_at": get_process_start_time(process.pid),
-        }
-        assert process.stdout is not None
-        child_identity = json.loads(process.stdout.readline())
-        assert child_identity["pid"] == parent_identity["pid"], (
-            "real-child PID differs from Popen PID; inspect the Windows launcher boundary: "
-            f"child={child_identity['pid']} parent={parent_identity['pid']}"
-        )
-        assert type(child_identity["process_started_at"]) is int, child_identity
-        assert type(parent_identity["process_started_at"]) is int, parent_identity
-        assert child_identity["process_started_at"] == parent_identity["process_started_at"], (
-            "real-child and parent start fingerprints differ: "
-            f"child={child_identity['process_started_at']} "
-            f"parent={parent_identity['process_started_at']}"
-        )
-    finally:
-        if process.stdin is not None:
+
+def _i13_job_member(native_job, process):
+    raw_handle = getattr(process, "raw_handle", None)
+    if native_job is None or raw_handle is None:
+        return "unknown"
+    try:
+        result = native_job.contains_process_handle(SimpleNamespace(raw_handle=raw_handle))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return "unknown"
+    return result if result in (True, False) else "unknown"
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monkeypatch, tmp_path):
+    """Diagnostic only: observe the real Cron spawn/ACK/ledger identity boundary.
+
+    This deliberately exercises ``_launch_external_cron_worker`` with a real no-agent script,
+    real ``spawn_server`` and the real durable execution ACK. It keeps the existing I13 refusal
+    contract fail-closed and emits a bounded synthetic receipt when the current identity check
+    rejects the child.
+    """
+    _coordinator, executions, _db = custody_runtime
+    from cron import jobs, scheduler
+    from cron.runtime_custody import CronOwnerBinding, reserve_execution
+    from gateway.status import get_process_start_time
+    from hermes_cli.local_runtime import processes as local_processes
+    from tui_gateway.windows_producer_identity import (
+        ProducerIdentityError, WindowsProducerHandle)
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    started = tmp_path / "i13-diagnostic-started"
+    release = tmp_path / "i13-diagnostic-release"
+    script = scripts / "i13-native-diagnostic.py"
+    script.write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        f"started = Path({str(started)!r})\n"
+        f"release = Path({str(release)!r})\n"
+        "started.write_text('started', encoding='utf-8')\n"
+        "deadline = time.monotonic() + 20\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "if not release.exists():\n"
+        "    raise SystemExit('diagnostic release timeout')\n"
+        "print('i13-diagnostic-complete', flush=True)\n",
+        encoding="utf-8",
+    )
+    job = jobs.create_job(
+        prompt=None, schedule="every 1h", name="I13 identity diagnostic",
+        script=script.name, no_agent=True, deliver="local",
+    )
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id=job["id"], source="builtin", required=True)
+    record = executions.create_execution(
+        job["id"], source="builtin", execution_id=binding.owner_id)
+    binding.bind_execution_record(record)
+    job = dict(job, execution_id=binding.execution_id, _cron_custody=binding)
+
+    receipt = {
+        "platform": "win32",
+        "launcher": {
+            "popen_pid": None, "popen_start": None, "popen_start_known": False,
+            "popen_handle_available": False, "popen_in_exact_job": "unknown",
+        },
+        "ack": {
+            "pid": None, "start": None, "start_known": False, "execution_id_present": False,
+            "dispatch_mode": "unknown", "scope_fields_present": False,
+        },
+        "durable_row": {
+            "id_matches_execution": False, "pid": None, "start": None,
+            "start_known": False, "status": "other", "matches_ack": False,
+        },
+        "native_child": {
+            "open_handle": False, "creation_filetime_known": False,
+            "creation_filetime": None,
+            "in_exact_job_by_handle": "unknown",
+        },
+        "comparisons": {
+            "pid_equal": False, "start_equal": False,
+            "popen_job_membership": "unknown", "child_job_membership": "unknown",
+            "identity_predicate": False,
+        },
+        "decision": "no_activation_receipt",
+        "constant_reason": "not_observed",
+    }
+    captured = {"process": None, "native_job": None}
+    query_handles = []
+    spawn_seen = Event()
+    activation_seen = Event()
+    launch_done = Event()
+    launch_state = {"returned_true": False, "error_type": None, "constant_reason": None}
+    cleanup_state = {
+        "forced_termination": False,
+        "launch_thread_alive": True,
+        "native_job_closed": False,
+    }
+
+    def capture_parent(process, native_job):
+        pid = getattr(process, "pid", None)
+        start = _i13_start_time(pid, get_process_start_time)
+        raw_handle = getattr(process, "_handle", None)
+        receipt["launcher"].update({
+            "popen_pid": pid if type(pid) is int else None,
+            "popen_start": start,
+            "popen_start_known": type(start) is int,
+            "popen_handle_available": raw_handle is not None,
+            "popen_in_exact_job": _i13_job_member(
+                native_job,
+                SimpleNamespace(raw_handle=raw_handle),
+            ) if raw_handle is not None else "unknown",
+        })
+
+    real_spawn_server = local_processes.spawn_server
+
+    def capture_spawn_server(command, **kwargs):
+        process, native_job = real_spawn_server(command, **kwargs)
+        captured["process"] = process
+        captured["native_job"] = native_job
+        capture_parent(process, native_job)
+        spawn_seen.set()
+        return process, native_job
+
+    monkeypatch.setattr(local_processes, "spawn_server", capture_spawn_server)
+
+    real_bind_process = CronOwnerBinding.bind_process
+    real_activate = CronOwnerBinding.activate_external_worker
+    real_reconcile = CronOwnerBinding.reconcile_unacknowledged
+
+    def capture_bind_process(self, process, *, native_job=None):
+        result = real_bind_process(self, process, native_job=native_job)
+        if self.owner_class == "I13_external_cron_worker":
+            capture_parent(process, native_job)
+        return result
+
+    def capture_activate(self, acknowledgement, process, *, dispatch_mode=None, scope_unit=None):
+        target = self.owner_class == "I13_external_cron_worker"
+        if target:
+            ack_pid = acknowledgement.get("pid") if isinstance(acknowledgement, dict) else None
+            ack_start = (
+                acknowledgement.get("process_started_at")
+                if isinstance(acknowledgement, dict) else None
+            )
+            ack_mode = acknowledgement.get("dispatch_mode") if isinstance(acknowledgement, dict) else None
+            receipt["ack"].update({
+                "pid": ack_pid if type(ack_pid) is int else None,
+                "start": ack_start if type(ack_start) is int else None,
+                "start_known": type(ack_start) is int,
+                "execution_id_present": (
+                    isinstance(acknowledgement, dict)
+                    and acknowledgement.get("execution_id") == self.execution_id
+                ),
+                "dispatch_mode": ack_mode if ack_mode in {"direct", "degraded", "scoped"} else "unknown",
+                "scope_fields_present": bool(
+                    isinstance(acknowledgement, dict)
+                    and (
+                        acknowledgement.get("scope_unit")
+                        or acknowledgement.get("scope_control_group")
+                    )
+                ),
+            })
             try:
-                process.stdin.write("x")
-                process.stdin.flush()
-                process.stdin.close()
-            except (BrokenPipeError, OSError, ValueError):
-                pass
-        process.wait(timeout=5)
+                row = executions.get_execution(self.execution_id)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                row = None
+            row_pid = row.get("pid") if isinstance(row, dict) else None
+            row_start = row.get("process_started_at") if isinstance(row, dict) else None
+            row_status = row.get("status") if isinstance(row, dict) else None
+            receipt["durable_row"].update({
+                "id_matches_execution": (
+                    isinstance(row, dict) and str(row.get("id")) == self.execution_id
+                ),
+                "pid": row_pid if type(row_pid) is int else None,
+                "start": row_start if type(row_start) is int else None,
+                "start_known": type(row_start) is int,
+                "status": row_status if row_status in {"claimed", "running", "completed", "failed"} else "other",
+                "matches_ack": (
+                    isinstance(row, dict)
+                    and str(row.get("id")) == self.execution_id
+                    and row_pid == ack_pid
+                    and row_start == ack_start
+                ),
+            })
+            receipt["comparisons"].update({
+                "pid_equal": receipt["launcher"]["popen_pid"] == ack_pid,
+                "start_equal": (
+                    receipt["launcher"]["popen_start"] == ack_start
+                    and type(ack_start) is int
+                ),
+                "popen_job_membership": receipt["launcher"]["popen_in_exact_job"],
+            })
+            child_handle = None
+            if type(ack_pid) is int:
+                try:
+                    child_handle = WindowsProducerHandle.open(ack_pid)
+                    query_handles.append(child_handle)
+                    receipt["native_child"].update({
+                        "open_handle": True,
+                        "creation_filetime_known": type(child_handle.creation_filetime) is int,
+                        "creation_filetime": (
+                            child_handle.creation_filetime
+                            if type(child_handle.creation_filetime) is int else None
+                        ),
+                        "in_exact_job_by_handle": _i13_job_member(
+                            self._native_job, child_handle),
+                    })
+                except ProducerIdentityError as error:
+                    if error.retained_handle is not None:
+                        query_handles.append(error.retained_handle)
+                    receipt["native_child"].update({
+                        "open_handle": False,
+                        "creation_filetime_known": False,
+                        "in_exact_job_by_handle": "unknown",
+                    })
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    receipt["native_child"].update({
+                        "open_handle": False,
+                        "creation_filetime_known": False,
+                        "in_exact_job_by_handle": "unknown",
+                    })
+            receipt["comparisons"]["child_job_membership"] = receipt["native_child"][
+                "in_exact_job_by_handle"]
+            receipt["comparisons"]["identity_predicate"] = bool(
+                receipt["comparisons"]["pid_equal"]
+                and receipt["comparisons"]["start_equal"]
+                and receipt["durable_row"]["matches_ack"]
+            )
+        try:
+            result = real_activate(
+                self, acknowledgement, process,
+                dispatch_mode=dispatch_mode, scope_unit=scope_unit)
+        except Exception as error:
+            if target:
+                receipt["decision"] = "refused"
+                receipt["constant_reason"] = _i13_constant_reason(error)
+            raise
+        else:
+            if target:
+                receipt["decision"] = "accepted"
+                receipt["constant_reason"] = "accepted"
+            return result
+        finally:
+            if target:
+                activation_seen.set()
+
+    def capture_reconcile(self, process=None, *, dispatch_mode=None):
+        try:
+            result = real_reconcile(self, process, dispatch_mode=dispatch_mode)
+        except Exception:
+            receipt["reconcile_result"] = "exception"
+            raise
+        if self.owner_class == "I13_external_cron_worker":
+            receipt["reconcile_result"] = result if result in {
+                "terminalized", "unknown", "unadopted", "not_applicable",
+            } else "other"
+        return result
+
+    monkeypatch.setattr(CronOwnerBinding, "bind_process", capture_bind_process)
+    monkeypatch.setattr(CronOwnerBinding, "activate_external_worker", capture_activate)
+    monkeypatch.setattr(CronOwnerBinding, "reconcile_unacknowledged", capture_reconcile)
+
+    def launch():
+        try:
+            launch_state["returned_true"] = scheduler._launch_external_cron_worker(job) is True
+        except Exception as error:
+            launch_state["error_type"] = type(error).__name__
+            launch_state["constant_reason"] = _i13_constant_reason(error)
+        finally:
+            launch_done.set()
+
+    thread = Thread(target=launch, name="i13-windows-diagnostic", daemon=True)
+    thread.start()
+    try:
+        spawn_observed = spawn_seen.wait(timeout=30)
+        activation_observed = activation_seen.wait(timeout=30) if spawn_observed else False
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if not launch_done.wait(timeout=30):
+            process = captured["process"]
+            if process is not None and process.poll() is None:
+                cleanup_state["forced_termination"] = True
+                process.terminate()
+                process.wait(timeout=10)
+            launch_done.wait(timeout=5)
+        thread.join(timeout=5)
+        cleanup_state["launch_thread_alive"] = thread.is_alive()
+        process = captured["process"]
+        if process is not None and process.stdin is not None:
+            process.stdin.close()
+        for handle in query_handles:
+            handle.close()
+        native_job = captured["native_job"]
+        if (
+            native_job is not None
+            and not cleanup_state["launch_thread_alive"]
+            and (process is None or process.poll() is not None)
+        ):
+            native_job.close()
+            cleanup_state["native_job_closed"] = True
+
+    final_row = executions.get_execution(binding.execution_id)
+    if isinstance(final_row, dict):
+        receipt["final_status"] = (
+            final_row.get("status")
+            if final_row.get("status") in {"claimed", "running", "completed", "failed", "unknown"}
+            else "other"
+        )
+    receipt["launch"] = {
+        "spawn_observed": spawn_observed,
+        "activation_observed": activation_observed,
+        "returned_true": launch_state["returned_true"],
+        "error_type": launch_state["error_type"],
+        "constant_reason": launch_state["constant_reason"],
+        "script_started": started.exists(),
+        "release_sent": release.exists(),
+    }
+    receipt["cleanup"] = cleanup_state
+    print("I13_WINDOWS_EXTERNAL_DIAGNOSTIC=" + json.dumps(receipt, sort_keys=True))
+    assert spawn_observed, json.dumps(receipt, sort_keys=True)
+    assert activation_observed, json.dumps(receipt, sort_keys=True)
+    assert receipt["launch"]["script_started"], json.dumps(receipt, sort_keys=True)
+    assert not cleanup_state["forced_termination"], json.dumps(receipt, sort_keys=True)
+    assert not cleanup_state["launch_thread_alive"], json.dumps(receipt, sort_keys=True)
+    assert cleanup_state["native_job_closed"], json.dumps(receipt, sort_keys=True)
+    assert receipt["decision"] == "accepted", json.dumps(receipt, sort_keys=True)
 
