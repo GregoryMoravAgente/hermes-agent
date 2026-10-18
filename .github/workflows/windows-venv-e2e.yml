@@ -1,109 +1,303 @@
-name: Windows venv-holder live E2E
-
-# ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
-#
-# Runs the live venv-holder E2E suite on a real windows-latest runner:
-# spawns actual processes with realistic Hermes argv shapes and drives the
-# REAL detection/classification/exemption code against the live process
-# table — the coverage that cannot exist on the Linux lanes and that the
-# maintainer cannot exercise locally before the work reaches main.
-#
-# Deliberately NOT wired to pull_request/main: it fires only on pushes to
-# wine2e/** working branches, so it costs nothing on normal PRs. Delete or
-# keep dormant after the venv-holder work lands.
+# OWN-FORK / SOURCE-ONLY AGC-1721 full40 native Windows transport.
+# This diagnostic workflow is one transport commit above a qualified parent. It
+# does not change product source, package pins, release policy, or Linux proof.
+name: AGC-1721 own-fork Windows full40 source-only bank
 
 on:
   push:
-    branches:
-      - 'wine2e/**'
-  workflow_call:
-    inputs:
-      commit:
-        description: Commit to test and build. Empty keeps the triggering commit.
-        type: string
-        default: ''
-      release:
-        description: 'Stable-release candidate run. Unused by the jobs; the caller passes it for a uniform callable surface.'
-        required: false
-        type: boolean
-        default: false
+    branches: ['wine2e/agc1721/**']
 
 permissions:
   contents: read
 
-# A workflow_call run (stable release) shares the caller's commit; its group
-# includes github.run_id so a rerun of the parent gets a fresh group instead
-# of cancelling this child mid-flight. wine2e push runs keep ref-scoped
-# collapse as before.
 concurrency:
-  group: windows-venv-e2e-${{ inputs.release == true && github.run_id || github.ref }}
-  cancel-in-progress: ${{ inputs.release != true }}
+  group: agc1721-native-full40-source-only-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  venv-holder-e2e:
-    name: venv-holder live E2E (windows-latest)
-    runs-on: blacksmith-32vcpu-windows-2025
-    timeout-minutes: 25
+  native-source-only:
+    name: AGC-1721 own-fork native Windows full40 source-only bank
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      HERMES_TEST_FILE_RETRIES: '0'
     steps:
-      - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
-        with:
-          # The stable caller dispatches on the candidate tag; github.sha is
-          # the exact candidate commit there and the head SHA everywhere else.
-          ref: ${{ inputs.commit || github.sha }}
+      - name: Configure Windows long paths and checkout semantics
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+          $longPaths = (Get-ItemProperty `
+            'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
+          if ($longPaths -ne 1) { throw 'LongPathsEnabled was not set to 1' }
+          if ((git config --global --get core.autocrlf) -ne 'false') {
+            throw 'core.autocrlf is not false before checkout'
+          }
 
-      - name: Set up locked Python and test dependencies
+      - name: Checkout the own-fork transport commit and its direct parent
+        timeout-minutes: 1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+
+      - name: Build the official locked PM test environment
+        id: setup_pm
+        timeout-minutes: 8
         uses: ./.github/actions/setup-pm
         with:
           extras: '["messaging"]'
           test-environment: 'true'
-          prune-python-cache: true
+          prune-python-cache: 'false'
 
-      - name: Run venv-holder live E2E
-        # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
-        # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
-        # isolation. The live files are host-marked windows-only, so the
-        # runner collects them on this runner instead of skipping them.
+      - name: Verify candidate byte closure before tests
+        id: source_guard_before
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/agc1721-native-full40-source-only"
+          mkdir -p "$out"
+          python .github/proof/agc1721_native_windows_source_guard.py \
+            --manifest .github/proof/agc1721_native_windows_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase before \
+            --receipt "$out/source-before.json"
+
+      - name: Run the exact full40 bank serially with per-file receipts
+        id: native_bank
+        timeout-minutes: 30
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
           set -uo pipefail
-          bash scripts/run_tests.sh \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/pm/test_held_entry_windows_live.py
+          out="$RUNNER_TEMP/agc1721-native-full40-source-only"
+          mkdir -p "$out/files"
+          python - "$PWD/.github/proof/agc1721_native_windows_manifest.json" "$out/test-files.tsv" <<'PY'
+          import json
+          import pathlib
+          import sys
 
-      - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
+          manifest_path, output_path = sys.argv[1:]
+          data = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+          files = data.get("target_test_files")
+          if not isinstance(files, list) or len(files) != 40 or len(set(files)) != 40:
+              raise SystemExit("manifest must select exactly 40 unique test files")
+          if data.get("execution_scope") != "full-file-context-per-file":
+              raise SystemExit("manifest execution_scope must require full context per file")
+          if data.get("file_retries") != 0 or data.get("parallelism") != 1:
+              raise SystemExit("manifest must require serial zero-retry execution")
+          if data.get("per_file_timeout_seconds") != 300:
+              raise SystemExit("manifest per-file timeout must be 300 seconds")
+          lines = []
+          for test_path in files:
+              if not test_path.endswith(".py") or "/" not in test_path:
+                  raise SystemExit(f"invalid test path: {test_path!r}")
+              xml_name = test_path[:-3].replace("/", "__") + "_py.xml"
+              lines.append(f"{test_path}\t{xml_name}\n")
+          pathlib.Path(output_path).write_bytes("".join(lines).encode("utf-8"))
+          PY
+          if [ "$(wc -l < "$out/test-files.tsv")" -ne 40 ]; then
+            echo 'materialized test list does not contain exactly 40 lines' >&2
+            exit 1
+          fi
+          overall=0
+          : > "$out/file-status.tsv"
+          while IFS=$'\t' read -r test_path junit_name; do
+            [ -n "$test_path" ] || continue
+            junit="$out/files/$junit_name"
+            runner_log="$out/files/$junit_name.runner.log"
+            if bash scripts/run_tests.sh -j 1 --file-timeout 300 --file-retries 0 \
+              "$test_path" -- -q --capture=tee-sys -o junit_logging=system-out \
+              -o faulthandler_timeout=45 --tb=short --junitxml="$junit" \
+              < /dev/null > "$runner_log" 2>&1; then
+              rc=0
+            else
+              rc=$?
+            fi
+            printf '%s\t%s\t%s\n' "$test_path" "$junit_name" "$rc" >> "$out/file-status.tsv"
+            if [ "$rc" -ne 0 ]; then
+              overall=1
+            fi
+          done < "$out/test-files.tsv"
+
+          python - "$out/files" "$out/file-status.tsv" "$PWD/.github/proof/agc1721_native_windows_manifest.json" "$out/junit-case-check.json" <<'PY'
+          from collections import Counter
+          from pathlib import Path
+          import hashlib
+          import json
+          import sys
+          import xml.etree.ElementTree as ET
+
+          files_root, status_path, manifest_path, result_path = sys.argv[1:]
+          manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+          expected = manifest.get("expected_junit_cases")
+          if not isinstance(expected, list):
+              raise SystemExit("manifest expected_junit_cases is missing")
+          expected_keys = Counter((case["file"], case["classname"], case["name"]) for case in expected)
+          expected_skips = Counter(
+              (case["file"], case["classname"], case["name"])
+              for case in expected if case.get("skip") is True
+          )
+          expected_files = {case["file"] for case in expected}
+          actual_xml = sorted(Path(files_root).glob("*.xml"))
+          actual_files = {path.name for path in actual_xml}
+          cases = []
+          actual_skips = Counter()
+          parse_errors = []
+          failures = 0
+          errors = 0
+          for junit_path in actual_xml:
+              try:
+                  root = ET.parse(junit_path).getroot()
+              except (OSError, ET.ParseError):
+                  parse_errors.append(junit_path.name)
+                  continue
+              for case in root.iter("testcase"):
+                  key = (junit_path.name, case.get("classname", ""), case.get("name", ""))
+                  cases.append(key)
+                  if list(case.iter("skipped")):
+                      actual_skips[key] += 1
+                  failures += sum(1 for _ in case.iter("failure"))
+                  errors += sum(1 for _ in case.iter("error"))
+          target_case = manifest.get("target_case")
+          expected_target = [
+              key for key in expected_keys if key[2] == target_case
+          ]
+          trace_errors = []
+          trace = None
+          target_cases = [
+              (junit_path, case)
+              for junit_path in actual_xml
+              for case in ET.parse(junit_path).getroot().iter("testcase")
+              if case.get("name") == target_case
+          ] if not parse_errors else []
+          if len(expected_target) != 1:
+              trace_errors.append("manifest target case is not unique")
+          if len(target_cases) != 1:
+              trace_errors.append("target case is not unique in JUnit")
+          elif expected_target and (target_cases[0][0].name, target_cases[0][1].get("classname", ""), target_cases[0][1].get("name", "")) != expected_target[0]:
+              trace_errors.append("target case identity differs from manifest")
+          elif target_cases:
+              for output in target_cases[0][1].iter("system-out"):
+                  for line in (output.text or "").splitlines():
+                      line = line.strip()
+                      if line.startswith("AGC1721_DEFERRED_HISTORY_TRACE="):
+                          try:
+                              trace = json.loads(line.split("=", 1)[1])
+                          except json.JSONDecodeError:
+                              trace_errors.append("target trace JSON is malformed")
+                          break
+                  if trace is not None:
+                      break
+          if trace is None:
+              trace_errors.append("target trace JSON is missing")
+          else:
+              if trace.get("history_worker_class") != "threading.Thread":
+                  trace_errors.append("history worker class is not threading.Thread")
+              for key in ("history_worker_is_captured_real", "history_worker_wait_succeeded", "first_return_before_worker_wait_exit"):
+                  if trace.get(key) is not True:
+                      trace_errors.append(f"trace boolean {key} is not true")
+              if trace.get("history_worker_is_main") is not False:
+                  trace_errors.append("history worker is unexpectedly the main thread")
+              ordered = [
+                  "test_enter_ns", "history_worker_enter_ns", "history_worker_wait_enter_ns",
+                  "first_return_ns", "history_started_observed_ns", "second_call_enter_ns",
+                  "second_return_ns", "release_before_ns", "release_after_ns",
+                  "history_worker_wait_exit_ns", "resume_history_ready_observed_ns", "cleanup_complete_ns",
+              ]
+              for key in ordered:
+                  value = trace.get(key)
+                  if isinstance(value, bool) or not isinstance(value, int):
+                      trace_errors.append(f"trace ordering field {key} is not an integer")
+              chains = [
+                  ["test_enter_ns", "first_return_ns", "history_started_observed_ns", "second_call_enter_ns", "second_return_ns", "release_before_ns", "release_after_ns", "resume_history_ready_observed_ns", "cleanup_complete_ns"],
+                  ["test_enter_ns", "history_worker_enter_ns", "history_worker_wait_enter_ns", "history_worker_wait_exit_ns", "resume_history_ready_observed_ns"],
+                  ["history_worker_enter_ns", "history_started_observed_ns"],
+                  ["release_before_ns", "history_worker_wait_exit_ns"],
+                  ["first_return_ns", "history_worker_wait_exit_ns"],
+              ]
+              for chain in chains:
+                  if all(isinstance(trace.get(key), int) and not isinstance(trace.get(key), bool) for key in chain):
+                      if any(trace[a] > trace[b] for a, b in zip(chain, chain[1:])):
+                          trace_errors.append("trace violates a causal ordering edge: " + " -> ".join(chain))
+          status_rows = [line for line in Path(status_path).read_text(encoding="utf-8").splitlines() if line]
+          status_rcs = [int(line.rsplit("\t", 1)[1]) for line in status_rows if "\t" in line]
+          no_test_file_logs = sum(
+              "No test files to run" in path.read_text(encoding="utf-8", errors="replace")
+              for path in Path(files_root).glob("*.runner.log")
+          )
+          result = {
+              "schema": "agc1721.native_windows_full40_junit_check.r1.v1",
+              "expected_case_count": len(expected),
+              "expected_skip_count": sum(expected_skips.values()),
+              "junit_files": len(actual_xml),
+              "case_count": len(cases),
+              "case_identity_multiset_match": Counter(cases) == expected_keys,
+              "skip_identity_multiset_match": actual_skips == expected_skips,
+              "failure_count": failures,
+              "error_count": errors,
+              "skipped_count": sum(actual_skips.values()),
+              "parse_errors": parse_errors,
+              "test_files_attempted": len(status_rows),
+              "runner_exit_codes": status_rcs,
+              "no_test_file_logs": no_test_file_logs,
+              "target_trace_present": trace is not None,
+              "target_trace_valid": not trace_errors,
+              "trace_errors": trace_errors,
+              "trace": trace,
+              "expected_case_source_sha256": manifest.get("expected_junit_cases_source_sha256"),
+          }
+          Path(result_path).write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
+          if (
+              len(status_rows) != 40
+              or actual_files != expected_files
+              or len(actual_xml) != 40
+              or len(cases) != len(expected)
+              or Counter(cases) != expected_keys
+              or actual_skips != expected_skips
+              or failures
+              or errors
+              or parse_errors
+              or no_test_file_logs
+              or any(rc != 0 for rc in status_rcs)
+              or trace_errors
+          ):
+              raise SystemExit("full40 JUnit must match the exact 1021-case identity and nine-skip receipt")
+          PY
+          if [ "$?" -ne 0 ]; then
+            overall=1
+          fi
+          cp "$out/junit-case-check.json" "$out/bank-result.json"
+          printf 'full40 overall_exit=%s\n' "$overall" > "$out/bank-status.log"
+          exit "$overall"
+
+      - name: Verify candidate byte closure after tests
+        id: source_guard_after
+        timeout-minutes: 1
+        if: ${{ always() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/gateway/test_telegram_closewait_windows_live.py
+          set -euo pipefail
+          out="$RUNNER_TEMP/agc1721-native-full40-source-only"
+          python .github/proof/agc1721_native_windows_source_guard.py \
+            --manifest .github/proof/agc1721_native_windows_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase after \
+            --receipt "$out/source-after.json" \
+            --baseline-receipt "$out/source-before.json"
 
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
-
-      - name: Turn Windows long paths off for later steps (#130242)
-        # The runner image turns LongPathsEnabled on; 0 is the Windows default
-        # most users have. A process reads the value when it starts, so only
-        # later steps see it. Keep this step after every lane that expects the
-        # image's setting. It does not depend on those lanes passing.
-        id: long_paths_off
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          reg add 'HKLM\SYSTEM\CurrentControlSet\Control\FileSystem' /v LongPathsEnabled /t REG_DWORD /d 0 /f
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
-
-      - name: Run PM long-path live E2E with long paths off (#130242)
-        # The test first asserts RtlAreLongPathsEnabled() is false in its own
-        # process, so this step cannot pass if the step above did not take.
-        # ``-m`` replaces pyproject's addopts, which deselect ``integration``.
-        if: ${{ !cancelled() && steps.long_paths_off.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/pm/test_long_paths_windows_live.py -- -m "platforms and integration" -v
+      - name: Retain per-file JUnit, runner logs, and guards
+        timeout-minutes: 6
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agc1721-native-full40-source-only-${{ github.sha }}
+          path: ${{ runner.temp }}/agc1721-native-full40-source-only/
+          if-no-files-found: error
+          retention-days: 14
