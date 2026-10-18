@@ -45,7 +45,7 @@
     "gateway/platforms/api_server.py": "28fdddb857b2bd9c415cd12c837d77e942d6d4e427bef6d1e7223614a01707a9",
     "gateway/platforms/api_server_cron_fire.py": "5abfedfd097bd0e35eb31ac9f3b7bf1c6fd37885b98ad32cfec7ac7a109ed2f2",
     "tests/cron/test_cron_multiplex_desktop_ticker_scope.py": "2fa6744fbecbf22a0a53463c29a827405789c50239c43a017a22ebbf79a07fd7",
-    "tests/cron/test_cron_owner_custody.py": "f301e369d09e56542cf2d4f5cfbd4af944e7d4f39e1322cf3e198ff42617fbee",
+    "tests/cron/test_cron_owner_custody.py": "5f1c8b52d7b3b2a5dd1d4617fb23030338935ec729757760a60bedc354eb6d29",
     "tests/cron/test_restart_safe_worker.py": "b1d73eb83fcea91cd1360ac9875dab0d5881d8acf736e8f7aa77cd9d02e23909",
     "tests/cron/test_scheduler_provider.py": "eabdc4f86a135d7358bf5aebf32ad1fb978291ba40ad920c7cf12b7ed47492a7",
     "tests/gateway/test_cron_fire_custody.py": "3ad457fad6592b3a6e1bad45b663a4dd76d476c30f4becd4e743e0bb71bda614",
@@ -84,5 +84,5 @@
     "tests/tui_gateway/test_compute_host_ack_writer_settlement_r9.py": "e7e5470aa21e6f14d18ac4953ace850246c133cfcffdf480cc2cd0f7f78a1661"
   },
   "featureCommit": "7dd31884c0b52c800a8e802184beed2571801b24",
-  "scope": "OWNFORK diagnostic sourcecomposition: qualifiedR13c production unchanged; one testonly rawprobe\u2192actualCron dispatch/ACK/durable/nativeJob diagnostic refinement. Full20/officialaccepted/pin/package/installed OPEN."
+  "scope": "Private own-fork Cron R16b proof: canonical per-home execution ledger with real cross-process regression; strict PID/birth/Job/ACK controls unchanged. Not accepted upstream or installed acceptance."
 }

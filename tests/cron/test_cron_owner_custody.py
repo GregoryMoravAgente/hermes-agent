@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -22,9 +23,13 @@ def custody_runtime(monkeypatch, tmp_path):
     from cron import runtime_custody
     import hermes_constants
 
-    db = tmp_path / "executions.db"
+    # Real external workers receive HERMES_HOME but do not inherit this process-local
+    # EXECUTIONS_FILE monkeypatch. Keep the fixture on the canonical per-home ledger so
+    # parent and child exercise the same durable ownership row.
+    db = tmp_path / "cron" / "executions.db"
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
     monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     coordinator = RuntimeCustodyCoordinator(
         process_instance="cron-custody-test", authority_epoch=11, fence=RetirementFence())
     runner = SimpleNamespace(
@@ -61,6 +66,41 @@ def _claimed(binding, executions, job_id="job-1"):
     binding.bind_execution_record(record)
     assert executions.mark_execution_running(binding.execution_id) is not None
     return record
+
+
+def test_cron_store_is_shared_by_real_home_child(custody_runtime, tmp_path):
+    """A real child must read the parent claim from the canonical profile ledger."""
+    _coordinator, executions, _db = custody_runtime
+    execution_id = "execution-cross-process-canonical"
+    record = executions.create_execution(
+        "job-cross-process", source="builtin", execution_id=execution_id)
+    assert record["status"] == "claimed"
+    child_code = textwrap.dedent(
+        f"""
+        import json
+        from cron import executions
+
+        row = executions.get_execution({execution_id!r})
+        print(json.dumps({{
+            "id": row.get("id") if isinstance(row, dict) else None,
+            "status": row.get("status") if isinstance(row, dict) else None,
+        }}), flush=True)
+        """
+    )
+    child_env = dict(os.environ)
+    child_env["HERMES_HOME"] = str(tmp_path)
+    result = subprocess.run(
+        [sys.executable, "-c", child_code],
+        cwd=Path(__file__).resolve().parents[2],
+        env=child_env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    observed = json.loads(result.stdout.strip().splitlines()[-1])
+    assert observed == {"id": execution_id, "status": "claimed"}
 
 
 def test_i12_holds_real_future_until_terminal_delivery_and_teardown(custody_runtime):
@@ -683,7 +723,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     contract fail-closed and emits a bounded synthetic receipt when the current identity check
     rejects the child.
     """
-    _coordinator, executions, _db = custody_runtime
+    _coordinator, executions, db = custody_runtime
     from cron import jobs, scheduler, scheduler_diagnostics
     from cron.runtime_custody import CronOwnerBinding, reserve_execution
     from gateway.status import get_process_start_time
@@ -722,6 +762,15 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         job["id"], source="builtin", execution_id=binding.owner_id)
     binding.bind_execution_record(record)
     job = dict(job, execution_id=binding.execution_id, _cron_custody=binding)
+
+    canonical_db = tmp_path / "cron" / "executions.db"
+    assert db == canonical_db
+    assert executions.EXECUTIONS_FILE == canonical_db
+    parent_row = executions.get_execution(binding.execution_id)
+    assert isinstance(parent_row, dict)
+    assert parent_row.get("id") == binding.execution_id
+    assert parent_row.get("status") == "claimed"
+    assert parent_row.get("handoff_pending") == 0
 
     receipt = {
         "platform": "win32",
@@ -1021,4 +1070,8 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     assert not cleanup_state["launch_thread_alive"], json.dumps(receipt, sort_keys=True)
     assert cleanup_state["native_job_closed"], json.dumps(receipt, sort_keys=True)
     assert receipt["decision"] == "accepted", json.dumps(receipt, sort_keys=True)
+    assert receipt["durable_row"]["id_matches_execution"], json.dumps(receipt, sort_keys=True)
+    assert receipt["durable_row"]["status"] == "running", json.dumps(receipt, sort_keys=True)
+    assert receipt["durable_row"]["matches_ack"], json.dumps(receipt, sort_keys=True)
+    assert receipt["final_status"] == "completed", json.dumps(receipt, sort_keys=True)
 
