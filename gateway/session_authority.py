@@ -18,6 +18,7 @@ from gateway.session_contract import (
     SubscriptionSnapshot,
 )
 from gateway.session_events import SessionEvents
+from gateway.session_authority_operations import PreservationOperationsMixin
 from gateway.session_pending_controls import PendingControls
 from hermes_state_runtime import (
     STEERING, RuntimeStoreError, admit_session_input, begin_runtime_epoch,
@@ -32,6 +33,19 @@ _MARKER_RELEASE_WAIT_S = 60.0
 # True in the admitting task once ``admit_native``'s shielded ledger write began: a caller cancelled
 # after that may still see the row commit, so it must not release the media the write commits.
 native_write_started = ContextVar('native_write_started', default=False)
+
+
+@dataclass(frozen=True)
+class SchedulerTaskHandoff:
+    """A joinable scheduler task plus an optional trusted durable Teams job identity."""
+
+    task: asyncio.Future
+    expected_job_id: str | None = None
+
+    def __await__(self):
+        # Keep the historical scheduler fixture contract awaitable while the adapter consumes the
+        # typed handoff before it installs the terminal callback.
+        return self.task.__await__()
 
 
 @dataclass
@@ -81,7 +95,7 @@ def _log_drain_failure(task):
     logging.getLogger(__name__).error('Session drain task died: %r', task.exception())
 
 
-class SessionAuthority:
+class SessionAuthority(PreservationOperationsMixin):
     def __init__(self, runner, *, profile_id, instance_id, db, epoch):
         self.runner = runner
         self.profile_id = profile_id
@@ -131,9 +145,23 @@ class SessionAuthority:
         # transaction returns.  A failed read leaves the exact lease retained as unknown.
         self._preservation_handles = {}
         self._preservation_children = {}
+        # Pending roots are object-bound records, never a request-id bucket. Their full producer
+        # identity remains attached to the exact handle until the durable callback binds or releases
+        # that handle; a Graph/native/API collision can therefore never steal another root.
         self._preservation_pending_roots = {}
+        self._preservation_scheduler_handles = {}
+        # A retryable Teams result remains attached to its original I01 lease until the next
+        # durable owner is bound.  The mapping is keyed by the durable job id, never by a
+        # provider request id that another producer could reuse.
+        self._preservation_scheduler_retry_handles = {}
         self._preservation_claiming = {}
         self._preservation_marker_watchers = {}
+        # Exact control, busy-delivery, and mutation leases. These are indexes of real
+        # RuntimeCustodyCoordinator handles; they are not a second ownership authority.
+        self._preservation_operations = {}
+        # Source-backed evidence that this authority has actually consumed the native inbound
+        # entrypoint.  An empty native registry is not evidence that the connector source is wired.
+        self._native_inbound_seen = False
 
     def _preservation_coordinator(self):
         return getattr(self.runner, 'runtime_custody', None)
@@ -149,25 +177,179 @@ class SessionAuthority:
             raise RuntimeStoreError(handle.code)
         return handle
 
-    def _preservation_pending_root(self, request_id, handle):
+    def _preservation_pending_root(self, request_id, handle, *, principal_id, session_id):
         if handle is not None:
-            self._preservation_pending_roots[request_id] = handle
+            self._preservation_pending_roots[id(handle)] = {
+                'handle': handle,
+                'owner_class': handle.owner_class,
+                'principal_id': principal_id,
+                'session_id': session_id,
+                'request_id': request_id,
+            }
 
-    def _preservation_pop_pending_root(self, request_id):
-        return self._preservation_pending_roots.pop(request_id, None)
+    def _preservation_forget_pending_root(self, handle):
+        if handle is None:
+            return
+        pending = self._preservation_pending_roots.pop(id(handle), None)
+        # Retain custody if an object-id were ever reused while the old record was still present.
+        if pending is not None and pending.get('handle') is not handle:
+            self._preservation_pending_roots[id(pending['handle'])] = pending
+
+    def _preservation_pending_matches_row(self, row, handle):
+        """Require the durable callback to belong to the exact object-bound producer identity."""
+        pending = self._preservation_pending_roots.get(id(handle))
+        if pending is None:
+            return False
+        if (pending.get('handle') is not handle
+                or pending.get('owner_class') != getattr(handle, 'owner_class', None)
+                or row.get('principal_id') != pending.get('principal_id')
+                or row.get('request_id') != pending.get('request_id')):
+            return False
+        target_session_id = row.get('target_session_id')
+        if target_session_id == pending.get('session_id'):
+            return True
+        try:
+            return target_session_id == self._current_owner(pending['session_id'])
+        except Exception:  # health: allow BLE001 -- opaque rotated-route identity lookup must fail closed rather than match a different producer
+            return False
+
+    def _preservation_release_unaccepted(self, handle):
+        coordinator = self._preservation_coordinator()
+        if coordinator is None or handle is None:
+            return
+        result = coordinator.release_unaccepted(handle)
+        if result is not None and result.code != 'stale_lease':
+            coordinator.mark_unknown(handle, 'read_failed')
+
+    def _preservation_bind_scheduler(self, scheduler_id, handle, *, expected_job_id=None):
+        """Bind a joinable scheduler task, retaining a trusted Teams job identity when supplied."""
+        if handle is None:
+            return
+        expected = None if expected_job_id is None else str(expected_job_id).strip()
+        if expected_job_id is not None and not expected:
+            coordinator = self._preservation_coordinator()
+            if coordinator is not None:
+                coordinator.mark_unknown(handle, 'unmapped_writer')
+            return
+        if scheduler_id in self._preservation_scheduler_handles:
+            coordinator = self._preservation_coordinator()
+            if coordinator is not None:
+                coordinator.mark_unknown(handle, 'unmapped_writer')
+            return
+        self._preservation_scheduler_handles[scheduler_id] = {
+            'handle': handle, 'expected_job_id': expected,
+        }
+        self._native_inbound_seen = True
+
+    def _preservation_adopt_scheduler_job(self, job_id):
+        """Bind a recovered Teams job to its exact predecessor lease or a new successor root."""
+        job_key = str(job_id or '').strip()
+        if not job_key:
+            raise RuntimeStoreError('preservation_owner_unmapped')
+        scheduler_id = f'teams-recovery:{job_key}'
+        prior = self._preservation_scheduler_retry_handles.pop(job_key, None)
+        if prior is not None:
+            prior_id, handle = prior
+            self._preservation_scheduler_handles.pop(prior_id, None)
+        else:
+            handle = self._preservation_root('I01_native_inbound', scheduler_id)
+        if handle is None:
+            raise RuntimeStoreError('runtime_custody_unavailable')
+        self._preservation_bind_scheduler(scheduler_id, handle, expected_job_id=job_key)
+        return scheduler_id
+
+    def _preservation_scheduler_done(self, scheduler_id, task):
+        """Settle a generic joinable task or an identity-bound durable Teams task."""
+        binding = self._preservation_scheduler_handles.get(scheduler_id)
+        if binding is None:
+            return
+        if isinstance(binding, dict):
+            handle = binding.get('handle')
+            expected_job_id = binding.get('expected_job_id')
+        else:  # compatibility with a pre-R9 in-memory binding during a live upgrade
+            handle, expected_job_id = binding, None
+        coordinator = self._preservation_coordinator()
+        if coordinator is None or handle is None:
+            return
+        if task.cancelled():
+            coordinator.mark_unknown(handle, 'join_failed')
+            return
+        if expected_job_id is None:
+            try:
+                task.result()
+            except BaseException:  # health: allow BLE001 -- opaque scheduler task settlement failure retains its exact custody as unknown without exception values
+                coordinator.mark_unknown(handle, 'join_failed')
+                return
+            # A generic scheduler owns no Teams durable row. A successful joinable task is its
+            # complete ownership boundary; its result shape must not be mistaken for a Teams model.
+            terminal = coordinator.mark_terminal(handle)
+            if terminal is None:
+                self._preservation_scheduler_handles.pop(scheduler_id, None)
+            else:
+                coordinator.mark_unknown(handle, 'lease_release_failed')
+            return
+        try:
+            result = task.result()
+        except BaseException:  # health: allow BLE001 -- opaque scheduler task settlement failure retains its exact custody as unknown without exception values
+            coordinator.mark_unknown(handle, 'join_failed')
+            return
+        job_id = result.get('job_id') if isinstance(result, dict) else getattr(result, 'job_id', None)
+        status = result.get('status') if isinstance(result, dict) else getattr(result, 'status', None)
+        if str(job_id or '').strip() != expected_job_id:
+            coordinator.mark_unknown(handle, 'foreign_custody')
+            return
+        if status not in {'completed', 'failed', 'retry_scheduled'}:
+            coordinator.mark_unknown(handle, 'join_failed')
+            return
+        # The task's returned model is not the durable authority. Re-read the exact expected job
+        # record so a provider callback cannot claim terminal custody before the JSON store persists it.
+        runtime = getattr(self.runner, '_teams_pipeline_runtime', None)
+        store = getattr(runtime, 'store', None) if runtime is not None else None
+        try:
+            persisted = None if store is None else store.get_job(expected_job_id)
+        except (OSError, ValueError, KeyError, TypeError):
+            persisted = None
+        if not isinstance(persisted, dict) or persisted.get('status') != status:
+            coordinator.mark_unknown(handle, 'read_failed')
+            return
+        if status == 'retry_scheduled':
+            # Future work is not a business-terminal failure. Keep the original lease live and let
+            # startup/rebind transfer it to this exact expected job id.
+            self._preservation_scheduler_retry_handles[expected_job_id] = (scheduler_id, handle)
+            return
+        terminal = coordinator.mark_terminal(handle)
+        if terminal is None:
+            self._preservation_scheduler_handles.pop(scheduler_id, None)
+        else:
+            coordinator.mark_unknown(handle, 'lease_release_failed')
 
     def _preservation_bind_or_release(self, row, handle):
         if handle is None:
             return
         if row is not None and row.get('status') != 'terminal':
-            self._preservation_handles[row['admission_id']] = handle
+            if not self._preservation_pending_matches_row(row, handle):
+                coordinator = self._preservation_coordinator()
+                if coordinator is not None:
+                    coordinator.mark_unknown(handle, 'unmapped_writer')
+                return
+            admission_id = row['admission_id']
+            existing = self._preservation_handles.get(admission_id)
+            if existing is not None:
+                self._preservation_forget_pending_root(handle)
+                if existing is not handle:
+                    self._preservation_release_unaccepted(handle)
+                return
+            # ``tracked_write(ordered=True)`` makes the durable row order authoritative. Bind the
+            # callback's own object, then let a later exact duplicate observe ``existing`` and
+            # release its own object; no request-id lookup can replace the original lease.
+            self._preservation_forget_pending_root(handle)
+            self._preservation_handles[admission_id] = handle
+            if handle.owner_class == 'I01_native_inbound':
+                self._native_inbound_seen = True
             return
-        coordinator = self._preservation_coordinator()
-        if coordinator is None:
-            return
-        result = coordinator.release_unaccepted(handle)
-        if result is not None and result.code != 'stale_lease':
-            coordinator.mark_unknown(handle, 'read_failed')
+        if row is not None:
+            self._preservation_forget_pending_root(handle)
+        self._preservation_release_unaccepted(handle)
 
     def _preservation_reconcile_failed(self, handle, *, principal_id, session_id, request_id):
         """Reconcile an admission write failure at its exact durable identity."""
@@ -200,9 +382,28 @@ class SessionAuthority:
         self._preservation_bind_or_release(row, handle)
 
     def _preservation_reconcile_api_failure(self, request_id, handle, *, session_id):
-        pending = self._preservation_pop_pending_root(request_id)
         self._preservation_reconcile_failed(
-            pending or handle, principal_id='api', session_id=session_id, request_id=request_id)
+            handle, principal_id='api', session_id=session_id, request_id=request_id)
+
+    def _preservation_teams_job_pending(self):
+        """Keep I01 open while a durable Teams job remains recoverable after restart/adoption."""
+        runtime = getattr(self.runner, '_teams_pipeline_runtime', None)
+        if runtime is None:
+            # A failed bind is an observation failure, not proof that no durable Teams work exists.
+            return None if getattr(self.runner, '_teams_pipeline_runtime_error', None) else False
+        store = getattr(runtime, 'store', None)
+        if store is None:
+            return None
+        try:
+            jobs = store.list_jobs().values()
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+        recoverable = {
+            'received', 'resolving_meeting', 'fetching_transcript', 'downloading_recording',
+            'transcribing_audio', 'summarizing', 'writing_notion', 'writing_linear', 'sending_teams',
+            'retry_scheduled',
+        }
+        return any(isinstance(job, dict) and job.get('status') in recoverable for job in jobs)
 
     def _preservation_reserve_claim(self, ref, first):
         if first is None:
@@ -380,20 +581,44 @@ class SessionAuthority:
             self._preservation_handles.pop(admission_id, None)
 
     def preservation_owner_ready(self, owner_class):
-        """Report quiescence for the API/FIFO source seams wired by this proposal.
+        """Report quiescence for the API/FIFO/native source seams wired by this proposal.
 
         This is a source-owned observation used by handoff preparation after natural settlement; it
-        It does not seal the other 18 owner classes or infer cross-process/native ownership.
+        does not seal the other 17 owner classes or infer cross-process ownership.
         """
-        # Native inbound remains explicitly unknown until a real native adapter lifecycle proves its
-        # producer/marker/delivery consumer. An empty native queue is not evidence that the
-        # process-wide connector source is quiescent.
-        if owner_class not in {'I02_api_session_turn', 'I04_fifo_turn_execution'}:
+        # Native inbound remains unknown until a committed native admission has passed through the
+        # production entrypoint. An empty native queue is not evidence that the process-wide
+        # connector source is quiescent.
+        if owner_class not in {'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution'}:
             return False
+        # The coordinator is the authoritative lease ledger while a producer is between callback
+        # admission phases.  Its active set also includes an exact lease retained as unknown after a
+        # failed identity/read reconciliation, even though no durable admission id can be bound in
+        # ``_preservation_handles``.  Do not turn either an in-flight root or an unknown root into a
+        # sealed class merely because this authority's local maps/queue happen to be empty.
+        coordinator = self._preservation_coordinator()
+        if coordinator is not None:
+            custody = coordinator.status()
+            if (owner_class in custody.get('active_owner_classes', ())
+                    or owner_class in custody.get('unknown_owner_classes', ())):
+                return False
+        if owner_class == 'I01_native_inbound' and not self._native_inbound_seen:
+            return False
+        if owner_class == 'I01_native_inbound':
+            teams_pending = self._preservation_teams_job_pending()
+            if teams_pending is None or teams_pending:
+                return False
         if (self._preservation_handles or self._preservation_children
                 or self._preservation_pending_roots or self._preservation_claiming
-                or self._preservation_marker_watchers or self.executing
-                or self.pending_results or self.pending_deliveries):
+                or self._preservation_scheduler_handles
+                or self._preservation_scheduler_retry_handles
+                or self._preservation_marker_watchers or self._preservation_operations or self.executing
+                or self.pending_results or self.pending_deliveries
+                or self.native_waiters or self.waiters
+                or getattr(self, 'marker_adopters', None)
+                or getattr(self, 'held_turn_markers', None)
+                or getattr(self, 'unsettled_deliveries', None)
+                or getattr(self, 'waiter_replies', None)):
             return False
         with self.db._read_ctx() as conn:
             return conn.execute(
@@ -683,22 +908,42 @@ class SessionAuthority:
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity, replaces)
 
-    async def admit_native(self, event):
+    async def admit_native(self, event, *, _preservation_handle=None):
         """Await current connector policy, then commit before ACK or scheduling execution."""
         from gateway.session_ingress_media import capture_lease
         reservation_id = str(getattr(event, 'message_id', None) or uuid.uuid4().hex)
-        self._require_fresh_admission_open()
+        try:
+            self._require_fresh_admission_open()
+        except BaseException:  # health: allow BLE001 -- a fresh-gate refusal must release the exact producer lease
+            # A producer reserved its I01 root before preparation.  If the fresh gate closes before
+            # this call reaches the durable writer, the authority owns the exact release decision.
+            if _preservation_handle is not None:
+                self._preservation_bind_or_release(None, _preservation_handle)
+            raise
         with capture_lease():  # captured bytes are held from capture until commit or refusal
-            return await self._admit_native(event, _reservation_id=reservation_id)
+            return await self._admit_native(
+                event, _reservation_id=reservation_id, _preservation_handle=_preservation_handle)
 
-    async def _admit_native(self, event, *, _reservation_id=None):
+    async def _admit_native(self, event, *, _reservation_id=None, _preservation_handle=None):
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
-        preservation_handle = self._preservation_root(
-            'I01_native_inbound', f'native:{_reservation_id or uuid.uuid4().hex}')
+        if _preservation_handle is None:
+            preservation_handle = self._preservation_root(
+                'I01_native_inbound', f'native:{_reservation_id or uuid.uuid4().hex}')
+        else:
+            coordinator = self._preservation_coordinator()
+            owned_lease = None if coordinator is None else coordinator._parent(_preservation_handle)
+            if (getattr(_preservation_handle, 'owner_class', None) != 'I01_native_inbound'
+                    or getattr(_preservation_handle, 'profile_id', None) != self.profile_id
+                    or getattr(_preservation_handle, 'authority_epoch', None) != self.epoch
+                    or owned_lease is None):
+                self._preservation_bind_or_release(None, _preservation_handle)
+                raise RuntimeStoreError('preservation_owner_unmapped')
+            preservation_handle = _preservation_handle
         request_id = None
         principal_id = None
         session_id = None
+        route_write_pending = False
         self._require_fresh_admission_open()
         try:
             payload = await prepare_native(self.runner, event)
@@ -707,16 +952,33 @@ class SessionAuthority:
             self._require_fresh_admission_open()
             source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
             from gateway.session_runtime_workers import tracked_write
-            ref = self._publish_route(
-                source,
-                *await tracked_write(self, partial(self._reserve_route, source, fresh=True)),
-                fresh=True,
-            )
+            route_write_pending = True
+
+            def route_finished(_result):
+                # A cancelled caller is allowed to leave this worker running, but the producer root
+                # is released only after the route worker has returned. No admission row exists yet.
+                self._preservation_bind_or_release(None, preservation_handle)
+
+            try:
+                route_result = await tracked_write(
+                    self, partial(self._reserve_route, source, fresh=True),
+                    on_cancel=route_finished, on_failure=lambda _error: route_finished(None))
+            except asyncio.CancelledError:
+                # ``tracked_write`` owns the shielded worker and invokes route_finished at completion.
+                raise
+            except BaseException:
+                route_write_pending = False
+                self._preservation_bind_or_release(None, preservation_handle)
+                raise
+            route_write_pending = False
+            ref = self._publish_route(source, *route_result, fresh=True)
             identity = json.dumps([source.profile, source.platform.value, source.chat_id,
                                    source.thread_id, source.user_id], separators=(',', ':'))
             request_id = str(payload['native_text_v1']['event']['message_id'] or uuid.uuid4().hex)
             session_id = ref.session_id
             principal_id = 'messaging:' + identity
+            self._preservation_pending_root(
+                request_id, preservation_handle, principal_id=principal_id, session_id=session_id)
             committed = [ref]  # the row's target: the write may retarget a rotated-away reservation
             # A /retry re-send carries its transcript rewrite: it commits in this admission's own write.
             from gateway import session_retry_admission
@@ -735,14 +997,21 @@ class SessionAuthority:
                     request_id=request_id, payload=payload,
                     authorize=session_retry_admission.compose(rewrite, self._admission_gate(fresh=True)),
                     raw=getattr(event, 'raw_message', None)),
-                    then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]))
+                    then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]),
+                    on_failure=partial(
+                        self._preservation_reconcile_failed, preservation_handle,
+                        principal_id=principal_id, session_id=session_id, request_id=request_id))
+            except asyncio.CancelledError:
+                # The tracked worker's late callback reconciles the exact row after the shielded
+                # transaction completes. Releasing here would race a commit that is still unseen.
+                raise
             except BaseException:
                 self._preservation_reconcile_failed(
                     preservation_handle, principal_id=principal_id, session_id=session_id,
                     request_id=request_id)
                 raise
         except BaseException:
-            if preservation_handle is not None and request_id is None:
+            if preservation_handle is not None and request_id is None and not route_write_pending:
                 coordinator = self._preservation_coordinator()
                 if coordinator is not None:
                     result = coordinator.release_unaccepted(preservation_handle)

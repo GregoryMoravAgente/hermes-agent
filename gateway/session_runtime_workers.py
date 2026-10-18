@@ -53,7 +53,8 @@ def track_mutation(authority, operation):
     return task
 
 
-async def tracked_write(authority, write, then=None, *, ordered=False, after=None):
+async def tracked_write(authority, write, then=None, *, ordered=False, after=None,
+                        on_cancel=None, on_failure=None):
     """Run a synchronous ledger write (``write()``) in a worker thread, off the owner loop.
 
     A held SQLite writer (``_WRITE_PATIENCE_S``) must not freeze every session, timer, socket,
@@ -67,7 +68,9 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
     write returns, as it did when admission was synchronous: the caller registers its delivery
     waiter before any drain it scheduled can claim, settle or pause that admission. A caller
     cancelled while the commit is in flight hands ``after`` to the commit's completion instead,
-    so a committed row is never stranded without a drain."""
+    so a committed row is never stranded without a drain. ``on_cancel`` and ``on_failure`` are
+    late-only custody callbacks: they run after a shielded worker finishes when the caller had
+    already been cancelled, and never authorize releasing a write that is still running."""
     order = getattr(authority, '_ordered_writes', None)
     if ordered and order is None:
         order = authority._ordered_writes = asyncio.Lock()
@@ -83,17 +86,29 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
         followed = then(result)
         return await followed if asyncio.iscoroutine(followed) else followed
     task = track_mutation(authority, run())
-    if after is None:
+    if after is None and on_cancel is None and on_failure is None:
         return await asyncio.shield(task)
     try:
         result = await asyncio.shield(task)
     except asyncio.CancelledError:
         def late(done):
-            if not done.cancelled() and done.exception() is None:
+            if done.cancelled():
+                if on_failure is not None:
+                    on_failure(asyncio.CancelledError())
+                return
+            error = done.exception()
+            if error is not None:
+                if on_failure is not None:
+                    on_failure(error)
+                return
+            if on_cancel is not None:
+                on_cancel(done.result())
+            elif after is not None:
                 after(done.result())
         task.add_done_callback(late)
         raise
-    after(result)
+    if after is not None:
+        after(result)
     return result
 
 

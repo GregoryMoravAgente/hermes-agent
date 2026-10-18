@@ -1,6 +1,10 @@
 """Trusted messaging admission and the existing TurnRunner invocation boundary."""
 import asyncio
+import hashlib
+import json
 import logging
+import sqlite3
+import uuid
 from contextvars import ContextVar
 from contextlib import nullcontext
 from dataclasses import replace
@@ -45,6 +49,9 @@ async def admit_message(authority, event):
             raise
         # Nothing was committed (main's busy-queue cap): say so instead of a generic turn error.
         return QUEUE_FULL_REPLY
+    preservation_key = getattr(event, '_preservation_operation_key', None)
+    if preservation_key is not None:
+        authority._preservation_operation_bind_admission(preservation_key, receipt.admission_id)
     if receipt.status == 'terminal':
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
@@ -126,6 +133,79 @@ def _registry(authority, name):
         found = {}
         setattr(authority, name, found)
     return found
+
+
+def begin_busy_preservation(adapter, event, session_key):
+    """Reserve the busy follow-up before the observer or burst timer is created."""
+    runner = getattr(adapter, 'gateway_runner', None)
+    if runner is None:
+        return None, None
+    from gateway.session_authorities import active_authority, authority_for_profile_id, served_profile_name
+    authority = active_authority(runner)
+    profile = getattr(getattr(event, 'source', None), 'profile', None)
+    if profile and authority is not None and profile not in {
+            authority.profile_id, served_profile_name(authority.profile_id)}:
+        authority = authority_for_profile_id(runner, profile)
+    if authority is None:
+        return None, None
+    source = getattr(event, 'source', None)
+    lookup = getattr(getattr(runner, 'session_store', None), 'lookup_by_session_key', None)
+    entry = lookup(session_key) if callable(lookup) else None
+    metadata = getattr(event, 'metadata', {}) or {}
+    session_id = getattr(entry, 'session_id', None) or metadata.get('gateway_session_id') or session_key
+    source_identity = hashlib.sha256(repr((getattr(source, 'platform', None), getattr(source, 'chat_id', None),
+                                           getattr(source, 'thread_id', None), getattr(source, 'user_id', None))).encode()).hexdigest()
+    request_id = getattr(event, 'message_id', None)
+    if not isinstance(request_id, str) or not request_id:
+        # ``admit_native`` uses the same private event identity when a connector omitted a
+        # message id; setting it before the admission lets the pre-admission lease bind exactly.
+        request_id = uuid.uuid4().hex
+        event.message_id = request_id
+    principal_id = 'messaging:' + json.dumps([
+        getattr(source, 'profile', None),
+        getattr(getattr(source, 'platform', None), 'value', getattr(source, 'platform', None)),
+        getattr(source, 'chat_id', None), getattr(source, 'thread_id', None),
+        getattr(source, 'user_id', None),
+    ], separators=(',', ':'))
+    key = authority._preservation_operation_start(
+        'I06_busy_followup_delivery', principal_id=principal_id,
+        session_id=session_id, operation='busy-followup', request_id=request_id,
+        generation=metadata.get('execution_generation', 'pre-admission'), source_identity=source_identity)
+    event._preservation_operation_key = key
+    return authority, key
+
+
+def finish_busy_preservation(authority, key, accepted, *, unknown=False):
+    if authority is None or key is None:
+        return
+    if not accepted:
+        try:
+            row = authority._preservation_operation_row(key)
+        except (OSError, RuntimeError, sqlite3.Error, RuntimeStoreError, TypeError, ValueError, KeyError):
+            # Exact busy admission read failure retains custody; no exception value is published.
+            authority._preservation_operation_unknown(key, 'read_failed')
+            return
+        if row is None:
+            authority._preservation_operation_release_unaccepted(key)
+        elif row.get('status') == 'terminal':
+            authority._preservation_operation_terminal(key, f'busy-refused:{key}')
+        else:
+            authority._preservation_operation_unknown(key, 'join_failed')
+    elif unknown:
+        authority._preservation_operation_unknown(key, 'join_failed')
+    else:
+        try:
+            row = authority._preservation_operation_row(key)
+        except (OSError, RuntimeError, sqlite3.Error, RuntimeStoreError, TypeError, ValueError, KeyError):
+            # Exact busy admission read failure retains custody; no exception value is published.
+            authority._preservation_operation_unknown(key, 'read_failed')
+            return
+        if row is None:
+            authority._preservation_operation_unknown(key, 'read_failed')
+        elif row.get('status') == 'terminal':
+            authority._preservation_operation_terminal(key, f'busy-delivery:{key}')
+        else:
+            authority._preservation_operation_unknown(key, 'join_failed')
 
 
 def waiter_replies(authority):
@@ -382,36 +462,54 @@ async def deliver_response(adapter, event, session_key, response):
                                        record_delivery=results.append)
 
 
-async def dispatch_shared_busy(adapter, event, session_key):
+async def dispatch_shared_busy(adapter, event, session_key, *, preservation=None):
     """Serial receive loops (IRC, Signal) await this before reading their next frame, so return
     once the follow-up is committed to the FIFO; a tracked observer delivers its one reply."""
-    delivery_event = replace(event, source=replace(event.source))
     accepted = asyncio.get_running_loop().create_future()
+    authority, preservation_key = preservation or begin_busy_preservation(adapter, event, session_key)
+    delivery_event = replace(event, source=replace(event.source))
 
     async def observe():
         # Like the first message's lifecycle, this sender adopts the turn's crash marker and
         # releases it only once the reply is ledgered (the marker moves onto ``event``).
         event._turn_marker_handoff = getattr(adapter, 'gateway_runner', None) is not None
+        failed = False
         try:
             response = await adapter._message_handler(event)
             # The ledgered send releases the marker off the event it sends.
             _move_marker(event, delivery_event)
             delivery_event._turn_marker_handoff = event._turn_marker_handoff
             await deliver_response(adapter, delivery_event, session_key, response)
+        except asyncio.CancelledError:
+            failed = True
+            raise
         except Exception as exc:
+            failed = True
             if not accepted.done():
                 raise  # nothing was queued: the receive loop sees the failure as before
             logger.error('[%s] Queued busy follow-up failed: %s', adapter.name, exc, exc_info=True)
             await adapter._notify_turn_error(delivery_event, exc)
         finally:
             # Clears the marker if no ledgered send did, then wakes the drain's bounded wait,
-            # which listens on the adopter (``event``).
-            await adapter._release_turn_marker(delivery_event)
-            await adapter._release_turn_marker(event)
+            # which listens on the adopter (``event``). A cleanup failure is ambiguous custody.
+            cleanup_failed = False
+            try:
+                await adapter._release_turn_marker(delivery_event)
+                await adapter._release_turn_marker(event)
+            except BaseException:  # health: allow BLE001 -- marker cleanup failure retains busy custody
+                cleanup_failed = True
+                raise
+            finally:
+                finish_busy_preservation(
+                    authority, preservation_key, accepted.done(), unknown=failed or cleanup_failed)
 
     token = busy_acceptance.set(accepted)
     try:
-        task = asyncio.create_task(observe())
+        try:
+            task = asyncio.create_task(observe())
+        except Exception:  # health: allow BLE001 -- observer creation failure releases only unaccepted custody
+            finish_busy_preservation(authority, preservation_key, False)
+            raise
     finally:
         busy_acceptance.reset(token)
     adapter._background_tasks.add(task)
@@ -421,6 +519,10 @@ async def dispatch_shared_busy(adapter, event, session_key):
     except asyncio.CancelledError:
         if not accepted.done():
             task.cancel()  # cancelled before commit: the input was never ACKed
+            finish_busy_preservation(authority, preservation_key, False)
+        # After the acceptance future resolves, the observer owns the exact lease until its
+        # delivery/marker cleanup. Cancelling this caller must not turn a still-running observer
+        # into an unknown operation that can never reach its natural terminal callback.
         raise
     if task.done():
         task.result()  # refused, consumed or answered inline before any durable acceptance

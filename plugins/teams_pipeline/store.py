@@ -19,6 +19,11 @@ from hermes_constants import get_hermes_home
 DEFAULT_TEAMS_PIPELINE_STORE_FILENAME = "teams_pipeline_store.json"
 # Persisted top-level buckets; the on-disk JSON shape must stay stable for existing user stores.
 _BUCKETS = ("subscriptions", "notification_receipts", "event_timestamps", "jobs", "sink_records")
+_RECOVERABLE_JOB_STATES = frozenset({
+    "received", "resolving_meeting", "fetching_transcript", "downloading_recording",
+    "transcribing_audio", "summarizing", "writing_notion", "writing_linear", "sending_teams",
+    "retry_scheduled",
+})
 
 
 def _utc_now_iso() -> str:
@@ -110,6 +115,34 @@ class TeamsPipelineStore:
                                                                  "payload": deepcopy(payload) if isinstance(payload, dict) else payload}
             self._persist()
             return True
+
+    def claim_recoverable_jobs(self, owner_id: str) -> list[dict[str, Any]]:
+        """Claim durable non-terminal jobs for the gateway owner that holds the profile lock.
+
+        The profile ownership fence is the cross-process exclusion for this JSON store.  The claim
+        fields make a second bind in the same process idempotent and leave a successor identity in
+        the durable record for a restarted owner; they do not pretend that a JSON field is a second
+        process lock.  ``retry_scheduled`` is deliberately recoverable: it is future work, unlike
+        the known business-terminal ``failed`` state.
+        """
+        owner = str(owner_id).strip()
+        if not owner:
+            raise ValueError("owner_id is required")
+        with self._lock:
+            claimed: list[dict[str, Any]] = []
+            changed = False
+            for job_id, record in self._state["jobs"].items():
+                if not isinstance(record, dict) or record.get("status") not in _RECOVERABLE_JOB_STATES:
+                    continue
+                if record.get("runtime_owner") != owner or record.get("runtime_claim") != "claimed":
+                    record["runtime_owner"] = owner
+                    record["runtime_claim"] = "claimed"
+                    record["runtime_claimed_at"] = _utc_now_iso()
+                    changed = True
+                claimed.append(deepcopy(record))
+            if changed:
+                self._persist()
+            return claimed
 
     def stats(self) -> dict[str, int]:
         with self._lock:

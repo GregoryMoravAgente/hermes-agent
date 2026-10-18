@@ -229,8 +229,10 @@ def _preservation_receipt(params):
 
 
 _INTEGRATED_PRESERVATION_OWNER_CLASSES = (
-    # I01 stays unknown until a real native adapter lifecycle supplies source-backed producer,
-    # marker handoff and delivery-ledger evidence. Empty durable rows alone cannot seal it.
+    # I01 is sealed only after the native entrypoint has been consumed and all producer/marker/
+    # delivery-ledger registries plus durable admissions are quiescent; an empty queue alone cannot
+    # seal it.
+    'I01_native_inbound',
     'I02_api_session_turn', 'I04_fifo_turn_execution',
 )
 
@@ -239,9 +241,9 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     """Seal only the source consumers whose durable terminal paths are wired here.
 
     The source hooks report quiescence per served authority after the natural drain. This does not
-    census the other owner classes, including native inbound I01: their coordinator state remains
-    ``unwired`` and therefore blocks handoff until their actual source/process/native seams provide
-    their own evidence.
+    census the other 17 owner classes, including cross-process and lifecycle owners: their
+    coordinator state remains ``unwired`` and therefore blocks handoff until their actual
+    source/process seams provide their own evidence.
     """
     authorities = _authorities(runner)
     if not authorities:

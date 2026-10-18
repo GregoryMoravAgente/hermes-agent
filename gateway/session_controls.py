@@ -730,26 +730,40 @@ class AuthorityConnection:
 
     async def cancel(self, ref, params):
         admission_id = params.get('admission_id')
-        if (await self.authority.receipt(self.actor, ref, admission_id)).status != 'queued':
-            return asdict(await self.authority.cancel_queued(self.actor, ref, admission_id))  # started: unaffected
-        # Queued at this read, claimed by the drain before the cancel commit: Stop that exact claim (as
-        # API and ACP do) instead of refusing while the withdrawn prompt runs.
-        row = await self.authority.cancel_or_claimed(self.actor, ref, admission_id)
-        if row is not None:
-            await self.interrupt(ref, {'execution_generation': row['generation']})
-        return asdict(await self.authority.receipt(self.actor, ref, admission_id))
+        async def call():
+            if (await self.authority.receipt(self.actor, ref, admission_id)).status != 'queued':
+                return asdict(await self.authority.cancel_queued(self.actor, ref, admission_id))  # started: unaffected
+            # Queued at this read, claimed by the drain before the cancel commit: Stop that exact claim (as
+            # API and ACP do) instead of refusing while the withdrawn prompt runs.
+            row = await self.authority.cancel_or_claimed(self.actor, ref, admission_id)
+            if row is not None:
+                await self.interrupt(ref, {'execution_generation': row['generation']})
+            return asdict(await self.authority.receipt(self.actor, ref, admission_id))
+        return await self.authority._preservation_control_call(
+            principal_id=self.actor.subject, session_id=ref.session_id, operation='cancel',
+            request_id=admission_id, admission_id=admission_id, call=call)
 
     async def resolve_unknown(self, ref, params):
         if set(params) != {'session_id', 'admission_id', 'execution_generation'}:
             raise RuntimeStoreError('invalid_params')
-        return asdict(await self.authority.resolve_unknown(
-            self.actor, ref, params['admission_id'], params['execution_generation']))
+        async def call():
+            return asdict(await self.authority.resolve_unknown(
+                self.actor, ref, params['admission_id'], params['execution_generation']))
+        return await self.authority._preservation_control_call(
+            principal_id=self.actor.subject, session_id=ref.session_id, operation='resolve_unknown',
+            request_id=params['admission_id'], admission_id=params['admission_id'],
+            generation=params['execution_generation'], call=call)
 
     async def interrupt(self, ref, params):
         from gateway.session_managed_worker import interrupt_managed
-        if interrupt_managed(self.authority, self.actor, ref, params.get('execution_generation')):
-            return asdict(self.authority._handle(ref))
-        return asdict(await self.authority.interrupt(self.actor, ref, params.get('execution_generation')))
+        generation = params.get('execution_generation')
+        async def call():
+            if interrupt_managed(self.authority, self.actor, ref, generation):
+                return asdict(self.authority._handle(ref))
+            return asdict(await self.authority.interrupt(self.actor, ref, generation))
+        return await self.authority._preservation_control_call(
+            principal_id=self.actor.subject, session_id=ref.session_id, operation='interrupt',
+            request_id=f'interrupt:{generation}', generation=generation, call=call)
 
     def _resolve_response(self, frame):
         from gateway.session_server_requests import may_settle, resolve

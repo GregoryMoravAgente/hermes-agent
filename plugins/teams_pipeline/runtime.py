@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from gateway.config import Platform
+from gateway.session_authority import SchedulerTaskHandoff
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore, resolve_teams_pipeline_store_path
 from plugins.teams_pipeline.subscriptions import build_graph_client
@@ -65,37 +66,129 @@ def build_pipeline_runtime(gateway: Any) -> TeamsMeetingPipeline:
     )
 
 
+def _teams_owner_id(gateway: Any) -> str:
+    descriptor = getattr(gateway, "session_runtime_descriptor", None) or {}
+    instance_id = str(descriptor.get("instance_id") or "").strip()
+    if not instance_id:
+        raise RuntimeError("Teams pipeline recovery requires a published runtime instance")
+    return f"teams:{instance_id}"
+
+
+def _adopt_recoverable_jobs(gateway: Any, runtime: TeamsMeetingPipeline) -> list[asyncio.Task]:
+    """Adopt durable Teams work through the same I01 scheduler custody as Graph notifications."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return []
+    claim = getattr(store, "claim_recoverable_jobs", None)
+    list_jobs = getattr(store, "list_jobs", None)
+    if not callable(claim) or not callable(list_jobs):
+        raise RuntimeError("Teams pipeline store cannot inspect recoverable jobs")
+    recoverable = {
+        "received", "resolving_meeting", "fetching_transcript",
+        "downloading_recording", "transcribing_audio", "summarizing",
+        "writing_notion", "writing_linear", "sending_teams", "retry_scheduled",
+    }
+    snapshot = list_jobs()
+    if not isinstance(snapshot, dict) or not any(
+        isinstance(record, dict) and record.get("status") in recoverable
+        for record in snapshot.values()
+    ):
+        return []
+    from gateway.session_authorities import active_authority
+    authority = active_authority(gateway)
+    if authority is None:
+        raise RuntimeError("Teams pipeline recovery has no active session authority")
+    descriptor = getattr(gateway, "session_runtime_descriptor", None) or {}
+    if not str(descriptor.get("instance_id") or "").strip():
+        raise RuntimeError("Teams pipeline recovery requires a published runtime instance")
+    from pathlib import Path
+    from gateway.runtime_ownership import process_ownership
+    authority_db = getattr(getattr(authority, "db", None), "db_path", None)
+    if authority_db is None or not process_ownership.owns(Path(authority_db).resolve().parent):
+        raise RuntimeError("Teams pipeline recovery requires profile ownership")
+    records = claim(_teams_owner_id(gateway))
+    if not records:
+        return []
+    active_jobs = getattr(gateway, "_teams_pipeline_active_jobs", None)
+    if active_jobs is None:
+        active_jobs = gateway._teams_pipeline_active_jobs = set()
+    adapter = gateway.adapters.get(Platform.MSGRAPH_WEBHOOK)
+    background = getattr(adapter, "_background_tasks", set())
+    tasks: list[asyncio.Task] = []
+    for record in records:
+        job_id = str(record.get("job_id") or "").strip()
+        if not job_id or job_id in active_jobs:
+            continue
+        scheduler_id = authority._preservation_adopt_scheduler_job(job_id)
+        task = asyncio.create_task(runtime.run_job(job_id))
+        active_jobs.add(job_id)
+        background.add(task)
+        task.add_done_callback(background.discard)
+        task.add_done_callback(lambda _task, key=job_id: active_jobs.discard(key))
+        task.add_done_callback(
+            lambda done, owner=authority, sid=scheduler_id: owner._preservation_scheduler_done(sid, done))
+        tasks.append(task)
+    return tasks
+
+
+def _install_runtime_refusal(adapter: Any) -> None:
+    """Keep authenticated Graph retries retryable when the Teams runtime cannot be observed."""
+    async def _refuse(_notification: dict[str, Any], _event: Any) -> None:
+        from hermes_state_runtime import RuntimeStoreError
+        raise RuntimeStoreError("teams_runtime_unavailable")
+    adapter.set_notification_scheduler(_refuse)
+
+
 def bind_gateway_runtime(gateway: Any) -> bool:
     """Attach the Teams pipeline runtime to the msgraph webhook adapter."""
     adapter = gateway.adapters.get(Platform.MSGRAPH_WEBHOOK)
     if adapter is None:
         return False
-    if getattr(gateway, "_teams_pipeline_runtime", None) is not None:
-        return True
-    try:
-        runtime = build_pipeline_runtime(gateway)
-    except Exception as exc:
-        # Without a runtime, notifications must still be acked (and dropped) so Graph does not retry-storm.
-        gateway._teams_pipeline_runtime_error = str(exc)
-        logger.warning(
-            "Teams pipeline runtime unavailable: %s. Installing a drop-scheduler "
-            "so Graph notifications ack cleanly without piling up unbound.", exc,
-        )
+    existing = getattr(gateway, "_teams_pipeline_runtime", None)
+    runtime = existing
+    if runtime is not None:
+        try:
+            _adopt_recoverable_jobs(gateway, runtime)
+        except Exception as exc:  # health: allow BLE001 -- binding/recovery is an opaque persistence boundary; refusal preserves retry and custody
+            gateway._teams_pipeline_runtime_error = str(exc)
+            _install_runtime_refusal(adapter)
+            return False
+        gateway._teams_pipeline_runtime_error = None
+    else:
+        try:
+            runtime = build_pipeline_runtime(gateway)
+        except Exception as exc:  # health: allow BLE001 -- runtime construction failure must install typed refusal instead of acknowledging work
+            gateway._teams_pipeline_runtime_error = str(exc)
+            logger.warning(
+                "Teams pipeline runtime unavailable: %s. Installing a refusal scheduler "
+                "so Graph retries remain visible and no work is acknowledged as dropped.", exc,
+            )
+            _install_runtime_refusal(adapter)
+            return False
 
-        async def _drop(notification: dict[str, Any], event: Any) -> None:
-            logger.debug("Dropping Graph notification because runtime is unavailable: id=%s resource=%s",
-                         notification.get("id"), notification.get("resource"))
-        adapter.set_notification_scheduler(_drop)
-        return False
+        gateway._teams_pipeline_runtime = runtime
+        gateway._teams_pipeline_runtime_error = None
+        try:
+            _adopt_recoverable_jobs(gateway, runtime)
+        except Exception as exc:  # health: allow BLE001 -- durable recovery observation failure retains retryable ingress and exact custody
+            gateway._teams_pipeline_runtime_error = str(exc)
+            logger.warning("Teams pipeline durable recovery unavailable: %s", exc)
+            _install_runtime_refusal(adapter)
+            return False
+
+    # Share the active-job set with the live Graph scheduler.  A recovered ``received`` record may
+    # still be in its first task turn when a duplicate notification arrives; the adapter must not
+    # create a second task for that exact durable job.
+    scheduled = getattr(gateway, "_teams_pipeline_active_jobs", None)
+    if scheduled is None:
+        scheduled = gateway._teams_pipeline_active_jobs = set()
 
     # Graph wants a prompt 202 once the work is durable: accept (persist the job) inside the request,
     # run the fetch/transcript/summary pipeline detached. An accept failure still fails the request.
     background = getattr(adapter, "_background_tasks", set())
     # Claim a job before scheduling its external effects: a no-id duplicate in one Graph batch
     # returns the same still-"received" job (run_job persists progress only once it runs).
-    scheduled: set[str] = set()
-
-    async def _schedule(notification: dict[str, Any], event: Any) -> None:
+    async def _schedule(notification: dict[str, Any], event: Any) -> SchedulerTaskHandoff | None:
         job = runtime.create_job_from_notification(notification)
         if job.status != "received" or job.job_id in scheduled:  # duplicate of a running or finished job
             return
@@ -104,7 +197,8 @@ def bind_gateway_runtime(gateway: Any) -> bool:
         background.add(task)
         task.add_done_callback(background.discard)
         task.add_done_callback(lambda _task: scheduled.discard(job.job_id))
+        # The adapter owns the I01 root until this real pipeline task settles. Return a typed
+        # handoff so the scheduler boundary binds the exact durable job before it accepts completion.
+        return SchedulerTaskHandoff(task=task, expected_job_id=job.job_id)
     adapter.set_notification_scheduler(_schedule)
-    gateway._teams_pipeline_runtime = runtime
-    gateway._teams_pipeline_runtime_error = None
     return True

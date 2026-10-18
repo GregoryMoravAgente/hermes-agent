@@ -236,6 +236,9 @@ def _initialize_run_state(self, *, store_factory) -> None:
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
         self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
     ) = ({} for _ in range(7))
+    # Indexes of the actual API-run Task and its child controls.  The RuntimeCustodyCoordinator is
+    # the authority; these maps only keep the run id attached to the real task/control objects.
+    self._run_preservation_handles = {}
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -553,6 +556,235 @@ class _RunLaunch:
             self.queue.put_nowait(event)
 
 
+def _run_custody_coordinator(self):
+    return getattr(getattr(self, 'gateway_runner', None), 'runtime_custody', None)
+
+
+def _run_custody_start(self, run: _RunLaunch):
+    """Reserve the direct API run before canonical admission or its background Task exists."""
+    coordinator = _run_custody_coordinator(self)
+    if coordinator is None:
+        return None
+    from gateway.runtime_custody import CustodyRefusal
+    from hermes_state_runtime import RuntimeStoreError
+    scope = str(self._run_owners.get(run.run_id) or '')
+    owner_id = f"api-run:{run.run_id}:{hashlib.sha256(scope.encode('utf-8')).hexdigest()[:24]}"
+    profile_id = run.request_profile or 'default'
+    handle = coordinator.reserve_root(
+        'I03_api_run_direct', owner_id, profile_id=profile_id,
+        authority_epoch=coordinator.authority_epoch)
+    if isinstance(handle, CustodyRefusal):
+        raise RuntimeStoreError(handle.code)
+    self._run_preservation_handles[run.run_id] = {
+        'handle': handle, 'profile_id': profile_id,
+        'authority_epoch': coordinator.authority_epoch,
+        'controls': {}, 'terminal_requested': None,
+    }
+    return handle
+
+
+def _run_custody_start_response(
+    self, launch, *, idempotency_key, idempotency_scope, _openai_error
+):
+    """Reserve the direct-run parent and translate a pre-task refusal into the API response."""
+    try:
+        _run_custody_start(self, launch)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _forget_run(
+            self, launch.run_id, self._run_streams, self._run_streams_created,
+            self._run_approval_sessions, self._run_statuses, self._run_owners,
+            self._run_idempotency_ids)
+        if idempotency_key:
+            self._run_idempotency_store.forget(idempotency_scope, idempotency_key)
+        from gateway.platforms.api_server_authority_runs import store_error_response
+        return store_error_response(_openai_error, exc)
+    return None
+
+
+def _run_custody_control_or_error(
+    self, run_id, operation, *, request_id, generation, _openai_error
+):
+    """Reserve one I05 child, returning ``(key, error_response)`` for an HTTP handler."""
+    try:
+        return _run_custody_control_start(
+            self, run_id, operation, request_id=request_id, generation=generation), None
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        from gateway.platforms.api_server_authority_runs import store_error_response
+        return None, store_error_response(_openai_error, exc)
+
+
+def _create_run_task(self, launch, admitted, *, _api_server):
+    try:
+        if admitted is not None:
+            return asyncio.create_task(
+                _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
+        return asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    except Exception:
+        _run_custody_unknown(self, launch.run_id, 'join_failed')
+        raise
+
+
+async def _admit_live_bot_chat_with_custody(self, session_id, user_message, turn_author, run_id):
+    try:
+        return await self._admit_to_live_bot_chat(session_id, user_message, turn_author)
+    except Exception:
+        _run_custody_unknown(self, run_id, 'partial_launch')
+        raise
+
+
+def _run_custody_control_start(self, run_id, operation, *, request_id=None, generation=None):
+    """Reserve an I05 child under the exact API-run lease before its control callback."""
+    coordinator = _run_custody_coordinator(self)
+    if coordinator is None:
+        return None
+    from gateway.runtime_custody import CustodyRefusal
+    from hermes_state_runtime import RuntimeStoreError
+    owner = self._run_preservation_handles.get(run_id)
+    if owner is None:
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    identity = f"{run_id}:{operation}:{request_id or 'none'}:{'none' if generation is None else generation}"
+    key = hashlib.sha256(identity.encode('utf-8')).hexdigest()
+    owner_id = f"api-control:{run_id}:{key[:24]}"
+    existing = owner['controls'].get(key)
+    if existing is not None:
+        # The deterministic key names one live operation. Never replace its handle with a second
+        # lease: the first HTTP callback remains the sole owner and the duplicate is retryable.
+        raise RuntimeStoreError('admission_conflict')
+    parent = owner['handle']
+    if coordinator.state == 'closing':
+        child = coordinator.reserve_root(
+            'I05_controls_and_unknown', owner_id, profile_id=owner['profile_id'],
+            authority_epoch=owner['authority_epoch'], parent=parent)
+    else:
+        reservation = coordinator.reserve_child(
+            parent, 'I05_controls_and_unknown', owner_id, profile_id=owner['profile_id'],
+            authority_epoch=owner['authority_epoch'])
+        child = (coordinator.activate_child(reservation)
+                 if not isinstance(reservation, CustodyRefusal) else reservation)
+    if isinstance(child, CustodyRefusal):
+        raise RuntimeStoreError(child.code)
+    owner['controls'][key] = {
+        'handle': child, 'operation': operation, 'request_id': request_id,
+        'generation': generation, 'resolved': False,
+    }
+    return key
+
+
+def _run_custody_control_release(self, run_id, key):
+    if key is None:
+        return
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    control = owner.get('controls', {}).get(key) if owner is not None else None
+    if control is None or coordinator is None:
+        return
+    result = coordinator.release_unaccepted(control['handle'])
+    if result is None or result.code == 'stale_lease':
+        owner['controls'].pop(key, None)
+    else:
+        coordinator.mark_unknown(control['handle'], 'read_failed')
+
+
+_RUN_CONTROL_DEFINITE_REFUSALS = frozenset({
+    'invalid_params', 'not_found', 'permission_denied', 'stale_generation',
+    'approval_not_pending', 'approval_not_active', 'run_not_active',
+    'steer_not_accepted', 'run_not_accepting_steer',
+})
+
+
+def _run_custody_control_error(self, run_id, key, reason):
+    """Release only a control that definitely did not mutate its run.
+
+    Store/I/O failures stay unknown: the callback may have committed its durable mutation before
+    the response failed, so a later control or run finalizer must reconcile the exact child.
+    """
+    if reason in _RUN_CONTROL_DEFINITE_REFUSALS:
+        _run_custody_control_release(self, run_id, key)
+    else:
+        _run_custody_control_unknown(self, run_id, key, 'read_failed')
+
+
+def _run_custody_control_unknown(self, run_id, key, reason):
+    if key is None:
+        return
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    control = owner.get('controls', {}).get(key) if owner is not None else None
+    if control is not None and coordinator is not None:
+        coordinator.mark_unknown(control['handle'], reason)
+
+
+def _run_custody_try_finish(self, run_id):
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    if owner is None or coordinator is None or owner.get('terminal_requested') is None:
+        return
+    controls = owner['controls']
+    if any(not control['resolved'] for control in controls.values()):
+        return
+    for key, control in list(controls.items()):
+        result = coordinator.mark_terminal(control['handle'])
+        if result is not None:
+            if result.code != 'stale_lease':
+                coordinator.mark_unknown(control['handle'], 'lease_release_failed')
+            return
+        controls.pop(key, None)
+    finalizer_id = owner['terminal_requested']
+    finalized = coordinator.mark_finalizing(owner['handle'], finalizer_id)
+    if finalized is not None:
+        coordinator.mark_unknown(owner['handle'], 'read_failed')
+        return
+    result = coordinator.mark_terminal(owner['handle'])
+    if result is None or result.code == 'stale_lease':
+        self._run_preservation_handles.pop(run_id, None)
+    else:
+        coordinator.mark_unknown(owner['handle'], 'lease_release_failed')
+
+
+def _run_custody_control_success(self, run_id, key, finalizer_id):
+    if key is None:
+        return
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    control = owner.get('controls', {}).get(key) if owner is not None else None
+    if control is None or coordinator is None:
+        return
+    result = coordinator.mark_finalizing(control['handle'], finalizer_id)
+    if result is not None:
+        coordinator.mark_unknown(control['handle'], 'read_failed')
+        return
+    control['resolved'] = True
+    _run_custody_try_finish(self, run_id)
+
+
+def _run_custody_request_finish(self, run_id, finalizer_id):
+    owner = self._run_preservation_handles.get(run_id)
+    if owner is None:
+        return
+    owner['terminal_requested'] = finalizer_id
+    _run_custody_try_finish(self, run_id)
+
+
+def _run_custody_unknown(self, run_id, reason):
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    if owner is not None and coordinator is not None:
+        coordinator.mark_unknown(owner['handle'], reason)
+
+
+def _run_custody_abandon_before_task(self, run_id):
+    """Release only an unstarted run; a committed admission remains unknown instead of guessed away."""
+    owner = self._run_preservation_handles.get(run_id)
+    coordinator = _run_custody_coordinator(self)
+    if owner is None or coordinator is None:
+        return
+    result = coordinator.release_unaccepted(owner['handle'])
+    if result is None or result.code == 'stale_lease':
+        self._run_preservation_handles.pop(run_id, None)
+    else:
+        coordinator.mark_unknown(owner['handle'], 'join_failed')
+
+
 def _forget_run(self, run_id: str, *tables) -> None:
     """Drop *run_id* from the given run-keyed dicts/sets, then release its owner stamp."""
     for table in tables:
@@ -708,6 +940,13 @@ async def _admit_run_to_authority(
             return None
         # A refused admission owns no run: drop every reservation so an exact
         # retry is refused again instead of replaying a run nobody executes.
+        if isinstance(exc, RuntimeStoreError) and exc.reason in {
+            'invalid_params', 'not_found', 'permission_denied', 'runtime_draining',
+            'admission_conflict', 'chain_moved',
+        }:
+            _run_custody_abandon_before_task(self, run_id)
+        else:
+            _run_custody_unknown(self, run_id, 'read_failed')
         _forget_run(
             self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
             self._run_statuses, self._run_owners, self._run_idempotency_ids)
@@ -829,12 +1068,23 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         browser_control_principal=_api_server._api_request_browser_control_principal.get(),
         browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
         turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
+    # The direct /v1/runs writer owns the task/executor/stream lifecycle even when the
+    # canonical admission below is rejected or becomes queued.  Reserve it before the first
+    # admission await so a control callback cannot arrive without an exact parent lease.
+    custody_error = _run_custody_start_response(
+        self, launch, idempotency_key=idempotency_key, idempotency_scope=idempotency_scope,
+        _openai_error=_openai_error)
+    if custody_error is not None:
+        return custody_error
     # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
     # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
     # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
     # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
     # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
+    admitted = (
+        await _admit_live_bot_chat_with_custody(
+            self, session_id, user_message, turn_author, run_id)
+        if selected_session_id else None)
     if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
         refused = await _admit_run_to_authority(
             self, launch, run_id, session_history_delivery, _declared_selected,
@@ -842,11 +1092,8 @@ async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Respon
         if refused is not None:
             return refused
     self._activate_admitted_request()
-    if admitted is not None:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
-    else:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
+    task = self._active_run_tasks[run_id] = _create_run_task(
+        self, launch, admitted, _api_server=_api_server)
     with suppress(TypeError):
         self._background_tasks.add(task)  # tracked for shutdown drain
     if hasattr(task, "add_done_callback"):
@@ -1008,6 +1255,8 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
         with suppress(Exception):
             run.put_event(None)  # sentinel: close the SSE stream
         _retire_live_run(self, run_id)
+        with suppress(Exception):
+            _run_custody_request_finish(self, run_id, f'api-run:{run_id}:live-finalizer')
 
 
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
@@ -1136,6 +1385,8 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         with suppress(Exception):
             loop.call_soon(run.put_event, None)  # close after the queued events
         _retire_live_run(self, run_id)
+        with suppress(Exception):
+            _run_custody_request_finish(self, run_id, f'api-run:{run_id}:run-finalizer')
 
 
 def _unregister_approval_notify(approval_session_key: Optional[str]) -> None:
@@ -1150,7 +1401,7 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     """Drop the owner stamp only once nothing keyed by *run_id* survives: ownership must
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
-            self._run_approval_sessions)
+            self._run_approval_sessions, self._run_preservation_handles)
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -1305,6 +1556,12 @@ _APPROVAL_CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "onc
 
 
 async def _handle_run_approval(self, request: web.Request, *, _api_server) -> web.Response:
+    return await _handle_run_approval_with_custody(self, request, _api_server=_api_server)
+
+
+async def _handle_run_approval_with_custody(
+    self, request: web.Request, *, _api_server
+) -> web.Response:
     """POST /v1/runs/{run_id}/approval — resolve a pending run approval."""
     _openai_error = _api_server._openai_error
     run_id, _, _, _, err = _load_owned_run(
@@ -1313,12 +1570,18 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
         return err
     try:
         body = await request.json()
-    except Exception:
+    except (TypeError, ValueError):
         return _json_error(_openai_error, "Invalid JSON", status=400)
     if getattr(self.gateway_runner, 'session_authority', None) is not None:
         if self._room_grant_token(request) and body.get('choice') not in {'once', 'deny'}:
             return _json_error(_openai_error, 'Room approvals require once or deny', status=400)
-        return await _respond_authority_run(self, run_id, body, kind='approval', _api_server=_api_server)
+        custody_key, custody_error = _run_custody_control_or_error(
+            self, run_id, 'approval', request_id=body.get('request_id'),
+            generation=body.get('execution_generation'), _openai_error=_openai_error)
+        if custody_error is not None:
+            return custody_error
+        return await _respond_authority_run(
+            self, run_id, body, kind='approval', _api_server=_api_server, custody_key=custody_key)
     raw_choice = str(body.get("choice", "")).strip().lower()
     choice = _APPROVAL_CHOICE_ALIASES.get(raw_choice, raw_choice)
     room_scoped = bool(self._room_grant_token(request))
@@ -1342,31 +1605,44 @@ async def _handle_run_approval(self, request: web.Request, *, _api_server) -> we
          f"Run has no active approval session: {run_id}", "approval_not_active", 409)):
         if failed:
             return _json_error(_openai_error, message, code=code, status=status)
+    custody_key, custody_error = _run_custody_control_or_error(
+        self, run_id, 'approval', request_id=request_id or None, generation=None,
+        _openai_error=_openai_error)
+    if custody_error is not None:
+        return custody_error
     try:
         from tools.approval import resolve_gateway_approval
         resolved = resolve_gateway_approval(
             approval_session_key, choice, resolve_all=resolve_all, request_id=request_id or None)
     except Exception as exc:
+        _run_custody_control_unknown(self, run_id, custody_key, 'read_failed')
         logger.exception("[api_server] approval resolution failed for run %s", run_id)
         return _json_error(_openai_error, str(exc), status=500)
     if resolved <= 0:
+        _run_custody_control_error(self, run_id, custody_key, 'approval_not_pending')
         return _json_error(
             _openai_error, f"Run has no pending approval: {run_id}", code="approval_not_pending", status=409)
     request_id_field = {"request_id": request_id} if request_id else {}
     _mark_run_event(self, run_id, "approval.responded", choice=choice, **request_id_field, resolved=resolved)
+    _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:approval')
     return web.json_response({
         "object": "hermes.run.approval_response", "run_id": run_id, "choice": choice, **request_id_field,
         "resolved": resolved})
 
 
-async def _respond_authority_run(self, run_id, body, *, kind, _api_server):
+async def _respond_authority_run(self, run_id, body, *, kind, _api_server, custody_key=None):
     from gateway.platforms.api_server_authority_runs import respond_run, store_error_response
     from hermes_state_runtime import RuntimeStoreError
     try:
         result = await respond_run(self, run_id, body, kind=kind)
+        _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:{kind}')
         return web.json_response({'run_id': run_id, **result})
     except RuntimeStoreError as exc:
+        _run_custody_control_error(self, run_id, custody_key, exc.reason)
         return store_error_response(_api_server._openai_error, exc)
+    except Exception:
+        _run_custody_control_unknown(self, run_id, custody_key, 'read_failed')
+        raise
 
 
 async def _handle_run_clarify(self, request, *, _api_server):
@@ -1377,7 +1653,13 @@ async def _handle_run_clarify(self, request, *, _api_server):
     body, err = await self._read_json_body(request)
     if err is not None:
         return err
-    return await _respond_authority_run(self, run_id, body, kind='clarify', _api_server=_api_server)
+    custody_key, custody_error = _run_custody_control_or_error(
+        self, run_id, 'clarify', request_id=body.get('request_id'),
+        generation=body.get('execution_generation'), _openai_error=_api_server._openai_error)
+    if custody_error is not None:
+        return custody_error
+    return await _respond_authority_run(
+        self, run_id, body, kind='clarify', _api_server=_api_server, custody_key=custody_key)
 
 
 def _steer_refused(_openai_error, run_id):
@@ -1386,6 +1668,12 @@ def _steer_refused(_openai_error, run_id):
 
 
 async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.Response:
+    return await _handle_steer_run_with_custody(self, request, _api_server=_api_server)
+
+
+async def _handle_steer_run_with_custody(
+    self, request: web.Request, *, _api_server
+) -> web.Response:
     """POST /v1/runs/{run_id}/steer — inject guidance into a running agent."""
     _openai_error = _api_server._openai_error
     run_id, status, agent, _, err = _load_owned_run(
@@ -1411,6 +1699,13 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
         return _json_error(
             _openai_error, "Missing non-empty steer text; expected 'input', 'message', or 'text'.",
             code="invalid_steer_input", status=400)
+    custody_generation = owned[1]['generation'] if owned is not None else None
+    custody_request_id = owned[1]['admission_id'] if owned is not None else run_id
+    custody_key, custody_error = _run_custody_control_or_error(
+        self, run_id, 'steer', request_id=custody_request_id, generation=custody_generation,
+        _openai_error=_openai_error)
+    if custody_error is not None:
+        return custody_error
     if owned is not None:
         from gateway.session_contract import SessionRef
         from hermes_state_runtime import RuntimeStoreError
@@ -1421,22 +1716,30 @@ async def _handle_steer_run(self, request: web.Request, *, _api_server) -> web.R
                 authority.check_approval_generation(sid, row['generation'])
                 # Before the claimed turn adopts its agent the steer is latched for that agent.
                 agent, latched = authority.steer_agent(SessionRef(authority.profile_id, sid), row['generation'], steer_text)
-        except (KeyError, RuntimeStoreError):
+        except (KeyError, RuntimeStoreError) as exc:
+            _run_custody_control_error(
+                self, run_id, custody_key,
+                exc.reason if isinstance(exc, RuntimeStoreError) else 'run_not_accepting_steer')
             agent = None
         if not latched and not hasattr(agent, "steer"):
+            _run_custody_control_error(self, run_id, custody_key, 'run_not_accepting_steer')
             return _steer_refused(_openai_error, run_id)
         if latched:
             _mark_run_event(self, run_id, "run.steered", accepted=True)
+            _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:steer')
             return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
     try:
         accepted = bool(agent.steer(steer_text))
     except Exception as exc:
+        _run_custody_control_unknown(self, run_id, custody_key, 'read_failed')
         logger.exception("[api_server] steer failed for run %s", run_id)
         return _json_error(_openai_error, _api_server._redact_api_error_text(exc), code="steer_failed", status=500)
     if not accepted:
+        _run_custody_control_error(self, run_id, custody_key, 'steer_not_accepted')
         return _json_error(
             _openai_error, f"Run did not accept steer text: {run_id}", code="steer_not_accepted", status=409)
     _mark_run_event(self, run_id, "run.steered", accepted=True)
+    _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:steer')
     return web.json_response({"object": "hermes.run.steer", "run_id": run_id, "accepted": True})
 
 
@@ -1447,6 +1750,16 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         self, request, _api_server=_api_server, permission="stop", active_fallback=True)
     if err is not None:
         return err
+    if status.get("status") in TERMINAL_STATUSES:
+        return web.json_response(status)
+    from hermes_state_runtime import RuntimeStoreError
+    try:
+        custody_key = _run_custody_control_start(
+            self, run_id, 'stop', request_id=run_id,
+            generation=status.get('execution_generation'))
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        from gateway.platforms.api_server_authority_runs import store_error_response
+        return store_error_response(_openai_error, exc)
     # A run whose turn a live Bot Chat owns (``_execute_run_via_live_owner``) is not an API
     # admission: its stop is the legacy in-process task cancel below, never ``stop_run``.
     if (getattr(self.gateway_runner, 'session_authority', None) is not None
@@ -1454,12 +1767,17 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         from gateway.platforms.api_server_authority_runs import stop_run, store_error_response
         from hermes_state_runtime import RuntimeStoreError
         try:
-            return web.json_response(await stop_run(self, run_id))
+            result = await stop_run(self, run_id)
+            _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:stop')
+            return web.json_response(result)
         except RuntimeStoreError as exc:
+            if exc.reason == 'unknown_execution':
+                _run_custody_control_unknown(self, run_id, custody_key, 'unmapped_writer')
+            else:
+                _run_custody_control_error(self, run_id, custody_key, exc.reason)
             return store_error_response(_openai_error, exc)
-    if status.get("status") in TERMINAL_STATUSES:
-        return web.json_response(status)
     if agent is None and task is None:
+        _run_custody_control_error(self, run_id, custody_key, 'run_not_active')
         return _json_error(
             _openai_error, f"Run is not active in this gateway process: {run_id}",
             code="run_not_active", status=409)
@@ -1471,6 +1789,7 @@ async def _handle_stop_run(self, request: web.Request, *, _api_server) -> web.Re
         # Reap only this run's background processes (epoch-gated inside, so a concurrent
         # run on the same session_id keeps its own); no-op if the run already finished.
         _api_server._reap_disconnected_agent_processes(agent, source="api_server_run_stop")
+    _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:stop')
     return web.json_response({"run_id": run_id, "status": "stopping"})
 
 
@@ -1489,10 +1808,23 @@ async def _handle_resolve_unknown_run(
     from gateway.platforms.api_server_authority_runs import resolve_unknown_run, store_error_response
     from hermes_state_runtime import RuntimeStoreError
     try:
+        custody_key = _run_custody_control_start(
+            self, run_id, 'resolve_unknown',
+            request_id=body.get('admission_id') if isinstance(body, dict) else None,
+            generation=body.get('execution_generation') if isinstance(body, dict) else None)
+    except (KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        return store_error_response(_api_server._openai_error, exc)
+    try:
         result = await resolve_unknown_run(self, run_id, body)
+        _run_custody_control_success(self, run_id, custody_key, f'api-control:{run_id}:resolve-unknown')
+        _run_custody_request_finish(self, run_id, f'api-run:{run_id}:unknown-finalizer')
         return web.json_response({'run_id': run_id, **result})
     except RuntimeStoreError as exc:
+        _run_custody_control_error(self, run_id, custody_key, exc.reason)
         return store_error_response(_api_server._openai_error, exc)
+    except Exception:
+        _run_custody_control_unknown(self, run_id, custody_key, 'read_failed')
+        raise
 
 
 async def _sweep_orphaned_runs(self) -> None:
