@@ -498,6 +498,62 @@ def test_i12_provider_claim_fire_returns_real_execution_receipt(custody_runtime,
 
 
 
+_I13_ALLOWED_PARENT_ERROR_CLASSES = frozenset({
+    "AttributeError",
+    "CronCustodyRefused",
+    "IntegrityError",
+    "JSONDecodeError",
+    "OSError",
+    "OperationalError",
+    "ProducerIdentityError",
+    "RuntimeError",
+    "TypeError",
+    "ValueError",
+})
+# These names are source-backed by the Hermes bootstrap/PM and cron layers.  The diagnostic
+# records only the final exception class name; it never records a module, path, or message.
+_I13_ALLOWED_CHILD_ERROR_CLASSES = frozenset({
+    "AttributeError",
+    "BuildFailure",
+    "CalledProcessError",
+    "FeatureProbeError",
+    "FileNotFoundError",
+    "ImportError",
+    "InstallError",
+    "IntegrityError",
+    "JSONDecodeError",
+    "KeyError",
+    "ModuleNotFoundError",
+    "NoCommittedEnvironment",
+    "OSError",
+    "OperationalError",
+    "PermissionError",
+    "PinMismatch",
+    "ProducerIdentityError",
+    "ResolutionConflict",
+    "RuntimeError",
+    "StaleLockRow",
+    "TimeoutError",
+    "TypeError",
+    "ValueError",
+})
+_I13_ALLOWED_STDERR_STAGES = frozenset({
+    "not_observed", "empty", "bootstrap", "payload", "plugin", "adoption", "ack", "unknown",
+})
+_I13_STAGE_FRAME_MARKERS = (
+    ("bootstrap", ("in worker_bootstrap", "in finish_worker_boot", "in hermes_bootstrap")),
+    ("payload", ("in _run_external_worker_payload", "could not load payload")),
+    ("plugin", ("in discover_plugins", "in _register_config_hooks", "register_config_hooks")),
+    ("adoption", ("in adopt_claimed_execution", "durable ownership")),
+    ("ack", ("os.replace(ack_tmp_path, ack_path)", "could not publish ready acknowledgement", "ready acknowledgement")),
+)
+
+
+def _i13_parent_exception_class(error):
+    name = type(error).__name__
+    return name if name in _I13_ALLOWED_PARENT_ERROR_CLASSES else "Other"
+
+
 def _i13_constant_reason(error):
     allowed = {
         "worker_ack_mismatch",
@@ -509,7 +565,63 @@ def _i13_constant_reason(error):
         "foreign_custody",
     }
     detail = str(error)
-    return detail if detail in allowed else type(error).__name__
+    return detail if detail in allowed else _i13_parent_exception_class(error)
+
+
+def _i13_child_exception_class(stderr_tail):
+    """Return only an allowlisted final traceback exception name."""
+    final_line = next(
+        (line.strip() for line in reversed(stderr_tail.splitlines()) if line.strip()), "")
+    if ":" not in final_line:
+        return "unknown"
+    prefix, _message = final_line.split(":", 1)
+    if not prefix or any(not (char.isalnum() or char in "_.") for char in prefix):
+        return "unknown"
+    name = prefix.rsplit(".", 1)[-1]
+    return name if name in _I13_ALLOWED_CHILD_ERROR_CLASSES else "unknown"
+
+
+def _i13_stderr_stage(stderr_tail):
+    """Map traceback frames to the last known stage, without exposing stderr text."""
+    last_stage = None
+    for line in stderr_tail.splitlines():
+        lower = line.lower()
+        for stage, markers in _I13_STAGE_FRAME_MARKERS:
+            if any(marker in lower for marker in markers):
+                last_stage = stage
+    if last_stage is not None:
+        return last_stage
+    return "empty" if not stderr_tail.strip() else "unknown"
+
+
+def test_i13_diagnostic_classifier_uses_traceback_order_and_redacts_unknown_text():
+    staged = "\n".join((
+        'File "cron/worker_bootstrap.py", line 1, in worker_bootstrap',
+        'File "cron/scheduler.py", line 2, in _run_external_worker_payload',
+        'File "hermes_cli/plugins.py", line 3, in discover_plugins',
+        'File "cron/executions.py", line 4, in adopt_claimed_execution',
+        "os.replace(ack_tmp_path, ack_path)",
+        "RuntimeError: synthetic failure",
+    ))
+    assert _i13_stderr_stage(staged) == "ack"
+    assert _i13_child_exception_class(staged) == "RuntimeError"
+
+    missing = "\n".join((
+        'File "cron/worker_bootstrap.py", line 1, in worker_bootstrap',
+        'ModuleNotFoundError: No module named "opaque_dep"',
+    ))
+    assert _i13_stderr_stage(missing) == "bootstrap"
+    assert _i13_child_exception_class(missing) == "ModuleNotFoundError"
+
+    opaque = "random output credential-like=redacted RuntimeError somewhere"
+    encoded = json.dumps({
+        "stage": _i13_stderr_stage(opaque),
+        "exception": _i13_child_exception_class(opaque),
+    })
+    assert _i13_stderr_stage(opaque) == "unknown"
+    assert _i13_child_exception_class(opaque) == "unknown"
+    assert "credential-like" not in encoded
+    assert "opaque_dep" not in encoded
 
 
 def _i13_start_time(pid, get_process_start_time):
@@ -543,7 +655,7 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     rejects the child.
     """
     _coordinator, executions, _db = custody_runtime
-    from cron import jobs, scheduler
+    from cron import jobs, scheduler, scheduler_diagnostics
     from cron.runtime_custody import CronOwnerBinding, reserve_execution
     from gateway.status import get_process_start_time
     from hermes_cli.local_runtime import processes as local_processes
@@ -614,12 +726,32 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
     spawn_seen = Event()
     activation_seen = Event()
     launch_done = Event()
-    launch_state = {"returned_true": False, "error_type": None, "constant_reason": None}
+    launch_state = {
+        "returned_true": False,
+        "error_type": None,
+        "parent_exception_class": None,
+        "child_exception_class": "not_observed",
+        "constant_reason": None,
+        "stderr_stage": "not_observed",
+    }
     cleanup_state = {
         "forced_termination": False,
         "launch_thread_alive": True,
         "native_job_closed": False,
     }
+
+    real_stderr_tail = scheduler_diagnostics.external_worker_stderr_tail
+
+    def capture_stderr_tail(path):
+        # The production seam deletes the file immediately after reading it. Keep only a
+        # constant stage; never retain or print the redacted text, argv, paths, or credentials.
+        tail = real_stderr_tail(path)
+        launch_state["stderr_stage"] = _i13_stderr_stage(tail)
+        launch_state["child_exception_class"] = _i13_child_exception_class(tail)
+        return ""
+
+    monkeypatch.setattr(
+        scheduler_diagnostics, "external_worker_stderr_tail", capture_stderr_tail)
 
     def capture_parent(process, native_job):
         pid = getattr(process, "pid", None)
@@ -788,7 +920,8 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
         try:
             launch_state["returned_true"] = scheduler._launch_external_cron_worker(job) is True
         except Exception as error:
-            launch_state["error_type"] = type(error).__name__
+            launch_state["error_type"] = _i13_parent_exception_class(error)
+            launch_state["parent_exception_class"] = launch_state["error_type"]
             launch_state["constant_reason"] = _i13_constant_reason(error)
         finally:
             launch_done.set()
@@ -830,17 +963,24 @@ def test_i13_windows_external_dispatch_identity_diagnostic(custody_runtime, monk
             if final_row.get("status") in {"claimed", "running", "completed", "failed", "unknown"}
             else "other"
         )
+    process = captured["process"]
+    exit_code = getattr(process, "returncode", None) if process is not None else None
     receipt["launch"] = {
         "spawn_observed": spawn_observed,
         "activation_observed": activation_observed,
         "returned_true": launch_state["returned_true"],
         "error_type": launch_state["error_type"],
+        "parent_exception_class": launch_state["parent_exception_class"],
+        "child_exception_class": launch_state["child_exception_class"],
         "constant_reason": launch_state["constant_reason"],
+        "stderr_stage": launch_state["stderr_stage"],
+        "exit_code": exit_code if type(exit_code) is int else None,
         "script_started": started.exists(),
         "release_sent": release.exists(),
     }
     receipt["cleanup"] = cleanup_state
     print("I13_WINDOWS_EXTERNAL_DIAGNOSTIC=" + json.dumps(receipt, sort_keys=True))
+    assert receipt["launch"]["stderr_stage"] in _I13_ALLOWED_STDERR_STAGES
     assert spawn_observed, json.dumps(receipt, sort_keys=True)
     assert activation_observed, json.dumps(receipt, sort_keys=True)
     assert receipt["launch"]["script_started"], json.dumps(receipt, sort_keys=True)

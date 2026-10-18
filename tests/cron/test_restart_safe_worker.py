@@ -240,21 +240,54 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
 
 
 def _stub_external_worker_launch(scheduler, monkeypatch):
-    """Fake Popen that acks the handoff and reports running -> completed.
+    """Unit seam for handoff assertions; native Job evidence stays in live tests.
 
-    Returns ``(spawned, payloads, handoff, get)`` for the caller's assertions.
+    Returns ``(spawned, payloads, handoff, get)`` for the caller's assertions.  On Windows the
+    seam is placed at ``local_processes.spawn_server`` so the real Job cleanup path never receives
+    an incomplete fake Popen.  The fake owner records close, but is never a native-owner proof.
     """
 
+    class FakeHandle:
+        def __init__(self):
+            self.closed = False
+
+        def Close(self):
+            self.closed = True
+
+    class FakeStream:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
     class FakeProcess:
-        returncode = None
+        def __init__(self):
+            self.pid = 4321
+            self.returncode = None
+            self._handle = FakeHandle()
+            self.stdin = FakeStream()
+            self.stdout = FakeStream()
+            self.stderr = FakeStream()
 
         def poll(self):
             return self.returncode
+
+        def kill(self):
+            self.returncode = -9
 
         def wait(self, timeout=None):
             if self.returncode is None:
                 raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
             return self.returncode
+
+    class FakeOwner:
+        def __init__(self, name):
+            self.name = name
+            self.closed = False
+
+        def close(self):
+            self.closed = True
 
     spawned = []
     payloads = []
@@ -270,9 +303,21 @@ def _stub_external_worker_launch(scheduler, monkeypatch):
         )
         return FakeProcess()
 
+    def fake_spawn_server(command, **kwargs):
+        from hermes_cli.local_runtime.processes import _valid_windows_job_name
+
+        owner_job_name = kwargs.get("owner_job_name")
+        assert _valid_windows_job_name(owner_job_name)
+        return popen(command, **kwargs), FakeOwner(owner_job_name)
+
     handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
-    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+    if sys.platform == "win32":
+        from hermes_cli.local_runtime import processes as local_processes
+
+        monkeypatch.setattr(local_processes, "spawn_server", fake_spawn_server)
+    else:
+        monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
     observed_statuses = iter(
         [
             {"id": "exec-1", "status": "running"},
@@ -303,13 +348,52 @@ def test_scoped_wrapper_exit_without_user_bus_names_the_cause_and_invalidates_pr
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending",
                         lambda _eid: {"id": "exec-1", "handoff_pending": 1})
 
+    class DeadStream:
+        def close(self):
+            return None
+
+    class DeadHandle:
+        def Close(self):
+            return None
+
     class DeadWrapper:
-        returncode = 1
+        def __init__(self):
+            self.pid = 4321
+            self.returncode = 1
+            self._handle = DeadHandle()
+            self.stdin = DeadStream()
+            self.stdout = DeadStream()
+            self.stderr = DeadStream()
 
         def poll(self):
-            return 1
+            return self.returncode
 
-    monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *a, **k: DeadWrapper())
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    class DeadOwner:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            return None
+
+    def dead_spawn_server(command, **kwargs):
+        from hermes_cli.local_runtime.processes import _valid_windows_job_name
+
+        owner_job_name = kwargs.get("owner_job_name")
+        assert _valid_windows_job_name(owner_job_name)
+        return DeadWrapper(), DeadOwner(owner_job_name)
+
+    if sys.platform == "win32":
+        from hermes_cli.local_runtime import processes as local_processes
+
+        monkeypatch.setattr(local_processes, "spawn_server", dead_spawn_server)
+    else:
+        monkeypatch.setattr(scheduler.subprocess, "Popen", lambda *a, **k: DeadWrapper())
     # Bus gone: systemd_user_bus_env derives nothing.
     monkeypatch.setattr(pr, "systemd_user_bus_env", lambda base_env=None: dict(base_env or {}))
     monkeypatch.setattr(pr, "_SYSTEMD_SCOPE_AVAILABLE", True)
