@@ -63,6 +63,10 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
 
+      - name: Verify frozen source composition before native tests
+        shell: bash
+        run: python .github/proof/agc1663_source_guard.py
+
       - name: Run venv-holder live E2E
         # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
         # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
@@ -94,6 +98,55 @@ jobs:
             tests/hermes_cli/test_local_runtime_windows_job_owner_live.py \
             tests/tui_gateway/test_host_supervisor_owner_r2.py
 
+      - name: Run producer handle and native owner handoff proof
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/run_tests.sh -j 2 --file-retries 0 \
+            tests/tui_gateway/test_compute_host_shutdown_admission_r6.py \
+            tests/tui_gateway/test_compute_host_shutdown_settlement_r7.py \
+            tests/tui_gateway/test_compute_host_producer_completion_r2.py \
+            tests/tui_gateway/test_compute_host_producer_completion_r3.py \
+            tests/tui_gateway/test_compute_host_producer_completion_gate.py \
+            tests/tui_gateway/test_compute_host_producer_payload_binding.py \
+            tests/tui_gateway/test_compute_host_producer_real_worker_causal.py \
+            tests/tui_gateway/test_compute_host_borrowed_lease.py \
+            tests/tui_gateway/test_host_supervisor_owner_r4_causal.py \
+            tests/tui_gateway/test_host_supervisor_owner_r5_startup.py \
+            tests/tui_gateway/test_host_supervisor_owner_r6_recovery.py \
+            tests/tui_gateway/test_host_supervisor_registry_lease_failure.py \
+            tests/tui_gateway/test_host_supervisor_owner_r6_cross_supervisor.py
+
+      - name: Record exact native producer identity and post-exit ACK
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/run_tests.sh -j 1 --file-retries 0 \
+            tests/tui_gateway/test_host_supervisor_owner_r7_process_handle.py \
+            -- --junitxml=native-owner-identity.xml
+
+      - name: Run real preservation admission and ledger contracts
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/run_tests.sh -j 2 --file-retries 0 \
+            tests/gateway/test_preservation_admission_consumers.py \
+            tests/gateway/test_preservation_drain_control.py \
+            tests/hermes_state/test_preservation_runtime_snapshot.py \
+            tests/gateway/test_runtime_custody_snapshot_contract.py
+
+      - name: Retain native identity receipt
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agc1663-native-owner-identity-${{ github.sha }}
+          path: native-owner-identity.xml
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
         shell: bash
         run: |
@@ -122,3 +175,10 @@ jobs:
         run: |
           set -uo pipefail
           bash scripts/run_tests.sh tests/pm/test_long_paths_windows_live.py -- -m "platforms and integration" -v
+
+      - name: Verify frozen source after all native tests
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        shell: bash
+        run: |
+          python .github/proof/agc1663_source_guard.py
+          git diff --quiet --exit-code
