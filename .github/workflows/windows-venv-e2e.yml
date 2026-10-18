@@ -56,6 +56,7 @@ jobs:
           ref: ${{ inputs.commit || github.sha }}
 
       - name: Set up locked Python and test dependencies
+        id: setup_pm
         uses: ./.github/actions/setup-pm
         with:
           extras: '["messaging"]'
@@ -76,6 +77,8 @@ jobs:
             tests/pm/test_held_entry_windows_live.py
 
       - name: Run Windows owner and identity live E2E
+        # Collect this independent diagnostic after genuine PM setup even if another test lane fails.
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
         # Keep the existing taskkill/process-registry probes in this native
         # owner lane and add the real Job/HostSupervisor proofs. Every file
         # below uses the real Windows process table or Job API; no platform
