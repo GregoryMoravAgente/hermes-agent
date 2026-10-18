@@ -336,13 +336,19 @@ def _legacy_pending_fields(pending):
 
 
 def _pid_alive(pid: int) -> bool:
+    """Read liveness without signaling; uncertain queries retain custody."""
     if pid <= 0:
         return False
     try:
-        os.kill(pid, 0)
+        import psutil
+    except ImportError:
         return True
-    except Exception as exc:
-        return isinstance(exc, PermissionError)
+    try:
+        return psutil.Process(pid).is_running()
+    except psutil.NoSuchProcess:
+        return False
+    except (psutil.Error, OSError, ValueError):
+        return True
 
 
 def _signal_pid(pid: int, sig: int, label: str) -> bool:

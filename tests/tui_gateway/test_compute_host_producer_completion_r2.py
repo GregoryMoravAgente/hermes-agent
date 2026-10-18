@@ -106,13 +106,13 @@ def test_exception_with_live_producer_worker_keeps_completion_unsettled(
                    what="exception pending turn removal")
         receipt = supervisor.shutdown_clean(timeout=30)
         assert receipt["clean"] is False
-        # Gate 1 deliberately has no native owner proof on POSIX, so the
-        # shutdown frame cannot be acknowledged as an owner-bound receipt.
-        # This remains a non-clean refusal and must never publish capture.
-        assert receipt["status"] == "shutdown_ack_missing"
+        # ACK serialization now succeeds, while POSIX still lacks the native
+        # process-owner proof required for a clean capture. These are independent.
+        assert receipt["status"] == "owner_unavailable"
+        assert receipt["owner_state"] == "unavailable"
         assert receipt["process_exited"] is True
         assert receipt["natural_exit"] is True
-        assert receipt["shutdown_ack"] is False
+        assert receipt["shutdown_ack"] is True
         assert receipt["exit_settled"] is True
         assert supervisor.capture_ready is False
         proc = supervisor._proc

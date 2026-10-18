@@ -108,6 +108,16 @@ class ComputeHost:
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers or _default_workers(), thread_name_prefix="compute-host-turn")
         self._closed = threading.Event()
+        self._shutdown_lock = threading.RLock()
+        self._shutdown_requested = threading.Event()
+        self._shutdown_complete = threading.Event()
+        # A parsed turn can already be inside the admission handler when a
+        # signal/orphan shutdown wins the lifecycle lock. Keep that handler alive
+        # until its typed refusal and source-bound receipt have been published.
+        self._turn_admission_condition = threading.Condition()
+        self._turn_admissions = 0
+        self._turn_admission_closed = False
+        self._turn_admission_expired = False
         self._parent_pid = os.getppid()
         self._boot_id = uuid.uuid4().hex
         self._progress_counter = 0
@@ -205,8 +215,16 @@ class ComputeHost:
             logging.getLogger(__name__).warning(
                 "compute host producer startup write failed")
 
-    def close(self) -> None:
+    def close(self, *, deadline: float | None = None) -> bool:
+        """Close transport after a bounded admission seal.
+
+        A direct close has no lifecycle budget and therefore uses an immediate
+        deadline.  It must never wait forever for a reader that may be stuck in
+        a terminal/refusal path; an expired seal leaves custody unresolved.
+        """
+        self._shutdown_requested.set()
         self._closed.set()
+        admissions_settled = self._seal_turn_admissions(deadline=deadline)
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._completion_close_requested.set()
         with self._completion_lock:
@@ -215,26 +233,24 @@ class ComputeHost:
             if fd is not None:
                 with contextlib.suppress(OSError):
                     os.close(fd)
-        # Every caller hard-exits next (os._exit skips atexit): a foreground command still
-        # running in its own process group would outlive the host.
+        # A foreground command in its own process group would outlive the closing host.
         with contextlib.suppress(Exception):
             from tools.environments.base import kill_live_foreground_processes
             kill_live_foreground_processes()
+        self._shutdown_complete.set()
+        return admissions_settled
 
-    def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
-        """Drain in-flight turns, then finalize every session.
-
-        ``_finalize_session`` is a one-shot latch, so finalizing before the drain would spend
-        it mid-turn and release the lease. ``_FLUSH_RESERVE_SECS`` (at most half of ``wait``)
-        is withheld from the drain so the flush still runs when turns outlast the window.
-        Sessions still running at the deadline are skipped (unfinalized keeps them
-        recoverable; atexit ``server._shutdown_sessions`` may re-finalize them).
-        """
-        self._closed.set()
+    def _drain_and_flush(
+        self, *, reason: str, wait: float, deadline: float | None = None,
+    ) -> bool:
+        """Drain accepted turns and flush idle sessions without closing the host transport."""
         budget = max(0.0, wait)
-        deadline = time.monotonic() + budget - min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        reserve = min(_FLUSH_RESERVE_SECS, budget / 2.0)
+        drain_deadline = time.monotonic() + budget - reserve
+        if deadline is not None:
+            drain_deadline = min(drain_deadline, deadline - reserve)
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = drain_deadline - time.monotonic()
             if remaining <= 0 or not self._live_turns():
                 break
             # Bounded by ``remaining``: a flat sleep would eat the reserve it protects.
@@ -242,7 +258,31 @@ class ComputeHost:
         with self._turn_futures_lock:
             live_sids = {sid for f, sid in self._turn_futures.items() if sid and not f.done()}
         self.flush_all_sessions(reason=reason, skip_sids=live_sids)
-        self.close()
+        return not self._live_turns()
+
+    def shutdown(self, *, reason: str = "shutdown", wait: float = 10.0) -> None:
+        """Drain in-flight turns, then close the host for non-command shutdown paths.
+
+        The explicit shutdown command uses ``_drain_and_flush`` first so its ACK can be
+        serialized while the host and completion transport are still alive. Signal, orphan,
+        and stdin-EOF paths retain the existing closed-before-drain behavior. The same
+        monotonic deadline bounds admission sealing; expiry leaves custody unknown.
+        """
+        deadline = time.monotonic() + max(0.0, wait)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self._shutdown_requested.set()
+            self._closed.set()
+        # Let a reader that already entered turn admission acquire the lifecycle
+        # lock, observe the shutdown boundary, and publish its refusal. Waiting
+        # while holding that lock would deadlock the reader before it can write.
+        self._drain_and_flush(reason=reason, wait=wait, deadline=deadline)
+        self._seal_turn_admissions(deadline=deadline)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self.close(deadline=deadline)
 
     def flush_all_sessions(
         self, *, reason: str = "shutdown", skip_sids: Collection[str] | None = None) -> None:
@@ -266,17 +306,79 @@ class ComputeHost:
                 "type": "error", "request_id": frame.get("request_id"),
                 "message": f"unknown frame type: {kind}"})
         else:
-            getattr(self, handler)(frame)
+            if kind == "turn.start":
+                # A frame that entered before shutdown remains counted even while
+                # it waits on the admission RLock. If the barrier was already
+                # sealed, drop it: stdout alone must never become an authenticated
+                # terminal or release a parent lease.
+                if not self._begin_turn_admission():
+                    return
+                try:
+                    getattr(self, handler)(frame)
+                finally:
+                    self._end_turn_admission()
+            else:
+                getattr(self, handler)(frame)
 
     def _handle_shutdown(self, frame: dict[str, Any]) -> None:
-        # Drain accepted worker futures before acknowledging the exact shutdown request.
-        # The parent refuses clean capture unless this post-drain receipt is observed.
-        self.shutdown(reason="shutdown")
-        self.emit({
-            "type": "shutdown.ack", "request_id": frame.get("request_id"),
-            "host_pid": os.getpid(), "host_boot_id": self._boot_id,
-            "drained": not self._live_turns(),
-        })
+        # The exact ACK must be serialized before close marks the host terminal or closes
+        # the completion channel. The parent refuses clean capture unless this receipt is
+        # observed and matches the current process identity. An expired admission seal
+        # deliberately emits no ACK, leaving the parent in unknown custody.
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            self._shutdown_requested.set()
+            self._closed.set()
+        deadline = time.monotonic() + 10.0
+        drained = self._drain_and_flush(reason="shutdown", wait=10.0, deadline=deadline)
+        admissions_settled = self._seal_turn_admissions(deadline=deadline)
+        with self._shutdown_lock:
+            if self._shutdown_complete.is_set():
+                return
+            try:
+                if admissions_settled:
+                    self.emit({
+                        "type": "shutdown.ack", "request_id": frame.get("request_id"),
+                        "host_pid": os.getpid(), "host_boot_id": self._boot_id,
+                        "drained": drained,
+                    })
+            finally:
+                self.close(deadline=deadline)
+
+    def _begin_turn_admission(self) -> bool:
+        """Register a parsed turn until its terminal/refusal path returns."""
+        with self._turn_admission_condition:
+            if self._turn_admission_closed:
+                return False
+            self._turn_admissions += 1
+            return True
+
+    def _end_turn_admission(self) -> None:
+        with self._turn_admission_condition:
+            self._turn_admissions -= 1
+            if self._turn_admissions == 0:
+                self._turn_admission_condition.notify_all()
+
+    def _seal_turn_admissions(self, *, deadline: float | None = None) -> bool:
+        """Bound the parsed-turn admission/refusal wait before closing custody."""
+        if deadline is None:
+            # A direct close has no caller-owned lifecycle budget.  Fail closed
+            # immediately rather than inventing an unbounded grace period.
+            deadline = time.monotonic()
+        with self._turn_admission_condition:
+            if self._turn_admission_expired:
+                self._turn_admission_closed = True
+                return False
+            while self._turn_admissions:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._turn_admission_closed = True
+                    self._turn_admission_expired = True
+                    return False
+                self._turn_admission_condition.wait(timeout=remaining)
+            self._turn_admission_closed = True
+            return True
 
     def _track_turn_future(self, future: concurrent.futures.Future, sid: str) -> None:
         """Track an in-flight turn; the done callback pops it or the map grows forever."""
@@ -289,18 +391,40 @@ class ComputeHost:
             self._turn_futures.pop(future, None)
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
-        try:
-            future = self._executor.submit(self._run_real_turn, dict(frame))
-        except RuntimeError as exc:
+        sid = str(frame.get("sid") or "")
+        request_id = frame.get("request_id")
+        refused_by_shutdown = False
+        submit_error: str | None = None
+        # The child reader and signal/orphan shutdown share this boundary.  Hold it
+        # only through submit+track: response/interrupt handlers remain outside the
+        # lock so already-accepted work can drain and publish its terminal frame.
+        with self._shutdown_lock:
+            if self._shutdown_requested.is_set() or self._closed.is_set():
+                refused_by_shutdown = True
+            else:
+                try:
+                    future = self._executor.submit(self._run_real_turn, dict(frame))
+                except RuntimeError as exc:
+                    submit_error = str(exc)
+                else:
+                    self._track_turn_future(future, sid)
+        if refused_by_shutdown:
             self._reply_and_complete(
-                "turn.error", str(frame.get("sid") or ""), frame.get("request_id"),
-                turn_id=str(frame.get("turn_id") or frame.get("request_id") or ""),
+                "turn.error", sid, request_id,
+                turn_id=str(frame.get("turn_id") or request_id or ""),
                 session_key=str(frame.get("session_key") or ""),
                 profile_home=str(frame.get("profile_home") or ""),
                 origin_session_key=str(frame.get("session_key") or ""),
-                reason="submit_refused", message=str(exc))
+                reason="shutdown_requested", message="compute host is shutting down")
             return
-        self._track_turn_future(future, str(frame.get("sid") or ""))
+        if submit_error is not None:
+            self._reply_and_complete(
+                "turn.error", sid, request_id,
+                turn_id=str(frame.get("turn_id") or request_id or ""),
+                session_key=str(frame.get("session_key") or ""),
+                profile_home=str(frame.get("profile_home") or ""),
+                origin_session_key=str(frame.get("session_key") or ""),
+                reason="submit_refused", message=submit_error)
 
     def _guarded(
         self, frame: dict[str, Any], error_kind: str, body: Callable, *,
@@ -768,6 +892,8 @@ class ComputeHost:
 
     def _heartbeat_loop(self) -> None:
         while not self._closed.wait(self._heartbeat_secs):
+            if self._shutdown_requested.is_set():
+                return
             active_turns = len(self._live_turns())
             with self._progress_lock:
                 counter = self._progress_counter
@@ -777,6 +903,8 @@ class ComputeHost:
 
     def _parent_guard_loop(self) -> None:
         while not self._closed.wait(1.0):
+            if self._shutdown_requested.is_set():
+                return
             ppid = os.getppid()
             if ppid in {0, 1} or (self._parent_pid and ppid != self._parent_pid):
                 self.emit({"type": "orphan", "old_ppid": self._parent_pid, "ppid": ppid})
@@ -879,6 +1007,8 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         "build_sha": _build_sha(), "cwd": os.getcwd(),
         "hermes_home": os.environ.get("HERMES_HOME", "")})
 
+    shutdown_command_started = threading.Event()
+
     def _reader() -> None:
         for raw in stdin:
             if host._closed.is_set():
@@ -891,9 +1021,14 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if not isinstance(frame, dict):
                 host.emit({"type": "error", "message": "frame must be an object"})
                 continue
+            is_shutdown = frame.get("type") == "shutdown"
+            if is_shutdown:
+                shutdown_command_started.set()
             host.handle_frame(frame)
-            if frame.get("type") == "shutdown":
-                os._exit(0)
+            if is_shutdown:
+                # The handler has emitted and flushed the ACK before close(). The main
+                # thread joins this reader before running any fallback finalizer.
+                return
             if host._closed.is_set():
                 break
     reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
@@ -903,8 +1038,13 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
             if not reader.is_alive():
                 break
     finally:
+        if shutdown_command_started.is_set():
+            # A command handler owns the shutdown lock and has a bounded drain. Joining
+            # here prevents the main thread from exiting while the ACK write is in flight.
+            reader.join()
         server.unregister_live_transport(host._transport)
-        host.shutdown(reason="stdin_closed", wait=2.0)
+        if not host._shutdown_complete.is_set():
+            host.shutdown(reason="stdin_closed", wait=2.0)
 
 
 def main(argv: list[str] | None = None) -> int:

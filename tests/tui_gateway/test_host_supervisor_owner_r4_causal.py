@@ -10,14 +10,20 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import subprocess
+import sys
+import threading
 import types
 
 import pytest
 
+from hermes_cli import backend_retirement
+from tests.waiting import wait_until
 from tui_gateway.host_supervisor import (
     HostSupervisor,
     _PendingTurn,
     _StreamState,
+    _pid_alive,
 )
 
 
@@ -67,7 +73,12 @@ def _seed_parent_state(supervisor: HostSupervisor, tmp_path: Path, *, exited: bo
         supervisor._owner = owner
         supervisor._owner_identity = (7, "boot-7", proc.pid)
         supervisor._producer_identity = (proc.pid, "boot-7")
-        supervisor._producer_process_handle = types.SimpleNamespace(is_open=True, close=lambda: None)
+        # This is only the closed typed state contract for portable ACK cases. Native
+        # handle/FILETIME/Job validity remains exclusively the real R7 Windows proof.
+        supervisor._producer_process_handle = types.SimpleNamespace(
+            pid=proc.pid, creation_filetime=77, is_open=True, close=lambda: None,
+        )
+        supervisor._producer_creation_filetime = 77
         supervisor._stream_states[id(proc)] = states
         if not hasattr(supervisor, "_exit_settled"):
             supervisor._exit_settled = {}
@@ -77,6 +88,28 @@ def _seed_parent_state(supervisor: HostSupervisor, tmp_path: Path, *, exited: bo
             wait=lambda timeout=None: exited,
         )
     return proc, owner
+
+
+def _real_r4_supervisor(
+    tmp_path: Path, *, ack_gate_paths: tuple[Path, Path] | None = None,
+) -> HostSupervisor:
+    root = Path(__file__).resolve().parents[2]
+    fixture = Path(__file__).with_name("compute_host_producer_gate_child_r3.py")
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    argv = [sys.executable, str(fixture), "--mode", "normal"]
+    if ack_gate_paths is not None:
+        ready, release = ack_gate_paths
+        argv.extend((
+            "--shutdown-ack-ready", str(ready),
+            "--shutdown-ack-release", str(release),
+        ))
+    return HostSupervisor(
+        autostart=False, registry_path=tmp_path / "compute-host.json", argv=argv,
+        cwd=root, env={"HERMES_HOME": str(hermes_home), "PYTHONPATH": str(root)},
+        expected_build_sha="unknown", expected_hermes_home=str(hermes_home),
+        heartbeat_secs=60,
+    )
 
 
 def test_pending_turn_refuses_shutdown_before_any_destructive_frame(monkeypatch, tmp_path: Path):
@@ -278,3 +311,145 @@ def test_destructive_owner_release_retains_identity_after_close_failure(tmp_path
     assert supervisor._owner is None
     assert supervisor._owner_identity is None
     assert owner.close_calls == 2
+
+
+@pytest.mark.platforms("windows")
+def test_native_shutdown_ack_barrier_precedes_close_and_reader_exit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    """The real child must publish ACK before close/finalization can win the race."""
+    ready = tmp_path / "shutdown-ack-ready"
+    release = tmp_path / "shutdown-ack-release"
+    supervisor = _real_r4_supervisor(tmp_path, ack_gate_paths=(ready, release))
+    fence = backend_retirement.RetirementFence()
+    monkeypatch.setattr(backend_retirement, "retirement", fence)
+    profile_home = tmp_path / "hermes-home"
+    lease = fence.acquire(
+        owner_kind="compute-host-turn", owner_id=str(tmp_path), profile_id=str(profile_home),
+    )
+    callback_done = threading.Event()
+    callback_frames: list[dict] = []
+
+    def callback(frame: dict) -> bool:
+        callback_frames.append(dict(frame))
+        callback_done.set()
+        return True
+
+    callback._retirement_lease = lease
+    receipt_box: list[dict] = []
+    shutdown_done = threading.Event()
+    stopper: threading.Thread | None = None
+    acked = False
+    try:
+        supervisor.start()
+        process_handle = supervisor._producer_process_handle
+        assert process_handle is not None and process_handle.is_open
+        supervisor.submit_turn(
+            {
+                "type": "turn.start", "sid": "compute-owner-sid",
+                "request_id": "owner-r4-ack-gate", "turn_id": "owner-r4-ack-gate",
+                "session_key": "compute-owner-session", "profile_home": str(profile_home),
+                "text": "owner ACK barrier turn", "history": [], "history_version": 0,
+                "cols": 80, "cwd": str(tmp_path), "source": "desktop",
+            },
+            on_complete=callback,
+        )
+        wait_until(callback_done.is_set, timeout=30, what="ACK barrier producer callback")
+        wait_until(lambda: fence.active_count() == 0, timeout=30, what="ACK barrier lease release")
+
+        def stop() -> None:
+            receipt_box.append(supervisor.shutdown_clean(timeout=30))
+            shutdown_done.set()
+
+        stopper = threading.Thread(target=stop, name="compute-owner-ack-barrier-stop")
+        stopper.start()
+        wait_until(ready.exists, timeout=30, what="real shutdown ACK write barrier")
+        assert shutdown_done.is_set() is False
+        assert supervisor._proc is not None and supervisor._proc.poll() is None
+        assert supervisor._owner is not None
+        assert supervisor.capture_ready is False
+        release.write_text("release", encoding="utf-8")
+        wait_until(shutdown_done.is_set, timeout=30, what="shutdown ACK barrier receipt")
+        stopper.join(timeout=2)
+        assert not stopper.is_alive()
+        receipt = receipt_box[0]
+        assert receipt["status"] == "clean_stopped"
+        assert receipt["clean"] is True
+        assert receipt["shutdown_ack"] is True
+        assert receipt["owner_state"] == "empty"
+        assert supervisor.acknowledge_clean_stop(receipt) is True
+        acked = True
+        assert process_handle.is_open is False
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if stopper is not None:
+            stopper.join(timeout=35)
+        if not acked:
+            supervisor.shutdown()
+        if fence.active_count():
+            fence.release(lease)
+
+
+@pytest.mark.platforms("windows")
+def test_windows_pid_probe_does_not_signal_live_foreign_process():
+    """A liveness probe must not terminate a live process outside this owner Job."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "input()"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    pid = child.pid
+    try:
+        assert _pid_alive(pid) is True
+        assert child.poll() is None
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
+    assert _pid_alive(pid) is False
+
+
+def test_real_shutdown_ack_barrier_serializes_before_transport_close(tmp_path: Path):
+    """Real run_host stays alive until its ACK write is released, on the actual OS."""
+    ready = tmp_path / "portable-ack-ready"
+    release = tmp_path / "portable-ack-release"
+    supervisor = _real_r4_supervisor(tmp_path, ack_gate_paths=(ready, release))
+    results = []
+    errors = []
+    done = threading.Event()
+
+    def stop():
+        try:
+            results.append(supervisor.shutdown_clean(timeout=30))
+        except BaseException as exc:
+            errors.append(type(exc).__name__)
+        finally:
+            done.set()
+
+    stopper = None
+    try:
+        supervisor.start()
+        proc = supervisor._proc
+        assert proc is not None
+        stopper = threading.Thread(target=stop, name="portable-real-ack-stop")
+        stopper.start()
+        wait_until(ready.exists, timeout=15, what="real child ACK write barrier")
+        # This is a bounded observation of the actual child, not a timing sleep or OS fake.
+        with pytest.raises(subprocess.TimeoutExpired):
+            proc.wait(timeout=1.0)
+        assert done.is_set() is False
+        assert supervisor.capture_ready is False
+        release.write_text("release", encoding="utf-8")
+        wait_until(done.is_set, timeout=30, what="real post-barrier ACK receipt")
+        stopper.join(timeout=2)
+        assert not stopper.is_alive()
+        assert not errors
+        assert len(results) == 1
+        assert results[0]["shutdown_ack"] is True
+        assert results[0]["natural_exit"] is True
+        assert results[0]["exit_settled"] is True
+        # Full clean/Job/retained-handle acceptance stays in the unchanged native R7 test.
+    finally:
+        release.write_text("release", encoding="utf-8")
+        if stopper is not None:
+            stopper.join(timeout=35)
+        supervisor.shutdown()  # Exact fixture containment, never counted as clean acceptance.

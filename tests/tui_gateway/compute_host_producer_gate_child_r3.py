@@ -36,6 +36,36 @@ _WIRE_STDOUT = sys.stdout
 
 from tests.waiting import wait_until
 
+
+class _ShutdownAckGate:
+    """Hold the real shutdown ACK write at a test-owned barrier."""
+
+    def __init__(self, stream, ready: str, release: str) -> None:
+        self._stream = stream
+        self._ready = Path(ready)
+        self._release = Path(release)
+        self._armed = False
+
+    def write(self, data: str) -> int:
+        if not self._armed:
+            try:
+                frame = json.loads(data.strip())
+            except (TypeError, json.JSONDecodeError):
+                frame = None
+            if isinstance(frame, dict) and frame.get("type") == "shutdown.ack":
+                self._ready.write_text("ready", encoding="utf-8")
+                wait_until(
+                    self._release.exists,
+                    timeout=30,
+                    what="test-owned shutdown ACK release",
+                )
+                self._armed = True
+        return self._stream.write(data)
+
+    def flush(self) -> None:
+        self._stream.flush()
+
+
 def _descendant_main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--descendant", action="store_true")
@@ -423,15 +453,24 @@ def _main(argv: list[str]) -> int:
     parser.add_argument("--retry-go", default="")
     parser.add_argument("--duplicate-go", default="")
     parser.add_argument("--duplicate-written", default="")
+    parser.add_argument("--shutdown-ack-ready", default="")
+    parser.add_argument("--shutdown-ack-release", default="")
     args = parser.parse_args(argv)
 
     _install_neutral_turn_seams()
     server._sessions[_SID] = _session()
     _configure_mode(args)
+    if bool(args.shutdown_ack_ready) != bool(args.shutdown_ack_release):
+        raise SystemExit("shutdown ACK gate requires both synchronization paths")
+    stdout = _WIRE_STDOUT
+    if args.shutdown_ack_ready:
+        stdout = _ShutdownAckGate(
+            _WIRE_STDOUT, args.shutdown_ack_ready, args.shutdown_ack_release,
+        )
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     # main() only parses argv then calls run_host() without an explicit stream. Pass
     # the captured pipe explicitly so server's logging redirect cannot move the wire.
-    compute_host.run_host(stdout=_WIRE_STDOUT)
+    compute_host.run_host(stdout=stdout)
     return 0
 
 
