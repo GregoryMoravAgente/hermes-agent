@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Collection
 
 from tui_gateway.host_supervisor import MUTATOR_ROUTE_TABLE, _build_sha
+from tui_gateway.windows_producer_identity import build_producer_startup_record
 
 
 def now_ns() -> int:
@@ -190,6 +191,20 @@ class ComputeHost:
             logging.getLogger(__name__).warning(
                 "compute host producer completion write failed")
 
+    def _emit_producer_startup(self) -> None:
+        """Bind the real child PID/boot before public hello or tool imports."""
+        record = build_producer_startup_record(pid=os.getpid(), boot_id=self._boot_id)
+        data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        try:
+            with self._completion_lock:
+                fd = self._completion_fd
+                if fd is None or self._completion_closed.is_set():
+                    return
+                _write_completion_bytes(fd, data)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "compute host producer startup write failed")
+
     def close(self) -> None:
         self._closed.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -254,9 +269,14 @@ class ComputeHost:
             getattr(self, handler)(frame)
 
     def _handle_shutdown(self, frame: dict[str, Any]) -> None:
-        self.emit({"type": "shutdown.ack", "request_id": frame.get("request_id")})
-        # Explicit shutdown is a clean close; SIGTERM and orphan paths do the durability flush.
-        self.close()
+        # Drain accepted worker futures before acknowledging the exact shutdown request.
+        # The parent refuses clean capture unless this post-drain receipt is observed.
+        self.shutdown(reason="shutdown")
+        self.emit({
+            "type": "shutdown.ack", "request_id": frame.get("request_id"),
+            "host_pid": os.getpid(), "host_boot_id": self._boot_id,
+            "drained": not self._live_turns(),
+        })
 
     def _track_turn_future(self, future: concurrent.futures.Future, sid: str) -> None:
         """Track an in-flight turn; the done callback pops it or the map grows forever."""
@@ -835,6 +855,9 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
     stdin = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)
     completion_fd = _open_producer_completion_fd()
     host = ComputeHost(stdout=stdout or sys.stdout, completion_fd=completion_fd)
+    # This is the only source-authenticated startup identity. It must precede
+    # public hello and the server/tool import path, whose output is untrusted.
+    host._emit_producer_startup()
     shutting_down = threading.Event()
     # No client is connected to this process: session-less broadcasts (``broadcast_plugin_event``
     # from a plugin tool/hook running in the isolated turn) ride the host pipe to the parent

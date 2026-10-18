@@ -334,6 +334,24 @@ async def _start_gateway_start_control_socket(runner):
             except concurrent.futures.TimeoutError:
                 return {"multiplex": True, "pending": True, "served_profiles": runner.served_profile_names()}
 
+        def _private_preservation_handler(operation):
+            """Marshal an authenticated private request to the gateway loop.
+
+            The socket executor never mutates runtime state.  A long local preservation phase may
+            outlive the two-second socket response budget; in that case the exact receipt remains
+            owned by the loop and the caller receives a typed pending result to poll.
+            """
+            def handler(params, peer_subject):
+                future = asyncio.run_coroutine_threadsafe(
+                    operation(runner, params, peer_subject), _main_loop)
+                try:
+                    return future.result(timeout=1.5)
+                except concurrent.futures.TimeoutError:
+                    return {"status": "pending", "operation": operation.__name__}
+                except Exception:  # health: allow BLE001 -- authenticated preservation operation callback is opaque; constant refusal retains receipt and custody without exposing exception values
+                    return {"status": "refused", "reason": "runtime_draining"}
+            return handler
+
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
                            "rescan-profiles": _rescan_profiles_handler,
@@ -344,6 +362,20 @@ async def _start_gateway_start_control_socket(runner):
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+        from gateway.run_runtime import (
+            acknowledge_preservation_native,
+            abort_preservation_drain,
+            begin_preservation_drain,
+            prepare_preservation_handoff,
+            preservation_drain_status,
+        )
+        _control_server.private_handlers.update({
+            "preservation-drain-begin": _private_preservation_handler(begin_preservation_drain),
+            "preservation-drain-prepare": _private_preservation_handler(prepare_preservation_handoff),
+            "preservation-drain-abort": _private_preservation_handler(abort_preservation_drain),
+            "preservation-drain-native-ack": _private_preservation_handler(acknowledge_preservation_native),
+            "preservation-drain-status": _private_preservation_handler(preservation_drain_status),
+        })
         _control_server.ticket_store = runner.session_ticket_store
         if not await _control_server.start():
             _control_server = None
@@ -398,10 +430,11 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in cron_profile_homes])
 
-    # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
+    # Only the in-process ticker polls local due jobs, so only it gets the reversible-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+            runner._draining or runner._external_drain_active
+            or getattr(runner, "_preservation_drain_active", False))
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(

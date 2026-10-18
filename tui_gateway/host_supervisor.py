@@ -24,6 +24,24 @@ from typing import Any
 from hermes_cli.local_runtime.processes import spawn_server
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
+from tui_gateway.host_supervisor_streams import drain_producer_completion, readers_settled
+from tui_gateway.windows_owner_recovery import (
+    new_windows_job_name,
+    owner_record_key,
+    owner_state,
+    persist_owner_record,
+    remove_registry_record,
+    RegistryLease,
+    reconcile_startup_orphan,
+    release_owner,
+    try_close_owner,
+)
+from tui_gateway.windows_producer_identity import (
+    accept_producer_startup,
+    cancel_producer_startup,
+    try_close_producer_handle,
+    valid_producer_startup_record,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -148,6 +166,11 @@ def _valid_producer_completion_record(record: dict[str, Any]) -> bool:
         type(digest) is str and len(digest) == 64
         and all(char in "0123456789abcdef" for char in digest)
     )
+
+
+def _valid_producer_startup_record(record: dict[str, Any]) -> bool:
+    """Validate the source-bound startup identity before accepting public hello."""
+    return valid_producer_startup_record(record, is_windows=os.name == "nt")
 
 
 def _close_fd(fd: int | None) -> None:
@@ -376,13 +399,42 @@ class HostSupervisor:
         self._hello_lock = threading.Lock()
         self._proc: subprocess.Popen[str] | None = None
         self._owner: Any | None = None
+        # The Windows Job name is the recoverable owner credential.  It is only
+        # persisted after startup identity validation; no PID is ever adopted.
+        self._owner_job_name: str | None = None
+        self._registry_owner_key: tuple[str, int, str, int, str | None] | None = None
+        self._registry_record_removed = False
+        # A query-only handle for a live named Job is retained while duplicate
+        # startup is refused.  Closing the last handle on KILL_ON_JOB_CLOSE can
+        # terminate members, so an active recovery handle is never closed merely
+        # to return an error.
+        self._recovery_owner: Any | None = None
+        self._registry_lease: RegistryLease | None = None
         self._owner_closed = False
         # The identity is deliberately unset until the exact child has passed hello
         # validation. It is (host generation, validated boot id, Popen pid), never a
         # random metadata token that could bind a different process.
         self._owner_identity: tuple[int, str, int] | None = None
+        # The private startup receipt binds the real ComputeHost identity separately
+        # from the Popen/owner identity.  A Windows venv launcher may have a
+        # different PID from the real child; completion and shutdown ACKs use this
+        # source-bound pair, while owner custody remains bound to Popen and its Job.
+        self._producer_identity: tuple[int, str] | None = None
+        self._producer_process_handle: Any | None = None
+        self._producer_creation_filetime: int | None = None
+        self._startup_event = threading.Event()
+        self._startup_identity: tuple[int, str] | None = None
+        self._startup_error = ""
+        self._startup_seen = False
+        self._startup_binding: tuple[Any, int] | None = None
+        self._startup_cancelled_generations: set[int] = set()
+        self._startup_orphan_handles: dict[int, Any] = {}
         self._pending_shutdown_receipt: dict[str, Any] | None = None
+        self._shutdown_request_id: str | None = None
+        self._shutdown_ack: dict[str, Any] | None = None
+        self._shutdown_admission_closed = False
         self._stream_states: dict[int, tuple[_StreamState, _StreamState, _StreamState]] = {}
+        self._exit_settled: dict[int, threading.Event] = {}
         self._shutdown_sent = False
         self._hello_event = threading.Event()
         self._hello: dict[str, Any] = {}
@@ -401,7 +453,10 @@ class HostSupervisor:
         # host work still runs, so the eventual control.ack is not silently dropped.
         # The host emits its control.ack whenever it finishes; without this the ack matched no queue and was
         # silently dropped. See #97948.
-        self._late_control_handlers: dict[str, tuple[float, Callable[[dict], None]]] = {}
+        self._late_control_handlers: dict[
+            str, tuple[float, Callable[[dict], None] | None]
+        ] = {}
+        self._late_control_uncertain = False
         self._stderr_tail: list[str] = []
         self._last_progress_counter = 0
         if autostart:
@@ -429,39 +484,57 @@ class HostSupervisor:
 
     def start(self) -> None:
         with self._lock:
+            if self._closing:
+                raise RuntimeError("compute host is closing")
             if self.is_running():
                 return
             if self._owner is not None:
                 raise RuntimeError("compute host owner is still retained after stop")
+            if self._registry_lease is None and not self._acquire_registry_lease():
+                raise RuntimeError("compute host registry is already owned")
             self._closing = False
+            self._shutdown_admission_closed = False
             self._pending_shutdown_receipt = None
             self._shutdown_sent = False
-            self.reconcile_startup_orphan()
+            self._shutdown_request_id = None
+            self._shutdown_ack = None
+            outcome = self.reconcile_startup_orphan(keep_lease=True)
+            if outcome == "owner-unavailable":
+                raise RuntimeError("compute host owner is still live or not proven absent")
             self._spawn_locked(reason="startup")
+
+    def _acquire_registry_lease(self) -> bool:
+        self._registry_lease = RegistryLease.acquire(self.registry_path)
+        return self._registry_lease is not None
+
+    def _release_registry_lease(self) -> bool:
+        if self._registry_lease is None:
+            return True
+        released = self._registry_lease.release()
+        self._registry_lease = None if released else self._registry_lease
+        return released
 
     def _owner_state(self) -> str:
         with self._lock:
             owner = self._owner
-        if owner is None:
-            return "unavailable"
-        try:
-            empty = owner.empty()
-        except Exception:  # health: allow BLE001 -- a native owner query cannot prove emptiness after any failure; retain unknown custody
-            return "unknown"
-        if empty is None:
-            return "unknown"
-        return "empty" if empty else "nonempty"
+        return owner_state(owner)
 
-    def _release_owner(self) -> None:
-        with self._lock:
-            owner = self._owner
-            self._owner = None
-            self._owner_closed = False
-            self._owner_identity = None
-            self._host_resource_custody_known = False
-        if owner is not None:
-            with contextlib.suppress(Exception):
-                owner.close()
+    def _release_owner(self) -> bool:
+        return release_owner(self)
+
+    @staticmethod
+    def _try_close_owner(owner: Any | None) -> bool:
+        return try_close_owner(owner)
+
+    def _try_close_producer_handle(self) -> bool:
+        return try_close_producer_handle(self)
+
+    @staticmethod
+    def _readers_settled(
+        states: tuple[_StreamState, _StreamState, _StreamState] | None,
+        timeout: float,
+    ) -> bool:
+        return readers_settled(states, timeout)
 
     @staticmethod
     def _stop_result(
@@ -469,6 +542,9 @@ class HostSupervisor:
         stdout: _StreamState | None, stderr: _StreamState | None,
         completion: _StreamState | None, owner_state: str, error: str = "",
         identity: tuple[int, str, int] | None = None,
+        shutdown_ack: bool = True, exit_settled: bool = True,
+        pending_turns: int = 0, pending_controls: int = 0,
+        late_controls: int = 0, late_control_uncertain: bool = False,
     ) -> dict[str, Any]:
         streams = (stdout, stderr, completion)
         reader_done = all(state is not None and state.done.is_set() for state in streams)
@@ -477,8 +553,17 @@ class HostSupervisor:
         clean = bool(
             shutdown_sent and process_exited and natural_exit and reader_done and reader_eof
             and not reader_failed and owner_state == "empty" and identity is not None
+            and shutdown_ack and exit_settled
+            and not pending_turns and not pending_controls and not late_controls
+            and not late_control_uncertain
         )
-        if clean:
+        if pending_turns or pending_controls or late_controls or late_control_uncertain:
+            status = "pending_work"
+        elif not shutdown_ack:
+            status = "shutdown_ack_missing"
+        elif not exit_settled:
+            status = "exit_settlement_pending"
+        elif clean:
             status = "clean_stopped"
         elif owner_state == "unavailable":
             status = "owner_unavailable"
@@ -504,6 +589,12 @@ class HostSupervisor:
             "completion_eof": bool(completion is not None and completion.eof),
             "completion_failed": bool(completion is not None and completion.failed),
             "owner_state": owner_state,
+            "shutdown_ack": bool(shutdown_ack),
+            "exit_settled": bool(exit_settled),
+            "pending_turns": int(pending_turns),
+            "pending_controls": int(pending_controls),
+            "late_controls": int(late_controls),
+            "late_control_uncertain": bool(late_control_uncertain),
         }
         if identity is not None:
             result.update({
@@ -531,11 +622,50 @@ class HostSupervisor:
             proc = self._proc
             states = self._stream_states.get(id(proc)) if proc is not None else None
             shutdown_sent = self._shutdown_sent
+            pending_turns = len(self._pending_turns)
+            pending_controls = len(self._pending_controls)
+            late_controls = len(self._late_control_handlers)
+            late_control_uncertain = self._late_control_uncertain
+            identity = self._owner_identity
+            shutdown_ack = self._shutdown_ack is not None
+            exit_event = self._exit_settled.get(id(proc)) if proc is not None else None
+
+            # Freeze new admission before checking pending state. The lock makes this
+            # one atomic boundary with submit_turn: no new turn can cross the check
+            # below, while an already accepted turn may still use the explicit
+            # respond/interrupt drain path.
+            self._shutdown_admission_closed = True
+            if not (pending_turns or pending_controls or late_controls or late_control_uncertain):
+                if not shutdown_sent:
+                    self._shutdown_request_id = f"shutdown-{uuid.uuid4().hex}"
+                    self._shutdown_ack = None
+                shutdown_request_id = self._shutdown_request_id
+            else:
+                shutdown_request_id = None
+
+        stdout, stderr, completion = states or (None, None, None)
+        if pending_turns or pending_controls or late_controls or late_control_uncertain:
+            result = self._stop_result(
+                shutdown_sent=shutdown_sent,
+                process_exited=bool(proc is not None and proc.poll() is not None),
+                natural_exit=False,
+                stdout=stdout, stderr=stderr, completion=completion,
+                owner_state=self._owner_state(), error="pending_work",
+                identity=identity, shutdown_ack=shutdown_ack,
+                exit_settled=bool(exit_event is not None and exit_event.is_set()),
+                pending_turns=pending_turns, pending_controls=pending_controls,
+                late_controls=late_controls, late_control_uncertain=late_control_uncertain,
+            )
+            result["admission_closed"] = True
+            result["retry_after_settlement"] = True
+            return result
         if proc is None:
             return self._stop_result(
                 shutdown_sent=shutdown_sent, process_exited=False, natural_exit=False,
-                stdout=None, stderr=None, completion=None, owner_state=self._owner_state(),
-                error="no_process", identity=self._owner_identity,
+                stdout=stdout, stderr=stderr, completion=completion,
+                owner_state=self._owner_state(), error="no_process", identity=identity,
+                shutdown_ack=shutdown_ack,
+                exit_settled=bool(exit_event is not None and exit_event.is_set()),
             )
         deadline = time.monotonic() + max(0.0, float(timeout))
         error = ""
@@ -543,13 +673,15 @@ class HostSupervisor:
             try:
                 if proc.poll() is None and proc.stdin is not None:
                     self._send_frame({
-                        "type": "shutdown", "request_id": f"shutdown-{uuid.uuid4().hex}",
-                    })
+                        "type": "shutdown", "request_id": shutdown_request_id,
+                    }, allow_shutdown=True)
                     shutdown_sent = True
                     with self._lock:
                         self._shutdown_sent = True
                 else:
                     error = "host_not_running"
+            except _FrameSendError as exc:
+                error = "shutdown_send_ambiguous" if exc.ambiguous else f"shutdown_send_failed:{type(exc).__name__}"
             except Exception as exc:  # health: allow BLE001 -- failed shutdown delivery cannot prove clean custody; retain the exception type only
                 error = f"shutdown_send_failed:{type(exc).__name__}"
 
@@ -558,15 +690,30 @@ class HostSupervisor:
                 proc.wait(timeout=max(0.0, deadline - time.monotonic()))
         process_exited = proc.poll() is not None
         natural_exit = bool(shutdown_sent and process_exited and proc.returncode == 0)
-        stdout, stderr, completion = states or (None, None, None)
         for state in (stdout, stderr, completion):
             if state is not None:
                 state.done.wait(timeout=max(0.0, deadline - time.monotonic()))
+        exit_settled = bool(
+            exit_event is not None
+            and exit_event.wait(timeout=max(0.0, deadline - time.monotonic()))
+        )
+        with self._lock:
+            shutdown_ack = (
+                self._shutdown_ack is not None
+                and self._shutdown_request_id == shutdown_request_id
+            )
+            pending_turns = len(self._pending_turns)
+            pending_controls = len(self._pending_controls)
+            late_controls = len(self._late_control_handlers)
+            late_control_uncertain = self._late_control_uncertain
+            identity = self._owner_identity
         result = self._stop_result(
             shutdown_sent=shutdown_sent, process_exited=process_exited,
             natural_exit=natural_exit, stdout=stdout, stderr=stderr,
             completion=completion, owner_state=self._owner_state(), error=error,
-            identity=self._owner_identity,
+            identity=identity, shutdown_ack=shutdown_ack, exit_settled=exit_settled,
+            pending_turns=pending_turns, pending_controls=pending_controls,
+            late_controls=late_controls, late_control_uncertain=late_control_uncertain,
         )
         if result["clean"]:
             with self._lock:
@@ -580,6 +727,7 @@ class HostSupervisor:
                     result["clean"] = False
                     result["ack_required"] = False
                     result["status"] = "stale_identity"
+        result["admission_closed"] = self._shutdown_admission_closed
         return result
 
     def acknowledge_clean_stop(self, receipt: dict[str, Any]) -> bool:
@@ -590,6 +738,14 @@ class HostSupervisor:
             proc = self._proc
             identity = self._owner_identity
             if expected is None or dict(receipt) != expected or owner is None or proc is None:
+                return False
+            exit_event = self._exit_settled.get(id(proc))
+            if exit_event is None or not exit_event.is_set():
+                return False
+            if (
+                self._pending_turns or self._pending_controls or self._late_control_handlers
+                or self._late_control_uncertain
+            ):
                 return False
             expected_identity = (
                 expected.get("host_generation"), expected.get("host_boot_id"),
@@ -606,16 +762,32 @@ class HostSupervisor:
                     logger.warning("compute host owner acknowledgement failed; custody retained")
                     return False
                 self._owner_closed = True
+            if not self._try_close_producer_handle():
+                return False
             # Keep the exact receipt and closed owner retryable when registry
             # deletion fails; capture readiness is published only after removal.
-            if not self._remove_registry():
+            if not self._remove_registry(self._registry_owner_key):
+                return False
+            # The lock is part of the same custody boundary as the owner record.
+            # Do not clear the receipt or publish capture readiness until its
+            # fallible close has succeeded under the lifecycle lock.
+            if not self._release_registry_lease():
                 return False
             self._owner = None
+            self._owner_job_name = None
             self._owner_closed = False
             self._owner_identity = None
+            self._producer_identity = None
+            self._registry_owner_key = None
+            self._registry_record_removed = False
             self._proc = None
             self._host_resource_custody_known = True
             self._pending_shutdown_receipt = None
+            self._shutdown_request_id = None
+            self._shutdown_ack = None
+            self._shutdown_admission_closed = False
+            self._closing = False
+            self._exit_settled.pop(id(proc), None)
             self._stream_states.pop(id(proc), None)
         return True
 
@@ -624,63 +796,99 @@ class HostSupervisor:
         result = self.shutdown_clean(timeout=_SHUTDOWN_TIMEOUT_SECS)
         if result.get("clean"):
             if self.acknowledge_clean_stop(result):
-                self._fail_pending_turns(reason="shutdown", message="compute host shutdown")
                 return result
-            result = {**result, "clean": False, "ack_required": True, "status": "ack_failed"}
+            # A clean receipt that cannot yet be acknowledged still owns the
+            # process/owner/registry custody. Do not fall through to destructive
+            # cleanup; the caller must retry the exact acknowledgement.
+            return {**result, "clean": False, "ack_required": True, "status": "ack_failed"}
+        if (
+            result.get("pending_turns")
+            or result.get("pending_controls")
+            or result.get("late_controls")
+            or result.get("late_control_uncertain")
+        ):
+            # A destructive fallback would turn accepted work into unknown custody.
+            # The caller must settle the exact records and retry shutdown_clean().
+            return result
         with self._lock:
             proc = self._proc
             owner = self._owner
+            recovery_owner = self._recovery_owner
+        if recovery_owner is not None or (owner is None and self.registry_path.exists()):
+            # Destructive cleanup cannot erase unresolved recovery custody or its registry.
+            return {
+                **result, "clean": False, "ack_required": False,
+                "status": "owner_unavailable", "owner_state": "unavailable",
+            }
         if proc is not None and proc.poll() is None:
             self._terminate_process(proc)
         self._fail_pending_turns(reason="shutdown", message="compute host shutdown")
-        if owner is not None:
-            with contextlib.suppress(Exception):
-                owner.close()
         with self._lock:
-            self._owner = None
-            self._owner_closed = False
-            self._owner_identity = None
-            self._proc = None
-            self._pending_shutdown_receipt = None
-            self._host_resource_custody_known = False
-            if proc is not None:
-                self._stream_states.pop(id(proc), None)
-        self._remove_registry()
+            producer_closed = self._try_close_producer_handle()
+            owner_closed = self._owner_closed or self._try_close_owner(owner)
+            registry_removed = (
+                owner_closed and producer_closed
+                and self._remove_registry(self._registry_owner_key)
+            )
+            if owner_closed and self._owner is owner:
+                self._owner_closed = True
+            lease_released = registry_removed and self._release_registry_lease()
+            cleanup_complete = registry_removed and lease_released
+            if cleanup_complete and self._owner is owner:
+                self._owner = None
+                self._owner_job_name = None
+                self._owner_closed = False
+                self._owner_identity = None
+                self._producer_identity = None
+                self._registry_owner_key = None
+                self._registry_record_removed = False
+                self._proc = None
+                self._pending_shutdown_receipt = None
+                self._shutdown_request_id = None
+                self._shutdown_ack = None
+                self._shutdown_admission_closed = False
+                self._closing = False
+                self._host_resource_custody_known = False
+                if proc is not None:
+                    self._exit_settled.pop(id(proc), None)
+                    self._stream_states.pop(id(proc), None)
+        if not cleanup_complete:
+            status = (
+                "owner_close_failed" if not owner_closed else
+                "producer_close_failed" if not producer_closed else
+                "registry_remove_failed" if not registry_removed else
+                "registry_lease_release_failed"
+            )
+            result = {**result, "clean": False, "ack_required": False, "status": status}
         return result
 
     def _legacy_shutdown(self) -> None:
         """Compatibility name for callers that only need destructive cleanup."""
         self.shutdown()
 
-    def reconcile_startup_orphan(self) -> str:
-        """Terminate a stale registered host, guarding against PID reuse."""
-        try:
-            data = json.loads(self.registry_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return "none"
-        except Exception:
-            data = None
-        if not isinstance(data, dict):
-            data = None
-        if (data or {}).get("owner_kind") == "windows_job":
-            # A new parent cannot reconstruct an unnamed Job handle. PID-only
-            # signalling would turn an owner-loss record into an unsafe adoption.
-            self._remove_registry()
+    def reconcile_startup_orphan(self, *, keep_lease: bool = False) -> str:
+        """Reconcile one persisted owner without adopting by PID."""
+        acquired = self._registry_lease is None
+        if acquired and not self._acquire_registry_lease():
             return "owner-unavailable"
-        try:
-            pid = int((data or {}).get("host_pid") or 0)
-        except Exception:
-            pid = 0
-        if data is None:
-            outcome = "invalid-registry"
-        elif pid <= 0 or not _pid_alive(pid):
-            outcome = "not-running"
-        elif not self._pid_matches_compute_host(pid):
-            outcome = "pid-reuse-ignored"  # PID reused by another process: never signal it
-        else:
-            self._terminate_pid(pid, timeout=_SHUTDOWN_TIMEOUT_SECS)
-            outcome = "terminated"
-        self._remove_registry()
+        with self._lock:
+            recovery_owner = self._recovery_owner
+        outcome, recovery_owner = reconcile_startup_orphan(
+            registry_path=self.registry_path,
+            recovery_owner=recovery_owner,
+            remove_registry=self._remove_registry,
+            pid_alive=_pid_alive,
+            pid_matches_compute_host=self._pid_matches_compute_host,
+            terminate_pid=self._terminate_pid,
+            shutdown_timeout_secs=_SHUTDOWN_TIMEOUT_SECS,
+        )
+        with self._lock:
+            self._recovery_owner = recovery_owner
+        if acquired and not keep_lease and outcome in {
+            "none", "owner-unavailable-absent", "not-running", "pid-reuse-ignored", "terminated",
+        }:
+            if not self._release_registry_lease():
+                return "owner-unavailable"
         return outcome
 
     def _make_pending_turn(
@@ -758,9 +966,13 @@ class HostSupervisor:
             host_boot_id = self._host_boot_id
             host_generation = self._host_generation
             host_proc = self._proc
+            if self._closing or self._shutdown_admission_closed:
+                _refuse_start(RuntimeError("compute host is closing; new turn refused"))
         if retirement_lease is not None and not host_boot_id:
             _refuse_start(RuntimeError("compute host did not provide a boot identity for a leased turn"))
         with self._lock:
+            if self._closing or self._shutdown_admission_closed:
+                _refuse_start(RuntimeError("compute host is closing; new turn refused"))
             pending = self._make_pending_turn(
                 request_id, payload, callback=on_complete, retirement_lease=retirement_lease,
                 host_proc=host_proc, host_generation=host_generation, host_boot_id=host_boot_id)
@@ -811,10 +1023,28 @@ class HostSupervisor:
             raise
         return request_id
 
-    def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
+    def _start_for_existing_sid(self, sid: str) -> None:
+        with self._lock:
+            if self._closing:
+                if (
+                    self._proc is None
+                    or self._proc.poll() is not None
+                    or not self._has_pending_sid_locked(sid)
+                ):
+                    raise RuntimeError("compute host is closing; existing response refused")
+                return
         self.start()
+
+    def interrupt(self, sid: str, *, request_id: str | None = None) -> None:
+        self._start_for_existing_sid(sid)
         self._send_frame(
-            {"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex})
+            {"type": "interrupt", "sid": sid, "request_id": request_id or uuid.uuid4().hex},
+            allow_existing_sid=sid,
+        )
+
+    def _has_pending_sid_locked(self, sid: str) -> bool:
+        return any(_legacy_pending_fields(pending)[0] == sid
+                   for pending in self._pending_turns.values())
 
     def has_pending_turn(self, sid: str) -> bool:
         """True when a host completion callback is still registered for ``sid``.
@@ -828,24 +1058,42 @@ class HostSupervisor:
             return any(_legacy_pending_fields(pending)[0] == sid
                        for pending in self._pending_turns.values())
 
-    def _await_reply(self, frame: dict[str, Any], request_id: str, timeout: float) -> dict:
+    def _await_reply(
+        self, frame: dict[str, Any], request_id: str, timeout: float,
+        *, late_handler: Callable[[dict], None] | None = None,
+        allow_existing_sid: str | None = None,
+    ) -> dict:
         """Send ``frame`` and block for the host reply carrying ``request_id``."""
         q: queue.Queue[dict] = queue.Queue(maxsize=1)
         with self._lock:
+            if (
+                self._shutdown_admission_closed
+                and (allow_existing_sid is None or not self._has_pending_sid_locked(allow_existing_sid))
+            ):
+                raise _AdmissionRefusedError("compute host shutdown admission is closed")
             self._pending_controls[request_id] = q
+        timed_out = False
         try:
-            self._send_frame(frame)
+            if allow_existing_sid is None:
+                self._send_frame(frame)
+            else:
+                self._send_frame(frame, allow_existing_sid=allow_existing_sid)
             return q.get(timeout=timeout)
+        except queue.Empty:
+            timed_out = True
+            raise
         finally:
             with self._lock:
                 self._pending_controls.pop(request_id, None)
+                if timed_out:
+                    self._register_late_control_handler_locked(request_id, late_handler)
 
     def respond(self, sid: str, params: dict[str, Any], *, timeout: float = 15.0) -> dict:
         """Deliver an interactive prompt response to the host that owns it."""
-        self.start()
+        self._start_for_existing_sid(sid)
         request_id = uuid.uuid4().hex
         frame = {"type": "respond", "sid": sid, "request_id": request_id, "params": dict(params)}
-        return self._await_reply(frame, request_id, timeout)
+        return self._await_reply(frame, request_id, timeout, allow_existing_sid=sid)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:
         payload = {"type": "reload_mcp", "sid": sid, "request_id": request_id or uuid.uuid4().hex}
@@ -869,36 +1117,76 @@ class HostSupervisor:
         if not wait:
             self._send_frame(frame)
             return {"status": "sent", "request_id": request_id}
-        try:
-            return self._await_reply(frame, request_id, timeout)
-        except queue.Empty:
-            if on_late_ack is not None:
-                self._register_late_control_handler(request_id, on_late_ack)
-            raise
+        return self._await_reply(frame, request_id, timeout, late_handler=on_late_ack)
 
-    def _register_late_control_handler(self, request_id: str, handler: Callable[[dict], None]) -> None:
+    def _register_late_control_handler_locked(
+        self, request_id: str, handler: Callable[[dict], None] | None,
+    ) -> None:
         now = time.monotonic()
-        with self._lock:
-            handlers = self._late_control_handlers
-            for rid in [r for r, (at, _cb) in handlers.items() if now - at > _LATE_CONTROL_TTL_SECS]:
-                handlers.pop(rid, None)
-            while len(handlers) >= _LATE_CONTROL_MAX:
-                handlers.pop(min(handlers, key=lambda rid: handlers[rid][0]), None)
-            handlers[request_id] = (now, handler)
+        handlers = self._late_control_handlers
+        for rid in [r for r, (at, _cb) in handlers.items() if now - at > _LATE_CONTROL_TTL_SECS]:
+            handlers.pop(rid, None)
+            self._late_control_uncertain = True
+        while len(handlers) >= _LATE_CONTROL_MAX:
+            handlers.pop(min(handlers, key=lambda rid: handlers[rid][0]), None)
+            self._late_control_uncertain = True
+        handlers[request_id] = (now, handler)
 
-    def _deliver_control_frame(self, request_id: str, frame: dict[str, Any]) -> None:
+    def _register_late_control_handler(
+        self, request_id: str, handler: Callable[[dict], None] | None,
+    ) -> None:
         with self._lock:
+            self._register_late_control_handler_locked(request_id, handler)
+
+    def _deliver_control_frame(
+        self, request_id: str, frame: dict[str, Any], *,
+        proc: subprocess.Popen[str] | None = None, host_generation: int | None = None,
+    ) -> None:
+        with self._lock:
+            if frame.get("type") == "shutdown.ack":
+                identity = self._owner_identity
+                producer_identity = self._producer_identity
+                if (
+                    request_id
+                    and request_id == self._shutdown_request_id
+                    and proc is self._proc
+                    and host_generation == self._host_generation
+                    and identity is not None
+                    and producer_identity is not None
+                    and (os.name != "nt" or (
+                        self._producer_process_handle is not None
+                        and self._producer_process_handle.is_open
+                        and self._producer_creation_filetime is not None
+                    ))
+                    and frame.get("host_pid") == producer_identity[0]
+                    and str(frame.get("host_boot_id") or "") == producer_identity[1]
+                    and frame.get("drained") is True
+                ):
+                    self._shutdown_ack = dict(frame)
+                else:
+                    logger.warning("ignored foreign or incomplete compute-host shutdown ack")
+                return
             q = self._pending_controls.get(request_id)
             late = None if q is not None else self._late_control_handlers.pop(request_id, None)
         if q is not None:
             with contextlib.suppress(queue.Full):
                 q.put_nowait(frame)
         elif late is not None:
-            _call_logged(late[1], frame, f"compute host late control ack handler failed (request_id={request_id})")
+            if late[1] is not None:
+                _call_logged(late[1], frame, f"compute host late control ack handler failed (request_id={request_id})")
+
+    def _accept_producer_startup(
+        self, record: dict[str, Any], *, proc: subprocess.Popen[str], host_generation: int,
+    ) -> bool:
+        return accept_producer_startup(
+            self, record, proc=proc, host_generation=host_generation)
 
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
+        with self._hello_lock:
+            if self._startup_binding is not None or self._startup_orphan_handles:
+                raise RuntimeError("compute host startup custody is still retained")
         env = {**hermes_subprocess_env(inherit_credentials=True), **os.environ, **(self.env or {})}
         env["HERMES_COMPUTE_HOST_HEARTBEAT_SECS"] = str(self.heartbeat_secs)
         root = str(_repo_root())
@@ -917,12 +1205,14 @@ class HostSupervisor:
             self._hello_event.clear()
             self._hello = {}
             self._host_boot_id = ""
+            owner_job_name = new_windows_job_name() if os.name == "nt" else None
             try:
                 proc, owner = spawn_server(
                     self.argv, cwd=str(self.cwd), env=env, stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                     encoding="utf-8", errors="replace", bufsize=1,
-                    start_new_session=True, **completion_spawn)
+                    start_new_session=True, owner_job_name=owner_job_name,
+                    **completion_spawn)
             except Exception:
                 _close_fd(completion_read_fd)
                 _close_fd(completion_write_fd)
@@ -934,15 +1224,32 @@ class HostSupervisor:
             host_generation = self._host_generation
             self._proc = proc
             self._owner = owner
+            self._owner_job_name = getattr(owner, "name", None) or owner_job_name
+            self._registry_owner_key = None
+            self._registry_record_removed = False
             self._owner_closed = False
             self._owner_identity = None
+            self._producer_identity = None
+            self._producer_process_handle = None
+            self._producer_creation_filetime = None
+            self._startup_event.clear()
+            self._startup_identity = None
+            self._startup_error = ""
+            self._startup_seen = False
+            self._startup_binding = None
             self._host_resource_custody_known = False
             self._shutdown_sent = False
+            self._shutdown_request_id = None
+            self._shutdown_ack = None
+            self._shutdown_admission_closed = False
             self._pending_shutdown_receipt = None
+            self._late_control_uncertain = False
             stdout_state = _StreamState()
             stderr_state = _StreamState()
             completion_state = _StreamState()
             self._stream_states[id(proc)] = (stdout_state, stderr_state, completion_state)
+            exit_settled = threading.Event()
+            self._exit_settled[id(proc)] = exit_settled
         from agent.memory_provider import spawn_context_thread
         spawn_context_thread(
             self._drain_stdout, name="compute-host-stdout",
@@ -957,21 +1264,40 @@ class HostSupervisor:
             self._drain_stderr, args=(proc, stderr_state), name="compute-host-stderr",
         ).start()
         spawn_context_thread(
-            self._wait_for_exit, args=(proc, host_generation), name="compute-host-wait",
+            self._wait_for_exit, args=(proc, host_generation, exit_settled), name="compute-host-wait",
         ).start()
-        if not self._hello_event.wait(timeout=_HELLO_TIMEOUT_SECS):
+        deadline = time.monotonic() + _HELLO_TIMEOUT_SECS
+        if not self._hello_event.wait(timeout=max(0.0, deadline - time.monotonic())):
+            cancel_producer_startup(self, proc=proc, host_generation=host_generation)
             self._terminate_process(proc)
             self._release_owner()
             raise RuntimeError(f"compute host did not send hello; stderr={self._stderr_tail[-5:]}")
+        if not self._startup_event.wait(timeout=max(0.0, deadline - time.monotonic())):
+            cancel_producer_startup(self, proc=proc, host_generation=host_generation)
+            self._terminate_process(proc)
+            self._release_owner()
+            raise RuntimeError("compute host did not send source-bound startup identity")
         try:
             self._validate_hello()
+            with self._hello_lock:
+                startup_identity = self._startup_identity
+                startup_error = self._startup_error
+                hello_pid = self._hello.get("host_pid")
+                hello_boot_id = str(self._hello.get("boot_id") or "")
+                if startup_error:
+                    raise RuntimeError(startup_error)
+                if startup_identity is None:
+                    raise RuntimeError("startup:missing_identity")
+                if hello_pid != startup_identity[0] or hello_boot_id != startup_identity[1]:
+                    raise RuntimeError("startup:hello_identity_mismatch")
+                self._host_boot_id = startup_identity[1]
+                self._producer_identity = startup_identity
+                self._owner_identity = (host_generation, startup_identity[1], int(proc.pid or 0))
         except BaseException:
+            cancel_producer_startup(self, proc=proc, host_generation=host_generation)
             self._terminate_process(proc)
             self._release_owner()
             raise
-        with self._hello_lock:
-            self._host_boot_id = str(self._hello.get("boot_id") or "")
-            self._owner_identity = (host_generation, self._host_boot_id, int(proc.pid or 0))
         self._persist_registry()
         logger.info("compute host started pid=%s reason=%s", proc.pid, reason)
 
@@ -987,41 +1313,55 @@ class HostSupervisor:
         expected = self.expected_build_sha
         if expected != "unknown" and got_sha not in {"", "unknown", expected}:
             raise RuntimeError(f"compute host build mismatch: {got_sha} != {expected}")
+        if type(hello.get("host_pid")) is not int or hello["host_pid"] <= 0:
+            raise RuntimeError("compute host missing validated host_pid")
         if not str(hello.get("boot_id") or ""):
             raise RuntimeError("compute host missing validated boot_id")
 
     def _persist_registry(self) -> None:
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.registry_path.with_suffix(self.registry_path.suffix + ".tmp")
         identity = self._owner_identity
         if identity is None:
             raise RuntimeError("cannot persist a host owner before hello validation")
-        payload = {
-            "host_pid": identity[2], "boot_id": identity[1],
-            "host_generation": identity[0],
-            "owner_kind": "windows_job" if self._owner is not None else "unowned",
-            "build_sha": self._hello.get("build_sha") or "",
-            "started_at": time.time(), "argv": self.argv,
-        }
-        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        tmp.replace(self.registry_path)
+        owner_kind = "windows_job" if self._owner is not None else "unowned"
+        persist_owner_record(
+            registry_path=self.registry_path, owner_identity=identity,
+            owner_kind=owner_kind, build_sha=self._hello.get("build_sha") or "",
+            argv=self.argv, owner_job_name=self._owner_job_name,
+        )
+        self._registry_owner_key = owner_record_key(
+            owner_identity=identity, owner_kind=owner_kind, owner_job_name=self._owner_job_name)
+        self._registry_record_removed = False
 
-
-    def _remove_registry(self) -> bool:
-        try:
-            self.registry_path.unlink(missing_ok=True)
-        except Exception:
-            logger.debug("failed to remove compute host registry", exc_info=True)
+    def _remove_registry(self, expected: object | None = None) -> bool:
+        if self._registry_lease is None and self.registry_path.exists():
             return False
-        return True
+        key = expected if expected is not None else self._registry_owner_key
+        if key is not None and key == self._registry_owner_key and self._registry_record_removed:
+            return not self.registry_path.exists()
+        removed = remove_registry_record(self.registry_path, key)
+        if removed and key is not None and key == self._registry_owner_key:
+            self._registry_record_removed = True
+        return removed
 
-    def _send_frame(self, frame: dict[str, Any]) -> None:
+    def _send_frame(
+        self, frame: dict[str, Any], *, allow_shutdown: bool = False,
+        allow_existing_sid: str | None = None,
+    ) -> None:
         try:
             payload = json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n"
         except Exception as exc:
             # No transport operation ran, so this is a proven pre-submit refusal.
             raise _FrameSendError(str(exc), ambiguous=False, proc=None) from exc
         with self._lock:
+            existing_allowed = bool(
+                allow_existing_sid is not None
+                and frame.get("sid") == allow_existing_sid
+                and frame.get("type") in {"respond", "interrupt"}
+                and self._has_pending_sid_locked(allow_existing_sid)
+            )
+            if self._shutdown_admission_closed and not (allow_shutdown or existing_allowed):
+                raise _FrameSendError(
+                    "compute host shutdown admission is closed", ambiguous=False, proc=self._proc)
             proc = self._proc
             if proc is None or proc.poll() is not None or proc.stdin is None:
                 raise _FrameSendError("compute host is not running", ambiguous=False, proc=proc)
@@ -1071,61 +1411,10 @@ class HostSupervisor:
         self, read_fd: int, proc: subprocess.Popen[str], host_generation: int,
         stream_state: _StreamState | None = None,
     ) -> None:
-        """Read only the exact child-owned completion channel for one Popen generation."""
-        state = stream_state or _StreamState()
-        try:
-            with os.fdopen(read_fd, "rb", buffering=0) as stream:
-                buffer = bytearray()
-                while True:
-                    chunk = stream.read(4096)
-                    if not chunk:
-                        break
-                    buffer.extend(chunk)
-                    while b"\n" in buffer:
-                        raw, _, remainder = buffer.partition(b"\n")
-                        buffer = bytearray(remainder)
-                        if len(raw) > _PRODUCER_COMPLETION_MAX_RECORD_BYTES:
-                            logger.warning("compute host producer completion record too large")
-                            state.failed = True
-                            state.error = "completion:record_too_large"
-                            return
-                        try:
-                            record = json.loads(raw.decode("utf-8"))
-                        except (UnicodeDecodeError, json.JSONDecodeError, TypeError):
-                            logger.warning("compute host emitted invalid producer completion")
-                            state.failed = True
-                            state.error = "completion:invalid_record"
-                            return
-                        if not isinstance(record, dict):
-                            logger.warning("compute host producer completion must be an object")
-                            state.failed = True
-                            state.error = "completion:non_object"
-                            return
-                        if not self._handle_producer_completion(
-                            record, proc=proc, host_generation=host_generation
-                        ):
-                            logger.warning("compute host producer completion was rejected")
-                            state.failed = True
-                            state.error = "completion:unmatched_record"
-                            return
-                    if len(buffer) > _PRODUCER_COMPLETION_MAX_RECORD_BYTES:
-                        logger.warning("compute host producer completion record too large")
-                        state.failed = True
-                        state.error = "completion:partial_record_too_large"
-                        return
-                if buffer:
-                    logger.warning("compute host producer completion ended with partial record")
-                    state.failed = True
-                    state.error = "completion:partial_record"
-                    return
-        except BaseException as exc:  # health: allow BLE001 -- an opaque completion reader failure cannot prove EOF; retain custody without exception values
-            state.failed = True
-            state.error = f"completion:{type(exc).__name__}"
-            logger.warning("compute host producer completion reader failed; custody retained")
-        else:
-            state.eof = True
-        finally:
-            state.done.set()
+        drain_producer_completion(
+            self, read_fd, proc, host_generation, stream_state or _StreamState(),
+            _PRODUCER_COMPLETION_MAX_RECORD_BYTES,
+        )
 
     def _producer_completion_matches(
         self, request_id: str, pending: _PendingTurn, record: dict[str, Any],
@@ -1134,7 +1423,16 @@ class HostSupervisor:
         """Bind a completion record to the exact child Popen and accepted turn."""
         if not _valid_producer_completion_record(record):
             return False
-        if record.get("host_pid") != proc.pid:
+        producer_identity = self._producer_identity
+        if producer_identity is None:
+            return False
+        if os.name == "nt" and (
+            self._producer_process_handle is None
+            or not self._producer_process_handle.is_open
+            or self._producer_creation_filetime is None
+        ):
+            return False
+        if record.get("host_pid") != producer_identity[0]:
             return False
         if str(record.get("request_id") or "") != request_id:
             return False
@@ -1147,7 +1445,9 @@ class HostSupervisor:
                 return False
         if str(record.get("profile_home") or "") != pending.profile_home:
             return False
-        if str(record.get("host_boot_id") or "") != pending.host_boot_id:
+        if str(record.get("host_boot_id") or "") != producer_identity[1]:
+            return False
+        if pending.host_boot_id != producer_identity[1]:
             return False
         if pending.host_proc is not proc or pending.host_generation != host_generation:
             return False
@@ -1186,9 +1486,13 @@ class HostSupervisor:
             # separately scheduled reader; the identity-bound state is enough
             # for that later stdout frame to open the callback gate.
             return True
-        return self._deliver_pending_terminal(
+        # This bool acknowledges the authenticated producer receipt, not the
+        # downstream callback outcome. A failed callback retains the exact pending
+        # record and lease while this channel stays open for a source-bound retry.
+        self._deliver_pending_terminal(
             request_id, terminal, proc=proc, host_generation=host_generation,
             source_bound=True)
+        return True
 
     def _drain_stderr(
         self, proc: subprocess.Popen[str], stream_state: _StreamState | None = None,
@@ -1483,7 +1787,8 @@ class HostSupervisor:
         ftype = str(frame.get("type") or "")
         request_id = str(frame.get("request_id") or "")
         if ftype in _CONTROL_REPLY_TYPES or (ftype == "error" and request_id):
-            self._deliver_control_frame(request_id, frame)
+            self._deliver_control_frame(
+                request_id, frame, proc=proc, host_generation=host_generation)
         elif ftype == "hello":
             # ``_spawn_locked`` waits for this event while holding ``_lock``;
             # never acquire that lifecycle lock from the reader thread.
@@ -1507,43 +1812,76 @@ class HostSupervisor:
             self._deliver_pending_terminal(request_id, frame, proc=proc,
                                             host_generation=host_generation)
 
-    def _wait_for_exit(self, proc: subprocess.Popen[str], host_generation: int | None = None) -> None:
-        while True:
-            try:
-                code = proc.wait(timeout=1.0)
-                break
-            except subprocess.TimeoutExpired:
-                continue
-        closing = False
-        owner = None
-        with self._lock:
-            if self._proc is not proc:
-                return
-            with self._hello_lock:
-                # Pair the process clear with the hello CAS so a stale reader
-                # cannot publish after this generation is retired.
+    def _wait_for_exit(
+        self, proc: subprocess.Popen[str], host_generation: int | None = None,
+        exit_settled: threading.Event | None = None,
+    ) -> None:
+        event = exit_settled or self._exit_settled.get(id(proc))
+        try:
+            while True:
+                try:
+                    code = proc.wait(timeout=1.0)
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+            closing = False
+            owner = None
+            with self._lock:
                 if self._proc is not proc:
                     return
-                closing = self._closing
-                if not closing:
-                    self._proc = None
-                    owner = self._owner
-                    self._owner = None
-                    self._owner_closed = False
-                    self._owner_identity = None
-                    self._host_resource_custody_known = False
-                    self._stream_states.pop(id(proc), None)
-        if not closing:
-            if owner is not None:
-                with contextlib.suppress(Exception):
-                    owner.close()
-            self._remove_registry()
-        reason = "shutdown" if closing else "crash"
-        self._fail_pending_turns(
-            reason=reason, message=f"compute host exited with code {code}",
-            proc=proc, host_generation=host_generation)
-        if not closing:
-            self._maybe_respawn_after_crash()
+                with self._hello_lock:
+                    # Pair the process clear with the hello CAS so a stale reader
+                    # cannot publish after this generation is retired.
+                    if self._proc is not proc:
+                        return
+                    closing = self._closing
+                    if not closing:
+                        owner = self._owner
+            if not closing:
+                cancel_producer_startup(
+                    self, proc=proc, host_generation=host_generation or self._host_generation)
+            owner_closed = True
+            producer_closed = True
+            if not closing:
+                stream_states = self._stream_states.get(id(proc))
+                readers_settled = self._readers_settled(
+                    stream_states, _SHUTDOWN_TIMEOUT_SECS)
+                if readers_settled:
+                    producer_closed = self._try_close_producer_handle()
+                    owner_closed = self._owner_closed or self._try_close_owner(owner)
+                else:
+                    owner_closed = producer_closed = False
+                registry_removed = (
+                    owner_closed and producer_closed
+                    and self._remove_registry(self._registry_owner_key)
+                )
+                with self._lock:
+                    if owner_closed:
+                        self._owner_closed = True
+                    lease_released = registry_removed and self._release_registry_lease()
+                    cleanup_complete = registry_removed and lease_released
+                    if self._proc is proc and cleanup_complete:
+                        self._proc = None
+                        self._owner = None
+                        self._owner_job_name = None
+                        self._owner_closed = False
+                        self._owner_identity = None
+                        self._producer_identity = None
+                        self._registry_owner_key = None
+                        self._registry_record_removed = False
+                        self._host_resource_custody_known = False
+                        self._stream_states.pop(id(proc), None)
+                if not cleanup_complete:
+                    owner_closed = False
+            reason = "shutdown" if closing else "crash"
+            self._fail_pending_turns(
+                reason=reason, message=f"compute host exited with code {code}",
+                proc=proc, host_generation=host_generation)
+            if not closing and owner_closed and producer_closed:
+                self._maybe_respawn_after_crash()
+        finally:
+            if event is not None:
+                event.set()
 
     def _fail_pending_turns(
         self, *, reason: str, message: str, proc: subprocess.Popen[str] | None = None,
@@ -1579,7 +1917,8 @@ class HostSupervisor:
             self._late_control_handlers = {}
         for request_id, (_registered_at, handler) in late.items():
             frame = {"type": "control.error", "request_id": request_id, **failure}
-            _call_logged(handler, frame, "compute host late control error handler failed")
+            if handler is not None:
+                _call_logged(handler, frame, "compute host late control error handler failed")
 
     def _maybe_respawn_after_crash(self) -> None:
         now = time.monotonic()
@@ -1598,6 +1937,8 @@ class HostSupervisor:
             time.sleep(delay)
             with self._lock:
                 if self._closing or self._stopped_respawning or self._proc is not None:
+                    return
+                if self._registry_lease is None and not self._acquire_registry_lease():
                     return
                 try:
                     self._spawn_locked(reason="crash")

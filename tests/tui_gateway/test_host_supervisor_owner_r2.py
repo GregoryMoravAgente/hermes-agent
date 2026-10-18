@@ -240,12 +240,12 @@ def test_ack_registry_failure_keeps_clean_receipt_retryable(monkeypatch, tmp_pat
     attempts = 0
     real_remove = supervisor._remove_registry
 
-    def fail_once() -> bool:
+    def fail_once(_expected=None) -> bool:
         nonlocal attempts
         attempts += 1
         if attempts == 1:
             return False
-        return real_remove()
+        return real_remove(_expected)
 
     monkeypatch.setattr(supervisor, "_remove_registry", fail_once)
     try:

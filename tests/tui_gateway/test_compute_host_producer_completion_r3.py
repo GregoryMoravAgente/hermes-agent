@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
@@ -155,6 +156,24 @@ def _assert_watcher_failure_custody(
     assert supervisor.has_pending_turn(_SID)
 
 
+def _contain_failed_watcher_host(supervisor: HostSupervisor) -> None:
+    """Bound test-owned child cleanup after a deliberately non-clean refusal.
+
+    This is resource containment only.  It must never be used as evidence of a
+    settled producer, a released lease, or a capture-ready host.
+    """
+    proc = supervisor._proc
+    if proc is None:
+        return
+    if proc.poll() is None:
+        supervisor._terminate_process(proc)
+    wait_until(lambda: proc.poll() is not None, timeout=30, what="test-owned failed host exit")
+    for stream in (proc.stdin, proc.stdout, proc.stderr):
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
 def _run_watcher_failure_case(monkeypatch, tmp_path: Path, failure: str):
     fence, supervisor, paths = _watcher_failure_supervisor(monkeypatch, tmp_path, failure)
     profile_home = paths["hermes-home"]
@@ -207,11 +226,24 @@ def _run_watcher_failure_case(monkeypatch, tmp_path: Path, failure: str):
         assert not ack_processed.is_set()
         assert fence.active_count() == 1
         assert supervisor.capture_ready is False
+        pending = supervisor._pending_turns["removed-session-turn"]
+        assert isinstance(pending, _PendingTurn)
+        assert pending.retirement_lease is lease
+        assert pending.lease_release_pending is False
+        refusal = supervisor.shutdown_clean(timeout=0)
+        assert refusal["clean"] is False
+        assert refusal["status"] == "pending_work"
+        assert refusal["shutdown_sent"] is False
+        assert refusal["pending_turns"] == 1
+        assert refusal["admission_closed"] is True
+        assert supervisor.capture_ready is False
     finally:
         paths["worker-release"].write_text("release", encoding="utf-8")
-        supervisor.shutdown()
-        proc = supervisor._proc
-        assert proc is None or proc.poll() is not None
+        # The production shutdown gate correctly refuses destructive cleanup
+        # while this known-error candidate remains unknown.  Contain the
+        # test-owned child separately; do not convert that forced exit into a
+        # producer receipt or a clean-capture result.
+        _contain_failed_watcher_host(supervisor)
         if fence.active_count():
             assert fence.release(lease)
 
@@ -405,6 +437,7 @@ def test_unknown_transport_custody_is_not_overridden_by_producer_receipt():
     pending.terminal = dict(terminal)
     supervisor._proc = proc
     supervisor._host_generation = 1
+    supervisor._producer_identity = (proc.pid, "boot")
     supervisor._pending_turns["unknown-custody"] = pending
     record = {
         "type": "producer.complete", "schema": 1, "host_pid": proc.pid,
@@ -413,9 +446,13 @@ def test_unknown_transport_custody_is_not_overridden_by_producer_receipt():
         "origin_session_key": _SESSION_KEY, "profile_home": "/tmp/profile",
         "terminal_sha256": _terminal_digest(terminal),
     }
-    assert supervisor._handle_producer_completion(record, proc=proc, host_generation=1) is False
+    # The receipt is authenticated and accepted even though its terminal still
+    # carries unknown physical custody; acceptance does not deliver the callback.
+    assert supervisor._handle_producer_completion(record, proc=proc, host_generation=1) is True
     assert supervisor._pending_turns["unknown-custody"] is pending
     assert pending.producer_settled is True
+    assert pending.callback_succeeded is False
+    assert pending.finalizing is False
     assert pending.terminal is not None
     assert pending.terminal.get("custody") == "unknown"
     assert supervisor.capture_ready is False

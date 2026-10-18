@@ -71,9 +71,11 @@ def test_exception_with_live_producer_worker_keeps_completion_unsettled(
         profile_id=str(profile_home),
     )
     callback_frames: list[dict] = []
+    callback_done = threading.Event()
 
     def completion(frame: dict) -> bool:
         callback_frames.append(frame)
+        callback_done.set()
         return True
 
     completion._retirement_lease = lease
@@ -95,7 +97,24 @@ def test_exception_with_live_producer_worker_keeps_completion_unsettled(
         assert callback_frames == []
         assert fence.active_count() == 1
         release.write_text("release", encoding="utf-8")
-        supervisor.shutdown()
+        # The watcher owns the accepted worker until its real join and session
+        # cleanup complete.  Shutdown must therefore happen only after the
+        # source-bound exception callback settles the exact turn lease.
+        wait_until(callback_done.is_set, timeout=30, what="post-worker exception callback")
+        wait_until(lambda: fence.active_count() == 0, timeout=30, what="exception turn lease release")
+        wait_until(lambda: not supervisor.has_pending_turn(_SID), timeout=30,
+                   what="exception pending turn removal")
+        receipt = supervisor.shutdown_clean(timeout=30)
+        assert receipt["clean"] is False
+        # Gate 1 deliberately has no native owner proof on POSIX, so the
+        # shutdown frame cannot be acknowledged as an owner-bound receipt.
+        # This remains a non-clean refusal and must never publish capture.
+        assert receipt["status"] == "shutdown_ack_missing"
+        assert receipt["process_exited"] is True
+        assert receipt["natural_exit"] is True
+        assert receipt["shutdown_ack"] is False
+        assert receipt["exit_settled"] is True
+        assert supervisor.capture_ready is False
         proc = supervisor._proc
         assert proc is None or proc.poll() is not None
     finally:

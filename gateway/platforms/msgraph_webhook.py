@@ -333,12 +333,16 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
         from hermes_state_runtime import admit_session_input, RuntimeStoreError
 
         async with producer_scope(self, event) as authority:
-            authority._require_admission_open()
+            authority._require_fresh_admission_open()
             provenance = capture_provenance(authority.runner, event)
             if provenance is None:
                 raise RuntimeStoreError('permission_denied')
             # The routing reservation writes too: off the owner loop like the admission below.
-            ref = authority._publish_route(event.source, *await asyncio.to_thread(authority._reserve_route, event.source))
+            ref = authority._publish_route(
+                event.source,
+                *await asyncio.to_thread(authority._reserve_route, event.source, fresh=True),
+                fresh=True,
+            )
             route = authority.sessions[ref.session_id].route
             source = event.source.to_dict()
             source['is_bot'] = event.source.is_bot
@@ -354,6 +358,6 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
                 admit_session_input, authority.db, epoch=authority.epoch,
                 principal_id='msgraph:' + route, session_id=ref.session_id, request_id=event.message_id,
                 payload={'text': event.text, 'native_text_v1': envelope},
-                _authorize_write=authority._admission_gate()),
+                _authorize_write=authority._admission_gate(fresh=True)),
                 then=partial(authority._admitted, ref, event), ordered=True,
                 after=partial(authority._schedule_admitted, ref))

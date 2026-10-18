@@ -138,14 +138,18 @@ def bind_api_session(authority, session_id, *, hosted_dispatch=None, declared_ke
                                     declared_key=declared_key, caller_key=caller_key))
 
 
-def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=None, caller_key=None):
+def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=None, caller_key=None,
+                   fresh=False):
     """``bind_api_session`` as write steps (``run_steps``): the binding transaction is yielded.
 
     ``caller_key`` is this request's validated ``X-Hermes-Session-Key`` even when an explicit
     session id selected the conversation (``declared_key`` is set only when the key selected it).
     It is used only to adopt a row an earlier release stamped with that same key, and is then
     registered as that session's declared key (and stamped into its binding receipt)."""
-    authority._require_admission_open()
+    if fresh:
+        authority._require_fresh_admission_open()
+    else:
+        authority._require_admission_open()
     if not isinstance(session_id, str) or not session_id or _is_path_unsafe(session_id):
         raise RuntimeStoreError('invalid_params')
     storage_source, title, room_identity, room_generation = 'api_server', None, None, 0
@@ -185,7 +189,12 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
 
     def write(conn):
         _epoch(conn, authority.epoch)
-        authority._require_admission_open()  # a drain that began while this waited on the writer wins
+        # Fresh API roots must lose the race even if this transaction waited on SQLite. Accepted
+        # FIFO continuations keep the ordinary gate and are handled by the claim path.
+        if fresh:
+            authority._require_fresh_admission_open()
+        else:
+            authority._require_admission_open()
         from hermes_state_mutation_retirement import RETIRED_PREFIX
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + session_id,)).fetchone():
             raise RuntimeStoreError('not_found')
