@@ -1,3 +1,6 @@
+# OWN-FORK PROOF-BRANCH VARIANT ONLY.
+# Keep this file on a wine2e/** proof branch; do not adopt it as a generic
+# product workflow without verifying runner capacity and action policy.
 name: Windows venv-holder live E2E
 
 # ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
@@ -42,11 +45,11 @@ concurrency:
 jobs:
   venv-holder-e2e:
     name: venv-holder live E2E (windows-latest)
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: windows-latest
     timeout-minutes: 25
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
         with:
           # The stable caller dispatches on the candidate tag; github.sha is
           # the exact candidate commit there and the head SHA everywhere else.
@@ -69,21 +72,30 @@ jobs:
           set -uo pipefail
           bash scripts/run_tests.sh \
             tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
             tests/hermes_cli/test_git_trampoline_windows_live.py \
             tests/pm/test_held_entry_windows_live.py
+
+      - name: Run Windows owner and identity live E2E
+        # Keep the existing taskkill/process-registry probes in this native
+        # owner lane and add the real Job/HostSupervisor proofs. Every file
+        # below uses the real Windows process table or Job API; no platform
+        # fakes, mocked owner, selector skip, or retry is introduced here. The
+        # HostSupervisor producer fixture is a tracked sibling of its test.
+        shell: bash
+        run: |
+          set -uo pipefail
+          bash scripts/run_tests.sh \
+            tests/hermes_cli/test_taskkill_identity_windows_live.py \
+            tests/tools/test_process_registry_windows_live.py \
+            tests/gateway/test_refused_owner_windows.py \
+            tests/hermes_cli/test_local_runtime_windows_job_owner_live.py \
+            tests/tui_gateway/test_host_supervisor_owner_r2.py
 
       - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
         shell: bash
         run: |
           set -uo pipefail
           bash scripts/run_tests.sh tests/gateway/test_telegram_closewait_windows_live.py
-
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
 
       - name: Turn Windows long paths off for later steps (#130242)
         # The runner image turns LongPathsEnabled on; 0 is the Windows default

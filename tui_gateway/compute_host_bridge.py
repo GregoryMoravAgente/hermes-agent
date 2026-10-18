@@ -261,7 +261,9 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+def _on_compute_host_turn_done(
+    rid: str, sid: str, session: dict, frame: dict, *, terminalizing_turn_id: str | None = None,
+) -> bool:
     with session["history_lock"]:
         _compute_host_adopt_frame_meta(session, frame)
         session["running"] = False
@@ -278,11 +280,19 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
     _apply_compute_host_metadata_mirror(session, frame)
     # Settlement of a turn whose session was closed mid-flight: the real lease was held for it.
-    _release_deferred_active_session_lease(session)
+    if not _release_deferred_active_session_lease(session):
+        raise RuntimeError("deferred active-session lease settlement failed")
     info = _compute_host_session_info(session)
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
+    if terminalizing_turn_id:
+        # Mark the predecessor's core terminal reconciliation before queue handoff. If the
+        # handoff raises after admitting a successor, its exact lease remains retryable by
+        # this marker and is never confused with the successor's turn id.
+        with session["history_lock"]:
+            session["_compute_host_terminalizing_core_done"] = terminalizing_turn_id
     _drain_queued_prompt(rid, sid, session)
+    return True
 
 
 def _submit_prompt_to_compute_host(
@@ -296,28 +306,163 @@ def _submit_prompt_to_compute_host(
     # Caller JSON-RPC ids may repeat across sockets and turns. Use an opaque
     # dispatch lifetime token, installed before a fast child can send activity.
     turn_id = frame["turn_id"] = frame["request_id"] = uuid.uuid4().hex
-    with session["history_lock"]:
-        session["_compute_host_turn_id"] = turn_id
-        session.pop("_compute_host_activity_ns", None)
+    session_key = str(frame.get("session_key") or "")
+    profile_home = str(frame.get("profile_home") or "")
 
-    def _complete(done: dict) -> None:
-        # submit_turn reports a synchronous pipe failure via the callback before re-raising;
-        # leave the session untouched so prompt.submit can fail open to the in-process path.
-        if done.get("reason") != "send_failed":
+    def _refuse_before_submit(reason: str, message: str) -> dict:
+        """Clear the outer admission through the existing JSON-RPC error contract."""
+        refusal = {
+            "type": "turn.error", "sid": sid, "request_id": turn_id,
+            "turn_id": turn_id, "session_key": session_key,
+            "profile_home": profile_home, "reason": reason,
+            "message": message}
+        try:
+            _on_compute_host_turn_done(rid, sid, session, refusal)
+        except Exception:  # health: allow BLE001 -- the callback crosses the session/provider boundary; cleanup failure stays fail-closed
+            logger.warning(
+                "compute-host admission callback cleanup failed; retaining custody"
+            )
             with session["history_lock"]:
-                if session.get("_compute_host_turn_id") != turn_id:
-                    return
+                session["running"] = False
+                _clear_inflight_turn(session)
+        with session["history_lock"]:
+            marker = session.get("_compute_host_admission_pending")
+            if isinstance(marker, dict) and marker.get("turn_id") == turn_id:
+                session.pop("_compute_host_admission_pending", None)
+        return _err(rid, 4090, message, {"reason": reason})
+
+    # The caller installs this reservation before _lock_in_submit_turn returns. It is
+    # deliberately a parent-owned local marker, not a product or checked-in manifest.
+    with session["history_lock"]:
+        marker = session.get("_compute_host_admission_pending")
+        if not isinstance(marker, dict):
+            marker = {"request_id": str(rid), "sid": str(sid), "state": "reserving"}
+            session["_compute_host_admission_pending"] = marker
+        marker["turn_id"] = turn_id
+        marker["state"] = "reserving"
+        if session.get("_closing"):
+            return _refuse_before_submit("session_closing", "compute-host turn admission is closing")
+
+    if not profile_home:
+        # Legacy single-profile session fixtures and pre-profile records have no
+        # field to copy. The effective launch home is their only profile; in
+        # multiplex mode absence is refused rather than guessed globally.
+        from agent.secret_scope import is_multiplex_active
+        if not is_multiplex_active():
+            from hermes_constants import get_hermes_home
+            profile_home = str(get_hermes_home())
+            frame["profile_home"] = profile_home
+    if not session_key or not profile_home:
+        return _refuse_before_submit(
+            "missing_profile_binding", "compute-host turn is missing an authenticated session profile")
+    from hermes_cli.backend_retirement import retirement
+    lease = retirement.acquire(
+        owner_kind="compute-host-turn",
+        owner_id=f"{profile_home}:{session_key}:{turn_id}",
+        profile_id=profile_home,
+    )
+    if lease is None:
+        return _refuse_before_submit("retirement_refused", "compute-host turn admission is closing")
+    with session["history_lock"]:
+        marker = session.get("_compute_host_admission_pending")
+        if (session.get("_closing") or not isinstance(marker, dict)
+                or marker.get("turn_id") != turn_id):
+            stale_admission = True
+        else:
+            stale_admission = False
+            marker["state"] = "accepted"
+            marker["profile_home"] = profile_home
+            marker["session_key"] = session_key
+            session["_compute_host_turn_id"] = turn_id
+            session.pop("_compute_host_activity_ns", None)
+            session.pop("_compute_host_custody_unknown", None)
+    if stale_admission:
+        supervisor = _get_compute_host_supervisor(cfg)
+        supervisor.retain_pre_submit_lease(
+            frame, lease, reason="session_closing", message="compute-host turn admission is closing")
+        return _refuse_before_submit("session_closing", "compute-host turn admission is closing")
+
+    def _complete(done: dict) -> bool:
+        if done.get("custody") == "unknown":
+            with session["history_lock"]:
+                if session.get("_compute_host_turn_id") == turn_id:
+                    session["_compute_host_custody_unknown"] = {
+                        "turn_id": turn_id, "reason": str(done.get("reason") or "unknown"),
+                        "message": str(done.get("message") or "")}
+            return False
+        with session["history_lock"]:
+            current_turn_id = session.get("_compute_host_turn_id")
+            terminalizing_turn_id = session.get("_compute_host_terminalizing_turn")
+            if current_turn_id != turn_id and terminalizing_turn_id != turn_id:
+                return False
+            if current_turn_id == turn_id:
+                # Clear this turn before draining a queued prompt. The drain may admit a
+                # successor and install its own id; that successor must not keep this
+                # terminal lease alive or get mistaken for the predecessor on retry.
+                session["_compute_host_terminalizing_turn"] = turn_id
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
-            _on_compute_host_turn_done(rid, sid, session, done)
+                marker = session.get("_compute_host_admission_pending")
+                if isinstance(marker, dict) and marker.get("turn_id") == turn_id:
+                    marker["state"] = "terminalizing"
+            core_done = session.get("_compute_host_terminalizing_core_done") == turn_id
+        if core_done:
+            # A prior callback reached core reconciliation but failed during queued handoff.
+            # The predecessor's custody is now terminal; a duplicate authenticated frame
+            # may settle its exact lease without replaying session cleanup or the successor.
+            with session["history_lock"]:
+                session.pop("_compute_host_terminalizing_turn", None)
+                session.pop("_compute_host_terminalizing_core_done", None)
+                session.pop("_compute_host_custody_unknown", None)
+                marker = session.get("_compute_host_admission_pending")
+                if isinstance(marker, dict) and marker.get("turn_id") == turn_id:
+                    session.pop("_compute_host_admission_pending", None)
+            return True
+        try:
+            _on_compute_host_turn_done(
+                rid, sid, session, done, terminalizing_turn_id=turn_id)
+        except Exception:
+            with session["history_lock"]:
+                session["_compute_host_custody_unknown"] = {
+                    "turn_id": turn_id, "reason": "callback_finalization_failed"}
+            logger.exception("compute-host terminal finalization failed sid=%s turn_id=%s", sid, turn_id)
+            return False
+        with session["history_lock"]:
+            session.pop("_compute_host_terminalizing_turn", None)
+            session.pop("_compute_host_terminalizing_core_done", None)
+            session.pop("_compute_host_custody_unknown", None)
+            marker = session.get("_compute_host_admission_pending")
+            if isinstance(marker, dict) and marker.get("turn_id") == turn_id:
+                session.pop("_compute_host_admission_pending", None)
+        return True
+
+    # HostSupervisor records this exact opaque lease beside the reader-owned host generation.
+    # It is intentionally an internal callback attribute so existing supervisor fakes/callers
+    # keep their submit_turn(frame, on_complete=...) shape without an anonymous release path.
+    _complete._retirement_lease = lease
     try:
         _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
     except Exception as exc:
+        if getattr(exc, "custody_unknown", False):
+            with session["history_lock"]:
+                session["_compute_host_active"] = True
+                session["_compute_host_custody_unknown"] = {
+                    "turn_id": turn_id, "reason": "transport_unknown", "message": str(exc)}
+                if image_paths is None:
+                    session["attached_images"] = []
+            # ``streaming`` is the existing PromptSubmitStatus value. The unknown
+            # custody state remains parent-local and is never widened onto the wire.
+            return _ok(rid, {"status": "streaming", "turn_isolation": True})
+        if getattr(exc, "admission_refused", False):
+            return _refuse_before_submit("admission_refused", str(exc))
         with session["history_lock"]:
             if session.get("_compute_host_turn_id") == turn_id:
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
+            marker = session.get("_compute_host_admission_pending")
+            if isinstance(marker, dict) and marker.get("turn_id") == turn_id:
+                session.pop("_compute_host_admission_pending", None)
+        return _refuse_before_submit("admission_refused", f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
         if image_paths is None:

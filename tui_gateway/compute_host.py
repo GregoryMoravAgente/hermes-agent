@@ -12,6 +12,7 @@ if __name__ == "__main__":
 import argparse
 import concurrent.futures
 import contextlib
+import hashlib
 import json
 import logging
 import os
@@ -55,6 +56,36 @@ _FLUSH_RESERVE_SECS = 1.0
 # Fallback control.error text when a routed server method returns an error without a message.
 _CONTROL_FAILURES = {
     "session.save": "session save failed", "session.compress": "session compression failed"}
+_PRODUCER_COMPLETION_ENV = "HERMES_COMPUTE_HOST_PRODUCER_COMPLETION_FD"
+_PRODUCER_COMPLETION_TYPE = "producer.complete"
+_PRODUCER_COMPLETION_SCHEMA = 1
+_PRODUCER_COMPLETION_MAX_BYTES = 4096
+_PRODUCER_COMPLETION_KEYS = frozenset({
+    "type", "schema", "host_pid", "host_boot_id", "sid", "request_id", "turn_id",
+    "session_key", "origin_session_key", "profile_home", "terminal_sha256",
+})
+_EXCEPTION_PRODUCER_JOIN_SECS = 1.0
+
+
+def _terminal_digest(terminal: dict[str, Any]) -> str:
+    """Digest the complete finalized terminal wire object with stable key ordering."""
+    encoded = json.dumps(
+        terminal, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _write_completion_bytes(
+    fd: int, data: bytes, *, write_fn: Callable[[int, Any], int] | None = None,
+) -> None:
+    """Write one bounded completion record, refusing short/zero/non-progress writes."""
+    writer = write_fn or os.write
+    view = memoryview(data)
+    while view:
+        written = writer(fd, view)
+        if type(written) is not int or written <= 0 or written > len(view):
+            raise OSError("producer completion pipe made no progress")
+        view = view[written:]
 
 
 class ComputeHost:
@@ -66,9 +97,13 @@ class ComputeHost:
 
     def __init__(
         self, *, stdout: Any = None, max_workers: int | None = None,
-        heartbeat_secs: float | None = None) -> None:
+        heartbeat_secs: float | None = None, completion_fd: int | None = None) -> None:
         self._stdout = stdout or sys.stdout
         self._write_lock = threading.Lock()
+        self._completion_fd = completion_fd
+        self._completion_lock = threading.Lock()
+        self._completion_close_requested = threading.Event()
+        self._completion_closed = threading.Event()
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max_workers or _default_workers(), thread_name_prefix="compute-host-turn")
         self._closed = threading.Event()
@@ -97,11 +132,74 @@ class ComputeHost:
 
     def _reply(self, kind: str, sid: str, request_id: Any, **extra: Any) -> None:
         """Emit a per-session frame keyed by the request it answers."""
-        self.emit({"type": kind, "sid": sid, "request_id": request_id, **extra})
+        self.emit({"type": kind, "sid": sid, "request_id": request_id,
+                   "host_boot_id": self._boot_id, **extra})
+
+    def _reply_and_complete(
+        self, kind: str, sid: str, request_id: Any, **extra: Any,
+    ) -> None:
+        """Emit a terminal frame, then mark the joined producer boundary."""
+        self._reply_terminal(kind, sid, request_id, producer_complete=True, **extra)
+
+    def _reply_terminal(
+        self, kind: str, sid: str, request_id: Any, *, producer_complete: bool,
+        **extra: Any,
+    ) -> None:
+        """Emit one finalized terminal object and optionally publish its producer receipt."""
+        terminal = {
+            "type": kind, "sid": sid, "request_id": request_id,
+            "host_boot_id": self._boot_id, **extra,
+        }
+        terminal.setdefault("host_ns", now_ns())
+        self.emit(terminal)
+        if producer_complete:
+            self._emit_producer_completion(terminal)
+
+    def _emit_producer_completion(self, terminal: dict[str, Any]) -> None:
+        """Record the real producer boundary after terminal-frame finalization.
+
+        This channel is a child-owned control handle passed only to this
+        ComputeHost. It is closed before tool/descendant creation, so a late
+        inherited stdout writer cannot forge this receipt. A failed write leaves
+        the parent in its existing unknown-custody state.
+        """
+        record = {
+            "type": _PRODUCER_COMPLETION_TYPE,
+            "schema": _PRODUCER_COMPLETION_SCHEMA,
+            "host_pid": os.getpid(),
+            "host_boot_id": self._boot_id,
+            "sid": str(terminal.get("sid") or ""),
+            "request_id": str(terminal.get("request_id") or ""),
+            "turn_id": str(terminal.get("turn_id") or terminal.get("request_id") or ""),
+            "session_key": str(terminal.get("session_key") or ""),
+            "origin_session_key": str(terminal.get("origin_session_key") or ""),
+            "profile_home": str(terminal.get("profile_home") or ""),
+            "terminal_sha256": _terminal_digest(terminal),
+        }
+        data = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        if len(data) > _PRODUCER_COMPLETION_MAX_BYTES:
+            logging.getLogger(__name__).warning("compute host producer completion record too large")
+            return
+        try:
+            with self._completion_lock:
+                fd = self._completion_fd
+                if fd is None or self._completion_closed.is_set():
+                    return
+                _write_completion_bytes(fd, data)
+        except OSError:
+            logging.getLogger(__name__).warning(
+                "compute host producer completion write failed")
 
     def close(self) -> None:
         self._closed.set()
         self._executor.shutdown(wait=False, cancel_futures=True)
+        self._completion_close_requested.set()
+        with self._completion_lock:
+            fd, self._completion_fd = self._completion_fd, None
+            self._completion_closed.set()
+            if fd is not None:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
         # Every caller hard-exits next (os._exit skips atexit): a foreground command still
         # running in its own process group would outlive the host.
         with contextlib.suppress(Exception):
@@ -171,7 +269,17 @@ class ComputeHost:
             self._turn_futures.pop(future, None)
 
     def _handle_turn_start(self, frame: dict[str, Any]) -> None:
-        future = self._executor.submit(self._run_real_turn, dict(frame))
+        try:
+            future = self._executor.submit(self._run_real_turn, dict(frame))
+        except RuntimeError as exc:
+            self._reply_and_complete(
+                "turn.error", str(frame.get("sid") or ""), frame.get("request_id"),
+                turn_id=str(frame.get("turn_id") or frame.get("request_id") or ""),
+                session_key=str(frame.get("session_key") or ""),
+                profile_home=str(frame.get("profile_home") or ""),
+                origin_session_key=str(frame.get("session_key") or ""),
+                reason="submit_refused", message=str(exc))
+            return
         self._track_turn_future(future, str(frame.get("sid") or ""))
 
     def _guarded(
@@ -228,12 +336,27 @@ class ComputeHost:
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
+        turn_id = str(frame.get("turn_id") or request_id)
+        session_key = str(frame.get("session_key") or "")
+        origin_session_key = session_key
+        profile_home = str(frame.get("profile_home") or "")
+        session: dict[str, Any] | None = None
+        run_thread: Any = None
+        dispatch_started = False
+        server_module: Any = None
         if not sid:
-            self._reply("turn.error", sid, request_id, message="sid required")
+            self._reply_and_complete(
+                "turn.error", sid, request_id, turn_id=turn_id,
+                session_key=session_key, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                reason="invalid_request", message="sid required")
             return
         try:
             from tui_gateway import server
+            server_module = server
             session = self._ensure_server_session(server, frame)
+            session_key = str(session.get("session_key") or session_key)
+            profile_home = str(session.get("profile_home") or profile_home)
             # #101416: the parent already holds this session's active-session lease (claimed in
             # prompt.submit before routing here). Install the inert borrow BEFORE the turn runs, or
             # _admit_prompt_turn re-claims from this child pid and is fenced out by the parent's own
@@ -246,15 +369,26 @@ class ComputeHost:
                 queued_gen = frame.get("queued_prompt_generation")
                 current_gen = int(session.get("_queued_prompt_generation", 0))
                 if queued_gen is not None and current_gen != int(queued_gen):
-                    self._reply("turn.end", sid, request_id, interrupted=True, ended_ns=now_ns())
+                    self._reply_and_complete(
+                        "turn.end", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        interrupted=True, ended_ns=now_ns())
                     return
                 if session.get("running"):
-                    self._reply("turn.error", sid, request_id, message="session busy")
+                    self._reply_and_complete(
+                        "turn.error", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        reason="session_busy", message="session busy")
                     return
                 session.update(running=True, _turn_cancel_requested=False, last_active=time.time())
                 server._start_inflight_turn(session, inflight)
                 turn_started_at = time.time()
-            self._reply("turn.started", sid, request_id, started_ns=now_ns())
+            self._reply("turn.started", sid, request_id, turn_id=turn_id,
+                        session_key=session_key, origin_session_key=origin_session_key,
+                        profile_home=profile_home,
+                        started_ns=now_ns())
             with contextlib.suppress(Exception):
                 server._ensure_session_db_row(session)
                 # #85303: the parent's prompt.submit reopened this row before dispatching here (or
@@ -269,10 +403,19 @@ class ComputeHost:
                 hermes_undo.on_user_message_appended(session["session_key"])
             with contextlib.suppress(Exception):
                 server._persist_branch_seed(session)
-            server._run_prompt_submit(
+            dispatch_started = True
+            accepted = server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 display_metadata=(frame.get("display_metadata")
                                   if isinstance(frame.get("display_metadata"), dict) else None))
+            if not accepted:
+                # No worker was admitted; the parent must receive a refused turn.
+                self._reply_and_complete(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="dispatch_refused", message="prompt dispatch refused")
+                return
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):
                 while run_thread.is_alive():
@@ -285,18 +428,118 @@ class ComputeHost:
             session_info = server._session_info(session.get("agent"), session)
             with self._progress_lock:
                 self._progress_counter += 1
-            self._reply(
-                "turn.end", sid, request_id, **meta, interrupted=interrupted, ended_ns=now_ns(),
+            self._reply_and_complete(
+                "turn.end", sid, request_id, turn_id=turn_id, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                **meta, interrupted=interrupted, ended_ns=now_ns(),
                 session_info=session_info, session_info_emitted=True)
         except Exception as exc:
-            with contextlib.suppress(Exception):
-                from tui_gateway import server
-                session = server._sessions.get(sid)
-                if session is not None:
-                    with session.get("history_lock", threading.Lock()):
-                        session["running"] = False
-                        server._clear_inflight_turn(session)
-            self._reply("turn.error", sid, request_id, reason="exception", message=str(exc))
+            # Keep the exact accepted session and worker references. The lifecycle may have
+            # popped this session from ``server._sessions`` while the worker is still running;
+            # looking it up again can otherwise turn a live worker into a false completion.
+            owned_session = session
+            if owned_session is not None and run_thread is None:
+                run_thread = owned_session.get("_run_thread")
+            joined = not dispatch_started
+            worker_live = False
+            if dispatch_started:
+                if run_thread is not None and hasattr(run_thread, "join"):
+                    try:
+                        if run_thread is not threading.current_thread():
+                            run_thread.join(timeout=_EXCEPTION_PRODUCER_JOIN_SECS)
+                            worker_live = bool(run_thread.is_alive())
+                            joined = not worker_live
+                    except Exception:  # health: allow BLE001 -- an opaque worker cannot prove join; preserve unknown custody
+                        logging.getLogger(__name__).warning(
+                            "compute host worker join failed; retaining unknown custody"
+                        )
+                        joined = False
+                        worker_live = False
+                else:
+                    joined = False
+            if joined and owned_session is not None and server_module is not None:
+                try:
+                    with owned_session.get("history_lock", threading.Lock()):
+                        owned_session["running"] = False
+                        server_module._clear_inflight_turn(owned_session)
+                except Exception:  # health: allow BLE001 -- cleanup can be session/provider-specific; failure keeps custody unknown
+                    logging.getLogger(__name__).warning(
+                        "compute host inflight cleanup failed; retaining unknown custody"
+                    )
+                    joined = False
+            if joined:
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=True)
+            elif worker_live and owned_session is not None and server_module is not None:
+                # Publish one bounded public observation while the accepted worker is
+                # still live. This is only an unknown-custody candidate: it must not
+                # invoke the callback, publish the private producer receipt, or release
+                # the exact turn lease. The watcher retains the original session/thread
+                # references and is the only path that may later publish producer_complete.
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=False)
+                if self._watch_exception_worker(
+                    server_module, owned_session, run_thread, sid=sid, request_id=request_id,
+                    turn_id=turn_id, session_key=session_key,
+                    origin_session_key=origin_session_key, profile_home=profile_home,
+                    message=str(exc),
+                ):
+                    return
+                # The bounded unknown frame above is already the public observation.
+                # If watcher startup fails, leave custody pending rather than emitting
+                # a duplicate frame or manufacturing a settled receipt.
+            else:
+                # No positive proof of a completed worker exists. Keep the parent in
+                # its existing unknown-custody path rather than publishing a receipt.
+                self._reply_terminal(
+                    "turn.error", sid, request_id, turn_id=turn_id,
+                    session_key=session_key, origin_session_key=origin_session_key,
+                    profile_home=profile_home,
+                    reason="exception", message=str(exc), producer_complete=False)
+
+    def _watch_exception_worker(
+        self, server: Any, session: dict[str, Any], run_thread: Any, *, sid: str,
+        request_id: str, turn_id: str, session_key: str, origin_session_key: str,
+        profile_home: str, message: str,
+    ) -> bool:
+        """Publish the exception receipt only after the accepted worker actually exits."""
+        def wait_for_worker() -> None:
+            try:
+                run_thread.join()
+                if run_thread.is_alive():
+                    raise RuntimeError("producer worker remained live after join")
+                with session.get("history_lock", threading.Lock()):
+                    session["running"] = False
+                    server._clear_inflight_turn(session)
+            except Exception:  # health: allow BLE001 -- worker join and session cleanup are opaque custody boundaries; failure keeps the lease unresolved
+                logging.getLogger(__name__).warning(
+                    "compute host exception worker cleanup failed; retaining unknown custody")
+                # The live-worker branch already emitted the single bounded
+                # producer_complete=false observation before starting this watcher.
+                # Keep that candidate and the exact lease pending on join/cleanup
+                # failure; a second frame would create a distinct digest and could
+                # obscure which custody state is still unresolved.
+                return
+            self._reply_terminal(
+                "turn.error", sid, request_id, turn_id=turn_id,
+                session_key=session_key, origin_session_key=origin_session_key,
+                profile_home=profile_home,
+                reason="exception", message=message, producer_complete=True)
+
+        from agent.memory_provider import spawn_context_thread
+        try:
+            spawn_context_thread(
+                wait_for_worker, name="compute-host-exception-worker",
+            ).start()
+        except RuntimeError:
+            return False
+        return True
 
     def _emit_turn_activity(self, sid: str, session: dict, turn_id: str, started_at: float) -> None:
         # Observe the agent clock, never the host heartbeat. A reused agent's last
@@ -546,11 +789,52 @@ def _default_workers() -> int:
         return 8
 
 
+def _open_producer_completion_fd() -> int | None:
+    """Claim the one inherited completion handle before importing tool/server code."""
+    raw = os.environ.pop(_PRODUCER_COMPLETION_ENV, "")
+    if not raw:
+        return None
+    fd: int | None = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle = int(raw)
+            fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY)
+            assert fd is not None
+            try:
+                os.set_handle_inheritable(handle, False)
+            except Exception:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+                fd = None
+                raise
+            return fd
+        fd = int(raw)
+        assert fd is not None
+        try:
+            os.set_inheritable(fd, False)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+            fd = None
+            raise
+        return fd
+    except (AssertionError, OSError, ValueError):
+        logging.getLogger(__name__).warning(
+            "compute host producer completion handle setup failed")
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        return None
+
+
 def run_host(stdin: Any = None, stdout: Any = None) -> None:
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     # JSONL framing is byte-oriented; avoid text-stream read-ahead on Windows pipes.
     stdin = stdin if stdin is not None else getattr(sys.stdin, "buffer", sys.stdin)
-    host = ComputeHost(stdout=stdout or sys.stdout)
+    completion_fd = _open_producer_completion_fd()
+    host = ComputeHost(stdout=stdout or sys.stdout, completion_fd=completion_fd)
     shutting_down = threading.Event()
     # No client is connected to this process: session-less broadcasts (``broadcast_plugin_event``
     # from a plugin tool/hook running in the isolated turn) ride the host pipe to the parent

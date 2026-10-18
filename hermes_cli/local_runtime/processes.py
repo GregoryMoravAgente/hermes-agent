@@ -33,6 +33,26 @@ class _IoCounters(ctypes.Structure):
     )]
 
 
+class _BasicAccounting(ctypes.Structure):
+    """Exact JOBOBJECT_BASIC_ACCOUNTING_INFORMATION layout.
+
+    The two per-period kernel/user counters precede the four DWORD counters.
+    Keeping the fourth LARGE_INTEGER is required for QueryInformationJobObject
+    to place ActiveProcesses at the documented offset.
+    """
+
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_longlong),
+        ("TotalKernelTime", ctypes.c_longlong),
+        ("ThisPeriodTotalUserTime", ctypes.c_longlong),
+        ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+        ("TotalPageFaultCount", wintypes.DWORD),
+        ("TotalProcesses", wintypes.DWORD),
+        ("ActiveProcesses", wintypes.DWORD),
+        ("TotalTerminatedProcesses", wintypes.DWORD),
+    ]
+
+
 class _ExtendedLimits(ctypes.Structure):
     _fields_ = [
         ("BasicLimitInformation", _BasicLimits),
@@ -53,6 +73,10 @@ class _WindowsJob:
             ("SetInformationJobObject", [wintypes.HANDLE, ctypes.c_int,
                                          ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
             ("AssignProcessToJobObject", [wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            ("QueryInformationJobObject", [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+                ctypes.POINTER(wintypes.DWORD),
+            ], wintypes.BOOL),
             ("CloseHandle", [wintypes.HANDLE], wintypes.BOOL),
         ):
             fn = getattr(self._api, name)
@@ -77,6 +101,26 @@ class _WindowsJob:
         # Popen retains the original process handle, avoiding a PID-reuse race.
         if not self._api.AssignProcessToJobObject(self._handle, int(proc._handle)):
             raise ctypes.WinError(ctypes.get_last_error())
+
+    def active_processes(self) -> int | None:
+        """Observe the real active member count without changing job state."""
+        with self._lock:
+            if self._handle is None:
+                return None
+            info = _BasicAccounting()
+            returned = wintypes.DWORD()
+            ok = self._api.QueryInformationJobObject(
+                self._handle, 1, ctypes.byref(info), ctypes.sizeof(info),
+                ctypes.byref(returned),
+            )
+            if not ok or returned.value != ctypes.sizeof(info):
+                return None
+            return int(info.ActiveProcesses)
+
+    def empty(self) -> bool | None:
+        """Return true only when the kernel reports zero active processes."""
+        active = self.active_processes()
+        return None if active is None else active == 0
 
     def close(self) -> None:
         """Terminate the contained tree; repeated closes are harmless."""

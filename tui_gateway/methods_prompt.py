@@ -733,14 +733,8 @@ def _lock_in_submit_turn(
 from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
-@method("prompt.submit")
-def _(rid, params: dict) -> dict:
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
-    sid = params.get("session_id", "")
-    raw_text = params.get("text", "")
-    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    # Off-screen sends (widget intents) type the row so no client renders a bubble;
-    # whitelisted to "hidden" — this RPC must not mint kinds.
+def _prompt_display_fields(params: dict) -> tuple[str | None, dict | None]:
+    """Normalize the two client-visible display fields without minting new kinds."""
     display_kind = "hidden" if params.get("display_kind") == "hidden" else None
     title_preview = params.get("title_preview")
     display_metadata = (
@@ -748,35 +742,21 @@ def _(rid, params: dict) -> dict:
         if isinstance(title_preview, str) and title_preview.strip()
         else None
     )
-    if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
-        return stopped
-    if params.get("interrupted"):
-        # Client-side barge-in: latch so this turn's model message carries the note.
-        from tools.tts_streaming import mark_speech_interrupted
-        mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
+    return display_kind, display_metadata
+
+
+def _prompt_turn_author(rid, params: dict):
+    """Accept only the gateway-created turn-author value."""
     from tools.bot_relay import DeliveryAuthor
 
-    # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
     raw_author = params.get("_turn_author")
     if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
-        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
-    turn_author = raw_author.author if raw_author is not None else None
-    hosted_task = params.get("_hosted_task")
-    hosted_terminal_callback = params.get("_hosted_terminal_callback")
-    internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
-    err = (
-        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
-        if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
-    if err is not None:
-        return err
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        # Refused HERE — before the busy queue, db row and agent build — so a refusal
-        # leaves the session untouched.  The reason travels as machine-readable data.
-        reason = getattr(limit_message, "reason", None)
-        return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None)
+        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client"), None
+    return None, raw_author.author if raw_author is not None else None
+
+
+def _apply_prompt_surface_and_replay(session: dict, params: dict, text: Any) -> tuple[Any, bool]:
+    """Refresh surface/voice state and expand replay text before turn admission."""
     # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
     session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
     # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
@@ -790,9 +770,70 @@ def _(rid, params: dict) -> dict:
         # A rewind replays what the transcript shows: re-expand a skill invocation or
         # `/work fix it` sends nine literal chars.
         text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
+    return text, has_truncation
+
+
+def _prepare_prompt_submit_admission(
+    rid, sid, session: dict, params: dict, text: Any,
+) -> tuple[dict | None, dict]:
+    """Run author, hosted-submit, active-slot, session-display, and isolation admission in order."""
+    author_error, turn_author = _prompt_turn_author(rid, params)
+    if author_error is not None:
+        return author_error, {}
+    hosted_task = params.get("_hosted_task")
+    hosted_terminal_callback = params.get("_hosted_terminal_callback")
+    internal_hosted_submit = hosted_task is not None or hosted_terminal_callback is not None
+    err = (
+        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback)
+        if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
+    if err is not None:
+        return err, {}
+    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
+        # Refused HERE — before the busy queue, db row and agent build — so a refusal
+        # leaves the session untouched. The reason travels as machine-readable data.
+        reason = getattr(limit_message, "reason", None)
+        return _err(rid, 4090, str(limit_message), {"reason": reason} if reason else None), {}
+    text, has_truncation = _apply_prompt_surface_and_replay(session, params, text)
     turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
     if internal_hosted_submit and turn_isolation:
-        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
+        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet"), {}
+    return None, {
+        "text": text,
+        "has_truncation": has_truncation,
+        "turn_author": turn_author,
+        "hosted_task": hosted_task,
+        "hosted_terminal_callback": hosted_terminal_callback,
+        "internal_hosted_submit": internal_hosted_submit,
+        "turn_isolation": turn_isolation,
+    }
+
+
+@method("prompt.submit")
+def _(rid, params: dict) -> dict:
+    from hermes_cli.input_sanitize import sanitize_user_prompt_text
+    sid = params.get("session_id", "")
+    raw_text = params.get("text", "")
+    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
+    display_kind, display_metadata = _prompt_display_fields(params)
+    if (stopped := _typed_stop_phrase_response(rid, text)) is not None:
+        return stopped
+    if params.get("interrupted"):
+        # Client-side barge-in: latch so this turn's model message carries the note.
+        from tools.tts_streaming import mark_speech_interrupted
+        mark_speech_interrupted()
+    session, err = _sess_nowait(params, rid)
+    if err:
+        return err
+    admission_error, admission = _prepare_prompt_submit_admission(rid, sid, session, params, text)
+    if admission_error is not None:
+        return admission_error
+    text = admission["text"]
+    has_truncation = admission["has_truncation"]
+    turn_author = admission["turn_author"]
+    hosted_task = admission["hosted_task"]
+    hosted_terminal_callback = admission["hosted_terminal_callback"]
+    internal_hosted_submit = admission["internal_hosted_submit"]
+    turn_isolation = admission["turn_isolation"]
     # Re-bind to the current transport: streaming must stay on the active websocket even
     # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
     # socket that already closed cannot cancel the orphan reap without coming back (#116464).
@@ -830,9 +871,27 @@ def _(rid, params: dict) -> dict:
     requested_rebind_ids = (
         {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
         if isinstance(raw_rebind_ids, list) else None)
+    if turn_isolation:
+        # Publish the parent-owned reservation before the running claim returns. Close
+        # either waits for this marker or sets _closing; the bridge then refuses before
+        # acquiring/sending a child turn, so ActiveSession release cannot race dispatch.
+        with session["history_lock"]:
+            if session.get("_closing"):
+                return _err(rid, 4090, "compute-host turn admission is closing",
+                            {"reason": "session_closing"})
+            session["_compute_host_admission_pending"] = {
+                "request_id": str(rid), "sid": str(sid), "state": "pending",
+                "session_key": str(session.get("session_key") or ""),
+                "profile_home": str(session.get("profile_home") or ""),
+            }
     err, survivor_fields = _lock_in_submit_turn(
         rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind)
     if err is not None:
+        if turn_isolation:
+            with session["history_lock"]:
+                marker = session.get("_compute_host_admission_pending")
+                if isinstance(marker, dict) and marker.get("request_id") == str(rid):
+                    session.pop("_compute_host_admission_pending", None)
         return err
     if turn_isolation:
         if turn_author:
@@ -857,17 +916,10 @@ def _(rid, params: dict) -> dict:
             # The truncation already happened inline above (memory + DB).
             isolated_response["result"].update(survivor_fields)
             return isolated_response
-        # An ordinal/id alone is not consent. A client that carries a leftover ordinal into an ORDINARY
-        # submit sends a request that is indistinguishable, field by field, from a real rewind — same
-        # method, same shape, an in-range target — and the cut it asks for is a destructive
-        # replace_messages() the user never requested (#80763: 296 -> 52 messages, 244 durable rows gone).
-        # Only the client knows whether this submit is a rewind/edit/regenerate, so it has to say so; refuse
-        # the cut when it doesn't. Consent is checked BEFORE target resolution: an unconfirmed
-        # (leaked-state) request must refuse with 4029 without paying the durable transcript read or
-        # heal-stamping live history dicts that row-id resolution performs.
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s", sid,
-            isolated_response["error"].get("message", "unknown error"))
+        # A compute-host attempt has already crossed the exact parent retirement
+        # admission boundary. Every error therefore returns through JSON-RPC; an
+        # inline worker here would create a second producer against the held lease.
+        return isolated_response
     if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
         return err
     # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.

@@ -123,16 +123,18 @@ def isolated_env(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
-def _run_turn(frame: dict, timeout: float = 30.0) -> tuple[list[dict], dict | None]:
-    """Run one turn.start through the real child path; return (all frames, turn.end frame)."""
+def _run_turn(
+    frame: dict, timeout: float = 30.0, *, terminal_type: str = "turn.end"
+) -> tuple[list[dict], dict | None]:
+    """Run one turn.start through the real child path and await its expected terminal frame."""
     out = io.StringIO()
     host = ComputeHost(stdout=out, heartbeat_secs=0)
     try:
         host.handle_frame(frame)
-        end = _wait(out, lambda f: f["type"] == "turn.end", timeout=timeout)
+        terminal = _wait(out, lambda f: f["type"] == terminal_type, timeout=timeout)
     finally:
         host.close()
-    return _frames(out), end
+    return _frames(out), terminal
 
 
 # ── Fix 1: the child borrows instead of re-claiming ─────────────────────────
@@ -162,8 +164,19 @@ def test_isolated_turn_without_matching_vouch_still_fails_closed(isolated_env):
     _is_same_writer is relaxed, and a stale lease never authorizes the continuation."""
     parent = _seed_parent_lease("s1-key")
     try:
-        frames, _ = _run_turn(_make_frame(
-            "s1", active_session_lease={"lease_id": parent.lease_id, "session_id": "stale-A"}))
+        frames, terminal = _run_turn(
+            _make_frame(
+                "s1",
+                active_session_lease={"lease_id": parent.lease_id, "session_id": "stale-A"},
+            ),
+            terminal_type="turn.error",
+        )
+        assert terminal["type"] == "turn.error"
+        assert terminal["sid"] == "s1"
+        assert terminal["request_id"] == "turn"
+        assert terminal["turn_id"] == "turn"
+        assert terminal["reason"] == "dispatch_refused"
+        assert not any(frame["type"] == "turn.end" for frame in frames)
         errors = [f["message"]["params"]["payload"]["message"] for f in frames
                   if f["type"] == "rpc" and (f["message"].get("params") or {}).get("type") == "error"]
         assert errors and "open in another Hermes window" in errors[0]
