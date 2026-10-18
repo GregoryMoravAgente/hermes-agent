@@ -88,7 +88,7 @@ def test_store_close_failure_retains_exact_handle_for_retry(tmp_path, monkeypatc
     assert store.close() is True
 
 
-def test_store_rejects_reads_writes_and_claims_after_close_or_lease_loss(tmp_path):
+def test_store_rejects_reads_writes_and_claims_after_close(tmp_path):
     from plugins.teams_pipeline.store import TeamsPipelineStore
     from plugins.teams_pipeline.store_ownership import TeamsStoreOwner, TeamsStoreOwnershipError
 
@@ -106,6 +106,16 @@ def test_store_rejects_reads_writes_and_claims_after_close_or_lease_loss(tmp_pat
         closed.claim_recoverable_jobs("teams:r11-guard", profile_id=owner.profile_id,
                                       authority_epoch=owner.authority_epoch, instance_id=owner.instance_id)
 
+
+@pytest.mark.platforms("posix")
+def test_store_rejects_reads_and_writes_after_inode_lease_loss(tmp_path):
+    from plugins.teams_pipeline.store import TeamsPipelineStore
+    from plugins.teams_pipeline.store_ownership import TeamsStoreOwner, TeamsStoreOwnershipError
+
+    owner = TeamsStoreOwner(
+        profile_id=str(tmp_path / "profile-a"), authority_epoch="r11-epoch",
+        instance_id="r11-guard", owner_id="teams:r11-guard",
+    )
     live = TeamsPipelineStore(tmp_path / "lost.json", owner=owner, lock=True)
     try:
         live._ownership.lock_path.unlink()
@@ -250,7 +260,8 @@ async def test_done_recovery_task_stays_owned_through_source_finalizer():
 
 
 @pytest.mark.asyncio
-async def test_scheduler_callback_marks_real_store_lease_loss_unknown(tmp_path):
+@pytest.mark.platforms("posix")
+async def test_scheduler_callback_marks_real_store_lease_loss_unknown(tmp_path, monkeypatch):
     """A real scheduler task plus a lost Teams store lease retains sticky unknown custody."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
@@ -261,6 +272,7 @@ async def test_scheduler_callback_marks_real_store_lease_loss_unknown(tmp_path):
 
     home = tmp_path / "profile"
     home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     runner = GatewayRunner(GatewayConfig(platforms={}))
     authority = await initialize_session_authority(
         runner, profile_id=str(home), instance_id="r13-lease-loss",
@@ -295,6 +307,64 @@ async def test_scheduler_callback_marks_real_store_lease_loss_unknown(tmp_path):
             ),
             timeout=10,
             what="real scheduler callback lease-loss custody",
+        )
+        record = coordinator._records[handle.lease.lease_id]
+        assert record.reason == "read_failed"
+        assert authority._preservation_scheduler_handles[scheduler_id]["handle"] is handle
+        assert coordinator.status()["active_owner_classes"] == ["I01_native_inbound"]
+    finally:
+        store.close()
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_callback_retains_unknown_after_real_lease_close(tmp_path, monkeypatch):
+    """A real lease close is observable through the still-open store wrapper and keeps custody unknown."""
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import initialize_session_authority
+    from hermes_state import SessionDB
+    from plugins.teams_pipeline.store import TeamsPipelineStore
+    from plugins.teams_pipeline.store_ownership import TeamsStoreOwner, TeamsStoreOwnershipError
+
+    home = tmp_path / "profile"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    runner = GatewayRunner(GatewayConfig(platforms={}))
+    authority = await initialize_session_authority(
+        runner, profile_id=str(home), instance_id="r15-lease-close",
+        db=SessionDB(home / "state.db"),
+    )
+    coordinator = _install_custody(authority)
+    owner = TeamsStoreOwner.for_authority(authority, owner_id="teams:r15-lease-close")
+    store = TeamsPipelineStore(tmp_path / "teams.json", owner=owner, lock=True)
+    job_id = "r15-lease-close-job"
+    scheduler_id = f"teams-recovery:{job_id}"
+    store.upsert_job(job_id, {"status": "completed", "event_id": job_id})
+    runner._teams_pipeline_runtime = SimpleNamespace(store=store)
+    handle = authority._preservation_root("I01_native_inbound", scheduler_id)
+    authority._preservation_bind_scheduler(scheduler_id, handle, expected_job_id=job_id)
+
+    assert store._ownership.close() is True
+    assert not store._closed
+    with pytest.raises(TeamsStoreOwnershipError, match="not_acquired"):
+        store.get_job(job_id)
+
+    task = asyncio.create_task(asyncio.sleep(0, result={
+        "job_id": job_id, "status": "completed",
+    }))
+    task.add_done_callback(
+        lambda done: authority._preservation_scheduler_done(scheduler_id, done)
+    )
+    try:
+        await task
+        await async_wait_until(
+            lambda: (
+                handle.lease.lease_id in coordinator._records
+                and coordinator._records[handle.lease.lease_id].state == "unknown"
+            ),
+            timeout=10,
+            what="real closed-lease callback custody",
         )
         record = coordinator._records[handle.lease.lease_id]
         assert record.reason == "read_failed"
