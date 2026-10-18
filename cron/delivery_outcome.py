@@ -83,6 +83,13 @@ def settle_queued_delivery(job_id: Optional[str], execution_id: Optional[str]) -
 
     settle_delivery_outcome(str(execution_id), terminal[0])
     _settle_job_record(str(job_id), str(execution_id), terminal[1])
+    # Wake the exact runtime-custody binding after both existing durable outcomes have been
+    # written.  The binding still checks the real worker/future/reaper state before releasing.
+    try:
+        from cron.runtime_custody import notify_execution_delivery
+        notify_execution_delivery(str(execution_id))
+    except Exception:
+        logger.warning("Cron execution %s custody wakeup failed", execution_id, exc_info=True)
     return True
 
 

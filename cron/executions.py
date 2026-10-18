@@ -212,12 +212,20 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
+    execution_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Persist a claimed attempt before executor/provider dispatch."""
+    """Persist a claimed attempt before executor/provider dispatch.
+
+    A custody-aware caller may supply the exact id it reserved before this transaction.  The
+    optional argument is additive: ordinary callers still receive a fresh id here.
+    """
     from cron.occurrences import scheduled_instant as canonical_instant
 
     now = _hermes_now().isoformat()
-    execution_id = uuid.uuid4().hex
+    if execution_id is None:
+        execution_id = uuid.uuid4().hex
+    elif type(execution_id) is not str or not execution_id:
+        raise ValueError("execution_id is required")
     pid = os.getpid()
     with _transaction() as conn:
         conn.execute(
@@ -596,6 +604,21 @@ def list_executions(
             "SELECT * FROM executions" + where
             + " ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT ?",
             params,
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_unsettled_executions() -> list[dict[str, Any]]:
+    """Return every nonterminal/undelivered execution for preservation quiescence.
+
+    This is intentionally a dedicated ledger query rather than a bounded history page: an old
+    active row beyond the normal status-history limit is still live custody and must block a close.
+    """
+    with _transaction() as conn:
+        rows = conn.execute(
+            "SELECT * FROM executions WHERE status IN ('claimed','running','unknown') "
+            "OR handoff_pending=1 OR delivery_outcome='queued' "
+            "ORDER BY claimed_at ASC, id ASC"
         ).fetchall()
     return [dict(row) for row in rows]
 
