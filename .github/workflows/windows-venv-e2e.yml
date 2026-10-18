@@ -1,109 +1,214 @@
-name: Windows venv-holder live E2E
-
-# ON-DEMAND ONLY (fleet-update #91277, venv-holder consolidation work).
-#
-# Runs the live venv-holder E2E suite on a real windows-latest runner:
-# spawns actual processes with realistic Hermes argv shapes and drives the
-# REAL detection/classification/exemption code against the live process
-# table — the coverage that cannot exist on the Linux lanes and that the
-# maintainer cannot exercise locally before the work reaches main.
-#
-# Deliberately NOT wired to pull_request/main: it fires only on pushes to
-# wine2e/** working branches, so it costs nothing on normal PRs. Delete or
-# keep dormant after the venv-holder work lands.
+# OWN-FORK / SOURCE-ONLY AGC-1721 transport template.
+# This is a single diagnostic transport commit directly above a qualified
+# candidate. It is not upstream product source, release policy, or a package
+# proof. Materialize the manifest once, then run this workflow on the own fork.
+name: AGC-1721 own-fork Windows deferred-worker diagnostic
 
 on:
   push:
-    branches:
-      - 'wine2e/**'
-  workflow_call:
-    inputs:
-      commit:
-        description: Commit to test and build. Empty keeps the triggering commit.
-        type: string
-        default: ''
-      release:
-        description: 'Stable-release candidate run. Unused by the jobs; the caller passes it for a uniform callable surface.'
-        required: false
-        type: boolean
-        default: false
+    branches: ['wine2e/agc1721/**']
 
 permissions:
   contents: read
 
-# A workflow_call run (stable release) shares the caller's commit; its group
-# includes github.run_id so a rerun of the parent gets a fresh group instead
-# of cancelling this child mid-flight. wine2e push runs keep ref-scoped
-# collapse as before.
 concurrency:
-  group: windows-venv-e2e-${{ inputs.release == true && github.run_id || github.ref }}
-  cancel-in-progress: ${{ inputs.release != true }}
+  group: agc1721-native-source-only-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  venv-holder-e2e:
-    name: venv-holder live E2E (windows-latest)
-    runs-on: blacksmith-32vcpu-windows-2025
+  native-source-only:
+    name: AGC-1721 own-fork native Windows source-only bank
+    runs-on: windows-latest
     timeout-minutes: 25
+    env:
+      HERMES_TEST_FILE_RETRIES: '0'
     steps:
-      - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
-        with:
-          # The stable caller dispatches on the candidate tag; github.sha is
-          # the exact candidate commit there and the head SHA everywhere else.
-          ref: ${{ inputs.commit || github.sha }}
+      - name: Configure Windows long paths and checkout semantics
+        timeout-minutes: 1
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git config --global core.autocrlf false
+          git config --global core.longpaths true
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem' `
+            -Name LongPathsEnabled -PropertyType DWord -Value 1 -Force | Out-Null
+          $longPaths = (Get-ItemProperty `
+            'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
+          if ($longPaths -ne 1) { throw 'LongPathsEnabled was not set to 1' }
+          if ((git config --global --get core.autocrlf) -ne 'false') {
+            throw 'core.autocrlf is not false before checkout'
+          }
 
-      - name: Set up locked Python and test dependencies
+      - name: Checkout the own-fork transport commit and its direct parent
+        timeout-minutes: 1
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+
+      - name: Build the official locked PM test environment
+        id: setup_pm
+        timeout-minutes: 8
         uses: ./.github/actions/setup-pm
         with:
           extras: '["messaging"]'
           test-environment: 'true'
-          prune-python-cache: true
+          prune-python-cache: 'false'
 
-      - name: Run venv-holder live E2E
-        # Canonical runner (scripts/run_tests.sh) — never bare pytest: it
-        # enforces credential hygiene, TZ, temp HERMES_HOME and subprocess
-        # isolation. The live files are host-marked windows-only, so the
-        # runner collects them on this runner instead of skipping them.
+      - name: Verify candidate byte closure before tests
+        id: source_guard_before
+        timeout-minutes: 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/agc1721-native-source-only"
+          mkdir -p "$out"
+          python .github/proof/agc1721_native_windows_source_guard.py \
+            --manifest .github/proof/agc1721_native_windows_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase before \
+            --receipt "$out/source-before.json"
+
+      - name: Run the selected target native test with a bounded receipt
+        id: native_bank
+        timeout-minutes: 6
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
           set -uo pipefail
-          bash scripts/run_tests.sh \
-            tests/hermes_cli/test_venv_holder_windows_live.py \
-            tests/hermes_cli/test_taskkill_identity_windows_live.py \
-            tests/hermes_cli/test_git_trampoline_windows_live.py \
-            tests/pm/test_held_entry_windows_live.py
+          out="$RUNNER_TEMP/agc1721-native-source-only"
+          mkdir -p "$out/files"
+          python - "$PWD/.github/proof/agc1721_native_windows_manifest.json" > "$out/test-files.txt" <<'PY'
+          import json, sys
+          data = json.load(open(sys.argv[1], encoding="utf-8"))
+          sys.stdout.reconfigure(newline="\n")
+          target_files = data.get("target_test_files")
+          if target_files != ["tests/tui_gateway/test_tui_gateway_server.py"]:
+              raise SystemExit("manifest must select exactly the known target test file")
+          for path in target_files:
+              print(path)
+          PY
+          if ! python - "$PWD/.github/proof/agc1721_native_windows_manifest.json" "$out/test-files.txt" <<'PY'
+          import json, pathlib, sys
+          manifest_path, list_path = sys.argv[1:]
+          data = json.loads(pathlib.Path(manifest_path).read_text(encoding="utf-8"))
+          expected = data.get("target_test_files")
+          if expected != ["tests/tui_gateway/test_tui_gateway_server.py"]:
+              raise SystemExit("manifest target scope is not the exact original failing file")
+          raw = pathlib.Path(list_path).read_bytes()
+          cr = raw.count(b"\r")
+          lf = raw.count(b"\n")
+          crlf = raw.count(b"\r\n")
+          if cr != 0 or lf != len(expected) or crlf != 0:
+              raise SystemExit(f"invalid Windows test list bytes: CR={cr} LF={lf} expected={len(expected)}")
+          actual = raw.decode("utf-8").splitlines()
+          if actual != expected:
+              raise SystemExit("Windows test list differs from manifest")
+          PY
+          then
+            echo "Windows test list byte assertion failed" >&2
+            exit 1
+          fi
+          overall=0
+          total=0
+          failed=0
+          : > "$out/file-status.log"
+          while IFS= read -r test_path; do
+            [ -n "$test_path" ] || continue
+            total=$((total + 1))
+            label="${test_path//\//__}"
+            label="${label//./_}"
+            junit="$out/files/${label}.xml"
+            runner_log="$out/files/${label}.runner.log"
+            diagnostic_args=()
+            if [ "$test_path" = "tests/tui_gateway/test_tui_gateway_server.py" ]; then
+              diagnostic_args=(-o junit_logging=all)
+            fi
+            set +e
+            bash scripts/run_tests.sh -j 1 --file-timeout 300 --file-retries 0 \
+              "$test_path" -- --tb=short --junitxml="$junit" "${diagnostic_args[@]}" \
+              < /dev/null > "$runner_log" 2>&1
+            rc=$?
+            set -e
+            printf '%s exit=%s\n' "$test_path" "$rc" >> "$out/file-status.log"
+            if [ "$rc" -ne 0 ]; then
+              overall=1
+              failed=$((failed + 1))
+            fi
+          done < "$out/test-files.txt"
+          junit_count=$(python - "$out/files" <<'PY'
+          from pathlib import Path
+          import sys
+          sys.stdout.reconfigure(newline="\n")
+          print(sum(1 for path in Path(sys.argv[1]).glob("*.xml") if path.is_file()))
+          PY
+          )
+          no_test_file_logs=$(python - "$out/files" <<'PY'
+          from pathlib import Path
+          import sys
+          sys.stdout.reconfigure(newline="\n")
+          count = 0
+          for path in Path(sys.argv[1]).glob("*.runner.log"):
+              if "No test files to run" in path.read_text(encoding="utf-8", errors="replace"):
+                  count += 1
+          print(count)
+          PY
+          )
+          if [ "$total" -ne 1 ]; then
+            printf "Expected 1 target test file, executed %s\n" "$total" >&2
+            overall=1
+          fi
+          if [ "$junit_count" -ne 1 ]; then
+            printf "Expected 1 target per-file JUnit file, observed %s\n" "$junit_count" >&2
+            overall=1
+          fi
+          if [ "$no_test_file_logs" -ne 0 ]; then
+            printf "Found %s runner logs reporting no test files\n" "$no_test_file_logs" >&2
+            overall=1
+          fi
+          python - "$out/bank-result.json" "$total" "$failed" "$overall" "$junit_count" "$no_test_file_logs" <<'PY'
+          import json, sys
+          path, total, failed, overall, junit_count, no_test_file_logs = sys.argv[1:]
+          json.dump({
+              "schema": "agc1721.native_windows_source_only_bank_result.r3.v1",
+              "file_retries": 0,
+              "expected_files": 1,
+              "target_test_files": ["tests/tui_gateway/test_tui_gateway_server.py"],
+              "files": int(total),
+              "failed_files": int(failed),
+              "exit_code": int(overall),
+              "expected_per_file_junit": 1,
+              "per_file_junit": int(junit_count),
+              "no_test_file_logs": int(no_test_file_logs),
+              "per_file_runner_logs": True,
+              "cr_bytes_checked": True,
+              "lf_bytes_checked": True,
+          }, open(path, "w", encoding="utf-8"), indent=2)
+          PY
+          exit "$overall"
 
-      - name: Run Telegram CLOSE-WAIT reconnect live E2E (#87057)
+      - name: Verify candidate byte closure after tests
+        id: source_guard_after
+        timeout-minutes: 1
+        if: ${{ always() && steps.setup_pm.outcome == 'success' && steps.source_guard_before.outcome == 'success' }}
         shell: bash
         run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/gateway/test_telegram_closewait_windows_live.py
+          set -euo pipefail
+          out="$RUNNER_TEMP/agc1721-native-source-only"
+          python .github/proof/agc1721_native_windows_source_guard.py \
+            --manifest .github/proof/agc1721_native_windows_manifest.json \
+            --proof-sha "$GITHUB_SHA" \
+            --phase after \
+            --receipt "$out/source-after.json" \
+            --baseline-receipt "$out/source-before.json"
 
-      - name: Run background-executor spawn parity live E2E (#70716)
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/tools/test_process_registry_windows_live.py
-
-      - name: Turn Windows long paths off for later steps (#130242)
-        # The runner image turns LongPathsEnabled on; 0 is the Windows default
-        # most users have. A process reads the value when it starts, so only
-        # later steps see it. Keep this step after every lane that expects the
-        # image's setting. It does not depend on those lanes passing.
-        id: long_paths_off
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          reg add 'HKLM\SYSTEM\CurrentControlSet\Control\FileSystem' /v LongPathsEnabled /t REG_DWORD /d 0 /f
-          if ($LASTEXITCODE) { exit $LASTEXITCODE }
-          (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem').LongPathsEnabled
-
-      - name: Run PM long-path live E2E with long paths off (#130242)
-        # The test first asserts RtlAreLongPathsEnabled() is false in its own
-        # process, so this step cannot pass if the step above did not take.
-        # ``-m`` replaces pyproject's addopts, which deselect ``integration``.
-        if: ${{ !cancelled() && steps.long_paths_off.outcome == 'success' }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          bash scripts/run_tests.sh tests/pm/test_long_paths_windows_live.py -- -m "platforms and integration" -v
+      - name: Retain per-file JUnit, runner logs, and guards
+        timeout-minutes: 2
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: agc1721-native-source-only-${{ github.sha }}
+          path: ${{ runner.temp }}/agc1721-native-source-only/
+          if-no-files-found: error
+          retention-days: 14
