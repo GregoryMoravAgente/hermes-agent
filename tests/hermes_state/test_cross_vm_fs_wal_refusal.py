@@ -30,9 +30,9 @@ SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share r
 
 class TestDetectCrossVmFs:
     @pytest.mark.parametrize("path,expected", [
-        ("/data/agent", True),          # fuse.virtiofs bind mount
-        ("/mnt/host/db", True),         # 9p bind mount
-        ("/mnt/my share/db", True),     # octal-escaped mount point
+        pytest.param("/data/agent", True, marks=pytest.mark.platforms("linux")),
+        pytest.param("/mnt/host/db", True, marks=pytest.mark.platforms("linux")),
+        pytest.param("/mnt/my share/db", True, marks=pytest.mark.platforms("linux")),
         ("/home/user/.hermes", False),  # ext4 root
         ("/data/native/db", False),     # ext4 mounted over the virtiofs tree — longest prefix wins
         ("/datastore", False),          # sibling path sharing a prefix string, not a mount prefix

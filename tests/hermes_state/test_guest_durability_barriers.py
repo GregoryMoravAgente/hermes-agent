@@ -40,14 +40,26 @@ def test_guest_barriers_apply_configured_synchronous(monkeypatch, tmp_path):
         conn.close()
 
 
-def test_guest_barriers_leave_synchronous_alone_when_unset(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "expected_synchronous",
+    [
+        pytest.param(1, marks=pytest.mark.platforms("not macos")),
+        pytest.param(2, marks=pytest.mark.platforms("macos")),
+    ],
+)
+def test_guest_barriers_apply_platform_synchronous_floor_when_unset(
+    monkeypatch, tmp_path, expected_synchronous
+):
+    """Unset config preserves the host level, including Darwin's safety floor."""
     _config(monkeypatch, {})
     conn = sqlite3.connect(tmp_path / "state.db")
     try:
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA synchronous=1")
         apply_durability_barriers(conn)
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == expected_synchronous
+        # The guest barrier must not change the owner's journal mode on either host.
+        assert str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "delete"
     finally:
         conn.close()
 
