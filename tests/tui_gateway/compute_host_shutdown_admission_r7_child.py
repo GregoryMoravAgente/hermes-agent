@@ -85,10 +85,18 @@ def _install_delayed_turn(paths: argparse.Namespace) -> None:
     def delayed_turn_start(self: ComputeHost, frame: dict) -> None:
         Path(paths.turn_entered).write_text("entered", encoding="utf-8")
         wait_until(
-            lambda: Path(paths.allow_turn).exists(),
+            lambda: (
+                Path(paths.allow_turn).exists()
+                or bool(getattr(self, "_turn_admission_expired", False))
+            ),
             timeout=30,
-            what="test-owned delayed turn admission release",
+            what="test-owned delayed turn admission release or expired shutdown",
         )
+        if getattr(self, "_turn_admission_expired", False):
+            # The test-owned gate is an admitted, unresolved handler. A real
+            # shutdown boundary may stop waiting here, but it must not fabricate
+            # a terminal frame or release the parent-owned lease.
+            return
         original_turn_start(self, frame)
 
     ComputeHost._handle_turn_start = delayed_turn_start
@@ -100,10 +108,18 @@ def _install_delayed_turn(paths: argparse.Namespace) -> None:
             if frame.get("type") == "turn.start":
                 Path(paths.frame_received).write_text("received", encoding="utf-8")
                 wait_until(
-                    lambda: Path(paths.allow_frame).exists(),
+                    lambda: (
+                        Path(paths.allow_frame).exists()
+                        or self._shutdown_requested.is_set()
+                    ),
                     timeout=30,
-                    what="test-owned pre-admission frame release",
+                    what="test-owned pre-admission frame release or shutdown",
                 )
+                if self._shutdown_requested.is_set():
+                    # This frame has not crossed the production admission
+                    # boundary. Let the reader finish without claiming work or
+                    # publishing an unauthenticated refusal.
+                    return
             original_handle_frame(self, frame)
 
         ComputeHost.handle_frame = delayed_handle_frame

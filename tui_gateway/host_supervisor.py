@@ -24,7 +24,10 @@ from typing import Any
 from hermes_cli.local_runtime.processes import spawn_server
 from hermes_constants import get_hermes_home
 from tools.environments.local import hermes_subprocess_env
-from tui_gateway.host_supervisor_streams import drain_producer_completion, readers_settled
+from tui_gateway.host_supervisor_streams import (
+    drain_producer_completion, readers_settled, send_host_frame, transport_write_pending,
+    send_shutdown_frame_until, shutdown_writer_result, shutdown_writer_window,
+)
 from tui_gateway.windows_owner_recovery import (
     new_windows_job_name,
     owner_record_key,
@@ -399,6 +402,11 @@ class HostSupervisor:
         self.expected_hermes_home = (
             str(get_hermes_home()) if expected_hermes_home is None else expected_hermes_home)
         self._lock = threading.RLock()
+        # Serialize bytes on the child stdin without holding the lifecycle lock. A
+        # blocked pipe writer is itself custody: shutdown can time out against this
+        # lock and retain the exact process/owner instead of starving on ``_lock``.
+        self._transport_write_lock = threading.Lock()
+        self._transport_write_identity: tuple[Any, int] | None = None
         # Startup waits for hello while the caller owns ``_lock``.  Keep the
         # reader's one-time hello CAS on a separate mutex: taking the parent
         # lifecycle lock from the stdout reader would deadlock every spawn.
@@ -436,6 +444,10 @@ class HostSupervisor:
         self._startup_cancelled_generations: set[int] = set()
         self._startup_orphan_handles: dict[int, Any] = {}
         self._pending_shutdown_receipt: dict[str, Any] | None = None
+        # One bounded shutdown-send attempt per process/request. If its writer thread
+        # is still blocked after the caller's deadline, the thread retains the actual
+        # stdin resource and later completion is reconciled by exact process identity.
+        self._shutdown_send_state: Any | None = None
         self._shutdown_request_id: str | None = None
         self._shutdown_ack: dict[str, Any] | None = None
         self._shutdown_admission_closed = False
@@ -642,7 +654,7 @@ class HostSupervisor:
             # respond/interrupt drain path.
             self._shutdown_admission_closed = True
             if not (pending_turns or pending_controls or late_controls or late_control_uncertain):
-                if not shutdown_sent:
+                if not shutdown_sent and self._shutdown_request_id is None:
                     self._shutdown_request_id = f"shutdown-{uuid.uuid4().hex}"
                     self._shutdown_ack = None
                 shutdown_request_id = self._shutdown_request_id
@@ -673,17 +685,24 @@ class HostSupervisor:
                 shutdown_ack=shutdown_ack,
                 exit_settled=bool(exit_event is not None and exit_event.is_set()),
             )
-        deadline = time.monotonic() + max(0.0, float(timeout))
+        writer_pending, deadline = shutdown_writer_window(
+            self, proc=proc, request_id=shutdown_request_id, timeout=timeout)
         error = ""
-        if not shutdown_sent:
+        if not shutdown_sent and not writer_pending:
             try:
                 if proc.poll() is None and proc.stdin is not None:
-                    self._send_frame({
-                        "type": "shutdown", "request_id": shutdown_request_id,
-                    }, allow_shutdown=True)
+                    writer = send_shutdown_frame_until(
+                        self, {"type": "shutdown", "request_id": shutdown_request_id},
+                        proc=proc, request_id=shutdown_request_id, deadline=deadline,
+                    )
+                    if not writer.sent:
+                        deadline = time.monotonic() if writer.pending else deadline
+                        raise _FrameSendError(
+                            "compute host shutdown writer pending" if writer.pending
+                            else "compute host shutdown writer failed",
+                            ambiguous=writer.pending or writer.ambiguous, proc=proc,
+                        )
                     shutdown_sent = True
-                    with self._lock:
-                        self._shutdown_sent = True
                 else:
                     error = "host_not_running"
             except _FrameSendError as exc:
@@ -722,6 +741,8 @@ class HostSupervisor:
             late_controls=late_controls, late_control_uncertain=late_control_uncertain,
         )
         with self._lock:
+            result.update(shutdown_writer_result(
+                self, proc=proc, request_id=shutdown_request_id, error=error))
             result["admission_closed"] = self._shutdown_admission_closed
             if result["clean"]:
                 # The process/owner identity must still be the one observed by all
@@ -816,6 +837,16 @@ class HostSupervisor:
             # A destructive fallback would turn accepted work into unknown custody.
             # The caller must settle the exact records and retry shutdown_clean().
             return result
+        if (result.get("transport_writer_pending")
+                or result.get("transport_writer_ambiguous")
+                or (result.get("transport_writer_sent") and not result.get("clean"))):
+            # A sent or unresolved writer is custody until the exact ACK/reader receipt settles.
+            status = (
+                "transport_writer_pending" if result.get("transport_writer_pending") else
+                "transport_writer_ambiguous" if result.get("transport_writer_ambiguous") else
+                "transport_writer_sent_pending_settlement")
+            return {**result, "clean": False, "ack_required": False,
+                    "status": status, "owner_state": "unknown"}
         with self._lock:
             proc = self._proc
             owner = self._owner
@@ -1190,6 +1221,13 @@ class HostSupervisor:
     def _spawn_locked(self, *, reason: str) -> None:
         if self._stopped_respawning:
             raise RuntimeError("compute host respawn disabled after crash loop")
+        writer_state = self._shutdown_send_state
+        if (writer_state is not None
+                and (not writer_state.done.is_set() or writer_state.ambiguous)):
+            raise RuntimeError("compute host shutdown writer custody is unresolved")
+        if self._transport_write_lock.locked():
+            raise RuntimeError("compute host transport writer is still pending")
+        self._shutdown_send_state = None
         with self._hello_lock:
             if self._startup_binding is not None or self._startup_orphan_handles:
                 raise RuntimeError("compute host startup custody is still retained")
@@ -1352,36 +1390,18 @@ class HostSupervisor:
     def _send_frame(
         self, frame: dict[str, Any], *, allow_shutdown: bool = False,
         allow_existing_sid: str | None = None,
+        expected_proc: subprocess.Popen[str] | None = None,
     ) -> None:
-        try:
-            payload = json.dumps(frame, separators=(",", ":"), ensure_ascii=False) + "\n"
-        except Exception as exc:
-            # No transport operation ran, so this is a proven pre-submit refusal.
-            raise _FrameSendError(str(exc), ambiguous=False, proc=None) from exc
-        with self._lock:
-            existing_allowed = bool(
-                allow_existing_sid is not None
-                and frame.get("sid") == allow_existing_sid
-                and frame.get("type") in {"respond", "interrupt"}
-                and self._has_pending_sid_locked(allow_existing_sid)
-            )
-            if self._shutdown_admission_closed and not (allow_shutdown or existing_allowed):
-                raise _FrameSendError(
-                    "compute host shutdown admission is closed", ambiguous=False, proc=self._proc)
-            proc = self._proc
-            if proc is None or proc.poll() is not None or proc.stdin is None:
-                raise _FrameSendError("compute host is not running", ambiguous=False, proc=proc)
-            try:
-                written = proc.stdin.write(payload)
-                if written != len(payload):
-                    raise _FrameSendError(
-                        f"compute host short write: {written!r}/{len(payload)} characters",
-                        ambiguous=True, proc=proc)
-                proc.stdin.flush()
-            except _FrameSendError:
-                raise
-            except Exception as exc:
-                raise _FrameSendError(str(exc), ambiguous=True, proc=proc) from exc
+        observation = send_host_frame(
+            self, frame, allow_shutdown=allow_shutdown,
+            allow_existing_sid=allow_existing_sid, expected_proc=expected_proc,
+        )
+        if observation.sent:
+            return
+        raise _FrameSendError(
+            observation.message or "compute host frame write failed",
+            ambiguous=observation.ambiguous, proc=observation.proc,
+        )
 
     def _drain_stdout(
         self, proc: subprocess.Popen[str], host_generation: int | None = None,
@@ -1849,9 +1869,9 @@ class HostSupervisor:
             owner_closed = True
             producer_closed = True
             if not closing:
-                stream_states = self._stream_states.get(id(proc))
-                readers_settled = self._readers_settled(
-                    stream_states, _SHUTDOWN_TIMEOUT_SECS)
+                readers_settled = (
+                    not transport_write_pending(self, proc) and self._readers_settled(
+                        self._stream_states.get(id(proc)), _SHUTDOWN_TIMEOUT_SECS))
                 if readers_settled:
                     producer_closed = self._try_close_producer_handle()
                     owner_closed = self._owner_closed or self._try_close_owner(owner)

@@ -76,6 +76,87 @@ def _terminal_digest(terminal: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _iter_control_lines_posix(fd: int, stop: threading.Event):
+    import select
+
+    buffer = bytearray()
+    while not stop.is_set():
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.1)
+        except (OSError, ValueError):
+            return
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 4096)
+        except (OSError, ValueError):
+            return
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while b"\n" in buffer:
+            raw, _, remainder = buffer.partition(b"\n")
+            buffer = bytearray(remainder)
+            yield bytes(raw)
+    if buffer and not stop.is_set():
+        yield bytes(buffer)
+
+
+def _iter_control_lines_windows(fd: int, stop: threading.Event):
+    import ctypes
+    import msvcrt
+
+    try:
+        raw_handle = msvcrt.get_osfhandle(fd)
+    except OSError:
+        return
+    if raw_handle in (-1, 0):
+        return
+    kernel32 = ctypes.windll.kernel32
+    available = ctypes.c_ulong(0)
+    buffer = bytearray()
+    while not stop.is_set():
+        try:
+            ok = kernel32.PeekNamedPipe(
+                ctypes.c_void_p(raw_handle), None, 0, None,
+                ctypes.byref(available), None,
+            )
+        except OSError:
+            return
+        if not ok:
+            return
+        if not available.value:
+            stop.wait(0.05)
+            continue
+        try:
+            chunk = os.read(fd, min(int(available.value), 4096))
+        except (OSError, ValueError):
+            return
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while b"\n" in buffer:
+            raw, _, remainder = buffer.partition(b"\n")
+            buffer = bytearray(remainder)
+            yield bytes(raw)
+    if buffer and not stop.is_set():
+        yield bytes(buffer)
+
+
+def _iter_control_lines(stream: Any, stop: threading.Event):
+    """Read control frames without blocking a buffered-reader close during shutdown."""
+    try:
+        fd = stream.fileno()
+    except (AttributeError, OSError, ValueError) as exc:
+        raise TypeError("compute host stdin must expose a pipe file descriptor") from exc
+    if type(fd) is not int or fd < 0:
+        raise TypeError("compute host stdin must expose a pipe file descriptor")
+    if os.name == "nt":
+        yield from _iter_control_lines_windows(fd, stop)
+    else:
+        yield from _iter_control_lines_posix(fd, stop)
+
+
 def _write_completion_bytes(
     fd: int, data: bytes, *, write_fn: Callable[[int, Any], int] | None = None,
 ) -> None:
@@ -111,6 +192,8 @@ class ComputeHost:
         self._shutdown_lock = threading.RLock()
         self._shutdown_requested = threading.Event()
         self._shutdown_complete = threading.Event()
+        self._shutdown_ack_failed = threading.Event()
+        self._shutdown_writer_state: dict[str, Any] | None = None
         # A parsed turn can already be inside the admission handler when a
         # signal/orphan shutdown wins the lifecycle lock. Keep that handler alive
         # until its typed refusal and source-bound receipt have been published.
@@ -139,7 +222,60 @@ class ComputeHost:
         frame.setdefault("host_ns", now_ns())
         data = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
         with self._write_lock:
+            if self._completion_closed.is_set():
+                return
             print(data, file=self._stdout, flush=True)
+
+    def _emit_until(self, frame: dict[str, Any], *, deadline: float) -> bool:
+        """Emit one lifecycle frame once while retaining any blocked writer state."""
+        frame.setdefault("host_ns", now_ns())
+        data = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
+        request_id = str(frame.get("request_id") or "")
+        with self._shutdown_lock:
+            state = self._shutdown_writer_state
+            if state is not None:
+                if state["request_id"] != request_id or not state["done"].is_set():
+                    return False
+                return bool(state["ok"])
+            done = threading.Event()
+            state = {
+                "request_id": request_id, "done": done, "ok": False,
+                "error_type": None, "thread": None,
+            }
+            self._shutdown_writer_state = state
+
+            def write() -> None:
+                remaining = deadline - time.monotonic()
+                acquired = remaining > 0 and self._write_lock.acquire(timeout=remaining)
+                if not acquired:
+                    state["error_type"] = "LockTimeout"
+                    done.set()
+                    return
+                try:
+                    if self._completion_closed.is_set():
+                        state["error_type"] = "TransportClosed"
+                        return
+                    print(data, file=self._stdout, flush=True)
+                    state["ok"] = True
+                except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                    state["error_type"] = type(exc).__name__
+                finally:
+                    self._write_lock.release()
+                    done.set()
+
+            from agent.memory_provider import spawn_context_thread
+            thread = spawn_context_thread(
+                write, name="compute-host-lifecycle-writer", daemon=False,
+            )
+            state["thread"] = thread
+            try:
+                thread.start()
+            except RuntimeError as exc:  # failed writer creation cannot prove an ACK
+                state["error_type"] = type(exc).__name__
+                done.set()
+        if not done.wait(timeout=max(0.0, deadline - time.monotonic())):
+            return False
+        return bool(state["ok"])
 
     def _reply(self, kind: str, sid: str, request_id: Any, **extra: Any) -> None:
         """Emit a per-session frame keyed by the request it answers."""
@@ -226,13 +362,39 @@ class ComputeHost:
         self._closed.set()
         admissions_settled = self._seal_turn_admissions(deadline=deadline)
         self._executor.shutdown(wait=False, cancel_futures=True)
+        if not admissions_settled:
+            # The parsed handler still owns an unresolved turn; closing either
+            # transport would discard its source-bound terminal/custody path.
+            return False
+        if self._shutdown_ack_failed.is_set():
+            # An explicit shutdown command already failed to publish its ACK. Do
+            # not close the source channels and manufacture a locally clean stop.
+            return False
         self._completion_close_requested.set()
-        with self._completion_lock:
-            fd, self._completion_fd = self._completion_fd, None
-            self._completion_closed.set()
-            if fd is not None:
-                with contextlib.suppress(OSError):
-                    os.close(fd)
+
+        def acquire(lock: Any) -> bool:
+            if deadline is None:
+                lock.acquire()
+                return True
+            return lock.acquire(timeout=max(0.0, deadline - time.monotonic()))
+
+        # A stdout writer is an actual child resource. Hold the lock through the
+        # completion close so a queued writer cannot publish after the close marker.
+        if not acquire(self._write_lock):
+            return False
+        try:
+            if not acquire(self._completion_lock):
+                return False
+            try:
+                fd, self._completion_fd = self._completion_fd, None
+                self._completion_closed.set()
+                if fd is not None:
+                    with contextlib.suppress(OSError):
+                        os.close(fd)
+            finally:
+                self._completion_lock.release()
+        finally:
+            self._write_lock.release()
         # A foreground command in its own process group would outlive the closing host.
         with contextlib.suppress(Exception):
             from tools.environments.base import kill_live_foreground_processes
@@ -336,14 +498,25 @@ class ComputeHost:
         with self._shutdown_lock:
             if self._shutdown_complete.is_set():
                 return
-            try:
-                if admissions_settled:
-                    self.emit({
-                        "type": "shutdown.ack", "request_id": frame.get("request_id"),
-                        "host_pid": os.getpid(), "host_boot_id": self._boot_id,
-                        "drained": drained,
-                    })
-            finally:
+            ack_written = False
+            if admissions_settled:
+                ack_written = self._emit_until({
+                    "type": "shutdown.ack", "request_id": frame.get("request_id"),
+                    "host_pid": os.getpid(), "host_boot_id": self._boot_id,
+                    "drained": drained,
+                }, deadline=deadline)
+            if not ack_written:
+                # A bounded observer may return while the exact non-daemon writer
+                # still owns stdout. Keep that state retryable; only a completed
+                # failed writer is a terminal ACK failure.
+                writer_state = self._shutdown_writer_state
+                if writer_state is not None and writer_state["done"].is_set():
+                    ack_written = bool(writer_state["ok"])
+                if not ack_written and (
+                    writer_state is None or writer_state["done"].is_set()
+                ):
+                    self._shutdown_ack_failed.set()
+            if ack_written:
                 self.close(deadline=deadline)
 
     def _begin_turn_admission(self) -> bool:
@@ -1007,44 +1180,90 @@ def run_host(stdin: Any = None, stdout: Any = None) -> None:
         "build_sha": _build_sha(), "cwd": os.getcwd(),
         "hermes_home": os.environ.get("HERMES_HOME", "")})
 
-    shutdown_command_started = threading.Event()
-
     def _reader() -> None:
-        for raw in stdin:
-            if host._closed.is_set():
-                break
-            try:
-                frame = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                host.emit({"type": "error", "message": f"invalid json: {exc}"})
-                continue
-            if not isinstance(frame, dict):
-                host.emit({"type": "error", "message": "frame must be an object"})
-                continue
-            is_shutdown = frame.get("type") == "shutdown"
-            if is_shutdown:
-                shutdown_command_started.set()
-            host.handle_frame(frame)
-            if is_shutdown:
-                # The handler has emitted and flushed the ACK before close(). The main
-                # thread joins this reader before running any fallback finalizer.
-                return
-            if host._closed.is_set():
-                break
-    reader = threading.Thread(target=_reader, name="compute-host-control-reader", daemon=True)
+        try:
+            frames = _iter_control_lines(stdin, shutting_down)
+            for raw in frames:
+                if host._closed.is_set():
+                    break
+                try:
+                    frame = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    host.emit({"type": "error", "message": f"invalid json: {exc}"})
+                    continue
+                if not isinstance(frame, dict):
+                    host.emit({"type": "error", "message": "frame must be an object"})
+                    continue
+                is_shutdown = frame.get("type") == "shutdown"
+                host.handle_frame(frame)
+                if is_shutdown:
+                    # The handler has emitted and flushed the ACK before close(). The main
+                    # thread joins this reader before running any fallback finalizer.
+                    return
+                if host._closed.is_set():
+                    break
+        except (OSError, TypeError, ValueError):
+            # A stopped or closed control pipe is a normal shutdown boundary.
+            # Unsupported streams fail closed instead of retaining a blocking buffered reader.
+            if not shutting_down.is_set():
+                raise
+
+    from agent.memory_provider import spawn_context_thread
+    reader = spawn_context_thread(
+        _reader, name="compute-host-control-reader", daemon=False,
+    )
     reader.start()
     try:
         while not host._closed.wait(0.2):
             if not reader.is_alive():
                 break
     finally:
-        if shutdown_command_started.is_set():
-            # A command handler owns the shutdown lock and has a bounded drain. Joining
-            # here prevents the main thread from exiting while the ACK write is in flight.
+        # Every exit from the host loop is a terminal boundary, including an
+        # internal close or reader EOF. Signal the stop-aware reader before
+        # unregistering transport; never close its stream from another thread.
+        # Keep the join bounded so an unresolved handler retains custody.
+        shutting_down.set()
+
+        def finish_after_reader() -> None:
+            # A reader still handling an explicit shutdown owns the ACK/transport
+            # ordering. Keep custody until it returns; a competing fallback close
+            # must not unregister the transport or manufacture a local terminal.
             reader.join()
-        server.unregister_live_transport(host._transport)
-        if not host._shutdown_complete.is_set():
-            host.shutdown(reason="stdin_closed", wait=2.0)
+
+            # The shutdown handler can return at its ten-second observation deadline
+            # while its separate non-daemon ACK writer still owns stdout. The reader
+            # boundary is therefore insufficient: wait for that exact writer thread
+            # before unregistering or attempting fallback cleanup.
+            with host._shutdown_lock:
+                writer_state = host._shutdown_writer_state
+                writer = writer_state.get("thread") if writer_state is not None else None
+            if writer_state is not None:
+                if writer is not None and writer.is_alive():
+                    writer.join()
+                with host._shutdown_lock:
+                    settled_state = host._shutdown_writer_state
+                    if (settled_state is not writer_state
+                            or not settled_state["done"].is_set()
+                            or not settled_state["ok"]):
+                        # A failed or unobservable ACK remains unknown custody. Do
+                        # not unregister the transport or manufacture a local stop.
+                        return
+
+            server.unregister_live_transport(host._transport)
+            if not host._shutdown_complete.is_set():
+                host.shutdown(reason="stdin_closed", wait=2.0)
+
+        reader.join(timeout=2.0)
+        # Always run terminal cleanup off the host main thread. If the reader has
+        # already returned, its exact join in finish_after_reader is immediate;
+        # an unresolved ACK writer must never block this main thread. The
+        # non-daemon finalizer retains custody until the real reader and writer
+        # settle, or returns unknown without unregistering on failure.
+        spawn_context_thread(
+            finish_after_reader,
+            name="compute-host-deferred-terminal-cleanup",
+            daemon=False,
+        ).start()
 
 
 def main(argv: list[str] | None = None) -> int:

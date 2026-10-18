@@ -33,6 +33,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 # Preserve the real HostSupervisor stdout pipe before importing tui_gateway.server;
 # that module intentionally redirects process stdout to stderr for its own logging.
 _WIRE_STDOUT = sys.stdout
+_WIRE_STDIN = getattr(sys.stdin, "buffer", sys.stdin)
 
 from tests.waiting import wait_until
 
@@ -137,6 +138,160 @@ from tui_gateway.compute_host import ComputeHost
 
 _SID = "compute-owner-sid"
 _SESSION_KEY = "compute-owner-session"
+
+
+class _FinishedInputProxy:
+    """Fixture-only fallback for source revisions that iterate stdin directly."""
+
+    def __init__(self, stream, finished: Path) -> None:
+        self._stream = stream
+        self._finished = finished
+
+    def fileno(self):
+        return self._stream.fileno()
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+    def __iter__(self):
+        try:
+            yield from self._stream
+        finally:
+            self._finished.write_text("reader-finished", encoding="utf-8")
+
+
+def _install_reader_finished_marker(finished: str, stream):
+    """Mark fixture cleanup while delegating the real production pipe reader."""
+    original_reader = getattr(compute_host, "_iter_control_lines", None)
+    if not callable(original_reader):
+        # Older source iterates stdin directly; delegate to that real stream
+        # through a fixture-only proxy and do not add a production hook.
+        return _FinishedInputProxy(stream, Path(finished))
+
+    def marked_reader(stream, stop):
+        try:
+            yield from original_reader(stream, stop)
+        finally:
+            Path(finished).write_text("reader-finished", encoding="utf-8")
+
+    compute_host._iter_control_lines = marked_reader
+    return stream
+
+
+def _install_shutdown_boundary_probe(args: argparse.Namespace) -> None:
+    """Observe real run_host ownership while the production drain is gated."""
+    required = (
+        args.shutdown_drain_ready, args.shutdown_drain_release,
+        args.shutdown_explicit_drain_returned, args.shutdown_fallback_entered,
+        args.shutdown_fallback_shutdown, args.shutdown_unregister,
+        args.shutdown_join_returned, args.shutdown_join_release,
+    )
+    if not all(required):
+        raise SystemExit(
+            "shutdown-boundary mode requires all synchronization paths"
+        )
+
+    original_drain = ComputeHost._drain_and_flush
+    drain_lock = threading.Lock()
+    drain_calls = 0
+
+    def gated_drain(self: ComputeHost, *drain_args, **drain_kwargs):
+        nonlocal drain_calls
+        with drain_lock:
+            drain_calls += 1
+            call_number = drain_calls
+        if call_number == 1:
+            Path(args.shutdown_drain_ready).write_text("entered", encoding="utf-8")
+            wait_until(
+                lambda: Path(args.shutdown_drain_release).exists(),
+                timeout=30,
+                what="test-owned explicit drain release",
+            )
+            result = original_drain(self, *drain_args, **drain_kwargs)
+            Path(args.shutdown_explicit_drain_returned).write_text(
+                "returned", encoding="utf-8"
+            )
+            return result
+        Path(args.shutdown_fallback_entered).write_text(
+            json.dumps({"thread": threading.current_thread().name}),
+            encoding="utf-8",
+        )
+        return original_drain(self, *drain_args, **drain_kwargs)
+
+    ComputeHost._drain_and_flush = gated_drain
+
+    original_shutdown = ComputeHost.shutdown
+
+    def observed_shutdown(self: ComputeHost, *shutdown_args, **shutdown_kwargs):
+        Path(args.shutdown_fallback_shutdown).write_text(
+            json.dumps({"thread": threading.current_thread().name}),
+            encoding="utf-8",
+        )
+        return original_shutdown(self, *shutdown_args, **shutdown_kwargs)
+
+    ComputeHost.shutdown = observed_shutdown
+
+    original_unregister = server.unregister_live_transport
+
+    def observed_unregister(transport):
+        Path(args.shutdown_unregister).write_text("unregistered", encoding="utf-8")
+        return original_unregister(transport)
+
+    server.unregister_live_transport = observed_unregister
+
+    original_join = threading.Thread.join
+
+    def observed_join(thread, timeout=None):
+        if (
+            thread.name == "compute-host-lifecycle-writer"
+            and timeout is None
+            and args.shutdown_writer_join_entered
+        ):
+            # This is emitted at the real deferred finalizer's writer.join(None)
+            # entry, before that join can be released by the ACK gate.
+            Path(args.shutdown_writer_join_entered).write_text(
+                json.dumps({"thread": threading.current_thread().name, "timeout": timeout}),
+                encoding="utf-8",
+            )
+        result = original_join(thread, timeout)
+        if (
+            thread.name == "compute-host-control-reader"
+            and timeout is None
+            and args.shutdown_reader_settled
+        ):
+            # This follows the exact reader.join(None) used by the deferred
+            # finalizer, rather than the fixture's generator-finally marker.
+            Path(args.shutdown_reader_settled).write_text(
+                json.dumps({"thread": threading.current_thread().name, "joined": True}),
+                encoding="utf-8",
+            )
+        if thread.name == "compute-host-control-reader" and timeout == 2.0:
+            Path(args.shutdown_join_returned).write_text(
+                json.dumps({"alive": thread.is_alive(), "timeout": timeout}),
+                encoding="utf-8",
+            )
+            if args.shutdown_reader_finishes_first:
+                # Use the saved original join directly so this control proves the
+                # reader really died while the ACK writer remained gated. The
+                # existing join-release barrier stays after that real thread exit.
+                original_join(thread)
+                if args.shutdown_reader_fully_returned:
+                    Path(args.shutdown_reader_fully_returned).write_text(
+                        json.dumps({
+                            "thread": threading.current_thread().name,
+                            "alive": thread.is_alive(),
+                            "joined": True,
+                        }),
+                        encoding="utf-8",
+                    )
+            wait_until(
+                lambda: Path(args.shutdown_join_release).exists(),
+                timeout=30,
+                what="test-owned reader-join boundary release",
+            )
+        return result
+
+    threading.Thread.join = observed_join
 
 
 def _agent() -> types.SimpleNamespace:
@@ -370,6 +525,69 @@ def _install_removed_session_held_exception(paths: argparse.Namespace) -> None:
     server._run_prompt_submit = run_with_removed_session
 
 
+def _install_completion_backpressure(paths: argparse.Namespace) -> None:
+    """Fill the real inherited completion pipe during the producer write."""
+    original_write = compute_host._write_completion_bytes
+    write_count = 0
+
+    def blocked_write(fd: int, data: bytes, **kwargs) -> None:
+        nonlocal write_count
+        write_count += 1
+        # Startup is the first record. Fill only the actual turn completion write,
+        # after the parent has authenticated startup and intentionally paused its
+        # completion reader. Every padding unit is the exact source-bound completion
+        # record, newline framed and within the production record budget; no malformed
+        # partial line can swallow the later real record.
+        if write_count == 2:
+            os.set_blocking(fd, False)
+            padding_count = 0
+            try:
+                while True:
+                    try:
+                        written = os.write(fd, data)
+                    except BlockingIOError:
+                        break
+                    if written != len(data):
+                        raise OSError("completion padding made a short framed write")
+                    padding_count += 1
+            finally:
+                os.set_blocking(fd, True)
+            Path(paths.completion_filled).write_text(str(padding_count), encoding="utf-8")
+            wait_until(
+                lambda: Path(paths.completion_release).exists(),
+                timeout=30,
+                what="test-owned completion pipe release",
+            )
+        return original_write(fd, data, **kwargs)
+
+    compute_host._write_completion_bytes = blocked_write
+    original_close = ComputeHost.close
+
+    def observed_close(self: ComputeHost, *args, **kwargs) -> bool:
+        result = original_close(self, *args, **kwargs)
+        result_path = Path(paths.close_result)
+        if not result_path.exists():
+            result_path.write_text(
+                json.dumps({
+                    "result": bool(result),
+                    "completion_closed": self._completion_closed.is_set(),
+                    "completion_fd_present": self._completion_fd is not None,
+                }, separators=(",", ":")),
+                encoding="utf-8",
+            )
+        return result
+
+    ComputeHost.close = observed_close
+    original_shutdown = ComputeHost.shutdown
+
+    def bounded_shutdown(self: ComputeHost, *args, **kwargs) -> None:
+        return original_shutdown(
+            self, *args, **{**kwargs, "wait": float(paths.shutdown_wait)},
+        )
+
+    ComputeHost.shutdown = bounded_shutdown
+
+
 def _configure_normal(_args: argparse.Namespace) -> None:
     return None
 
@@ -416,6 +634,15 @@ def _configure_removed_session_held_exception(args: argparse.Namespace) -> None:
     _install_removed_session_held_exception(args)
 
 
+def _configure_completion_backpressure(args: argparse.Namespace) -> None:
+    required = (args.completion_filled, args.completion_release, args.close_result)
+    if not all(required):
+        raise SystemExit(
+            "completion-backpressure mode requires fill, release, and close-result paths"
+        )
+    _install_completion_backpressure(args)
+
+
 _MODE_CONFIGURERS = {
     "normal": _configure_normal,
     "early": _configure_early,
@@ -423,6 +650,7 @@ _MODE_CONFIGURERS = {
     "retry": _configure_retry,
     "held-exception": _configure_held_exception,
     "removed-session-held-exception": _configure_removed_session_held_exception,
+    "completion-backpressure": _configure_completion_backpressure,
 }
 
 
@@ -435,7 +663,7 @@ def _main(argv: list[str]) -> int:
     parser.add_argument(
         "--mode", choices=(
             "normal", "early", "late", "retry", "held-exception",
-            "removed-session-held-exception",
+            "removed-session-held-exception", "completion-backpressure",
         ), required=True)
     parser.add_argument("--worker-release", default="")
     parser.add_argument("--worker-started", default="")
@@ -455,11 +683,30 @@ def _main(argv: list[str]) -> int:
     parser.add_argument("--duplicate-written", default="")
     parser.add_argument("--shutdown-ack-ready", default="")
     parser.add_argument("--shutdown-ack-release", default="")
+    parser.add_argument("--shutdown-drain-ready", default="")
+    parser.add_argument("--shutdown-drain-release", default="")
+    parser.add_argument("--shutdown-explicit-drain-returned", default="")
+    parser.add_argument("--shutdown-fallback-entered", default="")
+    parser.add_argument("--shutdown-fallback-shutdown", default="")
+    parser.add_argument("--shutdown-unregister", default="")
+    parser.add_argument("--shutdown-join-returned", default="")
+    parser.add_argument("--shutdown-join-release", default="")
+    parser.add_argument("--shutdown-reader-settled", default="")
+    parser.add_argument("--shutdown-writer-join-entered", default="")
+    parser.add_argument("--shutdown-reader-finishes-first", action="store_true")
+    parser.add_argument("--shutdown-reader-fully-returned", default="")
+    parser.add_argument("--completion-filled", default="")
+    parser.add_argument("--reader-finished", default="")
+    parser.add_argument("--completion-release", default="")
+    parser.add_argument("--close-result", default="")
+    parser.add_argument("--shutdown-wait", type=float, default=0.25)
     args = parser.parse_args(argv)
 
     _install_neutral_turn_seams()
     server._sessions[_SID] = _session()
     _configure_mode(args)
+    if args.shutdown_drain_ready:
+        _install_shutdown_boundary_probe(args)
     if bool(args.shutdown_ack_ready) != bool(args.shutdown_ack_release):
         raise SystemExit("shutdown ACK gate requires both synchronization paths")
     stdout = _WIRE_STDOUT
@@ -469,8 +716,11 @@ def _main(argv: list[str]) -> int:
         )
     os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
     # main() only parses argv then calls run_host() without an explicit stream. Pass
-    # the captured pipe explicitly so server's logging redirect cannot move the wire.
-    compute_host.run_host(stdout=stdout)
+    # the captured pipes explicitly so server's logging redirect cannot move the wire.
+    stdin = _WIRE_STDIN
+    if args.reader_finished:
+        stdin = _install_reader_finished_marker(args.reader_finished, stdin)
+    compute_host.run_host(stdin=stdin, stdout=stdout)
     return 0
 
 

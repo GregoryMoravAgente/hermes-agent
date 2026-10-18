@@ -108,6 +108,7 @@ async def test_managed_api_split_provider_runs_real_ledger_task_and_releases_cus
     from cron.scheduler_provider import InProcessCronScheduler
 
     home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(home))
     scripts_dir = home / "scripts"
     (home / "cron").mkdir(parents=True)
     scripts_dir.mkdir(parents=True)
@@ -182,6 +183,8 @@ async def test_managed_api_split_provider_runs_real_ledger_task_and_releases_cus
                     lambda: bool(claimed_bindings) and claimed_bindings[0]._future is not None,
                     timeout=30, what="the exact detached provider task binding")
                 binding = claimed_bindings[0]
+                assert binding.handle.profile_id == str(home.resolve())
+                assert binding.parent.handle.profile_id == str(home.resolve())
                 task = binding._future
                 await asyncio.wait_for(asyncio.shield(task), timeout=30)
                 await async_wait_until(
