@@ -1,6 +1,6 @@
 {
   "officialBase": "9e01b44dd23978f9ff40b7837467f3a9f1582130",
-  "qualifiedSourceTree": "f7647d96ceb99cf7b4467ae4397c9fae4b5db72d",
+  "qualifiedSourceTree": "4374e870b278f58e9dbe54a6315429fb8948651d",
   "previousPublicDraft": "ab6b1921d4321edd2d66230a980aa7a23d2dcb96",
   "sourceFiles": {
     "agent/compression_marker.py": "a91d730d12e187e16d0d9331b60a57928304544dcd2ba1ab323e0aecaf25a8eb",
@@ -51,7 +51,12 @@
     "uv.lock": "bce2b3fa48113c4ec5beb96290d9c04cd24cc970d88ec213de077f294603d715",
     ".github/actions/setup-pm/action.yml": "07e24a71548c846b0794bbd35fa69a119f855c8165974397f99ddff4645fe031",
     "scripts/run_tests.sh": "20c955e19e440bffb2abbc7bc645cc7c4d77a3fcdcd82434facf8b8ac9684467",
-    "scripts/run_tests_parallel.py": "3e18e138e66931a6e9ebacadfa430998d0c995d25dfbf43672594c6473c8e307"
+    "scripts/run_tests_parallel.py": "3e18e138e66931a6e9ebacadfa430998d0c995d25dfbf43672594c6473c8e307",
+    ".gitattributes": "0d6f68c5a837eee3f06dff499d762a5323fbce66d9e1168bd5e4e8ae3429f4fa"
   },
-  "scope": "Exporter component only; no full20, Host, addon, package, protected merge or installed acceptance."
+  "scope": "Exporter component only; no full20, Host, addon, package, protected merge or installed acceptance.",
+  "correctedExporterCommit": "e71dfdc3b1ad8f27ec5b3c8cf34747e0acb12b44",
+  "priorNativeRun": 39136510808,
+  "correction": "Only checkout attributes changed; all49 prior source/input hashes remain byte-identical. Frozen fixtures keep their existing digests.",
+  "previousQualifiedSourceTree": "f7647d96ceb99cf7b4467ae4397c9fae4b5db72d"
 }

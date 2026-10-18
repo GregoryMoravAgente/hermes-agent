@@ -25,10 +25,11 @@ jobs:
           test-environment: 'true'
           prune-python-cache: true
       - name: Verify frozen exporter source and runner inputs
+        id: source_guard
         shell: bash
         run: python .github/proof/agc1663_exporter_source_guard.py
       - name: Run exporter component bank on actual Windows
-        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -50,7 +51,7 @@ jobs:
             tests/tui_gateway/test_profiles_list_canonical_session.py \
             -- --tb=short
       - name: Run actual Windows junction and lock-release controls
-        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -58,13 +59,13 @@ jobs:
             tests/test_hermes_cron_custody_windows.py \
             -- --junitxml=native-exporter-namespace.xml --tb=short
       - name: Verify source after native execution
-        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard.outcome == 'success' }}
         shell: bash
         run: |
           python .github/proof/agc1663_exporter_source_guard.py
           git diff --quiet --exit-code
       - name: Retain native namespace receipt
-        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.setup_pm.outcome == 'success' && steps.source_guard.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: exporter-native-namespace-${{ github.sha }}
