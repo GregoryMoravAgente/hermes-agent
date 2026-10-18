@@ -87,10 +87,10 @@
     "tests/cron/test_external_worker_acceptance.py": "792f064624a52d7d3057ec0af4c115d7db34b6b2bdc7aea4bfca6cb95989b107",
     "tests/cron/test_restart_safe_worker_death_evidence.py": "7c18a0a28c248ffbce5316fa0bc4eef1821a08db2d3462c701e7261a0b24b60f",
     "tests/cron/test_external_worker_secret_sources.py": "b635a8414537720bb5662795064cd43f0960102da242aabe7d9b2bf3aaeede43",
-    "tests/cron/test_external_worker_config_hooks.py": "d74f1104561eb1d4b2f1c3c82a5abad434864fb166b10baf11d329a69e9c8a13",
+    "tests/cron/test_external_worker_config_hooks.py": "f4a7659bc5f164a901283ce25c12c8fd966ce83f05a845d0f29f9997804e9860",
     "tests/cron/test_scheduled_occurrence.py": "b53b41c17222af102e6573d5b892594e9a427fb3fc02d363123ee221a2d33ae2",
     ".github/workflows/windows-venv-e2e.yml": "df93102b6e1f1ba17a1a9e18cd47210e6550d5b408cc59ea260678f4c23b2e6c"
   },
-  "featureCommit": "a9f85df53801005a3bb586e8a861534da12b9249",
-  "scope": "Private own-fork Cron R17 R7 native component proof: mandatory parent acceptance, all known callers, strict nonce/generation/worker identity and real Job/FILETIME retained-handle cleanup. Parent a9 is the failed R16b baseline; candidate is the triggering immutable GitHub SHA. Not official protected adoption, full20, package or installed acceptance."
+  "featureCommit": "2314fa525c0cd74a578f1e5663dd50e0dd718a6f",
+  "scope": "Private own-fork Cron R17 R8 test-only Windows registry-key correction over R17R7. Production worker/nonce/generation/Job/FILETIME source unchanged. Same full native bank; canonicalize both observed/expected profile directories and assert launch profile remains untouched. Not full20/protectedadoption/package/installed acceptance."
 }
