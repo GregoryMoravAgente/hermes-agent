@@ -8,7 +8,6 @@ child or use a PID-only cleanup proof.
 from __future__ import annotations
 
 import json
-import sys
 from types import SimpleNamespace
 
 import pytest
@@ -17,6 +16,7 @@ from gateway.runtime_custody import RuntimeCustodyCoordinator
 from hermes_cli.backend_retirement import RetirementFence
 from tools.process_registry import ProcessRegistry
 from tools import terminal_tool_background
+from tests.tools.foreground_custody_diagnostics import shell_python_command
 from tests.tools.process_registry_native_profile import prepare_native_profile
 
 
@@ -29,7 +29,7 @@ def _coordinator() -> RuntimeCustodyCoordinator:
 
 
 def _child(code: str) -> str:
-    return f"{sys.executable} -c {code!r}"
+    return shell_python_command(code)
 
 
 def _registry(tmp_path, monkeypatch) -> ProcessRegistry:
