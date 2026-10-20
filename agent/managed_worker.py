@@ -438,12 +438,17 @@ def _construct_agent(frame, factory, policy, **kwargs):
 
 
 def hello():
-    """Identity the owner verifies before it reserves: this interpreter's pid and birth plus
-    the ancestor chain it observes. Launchers (uv's venv python.exe) put the owner's Popen
-    handle one or two hops above; the owner, never this process, decides whether they match."""
+    """Identity the owner verifies before it reserves: this interpreter's pid and canonical
+    integer start fingerprint plus the ancestor chain it observes. Launchers (uv's venv
+    python.exe) put the owner's Popen handle one or two hops above; the owner, never this
+    process, decides whether they match."""
     import psutil
+    from gateway.status import get_process_start_time
     me = psutil.Process()
-    return {'pid': me.pid, 'birth': me.create_time(), 'ancestors': [p.pid for p in me.parents()[:3]]}
+    birth = get_process_start_time(me.pid)
+    if type(birth) is not int:
+        raise RuntimeError('worker_birth_unavailable')
+    return {'pid': me.pid, 'birth': birth, 'ancestors': [p.pid for p in me.parents()[:3]]}
 
 
 def main():

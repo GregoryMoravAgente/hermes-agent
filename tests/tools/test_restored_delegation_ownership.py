@@ -17,10 +17,23 @@ Layers under test:
 """
 
 import json
+import os
 import queue
 import time
 
 from tools.process_registry import ProcessRegistry
+
+
+def _prepared_execution(delegation_id):
+    from gateway.status import get_process_start_time
+    birth = get_process_start_time(os.getpid())
+    assert type(birth) is int
+    return {
+        "handoff_id": delegation_id, "state": "prepared", "accepted": "unknown",
+        "worker_started": False, "worker_exited": False, "owner_pid": os.getpid(),
+        "owner_started_at": birth, "owner_execution_id": f"test:{delegation_id}",
+        "owner_scope": None, "error": None, "exception": None,
+    }
 
 
 def _make_registry():
@@ -74,6 +87,7 @@ def test_restore_stamps_restored_flag(tmp_path, monkeypatch):
         "dispatched_at": time.time() - 2.0,
         "completed_at": None,
         "interrupt_fn": None,
+        "execution": _prepared_execution("d-old"),
     }
     ad._persist_dispatch(record)
     evt = _delegation_event(session_key="OLD_SESSION_A", delegation_id="d-old")

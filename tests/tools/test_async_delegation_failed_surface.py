@@ -5,6 +5,7 @@ failed delegation had nowhere to show up. ``failed_delegations_for_session`` rea
 These tests write real rows into a temp ``state.db`` through the module's own persistence calls.
 """
 
+import os
 import time
 
 import pytest
@@ -22,9 +23,22 @@ def home(tmp_path):
     ad._reset_for_tests()
 
 
+def _prepared_execution(delegation_id):
+    from gateway.status import get_process_start_time
+    birth = get_process_start_time(os.getpid())
+    assert type(birth) is int
+    return {
+        "handoff_id": delegation_id, "state": "prepared", "accepted": "unknown",
+        "worker_started": False, "worker_exited": False, "owner_pid": os.getpid(),
+        "owner_started_at": birth, "owner_execution_id": f"test:{delegation_id}",
+        "owner_scope": None, "error": None, "exception": None,
+    }
+
+
 def _delegation(delegation_id, *, status, result, ui="ui-1", parent="agent-1", completed_at=None, **task):
     ad._persist_dispatch({"delegation_id": delegation_id, "session_key": "", "origin_ui_session_id": ui,
-                          "parent_session_id": parent, "dispatched_at": time.time() - 60, **task})
+                          "parent_session_id": parent, "dispatched_at": time.time() - 60,
+                          "execution": _prepared_execution(delegation_id), **task})
     ad._persist_completion({"delegation_id": delegation_id, "status": status,
                             "completed_at": completed_at or time.time()}, result)
 

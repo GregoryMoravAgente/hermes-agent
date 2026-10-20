@@ -6,6 +6,7 @@ No existing cron/child/compute consumer is switched until its inventory is cover
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import json
 import logging
@@ -19,6 +20,20 @@ from hermes_dir_acl import make_user_dir
 logger = logging.getLogger(__name__)
 
 _worker_process = False
+
+
+def _canonical_process_birth(pid):
+    """Return the gateway's integer process-start fingerprint for a live PID."""
+    if type(pid) is not int or pid <= 0:
+        raise WorkerPersistenceError('invalid_worker_identity')
+    try:
+        from gateway.status import get_process_start_time
+        birth = get_process_start_time(pid)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        birth = None
+    if type(birth) is not int or birth < 0:
+        raise WorkerPersistenceError('worker_birth_unavailable')
+    return birth
 
 
 def is_worker_process():
@@ -203,6 +218,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
         self.rpc = rpc
         self.scope = dict(scope)
+        if 'pid' in self.scope and 'birth' in self.scope:
+            supplied_birth = self.scope['birth']
+            if type(supplied_birth) is not int:
+                raise WorkerPersistenceError('worker_birth_unavailable')
+            canonical_birth = _canonical_process_birth(self.scope['pid'])
+            if supplied_birth != canonical_birth:
+                raise WorkerPersistenceError('outbox_scope_mismatch')
+            self.scope['birth'] = canonical_birth
+        requested_scope = dict(self.scope)
         self.max_bytes = max_bytes
         self.lock = threading.RLock()
         self.failure = None
@@ -234,7 +258,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 self._save(self.journal)
             if self.journal['pending']:
                 self.retry_pending()
-            if reconciled and self.scope != dict(scope):
+            if reconciled and self.scope != requested_scope:
                 # Replay must land the journal exactly on the adopted assignment (a pending
                 # publication moves it to the child); anything else is not this successor's outbox.
                 raise WorkerPersistenceError('outbox_scope_mismatch')
@@ -256,9 +280,21 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         the constructor then requires the replayed scope to equal the adopted one.
         """
         old, new = self.journal['scope'], self.scope
-        fixed = set(new) - {'epoch', 'session_id'}
+        physical = {'pid', 'birth'}
+        fixed = set(new) - {'epoch', 'session_id'} - physical
+        try:
+            from gateway.status import get_process_start_time
+            current_birth = get_process_start_time(os.getpid())
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            current_birth = None
+        physical_ok = (
+            type(new.get('pid')) is int and new['pid'] == os.getpid()
+            and type(new.get('birth')) is int
+            and current_birth is not None and current_birth == new['birth']
+        )
         if (not isinstance(adopted, dict) or set(old) != set(new)
                 or any(old[key] != new[key] for key in fixed)
+                or not physical_ok
                 or adopted.get('execution_id') != new.get('execution_id')
                 or adopted.get('generation') != new.get('generation')
                 or adopted.get('session_id') != new.get('session_id')
@@ -269,10 +305,47 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 or (old['session_id'] != new['session_id'] and not any(
                     entry['operation'] == 'compression.publish' for entry in self.journal['pending']))):
             raise WorkerPersistenceError('outbox_scope_mismatch')
-        candidate = dict(self.journal, scope=dict(old, epoch=new['epoch']))
+        # The authenticated worker.adopt call proves the new physical process. Carry its
+        # PID/birth into the journal before replay so every later request is fenced to it.
+        # A delegation entry also carries the worker claim inside its durable payload; leaving
+        # that nested claim on the dead process would make the replay fail its authenticated
+        # dispatch fence even though the same journal/row was safely rebound.
+        next_scope = dict(old, pid=new['pid'], birth=new['birth'], epoch=new['epoch'])
+        candidate = dict(self.journal, scope=next_scope,
+                         pending=self._rebind_adopted_pending(self.journal.get('pending'), old, next_scope))
         self._save(candidate)
         self.scope = candidate['scope']
         self.journal = candidate
+
+    @staticmethod
+    def _rebind_adopted_pending(pending, old, new):
+        """Move only an authenticated pending execution claim to the adopted process."""
+        if not isinstance(pending, list):
+            raise WorkerPersistenceError('outbox_scope_mismatch')
+        old_scope = {key: old.get(key) for key in ('profile_id', 'session_id', 'generation', 'epoch')}
+        new_scope = {key: new.get(key) for key in ('profile_id', 'session_id', 'generation', 'epoch')}
+        rebound = []
+        for entry in pending:
+            if not isinstance(entry, dict):
+                raise WorkerPersistenceError('outbox_scope_mismatch')
+            payload = entry.get('payload')
+            execution = payload.get('execution') if isinstance(payload, dict) else None
+            if execution is None:
+                rebound.append(entry)
+                continue
+            if (entry.get('operation') not in ('delegation.dispatch', 'delegation.execution')
+                    or not isinstance(execution, dict)
+                    or execution.get('owner_execution_id') != old.get('execution_id')
+                    or execution.get('owner_pid') != old.get('pid')
+                    or execution.get('owner_started_at') != old.get('birth')
+                    or execution.get('owner_scope') != old_scope
+                    or not isinstance(execution.get('handoff_id'), str)
+                    or not execution['handoff_id']):
+                raise WorkerPersistenceError('outbox_scope_mismatch')
+            next_execution = dict(execution, owner_pid=new['pid'],
+                                  owner_started_at=new['birth'], owner_scope=new_scope)
+            rebound.append(dict(entry, payload=dict(payload, execution=next_execution)))
+        return rebound
 
     def _save(self, journal):
         if self._outbox_owner.closed:
@@ -394,6 +467,53 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     # Transcript-tail reads the agent core makes on its session_db (failed-turn boundary, in-place
     # compaction coverage); a missing one raised AttributeError inside a best-effort guard.
+    def _read_all(self, sql, params=()):
+        """Read only the exact committed-message projection used by the managed proof.
+
+        The owner SessionDB exposes a raw read primitive, but a worker cannot receive
+        arbitrary SQL.  This compatibility method validates the generated query, binds
+        it to this worker's session, and uses the existing sequenced receipt ledger.
+        """
+        normalized = ' '.join(sql.split()) if isinstance(sql, str) else ''
+        prefix = 'SELECT * FROM messages WHERE session_id = ? AND id IN ('
+        if not normalized.startswith(prefix) or not normalized.endswith(')'):
+            raise WorkerPersistenceError('unsupported_operation')
+        marks = normalized[len(prefix):-1].split(',')
+        if not marks or any(mark.strip() != '?' for mark in marks):
+            raise WorkerPersistenceError('unsupported_operation')
+        values = tuple(params) if isinstance(params, (tuple, list)) else ()
+        if len(values) != len(marks) + 1:
+            raise WorkerPersistenceError('invalid_params')
+        session_id, *row_ids = values
+        self._session(session_id)
+        if any(type(row_id) is not int or row_id <= 0 for row_id in row_ids):
+            raise WorkerPersistenceError('invalid_params')
+        result = self._apply('session.committed_rows', {'row_ids': row_ids})
+        value = result.get('value') if isinstance(result, dict) else None
+        rows = value.get('rows') if isinstance(value, dict) else None
+        if not isinstance(rows, list):
+            raise WorkerPersistenceError('invalid_receipt')
+        decoded = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise WorkerPersistenceError('invalid_receipt')
+            if row.get('session_id') != self.scope['session_id'] or row.get('id') not in row_ids:
+                raise WorkerPersistenceError('permission_denied')
+            restored = {}
+            for key, item in row.items():
+                if isinstance(item, dict) and set(item) == {'__hermes_bytes__'}:
+                    encoded = item['__hermes_bytes__']
+                    if not isinstance(encoded, str):
+                        raise WorkerPersistenceError('invalid_receipt')
+                    try:
+                        restored[key] = base64.b64decode(encoded, validate=True)
+                    except (ValueError, TypeError):
+                        raise WorkerPersistenceError('invalid_receipt') from None
+                else:
+                    restored[key] = item
+            decoded.append(restored)
+        return decoded
+
     def latest_conversation_role(self, session_id):
         self._session(session_id)
         return self._apply('session.tail_role', {})['value']

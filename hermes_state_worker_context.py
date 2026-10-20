@@ -2,6 +2,7 @@
 
 Identity and lineage remain owner-reserved. This is not arbitrary SessionDB RPC.
 """
+import base64
 import json
 
 from hermes_state_runtime import RuntimeStoreError
@@ -84,3 +85,38 @@ def worker_row_role(db, conn, session_id, payload):
     row = conn.execute('SELECT role FROM messages WHERE id=? AND session_id=? AND active=1',
                        (payload['row_id'], session_id)).fetchone()
     return {'value': row[0] if row else None}
+
+
+def _wire_row_value(value):
+    """Keep SELECT * values JSON-safe without changing the stored row bytes."""
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return {'__hermes_bytes__': base64.b64encode(bytes(value)).decode('ascii')}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise RuntimeStoreError('storage_corrupt')
+
+
+def worker_committed_rows(db, conn, session_id, payload):
+    """Return only this worker's selected message rows through the receipt ledger."""
+    if not isinstance(payload, dict) or set(payload) != {'row_ids'} or not isinstance(payload['row_ids'], list):
+        raise RuntimeStoreError('invalid_params')
+    row_ids = payload['row_ids']
+    if not row_ids or any(type(row_id) is not int or row_id <= 0 for row_id in row_ids):
+        raise RuntimeStoreError('invalid_params')
+    # SQLite's bound-parameter ceiling is a statement limit, not a limit on this
+    # one authenticated receipt operation.  Deduplicate like SQL IN semantics,
+    # then execute bounded SELECTs on the same owner connection/transaction.
+    selected_ids = list(dict.fromkeys(row_ids))
+    rows = []
+    for start in range(0, len(selected_ids), 900):
+        chunk = selected_ids[start:start + 900]
+        placeholders = ','.join('?' for _ in chunk)
+        rows.extend(conn.execute(
+            f'SELECT * FROM messages WHERE session_id=? AND id IN ({placeholders})',
+            (session_id, *chunk),
+        ).fetchall())
+    rows.sort(key=lambda row: row['id'])
+    return {'value': {'rows': [
+        {key: _wire_row_value(value) for key, value in dict(row).items()}
+        for row in rows
+    ]}}

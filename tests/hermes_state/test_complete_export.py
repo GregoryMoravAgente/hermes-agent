@@ -174,7 +174,7 @@ _SCHEMA31_FIXTURE_SHA256 = "7aea9ccb4293e51d747cf05350268aa34921d60af954c5442acf
 
 
 class _HistoricalSchema31SessionDB(SessionDB):
-    """Use the real SessionDB writer while preserving a source-backed v31 fixture."""
+    """Use SessionDB's read-only path so the source-backed v31 fixture stays unchanged."""
 
     def _run_data_migrations(self, cursor, current_version, fts5_available):
         assert current_version == 31
@@ -376,12 +376,19 @@ def _seed_real_session_db(db: SessionDB) -> None:
         conn.execute(
             "INSERT OR REPLACE INTO async_delegations("
             "delegation_id, origin_session, origin_ui_session_id, state, dispatched_at, updated_at, "
-            "event_json, result_json, task_json, origin_session_id) "
-            "VALUES ('delegation-1', 'session-1', 'ui-1', 'completed', 1.0, 3.0, ?, ?, ?, 'session-1')",
+            "event_json, result_json, task_json, origin_session_id, execution_json) "
+            "VALUES ('delegation-1', 'session-1', 'ui-1', 'completed', 1.0, 3.0, ?, ?, ?, 'session-1', ?)",
             (
                 json.dumps({"event": "synthetic", "opaque": "business"}),
                 json.dumps({"result": "synthetic", "opaque": "business"}),
                 json.dumps({"task": "synthetic", "opaque": "business"}),
+                json.dumps({
+                    "handoff_id": "delegation-1", "state": "runner_exited", "accepted": "yes",
+                    "worker_started": True, "worker_exited": True, "owner_pid": 321,
+                    "owner_started_at": 4.0, "owner_execution_id": "execution-1",
+                    "owner_scope": {"profile_id": "default", "session_id": "session-1", "generation": 0, "epoch": 1},
+                    "error": None, "exception": None,
+                }, sort_keys=True),
             ),
         )
         conn.execute(
@@ -428,13 +435,25 @@ def test_live_schema_is_closed_and_optional_telegram_is_explicit(seeded_db):
         MIXED_REQUIRES_PROJECTION,
         DERIVED_INTERNAL,
     } <= dispositions
-    for table, policy in TABLE_POLICIES.items():
+    live_policy = schema_policy_for_version(32).table_policies
+    for table, policy in live_policy.items():
         if table not in present:
             assert policy.optional
             continue
         assert actual_columns[table] == policy.column_names
         assert all(column.raw_value_retention == "exact" for column in policy.columns)
         assert all(column.disposition for column in policy.columns)
+
+
+def test_schema32_retains_execution_claim_without_changing_schema31_wire():
+    legacy = schema_policy_for_version(31).table_policies["async_delegations"]
+    current = schema_policy_for_version(32).table_policies["async_delegations"]
+    assert "execution_json" not in legacy.column_names
+    assert current.column_names[:-1] == legacy.column_names
+    execution = current.columns[-1]
+    assert execution.name == "execution_json"
+    assert execution.disposition == CONTROL_RECOVERY
+    assert execution.raw_value_retention == "exact"
 
 
 def test_model_config_boundary_preserves_opaque_business_members():
@@ -647,6 +666,7 @@ def test_positive_core_capture_from_real_db(seeded_db, tmp_path):
         assert receipt.record_count >= 1
         assert receipt.byte_count == len(payload)
         assert b"synthetic answer" in payload
+        assert b'"execution_json"' in payload
         assert b"<SECRET>" not in payload
         records = [json.loads(line) for line in payload.splitlines()]
         assert records[0]["kind"] == "manifest"
@@ -662,7 +682,10 @@ def test_historical_schema31_fixture_captures_without_relabeling_current32(tmp_p
     """A real v31 DDL fixture remains supported independently of the current v32 writer."""
     complete_export = importlib.import_module("hermes_state_complete_export")
     _profile_home, state_path = _materialize_historical_schema31_profile(tmp_path)
-    db = _HistoricalSchema31SessionDB(state_path)
+    # A writable SessionDB applies the current declarative schema before the
+    # export reader can inspect the fixture.  Read-only opening is the real
+    # historical-store path and therefore preserves the pinned v31 shape.
+    db = _HistoricalSchema31SessionDB(state_path, read_only=True)
     try:
         with db._read_ctx() as conn:
             assert conn.execute("SELECT version FROM schema_version").fetchone()[0] == 31

@@ -727,7 +727,11 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     -- async_delegations shapes depending on whether the delegation tool had
     -- ever run, breaking rebuild/replay pipelines that reconstruct state.db
     -- from the canonical schema (#94691).
-    origin_session_id TEXT NOT NULL DEFAULT ''
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    -- Typed executor handoff/worker-exit claim; distinct from UI result/delivery state.
+    -- Keep this append-only at the end of the fresh-install shape so the v32
+    -- policy matches both the v31 wire order and ALTER TABLE backfills.
+    execution_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);

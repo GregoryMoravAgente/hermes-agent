@@ -31,8 +31,8 @@ FIELD_POLICY_REVIEW_SHA256 = "aa7756db0873e40505634d72dd62dede3818ce9078e43d5b2e
 SCHEMA32_SCHEMA_VERSION = 32
 SCHEMA32_SOURCE_ID = "official-e003-schema32"
 SCHEMA32_WRITER_SOURCE_ID = "current-writer-18c525b669b6ea4ba62e6967d228af21d89aa9d3"
-SCHEMA32_SCHEMA_CENSUS_SHA256 = "a9c9c9f8bb8c3e537a0bfd47adaff7ac76c42e23f514d2a26127d15f96ed26ff"
-SCHEMA32_FIELD_POLICY_REVIEW_SHA256 = "dbe0e921cbfea7ff3308046630b3b90c7862cc0ef9ebf8abce70f5d688d5d7a4"
+SCHEMA32_SCHEMA_CENSUS_SHA256 = "69f2667cbf445d75f9da3fd7f1b0aecfe539d2a2f5919caf1e185a0d4a28f0be"
+SCHEMA32_FIELD_POLICY_REVIEW_SHA256 = "99eb76b0dff75075878400020d0dcf566ff278e8cbb1949bcfca0f9628534bee"
 
 BUSINESS_PAYLOAD = "business_payload"
 BUSINESS_METADATA = "business_metadata"
@@ -355,10 +355,23 @@ def _make_schema30_table_policies() -> dict[str, TablePolicy]:
 
 
 SCHEMA30_TABLE_POLICIES = _make_schema30_table_policies()
-# Hermes v32 explicitly has no data migration: its source keeps the v31 table
-# layout and only advances the durable version after the v31 ledger columns exist.
-# Keep that structural relationship explicit while giving v32 its own provenance slot.
-SCHEMA32_TABLE_POLICIES = dict(TABLE_POLICIES)
+def _make_schema32_table_policies() -> dict[str, TablePolicy]:
+    """Add the v32 typed execution claim without mutating the v31 wire policy."""
+    policies = dict(TABLE_POLICIES)
+    current = policies["async_delegations"]
+    policies["async_delegations"] = TablePolicy(
+        name=current.name,
+        columns=current.columns + (ColumnPolicy("execution_json", CONTROL_RECOVERY),),
+        table_disposition=current.table_disposition,
+        writer_fence_status=current.writer_fence_status,
+        optional=current.optional,
+    )
+    return policies
+
+
+# v31 remains the historical export layout.  v32 adds the durable, typed executor
+# handoff claim as CONTROL_RECOVERY so restart/replay cannot silently discard it.
+SCHEMA32_TABLE_POLICIES = _make_schema32_table_policies()
 SCHEMA_POLICIES: dict[int, VersionedSchemaPolicy] = {
     30: VersionedSchemaPolicy(30, SCHEMA30_SOURCE_ID, SCHEMA30_WRITER_SOURCE_ID, SCHEMA30_TABLE_POLICIES),
     31: VersionedSchemaPolicy(
