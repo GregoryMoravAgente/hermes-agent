@@ -149,7 +149,7 @@ def _launch_managed_process(client: Any, cmd: list[str], spawn_env: dict[str, st
             client._proc = client._launch_transaction.launch(
                 cmd, text=False, env=spawn_env, cwd=client._cwd,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", start_new_session=True,
+                encoding=None, errors=None, bufsize=0, start_new_session=True,
                 creationflags=hide_flags,
             )
             client._custody.bind_physical_launch(client._proc, client._launch_transaction)
@@ -193,7 +193,7 @@ def _launch_external_process(client: Any, cmd: list[str], spawn_env: dict[str, s
             client._proc = client._launch_transaction.launch(
                 cmd, text=False, env=spawn_env, cwd=client._cwd,
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                encoding="utf-8", errors="replace", start_new_session=True,
+                encoding=None, errors=None, bufsize=0, start_new_session=True,
                 creationflags=hide_flags,
             )
             if client._proc is False or client._proc is None:

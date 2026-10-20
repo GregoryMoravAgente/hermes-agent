@@ -2162,9 +2162,9 @@ def _fetch_provider_catalog(
     normalized: str, entry: Any, fp: str, now: float, *, producer_policy: Any,
     force_refresh: bool, is_ollama: bool,
 ) -> list[str]:
-    live = provider_model_ids(normalized, force_refresh=force_refresh, producer_policy=producer_policy)
-    parent = getattr(producer_policy, "parent", None)
-    if live or parent is not None:
+    catalog_kwargs = {} if producer_policy is None else {"producer_policy": producer_policy}
+    live = provider_model_ids(normalized, force_refresh=force_refresh, **catalog_kwargs)
+    if (parent := getattr(producer_policy, "parent", None)) is not None or live:
         if getattr(parent, "state", None) == "unknown":
             return _chat_catalog_rows(list(live))
         fresh = _live_result_entry(fp, live, entry, now)

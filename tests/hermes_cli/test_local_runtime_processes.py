@@ -153,9 +153,9 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
     real_init = processes._WindowsJob.__init__
     real_assign = processes._WindowsJob.assign
 
-    def track_job(job):
+    def track_job(job, name=None):
         jobs.append(job)
-        real_init(job)
+        real_init(job, name=name)
         handles.append(job._handle)
 
     if failure == 'configure':
@@ -241,20 +241,25 @@ def test_owned_job_terminate_uses_same_handle_and_preserves_external_process(tmp
     """Use the returned Job for recovery while retaining external ownership."""
     from hermes_cli.local_runtime.processes import spawn_server
 
+    script = tmp_path / 'disposable server.py'
+    script.write_text(_SCRIPT)
     env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"),
                PYTHONPATH=str(Path(__file__).resolve().parents[2]))
     launcher = control = job = None
+    launchers = []
     log_path = tmp_path / "terminate.log"
     with log_path.open("w") as log:
         try:
             control = subprocess.Popen(
-                [sys.executable, __file__, str(tmp_path), "control"],
+                [sys.executable, str(script), str(tmp_path), "control"],
                 env=env, stdout=log, stderr=log,
             )
+            launchers.append(control)
             launcher, job = spawn_server(
-                [sys.executable, __file__, str(tmp_path), "router"],
+                [sys.executable, str(script), str(tmp_path), "router"],
                 env=env, stdout=log, stderr=log,
             )
+            launchers.append(launcher)
             router = _read(tmp_path / "router.json")
             grandchild = _read(tmp_path / "grandchild.json")
             assert job.contains_process_handle(
@@ -264,14 +269,20 @@ def test_owned_job_terminate_uses_same_handle_and_preserves_external_process(tmp
 
             job.terminate()
             assert _wait(lambda: not _alive(router) and not _alive(grandchild))
-            control_identity = {
-                "pid": control.pid,
-                "created": psutil.Process(control.pid).create_time(),
-            }
+            control_identity = _read(tmp_path / "control.json")
             assert _alive(control_identity)
             assert _wait(lambda: launcher.poll() is not None)
             assert job.empty() is True
         finally:
+            descendants = []
+            for owner in launchers:
+                try:
+                    descendants.extend(psutil.Process(owner.pid).children(recursive=True))
+                except psutil.NoSuchProcess:
+                    pass
+            for proc in reversed(descendants):
+                _kill({"pid": proc.pid, "created": proc.create_time()})
+
             def close_exact_process(process):
                 if process is None:
                     return

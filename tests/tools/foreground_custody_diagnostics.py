@@ -8,7 +8,6 @@ boundary in the test output.
 
 from __future__ import annotations
 
-import base64
 import ctypes
 import hashlib
 import json
@@ -25,17 +24,12 @@ _MAX_JOB_QUERY_BYTES = 1024 * 1024
 
 
 def encoded_python_source(source: str) -> str:
-    """Return an argv-safe Python wrapper preserving generated source bytes."""
-    payload = base64.b64encode(source.encode("utf-8")).decode("ascii")
-    return (
-        "import base64;exec(compile(base64.b64decode("
-        + repr(payload)
-        + ",validate=True).decode('utf-8'),'<hermes-custody-generated>','exec'))"
-    )
+    """Return an argv-safe Python wrapper preserving generated source text."""
+    return "exec(compile(" + repr(source) + ",'<hermes-custody-generated>','exec'))"
 
 
 def shell_python_command(source: str) -> str:
-    """Build the existing Bash command with an encoded Python source payload."""
+    """Build the existing Bash command with a literal Python source payload."""
     return f"{shlex.quote(sys.executable)} -c {shlex.quote(encoded_python_source(source))}"
 
 

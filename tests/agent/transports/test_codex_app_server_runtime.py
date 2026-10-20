@@ -189,7 +189,12 @@ while True:
         proc.stdin = None
         proc.wait.side_effect = [subprocess.TimeoutExpired(cmd="codex", timeout=0.01), 0]
         killed: list[int] = []
-        monkeypatch.setattr(mod, "kill_process_tree", lambda pid, **kw: killed.append(pid) or True)
+        def kill_tree(process, **kw):
+            assert process is proc
+            killed.append(process.pid)
+            return True
+
+        monkeypatch.setattr(mod, "kill_process_tree", kill_tree)
         monkeypatch.setattr(mod, "_snapshot_descendants", lambda pid: [])
 
         client = mod.CodexAppServerClient.__new__(mod.CodexAppServerClient)

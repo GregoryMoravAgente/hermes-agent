@@ -345,6 +345,12 @@ class ServiceProcessReceipt:
     # by the next spawn; an ordinary reserved receipt still belongs to its first bind.
     retry_ready: bool = False
     transaction: Any = None
+
+    @property
+    def native_scope(self) -> Any:
+        """Expose this receipt's exact native transaction to its Windows owner."""
+        return self.transaction
+
     # The ACP setup operation owns this exact fence from before either reader pump is created.
     # A same-handle retry cannot replace the receipt while the fence is still in flight.
     setup_fence: threading.Event | None = field(default=None, repr=False)
