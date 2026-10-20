@@ -605,6 +605,63 @@ def test_slow_browse_reconcile_gives_up_inside_its_budget_and_boot_waits_it_out(
     assert "last_read_at" not in _session_columns(path)
 
 
+class _InterruptAtProgressArm:
+    """A real connection whose production progress handler interrupts a real SQLite query while it is armed."""
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.progress_arm_called = False
+        self.interrupted = False
+        self.closed = False
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def set_progress_handler(self, handler, n):
+        if handler is None:
+            return self._conn.set_progress_handler(None, 0)
+        self.progress_arm_called = True
+        self._conn.set_progress_handler(handler, 1)
+        try:
+            self._conn.execute(
+                "WITH RECURSIVE counter(value) AS (SELECT 1 UNION ALL SELECT value + 1 FROM counter "
+                "WHERE value < 100000000) SELECT max(value) FROM counter"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            self.interrupted = str(exc).strip().lower() == "interrupted"
+            raise
+
+    def close(self):
+        self.closed = True
+        return self._conn.close()
+
+
+def test_budget_interrupt_during_progress_arm_is_typed_and_atomic(tmp_path, monkeypatch):
+    """R2-5: a real progress interrupt while arming the DDL connection is typed before the
+    transaction starts, and the connection is closed without changing the lagging store."""
+    from hermes_cli import sqlite_safe_read
+    import hermes_state_reconcile as reconcile
+
+    path = _lagging_store_with_history(_profile_home(tmp_path), rows=10)
+    before = _file_state(path)
+    original = sqlite_safe_read.connect_tracked
+    wrapped = []
+
+    def connect(*args, **kwargs):
+        candidate = _InterruptAtProgressArm(original(*args, **kwargs))
+        wrapped.append(candidate)
+        return candidate
+
+    monkeypatch.setattr(sqlite_safe_read, "connect_tracked", connect)
+    with pytest.raises(reconcile.BrowseBudgetExceeded):
+        reconcile._apply_additive_schema(path, reconcile._Budget(0.5))
+
+    assert wrapped and wrapped[0].progress_arm_called and wrapped[0].interrupted
+    assert wrapped[0].closed
+    assert _file_state(path) == before
+    assert "last_read_at" not in _session_columns(path)
+
+
 def test_equal_cardinality_corrupt_index_plus_drift_is_not_written(tmp_path):
     """R2-3: quick_check does not compare index keys with the table, so two equal-size indexes
     with swapped root pages pass it. Browse must still refuse as corrupt and write nothing."""
