@@ -2,6 +2,7 @@
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError
 
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
@@ -9,6 +10,8 @@ from gateway.session_group_controls import GROUP_METHODS
 from hermes_state import SessionDB
 from hermes_state_runtime import begin_runtime_epoch
 from tui_gateway.contracts.registry import CANONICAL_METHODS, METHODS
+
+pytest_plugins = ['tests.gateway.test_bot_roster_fleet']
 
 
 @pytest.fixture
@@ -54,3 +57,58 @@ async def test_declared_params_gate_canonical_verbs_before_their_handlers(owner)
         assert db.get_session('s')['title'] == 'Declared'
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_real_bot_relay_result_carries_typed_metadata_and_rejects_unknown_fields(fleet, monkeypatch):
+    from gateway.session_authorities import owner_scope
+    from tests.waiting import async_wait_until
+    from tools.bot_live_delivery import read_delivery_result
+
+    connection = fleet.connect('alpha')
+    authority = connection.authority
+    errors = ['Error code: 429 - rate limit exceeded']
+
+    async def execute(owner, _ref, row):
+        if errors:
+            owner.pending_results[row['admission_id']] = {
+                'result': {'final_response': '', 'messages': [], 'failed': True,
+                           'error': errors.pop()}, 'usage': {}}
+            return ''
+        return 'pong'
+
+    monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
+    params = {'id': 'a' * 32, 'profile': 'alpha', 'message': 'ping'}
+    try:
+        with owner_scope(authority):
+            response = await connection.dispatch({
+                'jsonrpc': '2.0',
+                'id': 'canonical-bot-relay',
+                'method': 'bot_relay.deliver',
+                'params': params,
+            })
+        assert 'result' in response, response
+        admission_id = response['result']['admission_id']
+        await async_wait_until(
+            lambda: (read_delivery_result(fleet.homes['alpha'], params['id']) or {}).get('status') == 'settled',
+            timeout=10, what='real retry mailbox projection')
+        with owner_scope(authority):
+            response = await connection.dispatch({
+                'id': 'canonical-bot-relay-retry', 'method': 'bot_relay.deliver', 'params': params,
+            })
+    finally:
+        await connection.close()
+
+    assert 'result' in response, response
+    result = response['result']
+    assert result['admission_id']
+    assert result['profile_id'] == authority.profile_id
+    assert result['authority_epoch'] == authority.epoch
+    assert result['admission_id'] == admission_id
+    assert result['retry_admission_id']
+    assert result['execution_generation'] >= 1
+    assert result['retry_execution_generation'] >= 1
+    contract = CANONICAL_METHODS['bot_relay.deliver'].result
+    contract.model_validate(result)
+    with pytest.raises(ValidationError):
+        contract.model_validate({**result, 'unexpected': True})

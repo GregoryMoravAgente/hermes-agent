@@ -22,6 +22,8 @@ _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provid
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
                  'session_history_delivery')
+# The authenticated API producer owns this route descriptor; request JSON never selects it.
+_API_PRODUCER_PROCESS_MODE = 'managed_turn'
 _OWNER_SCOPE_RE = re.compile(r'[0-9a-f]{64}')
 
 
@@ -54,12 +56,14 @@ def check_api_turn(authority, ref, payload):
     if 'api_turn_v1' in payload:
         data = payload['api_turn_v1']
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
-                         'relay_metadata'}
+                         'relay_metadata', 'producer_process_mode'}
                 or not {'history', 'settings'} <= set(data)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
-                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))):
+                or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
+                or ('producer_process_mode' in data
+                    and data['producer_process_mode'] != _API_PRODUCER_PROCESS_MODE)):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
             raise RuntimeStoreError('invalid_params')
@@ -156,14 +160,37 @@ def admit_api_turn(adapter, **kwargs):
     return run_steps(admit_api_steps(adapter, **kwargs))
 
 
-async def admit_api_turn_async(adapter, steps=None, **kwargs):
+async def admit_api_turn_async(adapter, steps=None, *, custody=None, **kwargs):
     """``admit_api_turn`` (or *steps*, a generator ending in ``admit_api_steps``) with every SQLite
     write off the owner loop, in admission order."""
     from gateway.session_authorities import active_authority
     authority = active_authority(adapter.gateway_runner)
     if authority is None:
         raise RuntimeStoreError('profile_mismatch')
-    return await run_steps_off_loop(authority, steps or admit_api_steps(adapter, **kwargs), orphaned=schedule_orphan)
+    if custody is not None:
+        refusal = custody.mark_admission_started()
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "admission_pending"))
+            raise RuntimeStoreError(getattr(refusal, "code", "admission_pending"))
+
+    def _orphaned(admitted):
+        schedule_orphan(admitted)
+        if custody is not None:
+            custody.retain_late_admission(admitted)
+
+    try:
+        return await run_steps_off_loop(
+            authority, steps or admit_api_steps(adapter, custody=custody, **kwargs),
+            orphaned=_orphaned if custody is not None else schedule_orphan)
+    except asyncio.CancelledError:
+        # The shielded mutation is still live; its done callback owns the late result.
+        raise
+    except BaseException:
+        # A completed refusal/error has no late admission to bind. Close the pending
+        # boundary before the caller's no-worker finalizer runs.
+        if custody is not None:
+            custody.mark_admission_closed()
+        raise
 
 
 def schedule_orphan(admitted):
@@ -187,84 +214,108 @@ def admit_api_steps(adapter, **kwargs):
     # Every API door (chat header, runs session_id, /api/sessions/{id}/chat, Responses chain) may
     # name a compression continuation; the binding, FIFO and retry identity live on its root.
     sid = authority.logical_owner(sid)
-    authority._require_admission_open()
-    settings = {key: kwargs.get(key) for key in _SETTING_KEYS}
-    # Route credentials remain in the server's configuration, never admission JSON.
-    route = settings.get('route')
-    if route and route.get('api_key'):
-        alias = settings.get('requested_model')
-        configured = adapter._model_routes.get(alias)
-        if configured != route:
-            raise RuntimeStoreError('permission_denied')
-        settings['route'] = {k: v for k, v in route.items() if k != 'api_key'}
-    payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': {
-        'history': None if kwargs.get('history_from_session') else kwargs['conversation_history'], 'settings': settings}}))
-    run_owner_scope = kwargs.get('run_owner_scope')
-    if run_owner_scope is not None:
-        if not _valid_owner_scope(run_owner_scope):
-            raise RuntimeStoreError('invalid_params')
-        # This opaque namespace is persisted in the same row/transaction as
-        # admission. It is never a bearer credential or execution input.
-        payload['api_turn_v1']['run_owner_scope'] = run_owner_scope
-    browser_control = _request_browser_control()
-    if browser_control is not None:
-        # Server-derived like the owner scope: the admission keeps the identity the legacy
-        # path bound for its executor, so execution and recovery can rebind it.
-        payload['api_turn_v1']['browser_control'] = browser_control
-    # Refuse a foreign-surface target before committing any media for it (a refused
-    # admission otherwise retains its image bytes under native-inputs/ forever).
-    existing = authority.db.get_session(sid)
-    if existing is not None and existing['source'] not in ('api_server', 'bot_room'):
-        raise RuntimeStoreError('permission_denied')
-    if kwargs.get('turn_author') is not None:
-        from agent.turn_author import parse_turn_author
-        author = parse_turn_author(kwargs['turn_author'])
-        if author is None:
-            raise RuntimeStoreError('invalid_params')
-        payload['api_turn_v1']['turn_author'] = author
-    if kwargs.get('relay_metadata'):
-        # The request's Relay metadata rides the admission to the turn it describes (main passed it
-        # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
-        payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+    authority._require_fresh_admission_open()
     request_id = kwargs.get('request_id') or kwargs.get('active_run_id') or uuid.uuid4().hex
-    if not isinstance(kwargs['user_message'], list):
-        return (yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs))
-    from gateway.session_api_media import commit_api_images
-    from gateway.session_ingress_media import capture_lease, drop_capture_lease, release_unheld_media
-    # Content-addressed bytes another admission may name are held from capture until this one
-    # commits or is refused: a concurrent release would otherwise unlink them in between.
-    with capture_lease():
-        payload['api_turn_v1']['media'] = commit_api_images(kwargs['user_message'])
-        # Retained bytes belong to an accepted admission. A refused request (or an exact retry of a
-        # retired one, whose references were erased) owns nothing, so its bytes are collected unless
-        # another admission holds them.
-        release = partial(release_unheld_media, authority.db, payload['api_turn_v1']['media'])
-        try:
-            admitted = yield from _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs)
-        except Exception:
-            drop_capture_lease()
-            yield release
-            raise
-    yield release
-    return admitted
+    preservation_handle = authority._preservation_root(
+        'I02_api_session_turn', f'api:{request_id}')
+    authority._preservation_pending_root(
+        request_id, preservation_handle, principal_id='api', session_id=sid)
+    try:
+        settings = {key: kwargs.get(key) for key in _SETTING_KEYS}
+        # Route credentials remain in the server's configuration, never admission JSON.
+        route = settings.get('route')
+        if route and route.get('api_key'):
+            alias = settings.get('requested_model')
+            configured = adapter._model_routes.get(alias)
+            if configured != route:
+                raise RuntimeStoreError('permission_denied')
+            settings['route'] = {k: v for k, v in route.items() if k != 'api_key'}
+        payload = json.loads(_json({'text': kwargs['user_message'], 'api_turn_v1': {
+            'history': None if kwargs.get('history_from_session') else kwargs['conversation_history'], 'settings': settings}}))
+        # Stamp the owner before either exact retry or new admission persistence.  This is a
+        # server-owned descriptor, never a request setting or an ambient ContextVar.
+        payload['api_turn_v1']['producer_process_mode'] = _API_PRODUCER_PROCESS_MODE
+        run_owner_scope = kwargs.get('run_owner_scope')
+        if run_owner_scope is not None:
+            if not _valid_owner_scope(run_owner_scope):
+                raise RuntimeStoreError('invalid_params')
+            # This opaque namespace is persisted in the same row/transaction as
+            # admission. It is never a bearer credential or execution input.
+            payload['api_turn_v1']['run_owner_scope'] = run_owner_scope
+        browser_control = _request_browser_control()
+        if browser_control is not None:
+            # Server-derived like the owner scope: the admission keeps the identity the legacy
+            # path bound for its executor, so execution and recovery can rebind it.
+            payload['api_turn_v1']['browser_control'] = browser_control
+        # Refuse a foreign-surface target before committing any media for it (a refused
+        # admission otherwise retains its image bytes under native-inputs/ forever).
+        existing = authority.db.get_session(sid)
+        if existing is not None and existing['source'] not in ('api_server', 'bot_room'):
+            raise RuntimeStoreError('permission_denied')
+        if kwargs.get('turn_author') is not None:
+            from agent.turn_author import parse_turn_author
+            author = parse_turn_author(kwargs['turn_author'])
+            if author is None:
+                raise RuntimeStoreError('invalid_params')
+            payload['api_turn_v1']['turn_author'] = author
+        if kwargs.get('relay_metadata'):
+            # The request's Relay metadata rides the admission to the turn it describes (main passed it
+            # to ``run_conversation``); it is client JSON, so it is part of the exact-retry identity.
+            payload['api_turn_v1']['relay_metadata'] = kwargs['relay_metadata']
+        if not isinstance(kwargs['user_message'], list):
+            return (yield from _admit_api_payload(
+                authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                preservation_handle, custody=kwargs.get("custody")))
+        from gateway.session_api_media import commit_api_images
+        from gateway.session_ingress_media import capture_lease, drop_capture_lease, release_unheld_media
+        # Content-addressed bytes another admission may name are held from capture until this one
+        # commits or is refused: a concurrent release would otherwise unlink them in between.
+        with capture_lease():
+            payload['api_turn_v1']['media'] = commit_api_images(kwargs['user_message'])
+            # Retained bytes belong to an accepted admission. A refused request (or an exact retry of a
+            # retired one, whose references were erased) owns nothing, so its bytes are collected unless
+            # another admission holds them.
+            release = partial(release_unheld_media, authority.db, payload['api_turn_v1']['media'])
+            try:
+                admitted = yield from _admit_api_payload(
+                    authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                    preservation_handle, custody=kwargs.get("custody"))
+            except BaseException:
+                drop_capture_lease()
+                yield release
+                raise
+        yield release
+        return admitted
+    except BaseException:
+        authority._preservation_reconcile_api_failure(request_id, preservation_handle, session_id=sid)
+        raise
 
 
-def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs):
+def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, declared_key, kwargs,
+                       preservation_handle, *, custody=None):
     from hermes_state_terminal import retry_terminal_admission
     row = retry_terminal_admission(authority.db, epoch=authority.epoch, principal_id='api',
         session_id=sid, request_id=request_id, payload=payload)
     if row is not None:
+        authority._preservation_bind_or_release(row, preservation_handle)
         check_api_settings(adapter, settings)
         from gateway.session_contract import SessionRef
         return authority, SessionRef(authority.profile_id, sid), row
     ref = yield from bind_api_steps(authority, sid, hosted_dispatch=kwargs.get("room_dispatch"), declared_key=declared_key,
-                                    caller_key=kwargs.get('gateway_session_key'), walked_from=kwargs.get('walked_from'))
+                                    caller_key=kwargs.get('gateway_session_key'),
+                                    walked_from=kwargs.get('walked_from'), fresh=True)
     check_api_turn(authority, ref, payload)
+    if custody is not None:
+        refusal = custody.bind_parent(preservation_handle, "I02_api_session_turn")
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "parent_owner_unmapped"))
+            raise RuntimeStoreError(getattr(refusal, "code", "parent_owner_unmapped"))
     row = yield partial(admit_session_input, authority.db, epoch=authority.epoch, principal_id='api',
                         session_id=sid, request_id=request_id, payload=payload,
                         _authorize_write=authority._admission_gate(partial(
                             _admit_target, sid, request_id, payload['api_turn_v1']['settings'],
-                            client_key=bool(kwargs.get('request_id')))))
+                            client_key=bool(kwargs.get('request_id'))), fresh=True))
+    authority._preservation_bind_or_release(row, preservation_handle)
     return authority, ref, row
 
 
@@ -272,6 +323,9 @@ def _admit_target(session_id, request_id, settings, conn, *, client_key=True):
     """Inside the admission's own off-loop transaction: one target per request id, and the
     session's settings for its later payload-less (internal) turns, committed with the admitted
     turn rather than by the drain on the owner loop (N50)."""
+    target = conn.execute("SELECT ended_at FROM sessions WHERE id = ?", (session_id,)).fetchone()
+    if target is None or target["ended_at"] is not None:
+        raise RuntimeStoreError('admission_conflict')
     _one_target(session_id, request_id, conn, client_key=client_key)
     conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                  (_SETTINGS_PREFIX + session_id, _json(settings)))
@@ -347,8 +401,30 @@ def recover_authority_api_turns(adapter, authority):
             logging.getLogger(__name__).warning('API session %s paused: %s', sid, exc.reason)
 
 
-async def run_api_turn(adapter, *, approval_notify_callback=None, approval_session_key=None, **kwargs):
-    admitted = await admit_api_turn_async(adapter, **kwargs)
+async def run_api_turn(
+    adapter, *, approval_notify_callback=None, approval_session_key=None, custody=None, **kwargs,
+):
+    try:
+        admitted = await admit_api_turn_async(adapter, custody=custody, **kwargs)
+    except BaseException:
+        if custody is not None:
+            custody.request_no_worker()
+        raise
+    if custody is not None:
+        refusal = custody.bind_admission(admitted)
+        if refusal is not None:
+            # A terminal admission is an authenticated read-only replay. It has no new
+            # parent edge or worker, but the canonical row/result remain consumable by the
+            # replay finalizer; do not poison that exact handle as unknown.
+            if getattr(refusal, "code", None) == "terminal_replay_readonly":
+                custody.request_no_worker()
+            else:
+                custody.mark_unknown(getattr(refusal, "code", "parent_owner_unmapped"))
+            raise RuntimeStoreError(getattr(refusal, "code", "parent_owner_unmapped"))
+        refusal = custody.mark_worker_submitted()
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "worker_submission_unknown"))
+            raise RuntimeStoreError(getattr(refusal, "code", "worker_submission_unknown"))
     if approval_notify_callback is None or not approval_session_key:
         return await observe_api_turn(admitted, **kwargs)
     # A streaming surface advertises its own run id (``chatcmpl-*`` / ``run_*``): bind it to this

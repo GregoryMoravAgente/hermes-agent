@@ -51,6 +51,8 @@ def _agent(db, **kwargs):
     agent = AIAgent(api_key="stub", base_url="https://stub.invalid", provider="openai", api_mode="codex_app_server",
                     quiet_mode=True, skip_context_files=True, skip_memory=True, session_db=db, session_id=SID, **kwargs)
     agent._spawn_background_review = lambda **kw: None
+    from gateway.runtime_service_operations import policy_without_spawn
+    agent._external_process_policy = policy_without_spawn()
     return agent
 
 

@@ -5216,19 +5216,17 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
             stream.flush()
+    # A physical close is unknown until it returns a typed success.  The backstop must never
+    # stamp a clean exit merely because its release callback raised or returned an unfamiliar value.
+    ownership_clean = False
     def _release_locks() -> None:
-        # BEFORE the log drain (bounded, but could take its full timeout on a wedged disk); idempotent.
-        from gateway.status import remove_pid_file, release_gateway_runtime_lock
-        remove_pid_file()
-        release_gateway_runtime_lock()
+        nonlocal ownership_clean
+        from gateway.shutdown_watchdog import _release_shutdown_watchdog_ownership
+        ownership_clean = _release_shutdown_watchdog_ownership()
 
     def _mark_exited() -> None:
-        # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
-        # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
-        from hermes_cli.observability.shared_metrics_process import stamp_exit
-        stamp_exit("clean")  # the exit-metrics marker too: os._exit skips its atexit stamp (never raises)
-        from gateway.lifecycle_ledger import mark_exited
-        mark_exited(exit_code, reason="graceful_shutdown")
+        from gateway.shutdown_watchdog import mark_graceful_exit
+        mark_graceful_exit(exit_code, ownership_clean=ownership_clean)
 
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():

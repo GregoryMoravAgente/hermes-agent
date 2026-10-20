@@ -37,7 +37,7 @@ async def _ensure_hosted_member_session(self, dispatch: Any) -> str:
         session_id = (await asyncio.to_thread(hosted_member_session, authority.db, identity))[1]
         # The binding transaction runs off the owner loop, in admission order (as API admission does).
         return (await run_steps_off_loop(authority, bind_api_steps(
-            authority, session_id, hosted_dispatch=dispatch.as_mapping()))).session_id
+            authority, session_id, hosted_dispatch=dispatch.as_mapping(), fresh=True))).session_id
 
     def atomic(conn):
         row = conn.execute("SELECT id, title, source FROM sessions WHERE id=?", (session_id,)).fetchone()

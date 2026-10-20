@@ -233,6 +233,13 @@ def continue_quiet_notify_completions(
         texts = [text for _event, text in drained if text]
         if texts:
             follow = run_turn("\n\n".join(texts))
+            # A quiet CLI completion is delivered only after the follow-up turn accepts the
+            # rendered text. A run_turn exception leaves the process custody unacknowledged.
+            for event, event_text in drained:
+                if event.get("type") == "completion" and event_text:
+                    acknowledge = getattr(process_registry, "acknowledge_completion_delivery", None)
+                    if callable(acknowledge):
+                        acknowledge(event.get("delivery_token", ""))
             # Same admission rule as the interactive CLI turn: a wake made ONLY of automatic
             # diagnostics (early failure / watch notices) still runs, but under suppression its
             # reply never displaces the requested one-shot answer on stdout.

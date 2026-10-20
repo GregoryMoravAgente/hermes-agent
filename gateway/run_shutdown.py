@@ -1268,18 +1268,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             return
         with suppress(Exception):
             if hasattr(agent, "shutdown_memory_provider"):
-                # Drain queued memory writes BEFORE teardown (shutdown_all() gives the worker only ~5s, so a
-                # /reset or rotation could drop them). Bounded; a failure never blocks teardown.
-                # The memory manager persists per-turn sync and end-of-session extraction on a single
-                # serialized background worker. shutdown_memory_provider() -> shutdown_all() only gives that
-                # worker a ~5s bounded drain and abandons (cancels) anything still queued past it, so a
-                # /reset — or any gateway session rotation that reaches this cleanup path — could silently
-                # drop writes the session had already handed off. The next session then loads stale memory
-                # (#73297). Give pending work a bounded head start through the manager's own barrier first,
-                # mirroring the CLI exit path (cli.py). Best-effort: a flush failure must never block
-                # teardown.
+                # Drain queued memory writes BEFORE teardown: shutdown_all() gives the single serialized
+                # worker only ~5s and cancels the rest, so a /reset or rotation could drop writes and the
+                # next session loads stale memory (#73297). Bounded, like the CLI exit path; never blocks.
+                # The teardown claim comes first: a /new that stops waiting on this job evicts the agent,
+                # and that soft release must leave extraction + provider shutdown to us.
                 _mm = getattr(agent, "_memory_manager", None)
-                if _mm is not None and hasattr(_mm, "flush_pending"):
+                if _mm is not None:
+                    with suppress(Exception):
+                        _mm.claim_teardown(session_end=True)
                     with suppress(Exception):
                         _mm.flush_pending(timeout=10)
                 # Pass the real transcript so ``on_session_end`` hooks don't see the empty default.
@@ -1949,8 +1946,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
+        self._api_server_hook("active_agent_work_count")
         await self._finalize_shutdown_agents(ctx.active_agents)
-        # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
         if _cache_lock is not None and _cache is not None:

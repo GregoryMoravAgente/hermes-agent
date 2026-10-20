@@ -32,6 +32,7 @@ from gateway.platforms.api_server import (
 from tools import approval as approval_mod
 from tools import approval_gateway_wait
 from tests.waiting import async_wait_until
+from tests.gateway.test_api_server_custody_fixtures import make_adapter as _make_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -61,16 +62,6 @@ def test_approval_event_choices_follow_backend_capabilities(
         )
         == expected
     )
-
-
-def _make_adapter(api_key: str = "") -> APIServerAdapter:
-    """Create an adapter with optional API key."""
-    extra = {}
-    if api_key:
-        extra["key"] = api_key
-    config = PlatformConfig(enabled=True, extra=extra)
-    adapter = APIServerAdapter(config)
-    return adapter
 
 
 def _claim_run(adapter: APIServerAdapter, run_id: str) -> None:
@@ -194,13 +185,13 @@ async def _read_sse_frame(response):
 
 
 @pytest.fixture
-def adapter():
-    return _make_adapter()
+def adapter(monkeypatch):
+    return _make_adapter(monkeypatch=monkeypatch)
 
 
 @pytest.fixture
-def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+def auth_adapter(monkeypatch):
+    return _make_adapter(api_key="sk-secret", monkeypatch=monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -1891,10 +1882,10 @@ class TestRunIdempotency:
 
     @pytest.mark.asyncio
     async def test_direct_status_hydrates_after_adapter_restart(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         path = tmp_path / "idem.db"
-        first_adapter = _make_adapter()
+        first_adapter = _make_adapter(monkeypatch=monkeypatch)
         _use_idempotency_db(first_adapter, path)
         first_app = _create_runs_app(first_adapter)
         async with TestClient(TestServer(first_app)) as cli:
@@ -1918,7 +1909,7 @@ class TestRunIdempotency:
                     await asyncio.sleep(0.05)
         first_adapter._run_idempotency_store.close()
 
-        restarted = _make_adapter()
+        restarted = _make_adapter(monkeypatch=monkeypatch)
         _use_idempotency_db(restarted, path)
         restarted_app = _create_runs_app(restarted)
         async with TestClient(TestServer(restarted_app)) as cli:

@@ -651,6 +651,8 @@ def owner(tmp_path):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_state import SessionDB
     from hermes_state_runtime import begin_runtime_epoch
 
@@ -661,6 +663,8 @@ def owner(tmp_path):
     authority = SessionAuthority(runner, profile_id='default', instance_id='first', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='first'))
     runner.session_authority = authority
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     yield authority
     db.close()
 

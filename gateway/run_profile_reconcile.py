@@ -388,7 +388,9 @@ class GatewayProfileReconcileMixin:
         profile's). Secrets are not re-hydrated: teardown must not block the loop on a source fetch.
         """
         from gateway.run import _profile_runtime_scope, _write_runtime_status_quiet
-        from gateway.run_runtime import release_profile_home, unserve_profile_runtime
+        from gateway.run_runtime import (
+            ProfileOwnershipRetained, release_profile_home, unserve_profile_runtime,
+        )
         # Retire before teardown; a False verdict (writer outlived its Stop) is honoured below.
         retired = getattr(self, 'session_authorities', None) is None or await unserve_profile_runtime(self, home)
         pending = (getattr(self, "_profile_failed_platforms", None) or {}).pop(name, None) or {}
@@ -451,7 +453,14 @@ class GatewayProfileReconcileMixin:
                     from hermes_logging import release_profile_log_handlers
                     await asyncio.to_thread(release_profile_log_handlers, home)
             finally:
-                release_profile_home(self, home)
+                try:
+                    release_profile_home(self, home)
+                except ProfileOwnershipRetained as exc:
+                    # A retained/unknown physical lock is still unrouted, but it is not an
+                    # ordinary parked success.  Keep the canonical reservation for the same
+                    # owner and let the next reconcile retry this exact handle.
+                    logger.error("[MULTIPLEX] Profile '%s' remains physically owned: %s", name, exc)
+                    return
             logger.info("[MULTIPLEX] Profile '%s' unserved — %d adapter(s) stopped and unrouted", name, len(adapters))
 
 

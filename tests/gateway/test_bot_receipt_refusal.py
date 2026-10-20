@@ -178,8 +178,8 @@ async def test_a_pin_without_refusal_proof_still_warns(bot, monkeypatch, caplog)
     from gateway.session_bot_mailbox import scan_receipts
     from tools.bot_live_delivery import read_delivery_result
     real = type(bot.authority).admit_automation
-    async def committed_then_refused(self, *args):
-        await real(self, *args)
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
         raise RuntimeStoreError('stale_epoch')
     monkeypatch.setattr(type(bot.authority), 'admit_automation', committed_then_refused)
     bot.authority._schedule = lambda ref: None

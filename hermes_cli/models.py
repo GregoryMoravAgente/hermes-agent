@@ -4,6 +4,8 @@ Origin module; cohesive clusters live in siblings and are re-imported here so
 ``hermes_cli.models.<name>`` stays the stable import/monkeypatch surface:
 ``models_catalog_static`` (curated tables, provider registry, aliases), ``models_reasoning_caps``,
 ``models_local`` (Ollama / LM Studio), ``models_pricing``, ``models_validate``.
+Pure Copilot catalog shapes and routing live in ``models_copilot_shapes``; this
+module remains the callback seam for the live catalog cache and runtime values.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import contextvars
 import copy
 import gzip
+import inspect
 import json
 import logging
 import os
@@ -64,6 +67,7 @@ from hermes_cli.models_local import (
     _ollama_probe_cache_key,
     _root_for_ollama_native_api,
     fetch_ollama_cloud_models)
+from hermes_cli import models_copilot_shapes as _copilot_shapes
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +80,7 @@ COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
+
 
 def _urlopen_model_catalog_request(req: urllib.request.Request, *, timeout: float, ssl_context=None):
     """Open catalog requests without forwarding headers across origins."""
@@ -1403,7 +1408,6 @@ def _openai_discovery_base_url(provider: str) -> str:
 
 def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
     from hermes_cli.codex_models import get_codex_model_ids
-
     # Live OAuth token so the picker matches what ChatGPT lists for this account; hardcoded
     # catalog without a token / when unreachable. Read-only (#68004): a picker never imports,
     # refreshes or persists a credential, so an expired stored token means the hardcoded catalog
@@ -1413,7 +1417,6 @@ def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
     base_url = None
     try:
         from hermes_cli.auth import _codex_access_token_is_expiring, resolve_codex_runtime_credentials
-
         creds = resolve_codex_runtime_credentials(read_only=True)
         access_token, base_url = creds.get("api_key"), creds.get("base_url")
         if _codex_access_token_is_expiring(access_token, 0):
@@ -1423,37 +1426,57 @@ def _codex_catalog(normalized: str, force_refresh: bool) -> list[str]:
     return get_codex_model_ids(access_token=access_token, base_url=base_url)
 
 
-_COPILOT_ACP_SESSION_MEMO_TTL = 300.0  # 5 min; SWR disk cache handles the rest
-_COPILOT_ACP_SESSION_FAIL_TTL = 30.0  # failed probes re-probe quickly so a fresh CLI login is picked up
-_copilot_acp_session_memo: Optional[tuple[float, float, Optional[list[str]]]] = None  # (at, ttl, models)
+_COPILOT_ACP_SESSION_MEMO_TTL = 300.0
+_COPILOT_ACP_SESSION_FAIL_TTL = 30.0
+_copilot_acp_session_memo: dict[str, tuple[float, float, Optional[list[str]]]] = {}
 
 
-def _copilot_acp_session_models(force_refresh: bool) -> Optional[list[str]]:
-    """Enabled models from a signed-in ``copilot --acp`` session, memoized for a few minutes —
-    successes AND failures. Model-switch validation (``models_validate._static_catalog``) reads
-    this uncached on every ``/model`` switch, and each miss is a CLI spawn + handshake (up to the
-    probe timeout), so without the memo every switch paid a subprocess. A failed probe is
-    memoized much more briefly so a user who signs in to the CLI right after a miss is picked up
-    on the next switch (or immediately via ``/model --refresh``, which clears this memo)."""
-    global _copilot_acp_session_memo
-    now = time.monotonic()
-    memo = _copilot_acp_session_memo
-    if not force_refresh and memo is not None and now - memo[0] < memo[1]:
+def _fetch_external_process_models(profile: Any, producer_policy: Any) -> Optional[list[str]]:
+    if producer_policy is None:
+        return None
+    fetch = getattr(profile, "fetch_models", None)
+    if not callable(fetch):
+        return None
+    try:
+        parameters = inspect.signature(fetch).parameters
+    except (TypeError, ValueError):
+        parameters = None
+    legacy_signature = parameters is not None and "producer_policy" not in parameters and not any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values())
+    try:
+        live = fetch() if legacy_signature else fetch(producer_policy=producer_policy)
+        return list(live) if live is not None else None
+    except Exception:
+        parent = getattr(producer_policy, "parent", None)
+        if parent is not None:
+            try:
+                from gateway.runtime_service_operations import mark_unknown
+                mark_unknown(parent, "catalog_discovery_failed")
+            except Exception:
+                logger.debug("external-process catalog ownership marking failed", exc_info=True)
+        logger.debug("external-process catalog fetch failed", exc_info=True)
+        return None
+
+
+def _copilot_acp_session_models(force_refresh: bool, *, producer_policy: Any = None) -> Optional[list[str]]:
+    if producer_policy is None:
+        return None
+    profile_key, now = _pricing_profile_key(), time.monotonic()
+    memo = None if force_refresh else _copilot_acp_session_memo.get(profile_key)
+    if memo is not None and now - memo[0] < memo[1]:
         return memo[2]
     from providers import get_provider_profile
-
-    try:
-        live = get_provider_profile("copilot-acp").fetch_models() or None
-    except Exception:
-        logger.debug("copilot-acp session model discovery failed", exc_info=True)
-        live = None
-    _copilot_acp_session_memo = (now, _COPILOT_ACP_SESSION_MEMO_TTL if live else _COPILOT_ACP_SESSION_FAIL_TTL, live)
+    profile = get_provider_profile("copilot-acp")
+    live = _fetch_external_process_models(profile, producer_policy) if profile else None
+    _copilot_acp_session_memo[profile_key] = (now, _COPILOT_ACP_SESSION_MEMO_TTL if live else _COPILOT_ACP_SESSION_FAIL_TTL, live)
     return live
 
 
-def _copilot_catalog(normalized: str, force_refresh: bool) -> Optional[list[str]]:
-    if normalized == "copilot-acp" and (live := _copilot_acp_session_models(force_refresh)):
-        return live
+def _copilot_catalog(normalized: str, force_refresh: bool, *, producer_policy: Any = None) -> Optional[list[str]]:
+    if normalized == "copilot-acp":
+        live = _copilot_acp_session_models(force_refresh, producer_policy=producer_policy)
+        if live is not None:
+            return live
     try:
         live = _fetch_github_models(_resolve_copilot_catalog_api_key())
         if live:
@@ -1652,7 +1675,7 @@ _OPENCODE_FREE_EXCLUDED_MODELS = frozenset(
 )
 
 
-def _profile_live_catalog(normalized: str) -> Optional[list[str]]:
+def _profile_live_catalog(normalized: str, *, producer_policy: Any = None) -> Optional[list[str]]:
     """Generic live fetch for any provider registered in providers/ with ``auth_type="api_key"``.
 
     Live results are merged with the curated list so models the live endpoint omits still appear:
@@ -1666,19 +1689,9 @@ def _profile_live_catalog(normalized: str) -> Optional[list[str]]:
     profile = get_provider_profile(normalized)
     if not profile:
         return None
-    # external_process providers (ACP agent CLIs) have no api_key/base_url credentials: the
-    # profile's fetch_models drives its own subprocess (kwargs are ignored per the base contract).
-    # Every non-api-key profile falls back to its own fallback_models (OAuth plugins have no
-    # static _PROVIDER_MODELS row), exactly as api_key plugins do below.
     if profile.auth_type == "external_process":
-        try:
-            live = profile.fetch_models()
-        except Exception as exc:  # a failed subprocess launch degrades to the curated list, like api_key below
-            logger.debug("external_process catalog fetch failed for %s: %s", normalized, exc)
-            live = None
-        # Same merge as setup (`_model_flow_plugin_provider`) so /model, the Desktop picker and
-        # `hermes model` offer one list: live ids plus any pinned id the probe omitted.
-        return merge_profile_catalog(normalized, profile, list(live) if live else None)
+        live = _fetch_external_process_models(profile, producer_policy)
+        return merge_profile_catalog(normalized, profile, list(live) if live is not None else None)
     if not (profile.auth_type == "api_key" and profile.base_url):
         return list(profile.fallback_models) or None
     api_key, base_url = _api_key_credentials(normalized)
@@ -1805,16 +1818,6 @@ def _static_catalog(normalized: str, fetcher: Any) -> list[str]:
     Shared by the normal path's final fallback and by the configured-relay degrade path, which
     must never reach a live vendor fetcher (#121387).
     """
-    # Merge static curated list with live API results so models that the live endpoint omits (stale cache,
-    # partial rollout) still appear in the picker. Single providers (kimi, zai) use curated-first (commit
-    # 658ac1d86) to surface newest models even when live API lags (#46309). OpenCode Zen / Go are different:
-    # their live API is the authoritative catalog, so they merge live-first — live entries lead and stale
-    # curated entries no longer pollute the top of the picker. (#49129) Plugin providers with no static
-    # _PROVIDER_MODELS entry fall back to the profile's curated fallback_models so their agentic picks lead
-    # the picker instead of whatever the live catalog happens to return first (e.g. Fireworks lists an image
-    # model, flux-*, ahead of its chat models).
-    # A provider with a live fetcher that declined is serving a placeholder; one without any live
-    # source is serving its authoritative catalog.
     curated_static = (CuratedFallbackModels if fetcher is not None else list)(_PROVIDER_MODELS.get(normalized, []))
     if normalized not in _MODELS_DEV_PREFERRED:
         return _chat_catalog_rows(_drop_delisted_opencode_models(normalized, curated_static))
@@ -1823,7 +1826,7 @@ def _static_catalog(normalized: str, fetcher: Any) -> list[str]:
     return _chat_catalog_rows(_xai_finalize_catalog(merged) if normalized in {"xai", "xai-oauth"} else merged)
 
 
-def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) -> list[str]:
+def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False, producer_policy: Any = None) -> list[str]:
     """Best known model catalog for a provider: per-provider live fetchers, then the generic profile
     fetch, then the static list (merged with models.dev for ``_MODELS_DEV_PREFERRED`` providers)."""
     requested = str(provider or "").strip().lower()
@@ -1831,11 +1834,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         return _ollama_local_catalog(force_refresh)
 
     normalized = normalize_provider(provider)
-    # A configured `model.base_url` relay is TERMINAL for live catalog egress: the picker must
-    # list what the configured endpoint serves and must never touch the vendor host (#121387).
-    # A failed or empty probe degrades to the local curated list — falling through to the
-    # canonical fetchers would send the provider credential to exactly the host the user
-    # deliberately routed away from, recreating the bug on the failure path.
+    if producer_policy is None:
+        try:
+            from providers import get_provider_profile
+            profile = get_provider_profile(normalized)
+        except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+            logger.debug("provider profile lookup failed during model discovery", exc_info=True)
+            profile = None
+        if profile is not None and getattr(profile, "auth_type", "") == "external_process":
+            from gateway.runtime_service_operations import external_catalog_model_ids
+            return external_catalog_model_ids(normalized, force_refresh=force_refresh)
     relay = _configured_relay_base_url(provider or "")
     if relay and normalized not in _RELAY_AWARE_CATALOG_FETCHERS:
         relayed = _relay_model_catalog(normalized, relay)
@@ -1843,12 +1851,16 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             return _chat_catalog_rows(relayed)
         return _static_catalog(normalized, _PROVIDER_CATALOG_FETCHERS.get(normalized))
     fetcher = _PROVIDER_CATALOG_FETCHERS.get(normalized)
-    if fetcher is not None:
+    if normalized == "copilot-acp":
+        models = _copilot_catalog(normalized, force_refresh, producer_policy=producer_policy)
+        if models is not None:
+            return _chat_catalog_rows(models)
+    elif fetcher is not None:
         models = fetcher(normalized, force_refresh)
         if models is not None:
             return _chat_catalog_rows(models)
     try:
-        models = _profile_live_catalog(normalized)
+        models = _profile_live_catalog(normalized, producer_policy=producer_policy)
     except Exception:
         models = None
     if models is not None:
@@ -1857,24 +1869,11 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
     return _static_catalog(normalized, fetcher)
 
 
-# ---------------------------------------------------------------------------
-# Disk cache for provider_model_ids() — keeps /model picker fast (otherwise every open re-fetches
-# every authed provider's /v1/models). One JSON file at $HERMES_HOME/provider_models_cache.json;
-# entries keyed by credential fingerprint (rotate OPENAI_API_KEY → entry invalidates); 1h TTL;
-# only NON-EMPTY results are cached so a transient failure is never pinned; any read/write error
-# degrades silently to a live fetch.
-# ---------------------------------------------------------------------------
 
 _PROVIDER_MODELS_CACHE_TTL = 3600  # 1h
-# Stale-while-revalidate window: an expired same-credentials entry is served IMMEDIATELY while a
-# daemon thread refreshes the disk cache; beyond this bound the caller blocks on a live fetch.
-# Catalogs change on release timescales, so hour-old data beats stalling every picker surface.
 _PROVIDER_MODELS_STALE_SERVE_MAX = 7 * 24 * 3600  # 7d
-# A curated fallback row is a placeholder for an outage, not a catalog: re-probe soon and never
-# serve it through the stale window.
 _PROVIDER_MODELS_FALLBACK_TTL = 60
 
-# Cache keys with a background SWR refresh in flight — dedupes concurrent refreshes.
 _swr_refresh_inflight: set = set()
 _swr_refresh_lock = threading.Lock()
 
@@ -1904,14 +1903,12 @@ def _ollama_native_probe_reachable() -> bool:
     return _OLLAMA_LOCAL_PROBE_REACHABLE.get(probe_key) is True
 
 
-def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
+def _spawn_swr_refresh(cache_key: str, refresh_fn=None, *, producer_policy: Any = None) -> None:
     """Fire-and-forget daemon refresh of *cache_key*'s cache entry, at most one in flight per key.
     Failures are swallowed — the stale entry stays served until a later refresh succeeds.
     ``refresh_fn`` (no-args → fresh entry dict or None) lets ``custom:<base_url>`` keys from
     :func:`cached_fetch_api_models` reuse the same inflight-dedupe scaffolding."""
-    # Under a routed profile the inflight key includes the home: the same provider slug names a
-    # different disk cache and credential set per profile, so one profile's refresh must not
-    # suppress another's. Unscoped keeps the bare key (tests inspect the set by slug).
+    # Routed profiles include their home; the default profile keeps the bare key.
     from hermes_constants import get_hermes_home_override, hermes_home_key
     inflight_key = cache_key if get_hermes_home_override() is None else (hermes_home_key(), cache_key)
     with _swr_refresh_lock:
@@ -1920,7 +1917,7 @@ def _spawn_swr_refresh(cache_key: str, refresh_fn=None) -> None:
         _swr_refresh_inflight.add(inflight_key)
 
     def _default_refresh():
-        live = provider_model_ids(cache_key, force_refresh=True)
+        live = provider_model_ids(cache_key, force_refresh=True, producer_policy=producer_policy)
         if live or (cache_key == "ollama" and _ollama_native_probe_reachable()):
             fp = _credential_fingerprint(cache_key)
             return _live_result_entry(fp, live or [], _load_provider_models_cache().get(cache_key))
@@ -2089,86 +2086,168 @@ def _model_requires_account_discovery(provider: Optional[str], model: str) -> bo
     return _normalized_cache_slug(provider) in {"openai", "openai-api", "openai-codex"} and is_astra_model(model)
 
 
-def cached_provider_model_ids(
-    provider: Optional[str], *, force_refresh: bool = False,
-    ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL, non_blocking: bool = False) -> list[str]:
-    """Disk-cached :func:`provider_model_ids`: fresh cache hit, else live fetch persisting a non-empty
-    result. Always returns a list.
+# Lookup failure is a distinct state from a known non-external provider.  A stale
+# entry may use the legacy unowned SWR writer only after classification succeeds.
+_PROFILE_CLASSIFICATION_UNKNOWN = object()
 
-    ``non_blocking`` marks the GUI read path (``model.options``): it NEVER waits on a provider probe.
-    A same-credentials row of any age is served as-is and a daemon thread warms the next open; a
-    cold/mismatched row returns ``[]`` so the caller keeps its curated list. One degraded provider
-    (hanging or timing-out ``/v1/models``) therefore delays nothing but itself (#114215)."""
-    normalized = _normalized_cache_slug(provider)
-    if not normalized:
-        return []
-    is_ollama = normalized == "ollama"
 
-    cache = _load_provider_models_cache()
-    fp = _credential_fingerprint(normalized)
-    entry = cache.get(normalized)
-    now = time.time()
+def _cached_provider_profile(normalized: str, producer_policy: Any) -> Any:
+    if producer_policy is not None:
+        return None
+    try:
+        from providers import get_provider_profile
+        return get_provider_profile(normalized)
+    except (ImportError, AttributeError, KeyError, TypeError, ValueError):
+        logger.debug("provider profile lookup failed during cached discovery", exc_info=True)
+        return _PROFILE_CLASSIFICATION_UNKNOWN
 
-    if not force_refresh:
-        tier = _disk_serve_tier(entry, fp, now, is_ollama=is_ollama, ttl_seconds=ttl_seconds)
-        if tier is not None:
-            if tier == "stale":
-                _spawn_swr_refresh(normalized)
-            return _chat_catalog_rows(list(entry["models"]))
 
-    if non_blocking and not force_refresh:
-        # Read path: never touch the network in the caller's thread. A same-credentials row past the
-        # SWR window is still served (hour-old catalog beats an empty picker) while a daemon thread
-        # warms the next open; a cold row returns [] and the caller falls back to its curated list.
-        _spawn_swr_refresh(normalized)
+def _external_catalog_cached_refresh(
+    normalized: str, profile: Any, *, non_blocking: bool,
+) -> list[str] | None:
+    if getattr(profile, "auth_type", "") != "external_process":
+        return None
+    from gateway.runtime_service_operations import external_catalog_model_ids
+    return external_catalog_model_ids(normalized, force_refresh=True, non_blocking=non_blocking)
+
+
+def _serve_cached_provider_entry(
+    normalized: str, entry: Any, fp: str, *, profile: Any, non_blocking: bool, is_ollama: bool,
+) -> list[str]:
+    if profile is _PROFILE_CLASSIFICATION_UNKNOWN:
+        # A stale cache with an unknown owner classification cannot authorize the
+        # old unowned refresh worker.  Serve only a still-valid bounded row set.
         if _cache_entry_valid(entry, fp, allow_empty=is_ollama):
-            return _chat_catalog_rows([
-                model for model in entry["models"]
-                if not _model_requires_account_discovery(normalized, model)])
+            return _chat_catalog_rows(
+                [model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)]
+            )
         return []
+    external = _external_catalog_cached_refresh(normalized, profile, non_blocking=non_blocking)
+    if external is not None:
+        return external
+    _spawn_swr_refresh(normalized)
+    if non_blocking:
+        if _cache_entry_valid(entry, fp, allow_empty=is_ollama):
+            return _chat_catalog_rows(
+                [model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)]
+            )
+        return []
+    return _chat_catalog_rows(list(entry["models"]))
 
-    live = provider_model_ids(normalized, force_refresh=force_refresh)
-    if live:
+
+def _cached_provider_entry_result(
+    normalized: str, entry: Any, fp: str, now: float, *, profile: Any, producer_policy: Any,
+    non_blocking: bool, is_ollama: bool, ttl_seconds: int, force_refresh: bool,
+) -> tuple[list[str] | None, bool]:
+    if force_refresh:
+        return None, True
+    tier = _disk_serve_tier(entry, fp, now, is_ollama=is_ollama, ttl_seconds=ttl_seconds)
+    if tier == "stale":
+        if profile is _PROFILE_CLASSIFICATION_UNKNOWN:
+            return _serve_cached_provider_entry(
+                normalized, entry, fp, profile=profile, non_blocking=non_blocking, is_ollama=is_ollama,
+            ), False
+        external = profile is not None and getattr(profile, "auth_type", "") == "external_process"
+        if external or producer_policy is None:
+            return _serve_cached_provider_entry(
+                normalized, entry, fp, profile=profile, non_blocking=non_blocking, is_ollama=is_ollama,
+            ), False
+        return None, True
+    if tier is not None:
+        return _chat_catalog_rows(list(entry["models"])), False
+    return None, False
+
+
+def _fetch_provider_catalog(
+    normalized: str, entry: Any, fp: str, now: float, *, producer_policy: Any,
+    force_refresh: bool, is_ollama: bool,
+) -> list[str]:
+    live = provider_model_ids(normalized, force_refresh=force_refresh, producer_policy=producer_policy)
+    parent = getattr(producer_policy, "parent", None)
+    if live or parent is not None:
+        if getattr(parent, "state", None) == "unknown":
+            return _chat_catalog_rows(list(live))
         fresh = _live_result_entry(fp, live, entry, now)
         if fresh is None:
-            # The live fetch degraded to the curated list; the account's real catalog is on disk.
-            return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
+            return _chat_catalog_rows(
+                [model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)]
+            )
         _store_cache_entry(normalized, fresh)
         return _chat_catalog_rows(list(live))
-
     if is_ollama:
         if _ollama_native_probe_reachable():
-            # A reachable empty native catalog is authoritative; do not resurrect a stale disk catalog.
             _store_cache_entry(normalized, _cache_entry(fp, [], now))
             return []
-        # A failed/non-native probe is not authoritative: keep a stale catalog rather than blanking
-        # the picker during a transient outage.
         same_creds = isinstance(entry, dict) and entry.get("fp") == fp
         if same_creds and isinstance(entry.get("models"), list) and entry["models"]:
             return _chat_catalog_rows(list(entry["models"]))
         return []
-    # Live returned nothing: a stale same-fingerprint entry beats an empty result — minus account-gated
-    # models, which only a successful discovery may advertise (the entry itself is untouched, so the
-    # next successful fetch restores them).
     if _cache_entry_valid(entry, fp):
-        return _chat_catalog_rows([model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)])
+        return _chat_catalog_rows(
+            [model for model in entry["models"] if not _model_requires_account_discovery(normalized, model)]
+        )
     return []
+
+
+def cached_provider_model_ids(provider: Optional[str], *, force_refresh: bool = False,
+                              ttl_seconds: int = _PROVIDER_MODELS_CACHE_TTL, non_blocking: bool = False,
+                              producer_policy: Any = None) -> list[str]:
+    """Cache provider catalogs with an owned external refresh and a bounded local SWR path."""
+    normalized = _normalized_cache_slug(provider)
+    if not normalized:
+        return []
+    is_ollama = normalized == "ollama"
+    cache = _load_provider_models_cache()
+    fp = _credential_fingerprint(normalized)
+    entry = cache.get(normalized)
+    profile = _cached_provider_profile(normalized, producer_policy)
+    now = time.time()
+
+    if profile is _PROFILE_CLASSIFICATION_UNKNOWN:
+        # Explicit producer policies already bypass this branch.  Without one,
+        # owner classification is unavailable, so never spawn a stale refresh.
+        return _serve_cached_provider_entry(
+            normalized, entry, fp, profile=profile, non_blocking=non_blocking, is_ollama=is_ollama,
+        )
+
+    if not force_refresh:
+        cached, force_refresh = _cached_provider_entry_result(
+            normalized, entry, fp, now, profile=profile, producer_policy=producer_policy,
+            non_blocking=non_blocking, is_ollama=is_ollama, ttl_seconds=ttl_seconds,
+            force_refresh=force_refresh,
+        )
+        if cached is not None:
+            return cached
+
+    if non_blocking and not force_refresh:
+        return _serve_cached_provider_entry(
+            normalized, entry, fp, profile=profile, non_blocking=True, is_ollama=is_ollama,
+        )
+
+    if profile is None and producer_policy is None:
+        return _static_catalog(normalized, _PROVIDER_CATALOG_FETCHERS.get(normalized))
+    if profile is not None and getattr(profile, "auth_type", "") == "external_process":
+        external = _external_catalog_cached_refresh(normalized, profile, non_blocking=non_blocking)
+        if external is not None:
+            return external
+
+    return _fetch_provider_catalog(
+        normalized, entry, fp, now, producer_policy=producer_policy,
+        force_refresh=force_refresh, is_ollama=is_ollama,
+    )
 
 
 def clear_provider_models_cache(provider: Optional[str] = None) -> None:
     """Drop one provider's cache entry, or wipe the whole cache (``provider=None``). Used by
     ``/model --refresh`` and ``hermes model --refresh``."""
     try:
-        # Native Ollama tags are keyed by root URL, not provider slug — a targeted refresh can't
-        # identify the root from the name alone, so clear this small in-process cache every time.
+        if provider is None:
+            _copilot_acp_session_memo.clear()
+        elif _normalized_cache_slug(provider) == "copilot-acp":
+            _copilot_acp_session_memo.pop(_pricing_profile_key(), None)
         _OLLAMA_LOCAL_MODELS_CACHE.clear()
         _OLLAMA_LOCAL_PROBE_FAILURE_CACHE.clear()
         _OLLAMA_LOCAL_PROBE_REACHABLE.clear()
-        # A fresh copilot-acp CLI login must be visible to the next /model switch (this helper is
-        # what ``--refresh`` runs): don't let the 5-min session memo (or its failure memo) serve
-        # a stale signed-out probe past an explicit refresh.
-        global _copilot_acp_session_memo
-        _copilot_acp_session_memo = None
         from hermes_cli.models_cache_lock import write_under_cache_lock
         path = _provider_models_cache_path()
 
@@ -2273,8 +2352,7 @@ def _fetch_anthropic_models(
 
 
 def _payload_items(payload: Any) -> list[dict[str, Any]]:
-    data = payload.get("data", []) if isinstance(payload, dict) else payload
-    return [item for item in data if isinstance(item, dict)] if isinstance(data, list) else []
+    return _copilot_shapes.payload_items(payload)
 
 
 def copilot_default_headers(*, is_agent_turn: bool = True) -> dict[str, str]:
@@ -2290,41 +2368,20 @@ def copilot_default_headers(*, is_agent_turn: bool = True) -> dict[str, str]:
             "x-initiator": "agent" if is_agent_turn else "user"}
 
 
-_COPILOT_CHAT_ENDPOINTS = {"/chat/completions", "/responses", "/v1/messages"}
+_COPILOT_CHAT_ENDPOINTS = _copilot_shapes.COPILOT_CHAT_ENDPOINTS
 
 
 def _copilot_catalog_item_is_text_model(
     item: dict[str, Any], *, ignore_picker_flag: bool = False) -> bool:
-    if not str(item.get("id") or "").strip():
-        return False
-    if not ignore_picker_flag and item.get("model_picker_enabled") is False:
-        return False
-    capabilities = item.get("capabilities")
-    if isinstance(capabilities, dict):
-        model_type = str(capabilities.get("type") or "").strip().lower()
-        if model_type and model_type != "chat":
-            return False
-    supported_endpoints = item.get("supported_endpoints")
-    if isinstance(supported_endpoints, list):
-        endpoints = {e for endpoint in supported_endpoints if (e := str(endpoint).strip())}
-        if endpoints and not endpoints & _COPILOT_CHAT_ENDPOINTS:
-            return False
-    return True
+    return _copilot_shapes.catalog_item_is_text_model(
+        item, ignore_picker_flag=ignore_picker_flag, chat_endpoints=_COPILOT_CHAT_ENDPOINTS,
+    )
 
 
 def _copilot_text_models(items: list[dict[str, Any]], *, ignore_picker_flag: bool = False) -> list[dict[str, Any]]:
-    """Chat-capable catalog rows, deduped by id, in catalog order."""
-    models: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for item in items:
-        model_id = str(item.get("id") or "").strip()
-        if model_id in seen_ids:
-            continue
-        if not _copilot_catalog_item_is_text_model(item, ignore_picker_flag=ignore_picker_flag):
-            continue
-        seen_ids.add(model_id)
-        models.append(item)
-    return models
+    return _copilot_shapes.text_models(
+        items, ignore_picker_flag=ignore_picker_flag, chat_endpoints=_COPILOT_CHAT_ENDPOINTS,
+    )
 
 
 # Short-TTL cache of the filtered GitHub Copilot /models catalog (picker + context/normalize helpers
@@ -2424,80 +2481,38 @@ def _fetch_github_models(api_key: Optional[str] = None, timeout: float = 5.0) ->
 
 def _copilot_catalog_ids(
     catalog: Optional[list[dict[str, Any]]] = None, api_key: Optional[str] = None) -> set[str]:
-    if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
-    return {mid for item in (catalog or []) if (mid := str(item.get("id") or "").strip())}
+    return _copilot_shapes.catalog_ids(catalog, api_key, fetch_github_model_catalog)
 
 
 def normalize_copilot_model_id(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> str:
-    raw = str(model_id or "").strip()
-    if not raw:
-        return ""
-
-    catalog_ids = _copilot_catalog_ids(catalog=catalog, api_key=api_key)
-    alias = _COPILOT_MODEL_ALIASES.get(raw)
-    if alias:
-        return alias
-
-    candidates = [raw]
-    if "/" in raw:
-        candidates.append(raw.split("/", 1)[1].strip())
-    if raw.endswith(("-mini", "-nano", "-chat")):
-        candidates.append(raw[:-5])
-
-    seen: set[str] = set()
-    for candidate in candidates:
-        if not candidate or candidate in seen:
-            continue
-        seen.add(candidate)
-        if candidate in _COPILOT_MODEL_ALIASES:
-            return _COPILOT_MODEL_ALIASES[candidate]
-        if candidate in catalog_ids:
-            return candidate
-
-    if "/" in raw:
-        stripped = raw.split("/", 1)[1].strip()
-        # Enterprise BYOK custom models expose ``owner/sub/model`` ids (two
-        # slashes). A strip guess that still contains "/" cannot be a Copilot
-        # id, so pass the input through untouched instead of corrupting it.
-        if stripped and "/" not in stripped:
-            return stripped
-    return raw
+    return _copilot_shapes.normalize_model_id(
+        model_id, catalog=catalog, api_key=api_key,
+        fetch_catalog=fetch_github_model_catalog, aliases=_COPILOT_MODEL_ALIASES,
+    )
 
 
 def _github_reasoning_efforts_for_model_id(model_id: str) -> list[str]:
-    raw = (model_id or "").strip().lower()
-    if raw.startswith(("openai/o1", "openai/o3", "openai/o4", "o1", "o3", "o4")):
-        return list(COPILOT_REASONING_EFFORTS_O_SERIES)
-    normalized = normalize_copilot_model_id(model_id).lower()
-    if is_astra_model(normalized):
-        return list(CODEX_ASTRA_EFFORTS)
-    if normalized.startswith("gpt-5"):
-        return list(COPILOT_REASONING_EFFORTS_GPT5)
-    return []
+    return _copilot_shapes.reasoning_efforts_for_model_id(
+        model_id, normalize=normalize_copilot_model_id,
+        gpt5_efforts=COPILOT_REASONING_EFFORTS_GPT5,
+        o_series_efforts=COPILOT_REASONING_EFFORTS_O_SERIES,
+        astra_efforts=CODEX_ASTRA_EFFORTS,
+    )
 
 
 def _should_use_copilot_responses_api(model_id: str) -> bool:
-    """opencode's ``shouldUseCopilotResponsesApi``: GPT-5+ uses the Responses API except
-    ``gpt-5-mini``; non-GPT models (Claude, Gemini, ...) use Chat Completions."""
-    match = re.match(r"^gpt-(\d+)", model_id)
-    return bool(match) and int(match.group(1)) >= 5 and not model_id.startswith("gpt-5-mini")
+    return _copilot_shapes.should_use_responses_api(model_id)
 
 
 def copilot_model_api_mode(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> str:
-    """API mode for a Copilot model from the id pattern (opencode's approach). Copilot's Claude models
-    go through its OpenAI-compatible chat endpoint, not the native Anthropic adapter: the catalog may
-    advertise /v1/messages but the Copilot token/header scheme lives in the OpenAI client path."""
-    if catalog is None and api_key:  # fetch once so normalize + endpoint check share it
-        catalog = fetch_github_model_catalog(api_key=api_key)
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
-    if normalized and _should_use_copilot_responses_api(normalized):
-        return "codex_responses"
-    return "chat_completions"
+    return _copilot_shapes.model_api_mode(
+        model_id, catalog=catalog, api_key=api_key,
+        fetch_catalog=fetch_github_model_catalog, normalize=normalize_copilot_model_id,
+    )
 
 
 def azure_foundry_model_api_mode(model_name: Optional[str]) -> Optional[str]:
@@ -2600,26 +2615,11 @@ def github_model_reasoning_efforts(
     model_id: Optional[str], *, catalog: Optional[list[dict[str, Any]]] = None,
     api_key: Optional[str] = None) -> list[str]:
     """Return supported reasoning-effort levels for a Copilot-visible model."""
-    normalized = normalize_copilot_model_id(model_id, catalog=catalog, api_key=api_key)
-    if not normalized:
-        return []
-
-    if catalog is None and api_key:
-        catalog = fetch_github_model_catalog(api_key=api_key)
-    catalog_entry = next((item for item in catalog if item.get("id") == normalized), None) if catalog else None
-    if catalog_entry is not None:
-        capabilities = catalog_entry.get("capabilities")
-        if isinstance(capabilities, dict):
-            # Structured catalog: the advertised list is authoritative (empty when absent).
-            supports = capabilities.get("supports")
-            efforts = supports.get("reasoning_effort") if isinstance(supports, dict) else None
-            if not isinstance(efforts, list):
-                return []
-            return list(dict.fromkeys(e for effort in efforts if (e := str(effort).strip().lower())))
-        # Legacy list-shaped capabilities: only a "reasoning" tag unlocks the pattern defaults.
-        if "reasoning" not in {str(c).strip().lower() for c in catalog_entry.get("capabilities", [])}:
-            return []
-    return _github_reasoning_efforts_for_model_id(str(model_id or normalized))
+    return _copilot_shapes.model_reasoning_efforts(
+        model_id, catalog=catalog, api_key=api_key,
+        fetch_catalog=fetch_github_model_catalog, normalize=normalize_copilot_model_id,
+        pattern_efforts=_github_reasoning_efforts_for_model_id,
+    )
 
 
 # Negative cache: monotonic timestamp of the last timed-out probe, keyed
@@ -2973,8 +2973,6 @@ def cached_fetch_api_models(
         if age < ttl_seconds:
             return _catalog(entry)
         # An empty native catalog is authoritative only inside the TTL (as in
-        # cached_provider_model_ids): never stale-serve it, or an Ollama that was model-less at
-        # first open keeps an empty row for the whole stale window after models are pulled.
         if entry["models"] and age < _PROVIDER_MODELS_STALE_SERVE_MAX:
             # Stale-while-revalidate: serve now, refresh off-thread for the next open. cache_only
             # opens (GUI pickers that must not block on a stopped local server) take the same

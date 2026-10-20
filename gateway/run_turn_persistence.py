@@ -52,6 +52,97 @@ def _acp_launch(runner, source) -> bool:
 
 
 class GatewayTurnPersistenceMixin:
+    def _event_thread_metadata(self, event, source):
+        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+
+    @staticmethod
+    def _pop_post_delivery_callback(adapter, key, generation):
+        """Pop the adapter's deferred post-delivery callback for ``key`` (legacy dict fallback)."""
+        if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+            return adapter.pop_post_delivery_callback(key, generation=generation)
+        if adapter and hasattr(adapter, "_post_delivery_callbacks"):
+            return adapter._post_delivery_callbacks.pop(key, None)
+        return None
+
+    async def _finish_classic_queued_first_response(
+        self, turn_ctx: TurnContext, adapter: Any, response: str, result: Any, delivered: bool,
+    ) -> None:
+        """Settle the direct classic occurrence delivered before an in-band queued follow-up.
+
+        The queued lane sends the first answer through a temporary ledger event, so the adapter's
+        outer finally cannot see that occurrence's delivery proof.  Read the canonical ledger row
+        back onto the original typed owner before the recursive follow-up starts; no response text
+        or empty custody map is accepted as a terminal witness.
+        """
+        event = getattr(turn_ctx, "classic_writer_event", None)
+        binding = getattr(turn_ctx, "classic_writer_binding", None)
+        if event is None or binding is None or not isinstance(result, dict):
+            return
+        from gateway.session_classic_custody import ClassicWriterBinding
+        if not isinstance(binding, ClassicWriterBinding):
+            return
+        authority = getattr(event, "_classic_custody_authority", None)
+        key = getattr(event, "_classic_custody_key", None)
+        records = getattr(authority, "_preservation_operations", None)
+        record = records.get(key) if isinstance(records, dict) and key is not None else None
+        if authority is None or not isinstance(record, dict) or record.get("parent_handle") is not None:
+            return
+        if result.get("_classic_writer_proof") is None:
+            return
+        try:
+            if not delivered:
+                authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                return
+            if isinstance(response, dict):
+                stream_witness = response.get("_classic_stream_delivery_witness")
+                if stream_witness is not None:
+                    event._classic_stream_delivery_witness = stream_witness
+                first_text = response.get("final_response") or ""
+            else:
+                first_text = str(response or "")
+            from gateway.run import _strip_response_attachments_for_direct_send
+            first_text = _strip_response_attachments_for_direct_send(first_text, adapter)
+            if not first_text and not getattr(event, "_classic_stream_delivery_witness", None):
+                return
+            if first_text:
+                from gateway import delivery_ledger
+                inbound_id = getattr(turn_ctx, "inbound_message_id", None) or getattr(event, "message_id", None)
+                if not inbound_id:
+                    authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                    return
+                obligation_id = delivery_ledger.compute_obligation_id(
+                    turn_ctx.session_key, str(inbound_id), first_text,
+                )
+                with self._media_delivery_scope_for_source(turn_ctx.source):
+                    proof = await asyncio.to_thread(
+                        delivery_ledger.read_obligation,
+                        obligation_id,
+                        session_key=turn_ctx.session_key,
+                        platform=str(getattr(turn_ctx.source.platform, "value", turn_ctx.source.platform)),
+                        chat_id=turn_ctx.source.chat_id,
+                        thread_id=getattr(turn_ctx.source, "thread_id", None),
+                        content=first_text,
+                        adapter_profile=getattr(adapter, "_owner_profile", None),
+                        expected_state="delivered",
+                    )
+                if proof is None:
+                    authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                    return
+                event._classic_delivery_proof = proof
+            store = getattr(self, "session_store", None)
+            entry = store.lookup_by_session_key(turn_ctx.session_key) if store is not None else None
+            from gateway.session_classic_custody import attach_classic_execution_receipt
+            receipt = attach_classic_execution_receipt(self, event, entry, result) if entry is not None else None
+            if receipt is None:
+                authority._classic_finish(event, success=False, reason="completion_receipt_missing")
+                return
+            authority._classic_finish(event, success=True, receipt=receipt)
+        except Exception:
+            logger.debug("Queued classic occurrence reconciliation failed", exc_info=True)
+            with suppress(Exception):
+                authority._classic_finish(event, success=False, reason="delivery_proof_readback_failed")
+
     async def _hmwa_shape_agent_response(
         self, agent_result, source, history, session_entry, session_key,
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
@@ -423,17 +514,30 @@ class GatewayTurnPersistenceMixin:
         # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        _classic_transcript_proofs = []
+        _classic_transcript_unknown = False
+
+        async def _append_classic_transcript(message, *, skip_db=False):
+            """Capture the exact row proof returned by the canonical SessionStore writer."""
+            nonlocal _classic_transcript_unknown
+            proof = await store.append_to_transcript(sid, message, skip_db=skip_db)
+            if proof is None and not skip_db:
+                _classic_transcript_unknown = True
+            else:
+                _classic_transcript_proofs.append(proof)
+            return proof
+
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
 
         if is_context_overflow_failure:
-            pass  # Skip all transcript writes — don't grow a broken session
+            _classic_transcript_unknown = True  # No durable turn witness exists.
         else:
             if not history and source.platform != Platform.LOCAL:
                 # Fresh session: the tool definitions (as sent in the API request) make the transcript
                 # self-describing. A LOCAL route (one-shot, chat -q, ACP, TUI attach) keeps the classic
                 # in-process CLI's transcript shape: the marker is gateway bookkeeping every local
                 # reader filters out, and the session row already carries model/model_config.
-                await store.append_to_transcript(sid, {
+                await _append_classic_transcript({
                     "role": "session_meta",
                     "tools": agent_result.get("tools", []) or [],
                     "model": _resolve_gateway_model(),
@@ -449,8 +553,9 @@ class GatewayTurnPersistenceMixin:
                         "Skipping duplicate user turn (message_id=%s) in session %s",
                         event.message_id, sid,
                     )
+                    _classic_transcript_unknown = True
                 else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    await _append_classic_transcript(_user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
                 await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
@@ -461,10 +566,10 @@ class GatewayTurnPersistenceMixin:
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
+                    await _append_classic_transcript(_user_row, skip_db=agent_persisted)
                     if response:
-                        await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
+                        await _append_classic_transcript(
+                            {"role": "assistant", "content": response, "timestamp": ts},
                             skip_db=agent_persisted,
                         )
                 else:
@@ -483,7 +588,39 @@ class GatewayTurnPersistenceMixin:
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
-                        await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+                        await _append_classic_transcript(entry, skip_db=agent_persisted)
+
+        # Private custody fields never enter the public result.  A managed writer may provide its
+        # canonical SessionDBWriteProof through the explicit typed handoff; without it the managed
+        # route remains unknown instead of borrowing a gateway row.
+        # A queued chain persists through the outer handler, but its final typed writer handoff
+        # belongs to the recursive event that produced it.  Keep the outer event as a compatibility
+        # carrier for transcript state while retaining the exact terminal occurrence separately.
+        _writer_event = agent_result.pop("_classic_writer_event", None) if isinstance(agent_result, dict) else None
+        if _writer_event is None:
+            _writer_event = event
+        _classic_carriers = (event,) if _writer_event is event else (event, _writer_event)
+        for _carrier in _classic_carriers:
+            _carrier._classic_transcript_write_proofs = tuple(_classic_transcript_proofs)
+            _carrier._classic_transcript_write_unknown = _classic_transcript_unknown
+            _carrier._classic_agent_persisted = bool(agent_persisted)
+        if isinstance(agent_result, dict):
+            _writer_handoff = agent_result.pop("_classic_writer_proof", None)
+            if _writer_handoff is not None:
+                # The custody consumer reads the one-use typed envelope from the owner/execution
+                # event pair.  Keep the envelope intact so it can revalidate both the exact
+                # SessionDB proof and the authenticated direct/I04 binding; separate proof and
+                # binding attributes cannot express that atomic handoff.
+                from agent.session_persistence_proof import GatewayWriterProofHandoff
+                if type(_writer_handoff) is GatewayWriterProofHandoff:
+                    _writer_event._classic_writer_handoff = _writer_handoff
+                    if _writer_event is not event:
+                        event._classic_terminal_event = _writer_event
+            _stream_witness = agent_result.pop("_classic_stream_delivery_witness", None)
+            if _stream_witness is not None:
+                _writer_event._classic_stream_delivery_witness = _stream_witness
+                if _writer_event is not event:
+                    event._classic_terminal_event = _writer_event
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(

@@ -819,19 +819,21 @@ def _run_agent_tool_execution_middleware(
             **tool_hook_ids(agent, effective_task_id, tool_call_id),
         )
 
-    state.result, _relay_args = relay_tools.execute(
-        function_name,
-        function_args,
-        _hermes_pipeline,
-        session_id=str(getattr(agent, "session_id", "") or ""),
-        tool_call_id=tool_call_id or None,
-        metadata={
-            "task_id": effective_task_id or "",
-            "turn_id": getattr(agent, "_current_turn_id", "") or "",
-            "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
-            "tool_call_id": tool_call_id or "",
-        },
-    )
+    from agent.shell_hook_custody import tool_dispatch
+    with tool_dispatch(agent, effective_task_id, tool_call_id):
+        state.result, _relay_args = relay_tools.execute(
+            function_name,
+            function_args,
+            _hermes_pipeline,
+            session_id=str(getattr(agent, "session_id", "") or ""),
+            tool_call_id=tool_call_id or None,
+            metadata={
+                "task_id": effective_task_id or "",
+                "turn_id": getattr(agent, "_current_turn_id", "") or "",
+                "api_request_id": getattr(agent, "_current_api_request_id", "") or "",
+                "tool_call_id": tool_call_id or "",
+            },
+        )
     return state
 
 
@@ -1163,7 +1165,17 @@ def _commit_tool_result(
         except Exception as callback_error:
             logging.debug("Tool result metadata callback error: %s", callback_error)
     messages.append(tool_message)
-    if not _flush_session_db_after_tool_progress(agent, messages, stage=f"tool result {function_name}"):
+    from agent.shell_hook_custody import commit_tool_result_delivery
+    managed_outcome, shell_result_committed = commit_tool_result_delivery(
+        agent, messages, tool_message, tool_call_id=tool_call_id,
+        function_result=function_result, persisted_result=persisted_result,
+        stage=f"managed tool result {function_name}",
+    )
+    if managed_outcome is False:
+        return None
+    if managed_outcome is None and not shell_result_committed and not _flush_session_db_after_tool_progress(
+        agent, messages, stage=f"tool result {function_name}",
+    ):
         return None
 
     if not blocked:
@@ -1717,6 +1729,7 @@ def _resolve_sequential_dispatch(agent, ref: _ToolCallRef, messages: list) -> _S
                 session_id=agent.session_id or "",
                 turn_id=getattr(agent, "_current_turn_id", "") or "",
                 api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                run_generation=getattr(agent, "_current_run_generation", None),
                 enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                 skip_pre_tool_call_hook=True,
                 skip_tool_request_middleware=True,
@@ -1818,11 +1831,13 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
     if not managed.blocked and not _execution_timed_out:
         ref.emit_post(agent, function_result, duration_ms=int(tool_duration * 1000))
         if not transform_applied:
-            function_result = apply_transform_tool_result(
-                agent, function_name=ref.name, function_args=ref.args, result=function_result,
-                effective_task_id=ref.task_id, tool_call_id=ref.call_id,
-                duration_ms=int(tool_duration * 1000),
-            )
+            from agent.shell_hook_custody import tool_dispatch
+            with tool_dispatch(agent, ref.task_id, ref.call_id):
+                function_result = apply_transform_tool_result(
+                    agent, function_name=ref.name, function_args=ref.args, result=function_result,
+                    effective_task_id=ref.task_id, tool_call_id=ref.call_id,
+                    duration_ms=int(tool_duration * 1000),
+                )
     # Classify the result the model will actually see, i.e. after any transform; the
     # registry and concurrent paths both classify post-transform.
     # Multimodal dict results (_multimodal=True) are not sliceable as strings.

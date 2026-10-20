@@ -601,6 +601,10 @@ def _notif_handle_event(sid, session, evt, emitted, registry, fmt, deferred, com
     if evt_type != "async_delegation" and _background_notifications_off(session):
         # The user opted out of process-driven agent wakes: the status row above is the whole
         # delivery. Subagent results are not process notifications and still land.
+        if evt_type == "completion":
+            acknowledge = getattr(registry, "acknowledge_completion_delivery", None)
+            if callable(acknowledge):
+                acknowledge(evt.get("delivery_token", ""))
         return True
     if evt_type == "completion" and completions is not None:
         completions.append((evt, text))
@@ -655,8 +659,15 @@ def _notif_dispatch_completions(sid, session, notifications, registry, deferred)
         for event, _text, claim in claimed:
             release_event_delivery(event, claim)
         return
+    accepted_by_tui = text is not None
     for event, _text, claim in claimed:
         complete_event_delivery(event, claim)
+        if accepted_by_tui and event.get("type") == "completion":
+            # The process registry only observes delivery after the actual TUI turn was
+            # admitted. Queue removal and formatting alone are not a delivery witness.
+            acknowledge = getattr(registry, "acknowledge_completion_delivery", None)
+            if callable(acknowledge):
+                acknowledge(event.get("delivery_token", ""))
 
 
 def _notif_handle_ready(sid, session, events, emitted, registry, fmt, deferred, *, owned=False):

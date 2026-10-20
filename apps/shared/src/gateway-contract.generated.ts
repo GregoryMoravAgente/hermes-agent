@@ -5244,12 +5244,16 @@ export interface CanonicalBotDeliverResult {
   status: string
   delivery_id: string
   profile_home: string
+  profile_id?: string | null
+  authority_epoch?: number | null
   session_id: string
   admission_id?: string | null
   refused?: true | null
   message: string
   reply?: string | null
   retry_admission_id?: string | null
+  execution_generation?: number | null
+  retry_execution_generation?: number | null
   error?: string | null
   reason?: string | null
 }

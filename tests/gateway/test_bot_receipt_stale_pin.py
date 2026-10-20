@@ -72,8 +72,8 @@ async def test_an_old_pin_whose_admission_committed_stays_and_still_warns(bot, m
     from gateway.session_bot import deliver, recover_bot_deliveries
     from tools.bot_live_delivery import read_delivery_result
     real = type(bot.authority).admit_automation
-    async def committed_then_refused(self, *args):
-        await real(self, *args)
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
         raise RuntimeStoreError('stale_epoch')
     monkeypatch.setattr(type(bot.authority), 'admit_automation', committed_then_refused)
     bot.authority._schedule = lambda ref: None
@@ -87,6 +87,120 @@ async def test_an_old_pin_whose_admission_committed_stays_and_still_warns(bot, m
     assert before['status'] == 'ambiguous' and 'admission_id' not in before
     assert _scan_warnings(caplog, KEY)
     assert _rows(bot) == ['bot:' + KEY]
+
+
+@pytest.mark.asyncio
+async def test_a_committed_pin_recovers_after_restart_and_adopts_the_exact_row(bot, monkeypatch):
+    """A committed ambiguous pin survives a new authority and settles only after its row is adopted."""
+    from copy import deepcopy
+    from types import SimpleNamespace
+
+    from gateway import session_bot
+    from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_contract import SessionRef
+    from gateway.session_bot_custody import _reconcile_unknown_bot_handles
+    from gateway.session_automation_custody import row_descriptor
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state import SessionDB
+    from hermes_state_runtime import (adopt_worker_execution, get_session_admission,
+        register_worker_execution)
+    from tools.bot_live_delivery import read_delivery_result
+
+    key = '7' * 32
+    bot.authority._schedule = lambda ref: None
+    real = type(bot.authority).admit_automation
+
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
+        raise RuntimeStoreError('stale_epoch')
+
+    monkeypatch.setattr(type(bot.authority), 'admit_automation', committed_then_refused)
+    with pytest.raises(RuntimeStoreError, match='stale_epoch'):
+        await session_bot.deliver(bot.connection, dict(id=key, profile='default', message='restart'))
+    first = read_delivery_result(bot.home, key)
+    assert first['status'] == 'ambiguous' and 'admission_id' not in first
+    committed_id = first['_committed_admission_id']
+
+    monkeypatch.setattr(type(bot.authority), 'admit_automation', real)
+    process_ownership.reserve([bot.home], purpose='bot-restart-test')
+    db = None
+    try:
+        store = SessionStore(bot.home / 'sessions', GatewayConfig())
+        db = SessionDB(db_path=bot.home / 'state.db')
+        runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
+                                 _evict_cached_agent=lambda route: None)
+        runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
+        authority = await initialize_session_authority(
+            runner, profile_id='default', instance_id='restarted', db=db)
+        runner.runtime_custody = RuntimeCustodyCoordinator(
+            process_instance=authority.instance_id, authority_epoch=authority.epoch,
+            fence=RetirementFence())
+        authority._schedule = lambda ref: None
+
+        await session_bot.recover_bot_deliveries(authority)
+        assert committed_id in authority._preservation_handles
+        current_root = authority._preservation_handles[committed_id]
+        assert current_root.authority_epoch == authority.epoch
+        assert current_root.process_instance == authority.instance_id
+
+        ref = SessionRef(authority.profile_id, bot.chat)
+        async def execute_claimed(owner, _ref, claimed):
+            assignment = dict(execution_id='restart-adopted-worker', session_id=ref.session_id,
+                              generation=claimed['generation'])
+            register_worker_execution(owner.db, epoch=owner.epoch, **assignment,
+                                      kind='compute', adoption_secret='restart-owned-worker')
+            adopt_worker_execution(owner.db, epoch=owner.epoch, **assignment,
+                                  adoption_secret='restart-owned-worker')
+            tampered_row = deepcopy(claimed)
+            tampered_descriptor = row_descriptor(tampered_row)
+            assert isinstance(tampered_descriptor, dict)
+            tampered_descriptor['process_instance'] = 'wrong-old-witness'
+            payload = tampered_row['payload']
+            if isinstance(payload.get('local_automation_v1'), dict):
+                payload['local_automation_v1']['custody'] = tampered_descriptor
+            elif (isinstance(payload.get('native_text_v1'), dict)
+                  and isinstance(payload['native_text_v1'].get('automation'), dict)):
+                payload['native_text_v1']['automation']['custody'] = tampered_descriptor
+            else:
+                raise AssertionError('canonical automation row has no real custody carrier')
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                _reconcile_unknown_bot_handles(owner, committed_id, tampered_row)
+            assert owner._preservation_handles[committed_id] is current_root
+            assert not any(record.handle.process_instance == 'wrong-old-witness'
+                           for record in owner._preservation_coordinator()._records.values())
+            return 'restart adopted'
+
+        monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute_claimed)
+        await authority._drain(ref)
+        terminal_row = get_session_admission(db, admission_id=committed_id)
+        assert terminal_row['status'] == 'terminal'
+        await session_bot.recover_bot_deliveries(authority)
+        result = read_delivery_result(bot.home, key)
+        assert result['status'] == 'settled' and result['reply'] == 'restart adopted', result
+        assert result['admission_id'] == committed_id
+        assert committed_id not in authority._preservation_handles
+    finally:
+        if db is not None:
+            db.close()
+        store = locals().get('store')
+        if store is not None and getattr(store, '_db', None) is not None:
+            store._db.close()
+        process_ownership.release(bot.home)
+
+@pytest.mark.parametrize('epoch_field', ['authority_epoch', '_committed_authority_epoch'])
+@pytest.mark.asyncio
+async def test_a_malformed_committed_epoch_is_skipped_without_type_error(bot, epoch_field, caplog):
+    from gateway.session_bot import recover_bot_deliveries
+
+    key = 'h' * 32
+    _pin(bot, key=key, admission_id='a' * 32, **{epoch_field: 'malformed'})
+    await recover_bot_deliveries(bot.authority)
+    assert (bot.home / 'runtime' / 'bot_live_delivery' / f'{key}.json').exists()
+    assert _scan_warnings(caplog, key)
 
 
 OTHER = 'e' * 32
@@ -156,13 +270,16 @@ async def test_a_committed_pin_on_a_deleted_bot_chat_is_kept_and_the_resend_does
     from gateway.session_bot import deliver, recover_bot_deliveries
     from gateway.session_local import create_local_session
     from gateway.session_local_title import title_new_session
+    from tools.bot_live_delivery import read_delivery_result
     real = type(bot.authority).admit_automation
-    async def committed_then_refused(self, *args):
-        await real(self, *args)
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
         raise RuntimeStoreError('stale_epoch')
     monkeypatch.setattr(type(bot.authority), 'admit_automation', committed_then_refused)
     with pytest.raises(RuntimeStoreError, match='stale_epoch'):
         await deliver(bot.connection, dict(id=KEY, profile='default', message='run once'))
+    private_pin = read_delivery_result(bot.home, KEY)
+    assert private_pin['status'] == 'ambiguous' and 'admission_id' not in private_pin, private_pin
     monkeypatch.setattr(type(bot.authority), 'admit_automation', real)
     for _ in range(250):
         rows = list_session_admissions(bot.authority.db, session_id=bot.chat, pending_only=False)
@@ -174,9 +291,51 @@ async def test_a_committed_pin_on_a_deleted_bot_chat_is_kept_and_the_resend_does
     _age(path, HOUR)
     await recover_bot_deliveries(bot.authority)
     assert path.exists()
+    assert read_delivery_result(bot.home, KEY) == private_pin
     chat = create_local_session(bot.authority, bot.connection.actor, {
         'request_id': 'bot2', 'source': 'gui', 'cwd': str(bot.home), 'model': 'fixture', 'toolsets': []})
     title_new_session(bot.authority, chat, 'Bot Chat')
     with pytest.raises(RuntimeStoreError, match='unknown_execution'):
         await deliver(bot.connection, dict(id=KEY, profile='default', message='run once'))
+    assert read_delivery_result(bot.home, KEY) == private_pin
     assert list_session_admissions(bot.authority.db, session_id=chat.session_id, pending_only=False) == []
+
+
+@pytest.mark.parametrize('tampered_owner_id', ['automation:foreign-owner', None])
+@pytest.mark.asyncio
+async def test_a_retired_pin_with_a_wrong_owner_witness_stays_private(bot, monkeypatch, caplog,
+                                                                       tampered_owner_id):
+    """A retired tombstone cannot promote a foreign or malformed I07 owner witness."""
+    import asyncio
+    from copy import deepcopy
+    from gateway.session_bot import deliver, recover_bot_deliveries
+    from tools.bot_live_delivery import _locked, _write, read_delivery_result
+    real = type(bot.authority).admit_automation
+
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
+        raise RuntimeStoreError('stale_epoch')
+
+    monkeypatch.setattr(type(bot.authority), 'admit_automation', committed_then_refused)
+    with pytest.raises(RuntimeStoreError, match='stale_epoch'):
+        await deliver(bot.connection, dict(id=KEY, profile='default', message='wrong owner'))
+    private_pin = read_delivery_result(bot.home, KEY)
+    monkeypatch.setattr(type(bot.authority), 'admit_automation', real)
+    for _ in range(250):
+        rows = list_session_admissions(bot.authority.db, session_id=bot.chat, pending_only=False)
+        if rows and all(row['status'] == 'terminal' for row in rows):
+            break
+        await asyncio.sleep(0.02)
+    assert bot.authority.db.delete_session(bot.chat)
+    tampered = deepcopy(private_pin)
+    tampered['automation_custody']['owner_id'] = tampered_owner_id
+    with _locked(bot.home) as root:
+        _write(root / f'{KEY}.json', tampered)
+    with caplog.at_level(logging.ERROR, logger='gateway.session_bot'):
+        await recover_bot_deliveries(bot.authority)
+    assert read_delivery_result(bot.home, KEY) == tampered
+    assert any('preservation_owner_unmapped' in record.getMessage() for record in caplog.records)
+    with _locked(bot.home) as root:
+        _write(root / f'{KEY}.json', private_pin)
+    await recover_bot_deliveries(bot.authority)
+    assert read_delivery_result(bot.home, KEY) == private_pin

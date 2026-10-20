@@ -169,24 +169,15 @@ def hygiene_no_commit_reason(agent) -> str:
 from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin
+from gateway.run_turn_stream_delivery import GatewayTurnStreamDeliveryMixin
 
 
-class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+class GatewayTurnMixin(
+    GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin,
+    GatewayTurnStreamDeliveryMixin,
+):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
-
-    def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
-        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-
-    @staticmethod
-    def _pop_post_delivery_callback(adapter, key, generation):
-        """Pop the adapter's deferred post-delivery callback for ``key`` (legacy dict fallback)."""
-        if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
-            return adapter.pop_post_delivery_callback(key, generation=generation)
-        if adapter and hasattr(adapter, "_post_delivery_callbacks"):
-            return adapter._post_delivery_callbacks.pop(key, None)
-        return None
 
     @staticmethod
     def _is_intentional_silence(agent_result, response) -> bool:
@@ -214,6 +205,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        event._hermes_run_generation = run_generation
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
@@ -235,6 +227,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             return prepared
         history, message_text = prepared.history, prepared.message_text
 
+        _classic_writer_event = event
         try:
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -264,10 +257,17 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            from gateway.session_classic_custody import (
+                classic_execution_owner_for_event, classic_writer_binding_for_event,
+            )
+            _classic_writer_event = classic_execution_owner_for_event(event)
+            _classic_writer_binding = classic_writer_binding_for_event(_classic_writer_event)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
-                run_generation=run_generation, event_message_id=self._reply_anchor_for_event(event),
+                run_generation=run_generation, classic_writer_binding=_classic_writer_binding,
+                classic_writer_event=_classic_writer_event,
+                event_message_id=self._reply_anchor_for_event(event),
                 inbound_message_id=str(event.message_id) if event.message_id else None,
                 channel_prompt=_turn_channel_prompt, moa_config=getattr(event, "_moa_config", None),
                 title_user_message=prepared.title_user_message,
@@ -289,8 +289,6 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             # routing is untouched: the anchor still comes from this event.
             if isinstance(agent_result, dict):
                 _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
-                if _terminal_inbound:
-                    event.ledger_message_id = str(_terminal_inbound)
                 if "queued_terminal_notification_category" in agent_result:
                     event.metadata["notification_category"] = agent_result["queued_terminal_notification_category"]
                 if isinstance(agent_result.get("_notification_reply_muted"), bool):
@@ -330,6 +328,89 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 hidden_reasoning_incomplete=hidden_reasoning_incomplete,
                 is_context_overflow_failure=is_context_overflow_failure,
             )
+            # Persistence has now transferred the private writer handoff to the event that
+            # produced the terminal queued occurrence.  Only then can the outer delivery ledger
+            # carry that occurrence's inbound identity through the authenticated bridge.
+            if isinstance(agent_result, dict):
+                _terminal_inbound = agent_result.get("queued_terminal_inbound_id")
+                if _terminal_inbound:
+                    from gateway.session_classic_custody import (
+                        classic_terminal_inbound_fallback_allowed, set_classic_terminal_inbound_id,
+                    )
+                    if (not set_classic_terminal_inbound_id(event, str(_terminal_inbound))
+                            and classic_terminal_inbound_fallback_allowed(event)):
+                        event.ledger_message_id = str(_terminal_inbound)
+            from gateway.session_classic_custody import attach_classic_execution_receipt
+            _classic_receipt_event = getattr(event, "_classic_terminal_event", _classic_writer_event)
+            _classic_receipt = attach_classic_execution_receipt(
+                self, _classic_receipt_event, session_entry, agent_result,
+            )
+            # A classic direct owner cannot terminalize at transcript persistence: the platform
+            # delivery ledger is completed by BasePlatformAdapter after this handler returns. Keep
+            # the immutable receipt private and reconcile it from the canonical ledger readback in
+            # the adapter's existing post-delivery callback. Managed I04 routes do not acquire a
+            # classic root and therefore do not register this callback.
+            _classic_authority = getattr(_classic_receipt_event, "_classic_custody_authority", None)
+            _classic_adapter = self._delivery_adapter_for(source)
+            _classic_text = response if isinstance(response, str) and response else None
+            if (
+                _classic_receipt is not None
+                and _classic_authority is not None
+                and _classic_text is not None
+                and _classic_adapter is not None
+                and hasattr(_classic_adapter, "register_post_delivery_callback")
+            ):
+                _classic_event = _classic_receipt_event
+                _classic_session_key = session_key
+                _classic_source = source
+
+                async def _finish_classic_after_delivery() -> None:
+                    try:
+                        from dataclasses import replace
+                        from gateway import delivery_ledger
+
+                        from gateway.session_classic_custody import classic_terminal_inbound_id
+                        _message_ref = classic_terminal_inbound_id(_classic_event)
+                        _delivery_proof = None
+                        if _message_ref:
+                            _obligation_id = delivery_ledger.compute_obligation_id(
+                                _classic_session_key, str(_message_ref), _classic_text,
+                            )
+                            with self._media_delivery_scope_for_source(_classic_source):
+                                _delivery_proof = await asyncio.to_thread(
+                                    delivery_ledger.read_obligation,
+                                    _obligation_id,
+                                    session_key=_classic_session_key,
+                                    platform=str(getattr(_classic_source.platform, "value", _classic_source.platform)),
+                                    chat_id=_classic_source.chat_id,
+                                    thread_id=getattr(_classic_source, "thread_id", None),
+                                    content=_classic_text,
+                                    adapter_profile=getattr(_classic_adapter, "_owner_profile", None),
+                                    expected_state="delivered",
+                                )
+                        if _delivery_proof is None:
+                            _classic_authority._classic_finish(
+                                _classic_event, success=False, reason="delivery_proof_missing",
+                            )
+                            return
+                        _classic_authority._classic_finish(
+                            _classic_event,
+                            success=True,
+                            receipt=replace(_classic_receipt, delivery_proof=_delivery_proof),
+                        )
+                    except Exception:
+                        logger.debug("Classic post-delivery custody reconciliation failed", exc_info=True)
+                        with suppress(Exception):
+                            _classic_authority._classic_finish(
+                                _classic_event, success=False, reason="delivery_proof_readback_failed",
+                            )
+
+                try:
+                    _classic_adapter.register_post_delivery_callback(
+                        session_key, _finish_classic_after_delivery, generation=run_generation,
+                    )
+                except Exception:
+                    logger.debug("Classic post-delivery callback registration failed", exc_info=True)
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -340,6 +421,15 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # A typed writer handoff belongs to this inbound event only. Attach consumes it on the
+            # normal path; this final guard clears it when persistence, delivery, or error handling
+            # exits before that consumer is reached.
+            for _classic_handoff_event in (
+                event, _classic_writer_event, getattr(event, "_classic_terminal_event", None),
+            ):
+                if _classic_handoff_event is not None:
+                    with suppress(AttributeError):
+                        delattr(_classic_handoff_event, "_classic_writer_handoff")
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
@@ -1795,6 +1885,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 _already_streamed = False
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
+        _text_delivered = False
         if first_response:
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
@@ -1826,6 +1917,10 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     # The queued lane already uploaded this response's MEDIA: attachments; without
                     # this the completion path's already_sent rescan uploads every file twice.
                     result["media_already_delivered"] = _deliver_media
+        if first_response:
+            await self._finish_classic_queued_first_response(
+                turn_ctx, adapter, _delivery_result, result, _text_delivered,
+            )
         # Release deferred bg-review notifications: pop (no double-fire in base.py's finally) and call.
         _bg_cb = self._pop_post_delivery_callback(adapter, session_key, turn_ctx.run_generation)
         if callable(_bg_cb):
@@ -1839,7 +1934,6 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         response: Any, result: Any, stream_task: Any,
     ) -> Any:
         """Run the queued / interrupting follow-up as the next turn (recursive ``_run_agent``)."""
-        from gateway.platforms.base import merge_pending_message_event
         from gateway.run import _preserve_queued_followup_history_offset
         source, session_id, session_key, run_generation = (
             turn_ctx.source, turn_ctx.session_id, turn_ctx.session_key, turn_ctx.run_generation,
@@ -1862,10 +1956,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 "queueing message instead of recursing.", _interrupt_depth, session_key,
             )
             adapter = self._delivery_adapter_for(source)
-            if adapter and pending_event:
-                merge_pending_message_event(adapter._pending_messages, session_key, pending_event)
-            elif adapter and hasattr(adapter, 'queue_message'):
-                adapter.queue_message(session_key, pending)
+            from gateway.platforms.base_busy_custody import requeue_pending_followup
+            requeue_pending_followup(adapter, session_key, pending_event, pending)
             return turn_ctx.result_holder[0] or {"final_response": response, "messages": history}
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
@@ -1959,6 +2051,14 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         await _run_followup_processing_hook(_hook_adapter, pending_event, "on_processing_start")
         # The re-baseline sits inside the try: a /stop landing on its DB await must still close the marker
         # (the helper's own ``except Exception`` does not catch cancellation).
+        _followup_classic_binding = None
+        _followup_classic_event = pending_event
+        if pending_event is not None:
+            from gateway.session_classic_custody import (
+                classic_execution_owner_for_event, classic_writer_binding_for_event,
+            )
+            _followup_classic_event = classic_execution_owner_for_event(pending_event)
+            _followup_classic_binding = classic_writer_binding_for_event(_followup_classic_event)
         try:
             await self._refresh_agent_cache_message_count(session_key, session_id)
 
@@ -1966,6 +2066,8 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                 source=next_source, session_id=session_id, session_key=next_session_key,
                 run_generation=run_generation, _interrupt_depth=_interrupt_depth + 1,
+                classic_writer_binding=_followup_classic_binding,
+                classic_writer_event=_followup_classic_event,
                 event_message_id=next_message_id, inbound_message_id=next_inbound_id,
                 channel_prompt=next_channel_prompt, message_type=next_message_type,
                 persist_user_message=next_persist_message,
@@ -2049,112 +2151,6 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                     # A background task that died of a real error must not abort the cleanup path.
                     logger.debug("background turn task failed during cleanup", exc_info=True)
 
-    async def _run_agent_edit_streamed_message(
-        self, _sc, source, response, content, *, _sk, ok, fail_result: str, fail_exc: str,
-    ) -> None:
-        """Edit the stream consumer's message in place with ``content``; on success mark
-        ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
-        ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
-        ``already_sent`` stays unset so the normal final send delivers the content."""
-        try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
-            )
-        except Exception as _edit_err:
-            logger.warning(fail_exc, _sk, _edit_err)
-            return
-        if not getattr(_res, "success", True):
-            logger.warning(fail_result, _sk, getattr(_res, "error", None))
-            return
-        response["already_sent"] = True
-        logger.info(*ok)
-
-    async def _run_agent_mark_streamed_delivery(self, response: Any, turn_ctx: TurnContext) -> None:
-        """Set ``response["already_sent"]`` when streaming already delivered the final reply.
-
-        Never when the agent failed (unseen error), on "(empty)", or on a finite (`-z`, `chat -q`) turn:
-        its viewer prints only the completion text, never the deltas (#139666). Both flags reflect call
-        success, not content: a mismatch with the recorded turn-final payload never suppresses."""
-        from gateway.session_finite import finite_turn_required
-        _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
-        if not isinstance(response, dict) or response.get("failed") or finite_turn_required() is True:
-            return
-        _final = response.get("final_response") or ""
-        _is_empty_sentinel = not _final or _final == "(empty)"
-        # response_previewed: only suppress if that EXACT text was delivered, not unrelated commentary.
-        # Unrelated commentary/progress must not be mistaken for the final response (#14238).
-        _previewed = bool(response.get("response_previewed"))
-        _content_delivered = bool(_sc and getattr(_sc, "final_content_delivered", False))
-        # #71643: a *successful* finalize edit can still carry only the last preview snapshot — deltas
-        # generated between that edit and stream completion never reach any API call, and both suppression
-        # flags are set from the call's success rather than its content. Reconcile the consumer's recorded
-        # turn-final payload against the completed response: on a demonstrable mismatch (False) neither
-        # final_response_sent nor final_content_delivered may suppress the normal final send. False also
-        # covers payload-less multi-message split delivery (#78541). None (no record on a non-split legacy
-        # path) keeps legacy trust; the failed-finalize family (#51828 / #33793) is unaffected because those
-        # paths leave the flags False or record the complete fallback payload.
-        _stale_finalized = False
-        if _content_delivered and not _is_empty_sentinel:
-            _matcher = getattr(_sc, "delivered_final_matches", None)
-            if callable(_matcher):
-                with suppress(Exception):
-                    _stale_finalized = _matcher(_final) is False
-            if _stale_finalized:
-                _content_delivered = False
-        # Plugin hooks may append content after streaming finished — then send the final version.
-        _transformed = bool(response.get("response_transformed"))
-        # Suppress the normal send only when the actual final reply reached the user.
-        _streamed = self._run_agent_stream_confirmed_final_delivery(_sc, _final, previewed=_previewed)
-        if _is_empty_sentinel:
-            return
-        _sk = session_key or "?"
-        if not _transformed and (_streamed or _content_delivered):
-            logger.info(
-                "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
-                _sk, _streamed, _previewed, _content_delivered,
-            )
-            response["already_sent"] = True
-        elif not _transformed and _stale_finalized and _sc is not None:
-            # Stale finalize: edit the streamed message up to the complete response (on failure the
-            # normal send delivers). Not for split delivery — message_id is only the LAST chunk.
-            _sc_msg_id = _sc.message_id
-            if getattr(_sc, "_turn_split_delivery", False):
-                logger.info(
-                    "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
-                    _sk,
-                )
-            elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
-                await self._run_agent_edit_streamed_message(
-                    _sc, source, response, _final, _sk=_sk,
-                    ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
-                    fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
-                    fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
-                )
-            else:
-                logger.info(
-                    "Stale streamed finalize detected for session %s with no editable message; delivering complete response via normal final send (#71643).",
-                    _sk,
-                )
-        elif _transformed and _sc is not None:
-            # Transformed after streaming: edit the streamed message instead of sending a duplicate.
-            if _sc.message_id:
-                await self._run_agent_edit_streamed_message(
-                    _sc, source, response, response["final_response"], _sk=_sk,
-                    ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
-                    fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
-                    fail_exc="Failed to edit streamed message for session %s: %s",
-                )
-        elif _sc is not None and getattr(_sc, "stream_deltas_enabled", True):
-            # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed but suppression did NOT fire; log
-            # the decision inputs ("signal never set" vs "ack-pending race"). Skipped for consumers
-            # never fed the final's deltas (interim-only wiring, #105341) — they cannot have raced
-            # the normal final send, so the warning would be a guaranteed false positive.
-            logger.warning(
-                "Normal final-send NOT suppressed despite active stream consumer for session %s: "
-                "streamed=%s previewed=%s content_delivered=%s transformed=%s final_len=%d — "
-                "possible duplicate send (see wecom ack-timeout RCA).",
-                _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
-            )
 
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Schedule deletion of tracked temporary progress bubbles after the final response lands.
@@ -2293,7 +2289,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
     async def _run_agent_inner(
         self, message: str, context_prompt: str, history: list[dict[str, Any]],
         source: SessionSource, session_id: str, session_key: str | None = None,
-        run_generation: Optional[int] = None, _interrupt_depth: int = 0,
+        run_generation: Optional[int] = None, classic_writer_binding: Any = None,
+        classic_writer_event: Any = None,
+        _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None, inbound_message_id: Optional[str] = None,
         channel_prompt: Optional[str] = None, moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None, persist_user_timestamp: Optional[float] = None,
@@ -2337,7 +2335,9 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             )
         turn_ctx, turn_runner, _cleanup_adapter = self._run_agent_build_turn_context(
             disp, AIAgent, message=message, source=source, session_key=session_key,
-            run_generation=run_generation, context_prompt=context_prompt, history=history,
+            run_generation=run_generation, classic_writer_binding=classic_writer_binding,
+            classic_writer_event=classic_writer_event,
+            context_prompt=context_prompt, history=history,
             session_id=session_id, _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id, inbound_message_id=inbound_message_id,
             channel_prompt=channel_prompt, moa_config=moa_config,

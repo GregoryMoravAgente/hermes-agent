@@ -71,7 +71,20 @@ class CLIProcessNotificationsMixin:
                 from agent.notification_presentation import diagnostic_process_event
                 if diagnostic_process_event(event) and not isinstance(pending, TimelineNotification):
                     pending = TimelineNotification(text, text, "internal_notification", "diagnostic")
-            self._pending_input.put(pending)
+            try:
+                self._pending_input.put(pending)
+            except Exception:
+                # The queue is the interactive CLI's admission boundary. A failed put must not
+                # turn a removed completion into a cleanly delivered process record.
+                for pending_event, _pending_text in notifications:
+                    if pending_event.get("type") == "completion":
+                        process_registry.completion_queue.put(pending_event)
+                raise
+            if evt_type == "completion":
+                acknowledge = getattr(process_registry, "acknowledge_completion_delivery", None)
+                for accepted_event, _accepted_text in notifications:
+                    if callable(acknowledge):
+                        acknowledge(accepted_event.get("delivery_token", ""))
 
     def _tui_unwrap_input(self, user_input):
         """Unwrap ``_VoiceInputMessage`` / ``_SeededQueryMessage`` -> ``(text_or_tuple, is_voice_input, is_seeded_query)``."""

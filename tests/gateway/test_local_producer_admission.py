@@ -225,6 +225,12 @@ async def messaging(tmp_path, monkeypatch):
     db = SessionDB(tmp_path / 'state.db')
     runner.session_store._db = runner._session_db = db
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='ticks', db=db)
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch,
+        fence=RetirementFence(),
+    )
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='***', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     runner._wire_adapter_handlers(adapter)

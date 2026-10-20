@@ -37,6 +37,10 @@ async def bot(tmp_path, monkeypatch):
                              _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='fixture')
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     owner = Principal('uid:1000', 'default', frozenset({'session:create', 'session:read', 'session:submit'}), 'native')
     chat = create_local_session(authority, owner, {'request_id': 'bot', 'source': 'gui', 'cwd': str(tmp_path),
                                                     'model': 'fixture', 'toolsets': []})

@@ -56,6 +56,26 @@ _SESSION_ASYNC_DELIVERY = ContextVar("HERMES_SESSION_ASYNC_DELIVERY", default=_U
 # or child-process export: a bound id alone cannot authorize detached delivery.
 _SESSION_HISTORY_DELIVERY = ContextVar("HERMES_SESSION_HISTORY_DELIVERY", default=_UNSET)
 
+# Exact in-process I03 custody binding for terminal/process producers.  This is deliberately not
+# exported through the child environment: callers must receive the opaque handle and scope token
+# through ContextVar propagation, never by reconstructing authority from a session id or PID.
+_I03_CUSTODY_BINDING = ContextVar("HERMES_I03_CUSTODY_BINDING", default=None)
+
+
+def set_i03_custody_binding(binding: Any):
+    """Bind one validated I03 custody object for this task and its propagated worker context."""
+    return _I03_CUSTODY_BINDING.set(binding)
+
+
+def reset_i03_custody_binding(token) -> None:
+    """Drop the I03 binding after all source-owned finalizers have observed it."""
+    _I03_CUSTODY_BINDING.reset(token)
+
+
+def get_i03_custody_binding() -> Any:
+    """Return the task-local validated I03 binding, never an ambient/default authority."""
+    return _I03_CUSTODY_BINDING.get()
+
 # Cron auto-delivery vars, set per-job in run_job() so concurrent jobs don't clobber.
 _CRON_AUTO_DELIVER_PLATFORM = ContextVar("HERMES_CRON_AUTO_DELIVER_PLATFORM", default=_UNSET)
 _CRON_AUTO_DELIVER_CHAT_ID = ContextVar("HERMES_CRON_AUTO_DELIVER_CHAT_ID", default=_UNSET)

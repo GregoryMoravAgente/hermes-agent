@@ -100,7 +100,9 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(
+        source: Any, text: str, *, internal: bool = False, _preservation_handoff=None,
+    ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
@@ -110,10 +112,18 @@ class GatewayGoalsMixin:
         """
         from gateway.session_identity import replace_source
         source = replace_source(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+            message_id=getattr(_preservation_handoff, "request_id", None),
+            # Keep the established command resolver active. The private handoff is custody state,
+            # never a request to reinterpret a supported slash command as agent text.
+            allow_gateway_control=True,
             inherit_channel_pin=True,
         )
+        if _preservation_handoff is not None:
+            event._preservation_handoff = _preservation_handoff
+            event._preservation_effect_started = True
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -421,6 +431,78 @@ class GatewayGoalsMixin:
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
+    @staticmethod
+    def _loop_custody_root(authority, entry, sid, manager, source):
+        if authority is None or entry is None:
+            return None
+        import json
+        from gateway.session_automation_custody import automation_source_identity
+        prior = manager.state
+        next_tick = (getattr(prior, 'ticks_fired', 0) + 1) if prior is not None else 1
+        source_event = GatewayGoalsMixin._synthetic_prompt_event(source, "", internal=True)
+        return authority._preservation_automation_root(
+            request_id=json.dumps(['loop', sid, next_tick], separators=(',', ':')),
+            principal_id='automation:' + entry.session_key,
+            session_id=authority.logical_owner(entry.session_id),
+            # This is the same source-owned digest that admit_automation stamps into the durable
+            # descriptor.  A route label alone is not an authenticated source identity.
+            source_identity=automation_source_identity(source_event, entry.session_key),
+            owner_class='I08_goals_loops_heartbeat',
+        )
+
+    @staticmethod
+    def _loop_custody_unknown(authority, handle, reason):
+        if authority is None or handle is None:
+            return
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(handle, reason)
+
+    @staticmethod
+    def _loop_custody_handoff(authority, entry, handle):
+        if authority is None or entry is None or handle is None:
+            return None
+        pending = getattr(authority, "_preservation_pending_roots", {}).get(id(handle))
+        request_id = pending.get("request_id") if isinstance(pending, dict) else None
+        source_identity = pending.get("source_identity") if isinstance(pending, dict) else None
+        if (not isinstance(request_id, str) or not request_id
+                or not isinstance(source_identity, str) or not source_identity):
+            return None
+        from gateway.session_ingress import PreservedAutomationHandoff
+        return PreservedAutomationHandoff(
+            authority=authority, handle=handle, owner_class="I08_goals_loops_heartbeat",
+            request_id=request_id, principal_id="automation:" + entry.session_key,
+            session_id=authority.logical_owner(entry.session_id),
+            source_identity=source_identity,
+        )
+
+    async def _loop_deliver_wakeup(self, mgr, wakeup, adapter, source, handoff, handle, entry):
+        from gateway.session_automation import admit_route_wake
+
+        admitted = False
+        is_command = wakeup.lstrip().startswith("/")
+        if not is_command:
+            admitted = await admit_route_wake(
+                self, adapter, source, wakeup, "loop-tick", _preservation_handle=handle,
+            )
+            if admitted and handoff is not None:
+                handoff.mark_admitted()
+        if not admitted:
+            event = self._synthetic_prompt_event(
+                source, wakeup, internal=True, _preservation_handoff=handoff,
+            )
+            if entry is not None:
+                event.metadata.update({
+                    "gateway_session_key": self._session_key_for_source(source),
+                    "gateway_session_id": entry.session_id,
+                })
+            if handoff is None:
+                await adapter.handle_message(event)
+            else:
+                await adapter.handle_message(event)
+        if is_command:
+            await self._run_in_executor_with_context(mgr.complete_tick, "")
+
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
     ) -> None:
@@ -476,11 +558,25 @@ class GatewayGoalsMixin:
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
         if check_paused("loop", logger):
             return
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        entry = authority and self.session_store.lookup_by_session_key(session_key)
+        handle = self._loop_custody_root(authority, entry, sid, mgr, source)
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        try:
+            wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        except BaseException:
+            self._loop_custody_unknown(authority, handle, 'join_failed')
+            raise
         if not wakeup:
+            if handle is not None:
+                authority._preservation_release_unaccepted(handle)
+            return
+        handoff = self._loop_custody_handoff(authority, entry, handle)
+        if handle is not None and handoff is None:
+            self._loop_custody_unknown(authority, handle, "join_failed")
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
         # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
@@ -493,19 +589,15 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            from gateway.session_automation import admit_route_wake
-            # Under a session authority the tick commits to the FIFO (never a classic turn beside an
-            # admitted one); a slash-command loop is a command and keeps the command path.
-            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick"):
-                await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
-            # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick immediately (caps + scheduling).
-            if wakeup.lstrip().startswith("/"):
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
-        except Exception as exc:
+            await self._loop_deliver_wakeup(mgr, wakeup, adapter, source, handoff, handle, entry)
+        except BaseException as exc:
+            if handoff is not None:
+                handoff.mark_unknown("join_failed")
+            else:
+                self._loop_custody_unknown(authority, handle, "join_failed")
+            if isinstance(exc, (asyncio.CancelledError, SystemExit, KeyboardInterrupt)):
+                raise
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-            with suppress(Exception):
-                mgr.abandon_tick()
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         self._publish_local_control(source)
 

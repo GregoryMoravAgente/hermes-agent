@@ -22,6 +22,8 @@ from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient, CodexAppServerError, CodexAppServerTransportError,
 )
+from agent.transports.codex_app_server_custody import CodexAppServerCustody
+from gateway.runtime_service_custody import ServiceCustodyError, TurnCustodyBinding
 from agent.transports.codex_event_projector import CodexEventProjector, ProjectionResult
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 
@@ -206,7 +208,7 @@ def _extract_thread_id(result: dict) -> Optional[str]:
 
 
 class CodexAppServerSession:
-    """One Codex thread per Hermes session, lifetime owned by AIAgent. Not thread-safe: one caller at a time."""
+    """One Codex thread per Hermes session, lifetime owned by AIAgent. Turns are serial; close is safe to join concurrently."""
 
     def __init__(
         self, *, cwd: Optional[str] = None, codex_bin: str = "codex",
@@ -217,14 +219,18 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         model: Optional[str] = None, model_provider: Optional[str] = None,
         developer_instructions: Optional[str] = None, resume_thread_id: Optional[str] = None,
-        history_seed: Optional[str] = None,
+        history_seed: Optional[str] = None, custody_binding: Optional[TurnCustodyBinding] = None,
+        require_custody: bool = False, producer_policy: Any = None,
     ) -> None:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        from agent.codex_lifecycle import codex_writer_key
+        self._writer_home = codex_writer_key(None, codex_home)[0]
         # A codex thread id persisted by an earlier process for this Hermes session: the first
         # ``ensure_started`` issues ``thread/resume`` for it instead of ``thread/start``.
         self._resume_thread_id = resume_thread_id
+        self._writer_thread_id = resume_thread_id  # identity survives consuming the one-shot resume attempt
         # ``thread/start.model``: the Hermes-selected slug, for every provider. ``.modelProvider``: a named
         # custom provider's id in codex's own ``[model_providers.<id>]`` table; only the id travels, codex
         # reads base_url/env_key itself.
@@ -247,6 +253,12 @@ class CodexAppServerSession:
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
+        self._custody_binding = custody_binding
+        self._require_custody = require_custody
+        self._producer_policy = producer_policy
+        self._custody: Optional[CodexAppServerCustody] = None
+        self._active_custody_binding: Optional[TurnCustodyBinding] = None
+        self._custody_retained = False
 
         self._client: Optional[CodexAppServerClient] = None
         self._thread_id: Optional[str] = None
@@ -257,16 +269,60 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so this feeds the prompt summary.
         self._pending_file_changes: dict[str, str] = {}
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._start_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._client_ready = threading.Event()
+        self._client_ready.set()
 
     def ensure_started(self) -> str:
         """Spawn, handshake, and ``thread/start`` (or ``thread/resume`` for a stored id); idempotent, returns
         the codex thread id. A failed resume raises :class:`CodexThreadResumeError` once; the next call
         starts a fresh thread on the same handshaken client."""
-        if self._thread_id is not None:
-            return self._thread_id
-        if self._client is None:
-            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
-            self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
+        # Only competing startups serialize here. close() must never wait for RPC I/O.
+        with self._start_lock:
+            return self._ensure_started()
+
+    def _new_client(self):
+        client_kwargs = {"codex_bin": self._codex_bin, "codex_home": self._codex_home}
+        if self._custody is not None:
+            client_kwargs.update(
+                cwd=self._cwd, custody=self._custody, require_custody=self._require_custody,
+            )
+        elif self._producer_policy is not None:
+            client_kwargs.update(cwd=self._cwd, producer_policy=self._producer_policy)
+        return self._client_factory(**client_kwargs)
+
+    def _ensure_started(self) -> str:
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("codex app-server session is closing")
+            if self._thread_id is not None:
+                return self._thread_id
+            client = self._client
+            if client is None:
+                self._client_ready.clear()
+        if client is None:
+            try:
+                client = self._new_client()
+                with self._state_lock:
+                    # A concurrent close waits for this publication, then retires this exact
+                    # client. It cannot report completion while construction is unresolved.
+                    self._client = client
+            finally:
+                self._client_ready.set()
+            with self._state_lock:
+                if self._closed:
+                    raise RuntimeError("codex app-server session is closing")
+            try:
+                client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
+            except BaseException:
+                if self._custody is not None and self._active_custody_binding is not None:
+                    self._custody.mark_unknown(self._active_custody_binding, "partial_launch")
+                raise
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("codex app-server session is closing")
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.
         # Hermes supplies the agent identity through its own system prompt; ``personality: "none"`` strips
@@ -280,7 +336,7 @@ class CodexAppServerSession:
             params["model"] = self._model
         if self._resume_thread_id:
             wanted, self._resume_thread_id = self._resume_thread_id, None  # one attempt per stored id
-            thread_id = self._resume_thread(wanted, params)
+            thread_id = self._resume_thread(wanted, params, client)
             # A resumed thread may carry a tier an earlier process selected (CLI ``/fast`` rebuilds the agent),
             # so its first turn sends Hermes' tier even when that is a clearing null.
             self._service_tier_sent = _TIER_UNKNOWN
@@ -289,7 +345,7 @@ class CodexAppServerSession:
             if self._history_seed:
                 params["developerInstructions"] = "\n\n".join(
                     part for part in (params.get("developerInstructions"), self._history_seed) if part)
-            result = self._client.request("thread/start", params, timeout=15)
+            result = client.request("thread/start", params, timeout=15)
             thread_id = _extract_thread_id(result)
             if not thread_id:
                 raise CodexAppServerError(
@@ -297,15 +353,97 @@ class CodexAppServerSession:
                 )
             self._service_tier_sent = None  # a new thread runs codex's own configured tier
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
-        self._thread_id = thread_id
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("codex app-server session closed during startup")
+            self._thread_id = self._writer_thread_id = thread_id
         return thread_id
 
-    def _resume_thread(self, wanted: str, params: dict[str, Any]) -> str:
+    def begin_turn(self, binding: TurnCustodyBinding) -> None:
+        """Reserve the exact request child before the client can spawn Codex."""
+        if self._closed:
+            raise ServiceCustodyError("session_closed")
+        from gateway.runtime_service_operations import policy_for_parent, parent_for_managed_service
+        parent = getattr(self._producer_policy, "parent", None)
+        if getattr(self._producer_policy, "mode", None) == "managed_turn" and parent is not None:
+            # The gateway reserves the service request, including its I04 secondary
+            # parent, before AIAgent/provider construction. Adopt that exact request;
+            # calling reserve_service a second time would create an unlinked root.
+            service = getattr(parent, "_service", None)
+            request = getattr(parent, "_request", None)
+            if service is None:
+                raise ServiceCustodyError("service_request_missing")
+            candidate_custody = CodexAppServerCustody(
+                binding, f"codex-service:{binding.session_id}", service=service, request=request,
+            )
+            if request is None:
+                candidate_custody.begin_turn(binding)
+                parent._request = candidate_custody.request
+            else:
+                candidate_custody._check_binding(binding)
+                if not service.request_is_active(request):
+                    raise ServiceCustodyError("service_request_missing")
+            # Keep the previous custody wrapper authoritative until every binding and
+            # request check succeeds.  A refused candidate must not erase a retained
+            # request that the close/unknown path still owns.
+            self._custody = candidate_custody
+            parent.turn_binding = binding
+            parent.state = "request_reserved"
+            self._producer_policy = policy_for_parent(parent, mode="managed_turn")
+        else:
+            if self._custody is None:
+                self._custody = CodexAppServerCustody(binding, f"codex-service:{binding.session_id}")
+            self._custody.begin_turn(binding)
+            if parent is None:
+                parent = parent_for_managed_service(binding, self._custody.service)
+            self._producer_policy = policy_for_parent(parent, mode="managed_turn")
+        self._active_custody_binding = binding
+
+    def finish_turn(
+        self, *, durable: bool, proof=None,
+    ) -> None:
+        """Stage a typed durable result; delivery/physical close remain later fences."""
+        if self._custody is None or self._active_custody_binding is None:
+            raise ServiceCustodyError("service_request_missing")
+        binding = self._active_custody_binding
+        if durable:
+            self._custody.finish_turn(binding, durable=True, proof=proof)
+            self._active_custody_binding = None
+        else:
+            self._custody.mark_unknown(binding)
+
+    def mark_custody_unknown(self, reason: str = "join_failed") -> None:
+        if self._custody is not None and self._active_custody_binding is not None:
+            self._custody.mark_unknown(self._active_custody_binding, reason)
+        parent = getattr(self._producer_policy, "parent", None)
+        if parent is not None and self._custody is None:
+            from gateway.runtime_service_operations import mark_unknown
+            mark_unknown(parent, reason)
+
+    @property
+    def custody_retained(self) -> bool:
+        """Whether an uncertain close still owns the exact service/request lease."""
+        parent = getattr(self._producer_policy, "parent", None)
+        return self._custody_retained or getattr(parent, "state", None) == "unknown"
+
+    def _close_external_parent(self) -> None:
+        parent = getattr(self._producer_policy, "parent", None)
+        if parent is None or self._custody is not None:
+            return
+        from gateway.runtime_service_operations import close_after_finalizers, mark_unknown
+        if close_after_finalizers(parent):
+            return
+        mark_unknown(parent, "native_close_failed")
+        self._custody_retained = True
+        raise CodexAppServerTransportError(
+            code=-32001, message="external process custody finalizer did not complete",
+        )
+
+    def _resume_thread(self, wanted: str, params: dict[str, Any], client) -> str:
         """``thread/resume`` for the stored id; the same thread/start params ride along so the resumed thread
         carries the CURRENT prompt composition and provider (accepted by the resume schema, codex 0.147)."""
-        assert self._client is not None
         try:
-            result = self._client.request("thread/resume", {"threadId": wanted, **params}, timeout=15)
+            result = client.request("thread/resume", {"threadId": wanted, **params}, timeout=15)
         except CodexAppServerError as exc:
             raise CodexThreadResumeError(wanted, exc.message) from exc
         thread_id = _extract_thread_id(result)
@@ -313,17 +451,57 @@ class CodexAppServerSession:
             raise CodexThreadResumeError(wanted, f"app-server answered with thread {str(thread_id)[:8]!r}")
         return wanted
 
+    @property
+    def writer_key(self):
+        return self._writer_home, self._thread_id or self._writer_thread_id
+
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        with self._active_turn_lock:
-            self._active_turn_id = None
-        if self._client is not None:
-            with contextlib.suppress(Exception):  # pragma: no cover - best-effort cleanup
-                self._client.close()
-        self._client = None
-        self._thread_id = None
+        if not self._close_lock.acquire(timeout=30):
+            raise TimeoutError("codex app-server session close is still in progress")
+        try:
+            with self._state_lock:
+                if self._closed and self._client is None:
+                    return
+                self._closed = True
+            if not self._client_ready.wait(timeout=30):
+                raise TimeoutError("codex app-server client construction is still in progress")
+            had_active_custody = self._active_custody_binding is not None
+            with self._active_turn_lock:
+                self._active_turn_id = None
+            if had_active_custody:
+                try:
+                    self.mark_custody_unknown("join_failed")
+                except Exception:
+                    logger.warning("Codex custody reconciliation failed during close", exc_info=True)
+            with self._state_lock:
+                client = self._client
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    try:
+                        self.mark_custody_unknown("join_failed")
+                    except Exception:
+                        # The transport exception is the authoritative close result; the
+                        # exact custody object remains retained by the first unknown transition.
+                        logger.warning("Codex custody reconciliation failed after close error", exc_info=True)
+                    self._custody_retained = True
+                    raise
+            self._close_external_parent()
+            if self._custody is not None and self._active_custody_binding is None:
+                try:
+                    self._custody.close()
+                except Exception:
+                    self._custody_retained = True
+                    raise
+                self._custody = None
+            with self._state_lock:
+                self._client = None
+                self._thread_id = None
+            if had_active_custody:
+                self._custody_retained = True
+        finally:
+            self._close_lock.release()
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to issue turn/interrupt and unwind."""

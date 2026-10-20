@@ -1,5 +1,7 @@
 """Process-tree termination and post-kill survivor verification for ProcessRegistry."""
 
+from __future__ import annotations
+
 import logging
 import os
 import signal
@@ -146,7 +148,7 @@ class ProcessTerminationMixin:
     # escalated kill as incomplete.
     _KILL_SETTLE_SECONDS = 1.0
 
-    def _post_kill_survivors(self, session: "ProcessSession") -> list[int]:
+    def _post_kill_survivors(self, session: ProcessSession) -> list[int]:
         """Host PIDs still alive once the kill signals have had time to land (#115490).
 
         Fail-closed: anything unverifiable counts as a survivor, so a kill
@@ -160,7 +162,7 @@ class ProcessTerminationMixin:
                 return survivors
             time.sleep(0.05)
 
-    def _probe_survivors(self, session: "ProcessSession") -> list[int]:
+    def _probe_survivors(self, session: ProcessSession) -> list[int]:
         survivors: list[int] = []
         proc = getattr(session, "process", None)
         if proc is not None:
@@ -189,3 +191,101 @@ class ProcessTerminationMixin:
             # reparented orphans are outside PID scope (systemd scope stop,
             # issued before this check, covers the cgroup case).
         return [pid for pid in survivors if pid]
+
+
+# Extracted registry kill/scope methods; the facade resolves these through ProcessTerminationMixin.
+    @staticmethod
+    def _stop_scope(session: ProcessSession) -> bool:
+        """Stop the session's systemd scope: True when it has none or the stop worked. Every kill
+        path stops the scope through here, so a failed stop always leaves it marked for retry."""
+        from tools.process_registry import _stop_systemd_unit
+        if not session.systemd_unit:
+            return True
+        stopped = _stop_systemd_unit(session.systemd_unit)
+        session._scope_stop_pending = not stopped
+        return stopped
+
+
+    def _signal_kill(
+        self, session: ProcessSession, session_id: str, consume_output: bool,
+        source: str = "process.kill",
+    ) -> Optional[dict]:
+        """Deliver the kill via PTY, local Popen tree, sandbox exec or recovered host
+        PID. A typed foreground reader is stopped through its retained native Job and
+        returns a pending result while its original finalizer drains; ordinary paths return
+        a final result dict when the kill cannot proceed (recycled/dead recovered PID, or
+        no runtime handle), else None."""
+        from tools.process_registry import _completion_output, _stop_systemd_unit
+        managed = self._request_foreground_reader_termination(
+            session, source=source, consume_output=consume_output,
+        )
+        if managed is not None:
+            return {**managed, **_completion_output(session)}
+        if self._foreground_reader_finish_guard(session):
+            return self._foreground_reader_blocked_result(session)
+        native_scope = getattr(session.custody, "native_scope", None) if session.custody is not None else None
+        if native_scope is not None:
+            try:
+                if getattr(native_scope, "can_bind_process", False):
+                    native_scope.terminate_owned_tree()
+                else:
+                    native_scope.terminate_partial_exact()
+            except Exception as exc:
+                logger.exception("Background process _signal_kill failed; retaining existing custody")
+                self._custody_unknown(session, "native_termination_failed")
+                return {"status": "error", "error": str(exc), "session_id": session_id}
+            self._sync_process_custody(session)
+            return {
+                "status": "killing", "session_id": session_id,
+                "completion_reason": "kill_requested", **_completion_output(session),
+            }
+        if session._pty:
+            try:
+                session._pty.terminate(force=True)
+            except Exception:
+                logger.exception("Background process _signal_kill failed; retaining existing custody")
+                if session.pid:
+                    os.kill(session.pid, signal.SIGTERM)
+        elif session.process:
+            # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
+            # leaves Git Bash descendants behind.
+            self._terminate_host_pid(session.process.pid, session.host_start_time)
+        elif session.env_ref and session.pid:
+            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+        elif session.detached and session.pid_scope == "host" and session.pid:
+            # Same fate as poll/list: a gone or reused PID means our process is
+            # gone — never tree-kill the stranger — but a live PID with an
+            # unreadable start time is still ours and must really be killed.
+            # If this recovered session also carries an owned systemd scope, stop that scope before
+            # returning: a daemonized descendant may still be alive there even though the wrapper PID exited
+            # or was recycled across the gateway restart (#70716, teknium1 review).
+            if self._detached_host_fate(session.pid, session.host_start_time) != "running":
+                scope_stopped = self._stop_scope(session)
+                with session._lock:
+                    output = _completion_output(session)
+                if consume_output:
+                    self._completion_consumed.add(session_id)
+                # No waitable handle, so this is not a collected exit. Close the
+                # entry without queueing a completion, and do not signal a PID
+                # whose start time does not match.
+                self._close_reused_detached(session)
+                result = {"status": "already_exited", "exit_code": session.exit_code, **output}
+                if not scope_stopped:
+                    result["scope_stop_failed"] = session.systemd_unit
+                return result
+            # Identity was just proven above. Re-passing the start time would make
+            # an unreadable probe refuse the kill and leave the re-adopted child running.
+            self._terminate_host_pid(session.pid)
+        else:
+            return {
+                # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
+                # enforces schemas before dispatch. timeout=0 is falsy, so without this guard it silently
+                # fell through (`0 or max_timeout`) to the DEFAULT wait instead of erroring. Salvaged from
+                # PR #60004 (credit @isheng-eqi).
+                "status": "error",
+                "error": "Recovered process cannot be killed after restart because "
+                         "its original runtime handle is no longer available",
+            }
+        return None
+
+

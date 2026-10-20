@@ -134,6 +134,12 @@ class ProcessCheckpointMixin:
                 command=entry.get("command", "unknown"),
                 owner_task_id=entry.get("owner_task_id", "") or entry.get("task_id", ""),
                 started_at=entry.get("started_at", time.time()))
+            # The coordinator's opaque lease handle cannot be reconstructed from JSON. Keep a
+            # live child visible for manual recovery, but refuse to project it as a new owner until
+            # an authenticated successor binds the exact runtime instance/authority generation.
+            if entry.get("custody_owner_id") or entry.get("process_instance"):
+                fields["custody_state"] = "unknown"
+                fields["custody_error"] = "successor_proof_missing"
             # detached: no Popen handle, but can report status + kill; a worker spawn's output log
             # (and recorded exit) outlives its spawner, so tail it from the start.
             fields["output_log"] = log

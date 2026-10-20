@@ -6,6 +6,8 @@ The done callback retains the watch's profile ContextVars and manager claim.
 """
 import logging
 
+from hermes_state_runtime import RuntimeStoreError
+
 logger = logging.getLogger("gateway.run")
 
 
@@ -55,6 +57,8 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     authority = active_authority(runner)
     if authority is None:
         return
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
     # Admissions live on the route's logical owner (the compression root), not its transcript tip;
     # a LOCAL route's heartbeat rides local_automation_v1.
     pending = list_session_admissions(authority.db, session_id=authority.logical_owner(session_id))
@@ -62,17 +66,35 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
            or row['payload'].get('local_automation_v1', {}).get('heartbeat') for row in pending):
         return
     manager = HeartbeatManager(session_id)
+    state = manager.state
+    if state is None:
+        return
+    owner = authority.logical_owner(session_id)
+    identity = json.dumps(
+        ['heartbeat', session_id, state.created_at, state.fire_count + 1], separators=(',', ':'))
+    principal_id = 'automation:' + route
+    root = getattr(authority, '_preservation_automation_root', None)
+    if coordinator is not None and not callable(root):
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    handle = (root(
+        request_id=identity, principal_id=principal_id, session_id=owner,
+        source_identity='heartbeat:' + route, owner_class='I08_goals_loops_heartbeat',
+    ) if coordinator is not None else None)
     prompt = manager.due_prompt()
     if prompt is None:
+        authority._preservation_release_unaccepted(handle)
         return
-    state = manager.state
-    identity = json.dumps(['heartbeat', session_id, state.created_at, state.fire_count], separators=(',', ':'))
     event = MessageEvent(text=prompt, source=source, internal=True, message_id=identity,
         metadata={'gateway_session_key': route, 'gateway_session_id': session_id})
     event._heartbeat_session_id = session_id
+    event._preservation_effect_started = True
     try:
-        await authority.admit_automation(adapter, event, identity)
+        await authority.admit_automation(
+            adapter, event, identity, _preservation_handle=handle)
     except BaseException:
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(handle, 'join_failed')
         # Readiness is not a delivery attempt, and cancellation before commit is not ACK.
         if getattr(event, '_gateway_accepted', False) is not True:
             manager.abandon_fire()

@@ -20,6 +20,8 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
     from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
@@ -28,6 +30,11 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
     adapter.gateway_runner = runner  # as GatewayRunner._create_adapter binds every adapter
     runner.adapters = {Platform.TELEGRAM: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id,
+        authority_epoch=authority.epoch,
+        fence=RetirementFence(),
+    )
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='busy-chat', chat_type='dm', user_id='fixture-user')
     key = runner.session_store._generate_session_key(source)

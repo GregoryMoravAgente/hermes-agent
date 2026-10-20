@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -233,3 +234,64 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
             proc._handle.Close()
         for job in jobs:
             job.close()
+
+
+@pytest.mark.platforms("windows")
+def test_owned_job_terminate_uses_same_handle_and_preserves_external_process(tmp_path):
+    """Use the returned Job for recovery while retaining external ownership."""
+    from hermes_cli.local_runtime.processes import spawn_server
+
+    env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"),
+               PYTHONPATH=str(Path(__file__).resolve().parents[2]))
+    launcher = control = job = None
+    log_path = tmp_path / "terminate.log"
+    with log_path.open("w") as log:
+        try:
+            control = subprocess.Popen(
+                [sys.executable, __file__, str(tmp_path), "control"],
+                env=env, stdout=log, stderr=log,
+            )
+            launcher, job = spawn_server(
+                [sys.executable, __file__, str(tmp_path), "router"],
+                env=env, stdout=log, stderr=log,
+            )
+            router = _read(tmp_path / "router.json")
+            grandchild = _read(tmp_path / "grandchild.json")
+            assert job.contains_process_handle(
+                SimpleNamespace(raw_handle=launcher._handle),
+            ) is True
+            assert job.empty() is False
+
+            job.terminate()
+            assert _wait(lambda: not _alive(router) and not _alive(grandchild))
+            control_identity = {
+                "pid": control.pid,
+                "created": psutil.Process(control.pid).create_time(),
+            }
+            assert _alive(control_identity)
+            assert _wait(lambda: launcher.poll() is not None)
+            assert job.empty() is True
+        finally:
+            def close_exact_process(process):
+                if process is None:
+                    return
+                handle = getattr(process, "_handle", None)
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=10)
+                    assert handle is not None
+                    assert not handle.closed
+                finally:
+                    if handle is not None and not handle.closed:
+                        handle.Close()
+                    assert handle is not None and handle.closed
+
+            try:
+                if job is not None:
+                    job.close()
+            finally:
+                try:
+                    close_exact_process(launcher)
+                finally:
+                    close_exact_process(control)

@@ -647,10 +647,17 @@ class _CallIds:
     tool_call_id: Optional[str] = None
     turn_id: Optional[str] = None
     api_request_id: Optional[str] = None
+    run_generation: Optional[int] = None
 
     def hook_kwargs(self) -> dict[str, str]:
         """Same fields with None -> "" (hook/middleware wire contract)."""
-        return {k: v or "" for k, v in asdict(self).items()}
+        return {
+            "task_id": self.task_id or "",
+            "session_id": self.session_id or "",
+            "tool_call_id": self.tool_call_id or "",
+            "turn_id": self.turn_id or "",
+            "api_request_id": self.api_request_id or "",
+        }
 
 
 def _tool_result_observer_fields(tool_name: str, result: Any) -> tuple[str, Optional[str], Optional[str]]:
@@ -825,6 +832,12 @@ def _execute_tool(function_name: str, function_args: dict[str, Any], original_ar
     """Run the registry handler (through tool-execution middleware unless skipped)
     with the approval observability context bound for the duration."""
     dispatch_kwargs: dict[str, Any] = {"task_id": ids.task_id, "session_id": ids.session_id}
+    if function_name == "terminal":
+        dispatch_kwargs.update(
+            tool_call_id=ids.tool_call_id,
+            turn_id=ids.turn_id,
+            run_generation=ids.run_generation,
+        )
     if function_name == "execute_code":
         # Prefer the caller's list so subagents can't overwrite the parent's
         # tool set via the process-global.
@@ -873,7 +886,8 @@ def _elapsed_ms(start: float) -> int:
 def handle_function_call(
     function_name: str, function_args: dict[str, Any], task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None, session_id: Optional[str] = None, turn_id: Optional[str] = None,
-    api_request_id: Optional[str] = None, user_task: Optional[str] = None, enabled_tools: Optional[list[str]] = None,
+    api_request_id: Optional[str] = None, run_generation: Optional[int] = None,
+    user_task: Optional[str] = None, enabled_tools: Optional[list[str]] = None,
     skip_pre_tool_call_hook: bool = False, skip_tool_request_middleware: bool = False,
     skip_tool_execution_middleware: bool = False, tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
     enabled_toolsets: Optional[list[str]] = None, disabled_toolsets: Optional[list[str]] = None,
@@ -891,13 +905,13 @@ def handle_function_call(
         function_args = {}
     trace = list(tool_request_middleware_trace or [])
     function_name = _LEGACY_TOOL_ALIASES.get(function_name, function_name)
-    ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id)
+    ids = _CallIds(task_id, session_id, tool_call_id, turn_id, api_request_id, run_generation)
     start = time.monotonic()
 
     def _emit(result: Any, **extra: Any) -> Any:
         """Emit post_tool_call with this call's identity fields; returns *result*."""
         _emit_post_tool_call_hook(function_name=function_name, function_args=function_args, result=result,
-                                  **asdict(ids), middleware_trace=list(trace), **extra)
+                                  **ids.hook_kwargs(), middleware_trace=list(trace), **extra)
         return result
 
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled

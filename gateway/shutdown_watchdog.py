@@ -261,6 +261,45 @@ def _write_watchdog_dump(dump_path: Path, *, delay_s: float, snapshot: Optional[
         faulthandler.dump_traceback(all_threads=True)
 
 
+def mark_graceful_exit(exit_code: int, *, ownership_clean: bool) -> None:
+    # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
+    # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
+    from hermes_cli.observability.shared_metrics_process import stamp_exit
+    stamp_exit("clean" if ownership_clean else "unknown_custody")
+    from gateway.lifecycle_ledger import mark_exited
+    mark_exited(
+        exit_code,
+        reason="graceful_shutdown" if ownership_clean else "graceful_shutdown_unknown_custody",
+    )
+
+
+def _invalidate_clean_shutdown_marker() -> None:
+    try:
+        (_process_hermes_home() / '.clean_shutdown').unlink(missing_ok=True)
+    except BaseException as exc:  # health: allow BLE001 -- failure to invalidate remains unknown
+        logger.error('Could not invalidate the clean-shutdown marker: %r', exc)
+
+
+def _release_shutdown_watchdog_ownership() -> bool:
+    """Resolve physical custody and PID fencing before the watchdog stamps shutdown."""
+    try:
+        from gateway.status import remove_pid_file_checked, release_gateway_runtime_lock
+        summary = release_gateway_runtime_lock()
+        if summary is not None and getattr(summary, 'failed', True):
+            logger.error('Shutdown watchdog retained physical profile custody: %s', summary.describe())
+            _invalidate_clean_shutdown_marker()
+            return False
+        if remove_pid_file_checked() is not True:
+            logger.error('Shutdown watchdog could not prove removal of the physical-owner PID marker')
+            _invalidate_clean_shutdown_marker()
+            return False
+        return True
+    except BaseException as exc:  # health: allow BLE001 -- any unknown cleanup stays unknown
+        logger.error('Shutdown watchdog could not resolve physical profile custody: %r', exc)
+        _invalidate_clean_shutdown_marker()
+        return False
+
+
 def arm_shutdown_watchdog(
     delay_s: float, *, done_event: Optional[threading.Event] = None,
     snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None, exit_code: int = 1,
@@ -292,19 +331,16 @@ def arm_shutdown_watchdog(
         for stream in (sys.stdout, sys.stderr):
             with contextlib.suppress(Exception):
                 stream.flush()
-        # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-        # (never strand locks), then drain the log queue so logger.critical lands before os._exit.
-        with contextlib.suppress(Exception):
-            # Mirror _exit_after_graceful_shutdown: release PID file + runtime lock BEFORE the log drain
-            # (locks must never be stranded), then drain the async log queue so the logger.critical above
-            # actually reaches the file before os._exit bypasses atexit. (#66892)
-            from gateway.status import remove_pid_file, release_gateway_runtime_lock
-            remove_pid_file()
-            release_gateway_runtime_lock()
+        # Mirror _exit_after_graceful_shutdown: release physical custody and the PID fence BEFORE
+        # the log drain (never strand locks), then drain the log queue before os._exit.
+        ownership_clean = _release_shutdown_watchdog_ownership()
         with contextlib.suppress(Exception):
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
-        _mark_exited_quietly(exit_code, "shutdown_watchdog")
+        _mark_exited_quietly(
+            exit_code,
+            "shutdown_watchdog" if ownership_clean else "shutdown_watchdog_unknown_custody",
+        )
         _hard_exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()

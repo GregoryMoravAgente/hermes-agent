@@ -105,7 +105,7 @@ async def test_adopted_result_during_unknown_projection_is_not_lost(bot, monkeyp
         if record['status'] == 'ambiguous' and not entered.is_set():
             entered.set()
             await release.wait()
-        await original(home, record)
+        return await original(home, record)
     monkeypatch.setattr(session_bot, 'write_receipt', held)
     bot.authority._publish_pending(ref)
     try:
@@ -125,6 +125,68 @@ async def test_adopted_result_during_unknown_projection_is_not_lost(bot, monkeyp
         release.set()
         tasks = list(getattr(bot.authority, '_bot_receipt_tasks', ()))
         if tasks: await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+
+
+@pytest.mark.asyncio
+async def test_unknown_projection_rejects_a_foreign_current_authority(bot, monkeypatch):
+    """A terminal row cannot reopen UNKNOWN custody when the current authority tuple is foreign."""
+    from gateway import session_bot
+    from gateway.session_contract import SessionRef
+    from hermes_state_runtime import (begin_runtime_epoch, claim_session_input, recover_session_inputs,
+        register_worker_execution, adopt_worker_execution, settle_session_input)
+    from tools.bot_live_delivery import read_delivery_result
+
+    monkeypatch.setattr(bot.authority, '_schedule', lambda ref: None)
+    key = '8' * 32
+    receipt = await session_bot.deliver(bot.connection, dict(id=key, profile='default', message='foreign'))
+    ref = SessionRef(bot.authority.profile_id, receipt['session_id'])
+    row = claim_session_input(bot.authority.db, epoch=bot.authority.epoch, session_id=ref.session_id)
+    original_coordinator = bot.authority._preservation_coordinator()
+    original_root = bot.authority._preservation_handles[row['admission_id']]
+    assignment = dict(execution_id='foreign-authority-worker', session_id=ref.session_id,
+                      generation=row['generation'])
+    register_worker_execution(bot.authority.db, epoch=bot.authority.epoch, **assignment,
+                              kind='compute', adoption_secret='foreign-authority-owned')
+    bot.authority.epoch = begin_runtime_epoch(bot.authority.db, instance_id='recovery')
+    recover_session_inputs(bot.authority.db, epoch=bot.authority.epoch)
+    bot.authority._pause(ref, 'unknown_execution')
+    await asyncio.wait_for(asyncio.gather(*list(bot.authority._bot_receipt_tasks)), 5)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = session_bot.write_receipt
+
+    async def held(home, record):
+        if record['status'] == 'ambiguous' and not entered.is_set():
+            entered.set()
+            await release.wait()
+        return await original(home, record)
+
+    monkeypatch.setattr(session_bot, 'write_receipt', held)
+    bot.authority._publish_pending(ref)
+    bot.authority._publish_pending(ref)
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        adopt_worker_execution(bot.authority.db, epoch=bot.authority.epoch, **assignment,
+                               adoption_secret='foreign-authority-owned')
+        settle_session_input(
+            bot.authority.db, epoch=bot.authority.epoch, admission_id=row['admission_id'],
+            generation=row['generation'], outcome='completed',
+            result={'result': {'final_response': 'must stay unknown'}, 'usage': {}})
+        bot.authority.instance_id = 'foreign-authority'
+        bot.authority._publish_pending(ref)
+        release.set()
+        deadline = time.monotonic() + 5
+        while (await asyncio.to_thread(read_delivery_result, bot.home, key))['status'] != 'ambiguous':
+            assert time.monotonic() < deadline, 'foreign authority reopened the unknown projection'
+            await asyncio.sleep(.01)
+        retained = original_coordinator._records[original_root.lease.lease_id]
+        assert retained.handle is original_root
+        assert not any(record.handle.process_instance == 'foreign-authority'
+                       for record in original_coordinator._records.values())
+    finally:
+        release.set()
+        tasks = list(getattr(bot.authority, '_bot_receipt_tasks', ()))
+        if tasks: await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), 10)
+        bot.authority.instance_id = 'fixture'
 
 
 @pytest.mark.asyncio

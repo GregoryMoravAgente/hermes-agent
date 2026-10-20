@@ -147,7 +147,7 @@ def bind_api_session(authority, session_id, *, hosted_dispatch=None, declared_ke
 
 
 def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=None, caller_key=None,
-                   walked_from=None):
+                   walked_from=None, fresh=False):
     """``bind_api_session`` as write steps (``run_steps``): the binding transaction is yielded.
 
     ``caller_key`` is this request's validated ``X-Hermes-Session-Key`` even when an explicit
@@ -158,7 +158,10 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
     ``walked_from`` is the stored session a Responses/Runs chain continued from when the chain moved
     past it to *session_id* (``continued_api_session``): the fences it passed stay for good. If one
     aged out since that lookup, the bind refuses with the retryable ``chain_moved``."""
-    authority._require_admission_open()
+    if fresh:
+        authority._require_fresh_admission_open()
+    else:
+        authority._require_admission_open()
     if not isinstance(session_id, str) or not session_id or _is_path_unsafe(session_id):
         raise RuntimeStoreError('invalid_params')
     storage_source, title, room_identity, room_generation = 'api_server', None, None, 0
@@ -198,7 +201,12 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
 
     def write(conn):
         _epoch(conn, authority.epoch)
-        authority._require_admission_open()  # a drain that began while this waited on the writer wins
+        # Fresh API roots must lose the race even if this transaction waited on SQLite. Accepted
+        # FIFO continuations keep the ordinary gate and are handled by the claim path.
+        if fresh:
+            authority._require_fresh_admission_open()
+        else:
+            authority._require_admission_open()
         from hermes_state_mutation_retirement import RETIRED_PREFIX, keep_passed_fences
         if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + session_id,)).fetchone():
             raise RuntimeStoreError('not_found')

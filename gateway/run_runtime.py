@@ -130,6 +130,15 @@ async def initialize_gateway_runtime(runner):
             _park_reserved_profile(runner, name, home, exc)
     descriptor['authority_epoch'] = registry.launch.epoch
     descriptor['served_profiles'] = registry.served_profiles()
+    # The preservation coordinator is installed only after the launch authority epoch exists.
+    # It owns the process-global close receipt; it does not replace the per-profile authority
+    # registry or the OS profile locks.
+    from gateway.runtime_custody import install_runtime_custody
+    coordinator = install_runtime_custody(runner)
+    # Bind the process registry only after the authenticated process instance and authority epoch
+    # exist. Pre-existing children are retained as unknown instead of being adopted after Popen.
+    from tools.process_registry import process_registry
+    process_registry.bind_runtime_custody(coordinator)
     # Publish this boot's verdict (an empty map clears a previous run's parked set).
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
@@ -175,14 +184,436 @@ def reserve_profile_home(runner, name, home):
 
 
 def release_profile_home(runner, home):
-    """Shrink the reservation by one profile (deleted, or parked because it cannot be served)."""
+    """Release the real profile lock before withdrawing its canonical reservation.
+
+    A failed or ambiguous close remains owned and retryable; no served/reserved map or successor
+    path may describe that home as clean until the exact descriptor is released.
+    """
     from gateway.runtime_ownership import process_ownership
     home = Path(home).resolve()
     registry = getattr(runner, 'session_authorities', None)
-    if registry is not None and registry.for_home(home) is not None:
+    authority = None if registry is None else registry.for_home(home)
+    if authority is not None:
+        if not _settle_external_process_finalizers(authority):
+            raise RuntimeError('External process finalizer must settle before ownership is released')
         raise RuntimeError('Profile authority must retire before ownership is released')
+    outcome = process_ownership.release_outcome(home)
+    if getattr(outcome, "value", None) != "released":
+        raise ProfileOwnershipRetained(
+            f"profile {home} retains physical custody ({getattr(outcome, 'value', outcome)})"
+        )
     _withdraw_profile_home(runner, home)
-    process_ownership.release(home)
+
+
+def _settle_external_process_finalizers(authority) -> bool:
+    """Consume every registered external parent before a profile can be retired.
+
+    The registry contains object-bound parents backed by the existing custody coordinator. A
+    failed reader/native/durable/cache finalizer stays registered and therefore keeps the profile
+    owner alive for the same-handle retry; an empty local map is never treated as quiescence.
+    """
+    getter = getattr(authority, 'external_process_finalizers', None)
+    if not callable(getter):
+        return True
+    from gateway.runtime_service_operations import close_after_finalizers
+    forget = getattr(authority, 'forget_external_process_finalizer', None)
+    for parent in tuple(getter()):
+        if getattr(parent, 'state', None) != 'terminal':
+            try:
+                if close_after_finalizers(parent) is not True:
+                    return False
+            except Exception:
+                logger.warning('External process finalizer did not settle for %s',
+                               getattr(parent, 'operation_id', '?'), exc_info=True)
+                return False
+        if not callable(forget) or forget(getattr(parent, 'operation_id', None), parent) is not True:
+            return False
+    return not tuple(getter())
+
+
+def _preservation_ownership_reason(runner, *, require_running: bool = True):
+    """Return a refusal when the existing profile locks/lifecycle owner cannot be proven.
+
+    ``RetirementFence`` is process-local.  The profile ``gateway.lock`` handles are the existing
+    cross-process exclusion boundary; preservation must hold them for every served home before it
+    can claim that an independent CLI, cron process, or successor is absent.  This helper only
+    observes that authority and never acquires, releases, or replaces a lock.
+    """
+    if require_running and (
+        not getattr(runner, '_running', False)
+        or getattr(runner, '_restart_requested', False)
+        or getattr(runner, '_stop_task', None) is not None
+    ):
+        return 'lifecycle_owned'
+    from gateway.runtime_ownership import process_ownership
+    homes = reserved_profile_homes(runner)
+    if not homes:
+        return 'unmapped_writer'
+    if any(
+        process_ownership.reservation_evidence(home) is None
+        for _name, home in homes
+    ):
+        return 'foreign_custody'
+    return None
+
+
+def _preservation_receipt(params):
+    receipt = params.get('receipt') if isinstance(params, dict) else None
+    if not isinstance(receipt, dict):
+        raise ValueError('invalid_params')
+    from gateway.runtime_custody import DrainReceipt
+    required = {'receipt_id', 'process_instance', 'authority_epoch', 'close_generation', 'status'}
+    if set(receipt) != required:
+        raise ValueError('invalid_params')
+    if receipt.get('status') not in {'closing', 'handoff_pending'}:
+        raise ValueError('invalid_params')
+    return DrainReceipt(
+        receipt['receipt_id'], receipt['process_instance'], receipt['authority_epoch'],
+        receipt['close_generation'], receipt['status'])
+
+
+_INTEGRATED_PRESERVATION_OWNER_CLASSES = (
+    # I01 is sealed only after the native entrypoint has been consumed and all producer/marker/
+    # delivery-ledger registries plus durable admissions are quiescent; an empty queue alone cannot
+    # seal it.
+    'I01_native_inbound',
+    'I02_api_session_turn', 'I04_fifo_turn_execution',
+    # Automation supplies its own observed-ingress and durable/terminal readiness checks.
+    'I07_automation_route_wakes',
+)
+
+
+def _strict_physical_owner_bindings(physical, homes):
+    """Validate the physical evidence tuple before handing I20 to the existing coordinator."""
+    if not physical or len(physical) != len(homes):
+        return None
+    bindings = []
+    seen_homes = set()
+    for evidence, (_name, home) in zip(physical, homes):
+        if not isinstance(evidence, dict):
+            return None
+        try:
+            expected_home = str(Path(home).resolve())
+            profile_home = Path(evidence['profile_home']).resolve()
+            epoch = evidence['owner_epoch']
+            descriptor = evidence['native_descriptor']
+            record = evidence['record']
+            record_home = Path(record['hermes_home']).resolve()
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            str(profile_home) != expected_home
+            or not isinstance(epoch, str) or not epoch
+            or isinstance(descriptor, bool) or not isinstance(descriptor, int) or descriptor < 0
+            or not isinstance(record, dict)
+            or record.get('owner_epoch') != epoch
+            or str(record_home) != expected_home
+            or evidence.get('physical_binding') != (str(profile_home), epoch, descriptor)
+            or evidence.get('native_handle_retained') is not True
+            or evidence.get('os_lock_owner') is not True
+            or evidence.get('cross_process_proof') is not True
+            or evidence.get('observed') is not True
+            or expected_home in seen_homes
+        ):
+            return None
+        seen_homes.add(expected_home)
+        bindings.append((expected_home, epoch, descriptor))
+    return tuple(bindings)
+
+
+def _api_server_adapters(runner):
+    from gateway.config import Platform
+    found = []
+    primary = (getattr(runner, "adapters", None) or {}).get(Platform.API_SERVER)
+    if primary is not None:
+        found.append(primary)
+    for profile_adapters in (getattr(runner, "_profile_adapters", None) or {}).values():
+        adapter = (profile_adapters or {}).get(Platform.API_SERVER)
+        if adapter is not None and all(adapter is not item for item in found):
+            found.append(adapter)
+    return found
+
+
+def _seal_physical_profile_owner(runner, coordinator, receipt, descriptor):
+    """Seal I20 from each actual retained profile descriptor and physical incarnation."""
+    from gateway.runtime_custody import OWNER_SPECS
+    # I20 is sealed only from the actual ProfileOwnership reservation.  A running flag,
+    # PID, empty map, or ``_seal_all`` cannot prove the cross-process exclusion that a
+    # successor must wait for.  Each served home contributes its own physical incarnation;
+    # authority/process epochs remain separate fields in the receipt.
+    try:
+        from gateway.runtime_ownership import process_ownership
+        homes = reserved_profile_homes(runner)
+        physical = [
+            process_ownership.reservation_evidence(home)
+            for _name, home in homes
+        ]
+        physical_bindings = _strict_physical_owner_bindings(physical, homes)
+        if physical_bindings is None:
+            coordinator.mark_owner_unknown('I20_runtime_ownership_and_foreign_handoff', 'foreign_custody')
+        else:
+            epochs = {item['owner_epoch'] for item in physical}
+            evidence = {
+                'source': OWNER_SPECS['I20_runtime_ownership_and_foreign_handoff'].source,
+                'process_instance': receipt.process_instance,
+                'authority_epoch': receipt.authority_epoch,
+                'close_generation': receipt.close_generation,
+                'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:I20',
+                'observed': True,
+                'cross_process_proof': all(item.get('cross_process_proof') is True for item in physical),
+                'os_lock_owner': all(item.get('os_lock_owner') is True for item in physical),
+                'native_handle_retained': all(item.get('native_handle_retained') is True for item in physical),
+                'owner_epochs': tuple(sorted(epochs)),
+                'native_handles': tuple(item['native_descriptor'] for item in physical),
+                'profile_homes': tuple(item['profile_home'] for item in physical),
+                'physical_bindings': physical_bindings,
+            }
+            refusal = coordinator.seal_owner('I20_runtime_ownership_and_foreign_handoff', evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown(
+                    'I20_runtime_ownership_and_foreign_handoff',
+                    getattr(refusal, 'code', 'foreign_custody'),
+                )
+    except BaseException:  # health: allow BLE001 -- interrupted I20 evidence stays unknown
+        coordinator.mark_owner_unknown('I20_runtime_ownership_and_foreign_handoff', 'read_failed')
+
+
+def _seal_integrated_preservation_owners(runner, coordinator, receipt):
+    """Seal source consumers whose durable terminal paths are wired here.
+
+    Per-authority hooks retain I01/I02/I04/I07 readiness. Cron uses its ledger, process and pipe
+    evidence independently, even without session authorities. Every other class stays unwired
+    until its own source seam proves readiness.
+    """
+    authorities = _authorities(runner)
+    from gateway.runtime_custody import OWNER_SPECS
+    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
+    if authorities:
+        for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
+            try:
+                if not all(authority.preservation_owner_ready(owner_class) for authority in authorities):
+                    continue
+            except BaseException:  # health: allow BLE001 -- opaque owner custody query failure marks that owner unknown and withholds handoff
+                coordinator.mark_owner_unknown(owner_class, 'read_failed')
+                continue
+            evidence = {
+                'source': OWNER_SPECS[owner_class].source,
+                'process_instance': receipt.process_instance,
+                'authority_epoch': receipt.authority_epoch,
+                'close_generation': receipt.close_generation,
+                'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
+                'observed': True,
+            }
+            refusal = coordinator.seal_owner(owner_class, evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+
+    # Direct API runs have a separate adapter-owned source hook.  It may seal only after the
+    # adapter registered its run lifecycle and every source-owned run/status/transport/finalizer
+    # record is terminal; an absent or incomplete hook remains unwired and blocks handoff.
+    api_adapters = _api_server_adapters(runner)
+    if api_adapters:
+        try:
+            from gateway.platforms.api_server_run_custody import preservation_owner_evidence
+            evidence = preservation_owner_evidence(
+                api_adapters, runner, process_instance=receipt.process_instance,
+                authority_epoch=receipt.authority_epoch, close_generation=receipt.close_generation,
+                owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:I03_api_run_direct')
+        except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+            coordinator.mark_owner_unknown('I03_api_run_direct', 'read_failed')
+        else:
+            if evidence is not None:
+                evidence = dict(evidence)
+                evidence['source'] = OWNER_SPECS['I03_api_run_direct'].source
+                refusal = coordinator.seal_owner('I03_api_run_direct', evidence)
+                if refusal is not None:
+                    coordinator.mark_owner_unknown(
+                        'I03_api_run_direct', getattr(refusal, 'code', 'read_failed'))
+
+    # ProcessRegistry is a cross-process owner: it must supply a real reservation/identity/reader
+    # observation, not an empty running map. A missing or failed source hook is explicitly unknown.
+    try:
+        from tools.process_registry import process_registry
+        process_evidence = process_registry.preservation_owner_evidence(
+            process_instance=receipt.process_instance,
+            authority_epoch=receipt.authority_epoch,
+            close_generation=receipt.close_generation,
+            owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:I15_process_registry_terminal',
+            profile_id=process_registry._process_profile_id(),
+        )
+        if process_evidence is None:
+            coordinator.mark_owner_unknown('I15_process_registry_terminal', 'cross_process_unproven')
+        else:
+            process_evidence = dict(process_evidence)
+            process_evidence['source'] = OWNER_SPECS['I15_process_registry_terminal'].source
+            refusal = coordinator.seal_owner('I15_process_registry_terminal', process_evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown('I15_process_registry_terminal', getattr(refusal, 'code', 'read_failed'))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        coordinator.mark_owner_unknown('I15_process_registry_terminal', 'read_failed')
+
+    _seal_physical_profile_owner(runner, coordinator, receipt, descriptor)
+
+    try:
+        from cron.runtime_custody import preservation_owner_evidence
+        for owner_class in (
+            'I12_cron_fire', 'I13_external_cron_worker', 'I14_api_detached_cron',
+        ):
+            evidence = preservation_owner_evidence(
+                owner_class,
+                process_instance=receipt.process_instance,
+                authority_epoch=receipt.authority_epoch,
+                close_generation=receipt.close_generation,
+                owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
+            )
+            if evidence is None:
+                continue
+            refusal = coordinator.seal_owner(owner_class, evidence)
+            if refusal is not None:
+                coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        for owner_class in (
+            'I12_cron_fire', 'I13_external_cron_worker', 'I14_api_detached_cron',
+        ):
+            coordinator.mark_owner_unknown(owner_class, 'read_failed')
+
+
+async def begin_preservation_drain(runner, params, peer_subject):
+    """Atomically close fresh roots through the existing authenticated private socket.
+
+    This reversible phase only changes the admission state. It intentionally does not call the
+    destructive shutdown drain/interrupt/kill path: a pre-handoff refusal must be able to restore
+    the same owner without losing accepted leases.
+    """
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}
+    if not isinstance(params, dict) or set(params) != {
+        'instance_id', 'authority_epoch', 'owner_id', 'scope', 'deadline_s'
+    }:
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
+    if params['instance_id'] != descriptor.get('instance_id'):
+        return {'status': 'refused', 'reason': 'stale_instance'}
+    if params['authority_epoch'] != descriptor.get('authority_epoch'):
+        return {'status': 'refused', 'reason': 'stale_authority_epoch'}
+    ownership_reason = _preservation_ownership_reason(runner)
+    if ownership_reason is not None:
+        return {'status': 'refused', 'reason': ownership_reason}
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    receipt = coordinator.begin_close(
+        owner_id=f'{peer_subject}:{params["owner_id"]}',
+        scope=params['scope'],
+        deadline_s=params['deadline_s'],
+    )
+    if hasattr(receipt, 'as_wire'):
+        wire = receipt.as_wire()
+    else:
+        wire = {'status': 'refused', 'reason': getattr(receipt, 'code', 'close_conflict')}
+    if wire.get('status') == 'closing':
+        # Preserve the existing reversible external-drain distinction: fresh roots refuse, while
+        # already accepted FIFO continuations may claim and settle under their live parent lease.
+        # Ordinary ``_draining`` remains reserved for shutdown/restart and must stay false here.
+        runner._external_drain_active = True
+        runner._preservation_drain_active = True
+        descriptor.update(state='draining', capabilities=[], drain_reason='preservation')
+    return wire
+
+
+async def preservation_drain_status(runner, params, peer_subject):
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}
+    if not isinstance(params, dict) or set(params) != {'instance_id', 'authority_epoch'}:
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
+    if params['instance_id'] != descriptor.get('instance_id'):
+        return {'status': 'refused', 'reason': 'stale_instance'}
+    if params['authority_epoch'] != descriptor.get('authority_epoch'):
+        return {'status': 'refused', 'reason': 'stale_authority_epoch'}
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    return coordinator.status()
+
+
+async def prepare_preservation_handoff(runner, params, peer_subject):
+    """Return a typed local-drain or unknown result; native ACK remains a later phase."""
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}
+    if not isinstance(params, dict):
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    try:
+        receipt = _preservation_receipt(params)
+    except (TypeError, ValueError, KeyError):
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    ownership_reason = _preservation_ownership_reason(runner)
+    if ownership_reason is not None:
+        return {'status': 'refused', 'reason': ownership_reason}
+    from gateway.session_runtime_workers import await_authority_work
+    remaining = coordinator.remaining_seconds()
+    if remaining is None:
+        return {'status': 'refused', 'reason': 'stale_close_receipt'}
+    for authority in _authorities(runner):
+        try:
+            await await_authority_work(authority, remaining)
+        except TimeoutError:
+            return {'status': 'refused', 'reason': 'custody_pending'}
+    _seal_integrated_preservation_owners(runner, coordinator, receipt)
+    prepared = coordinator.prepare_handoff(receipt)
+    if hasattr(prepared, 'as_wire'):
+        return prepared.as_wire()
+    return {'status': 'refused', 'reason': getattr(prepared, 'code', 'custody_pending')}
+
+
+async def abort_preservation_drain(runner, params, peer_subject):
+    """Reopen only the exact pre-handoff receipt; unresolved leases remain in the ledger."""
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}
+    try:
+        receipt = _preservation_receipt(params)
+    except (TypeError, ValueError, KeyError):
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    ownership_reason = _preservation_ownership_reason(runner)
+    if ownership_reason is not None:
+        # Keep the close receipt and all unresolved leases live for the active lifecycle owner.
+        # A failed ownership check is never permission to release or reopen that custody.
+        return {'status': 'refused', 'reason': ownership_reason}
+    refused = coordinator.abort_before_handoff(receipt)
+    if refused is not None:
+        return refused.as_wire()
+    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
+    runner._external_drain_active = False
+    runner._preservation_drain_active = False
+    descriptor.update(state='ready', capabilities=['session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
+    descriptor.pop('drain_reason', None)
+    return {'status': 'open', 'instance_id': descriptor.get('instance_id'),
+            'authority_epoch': descriptor.get('authority_epoch')}
+
+
+async def acknowledge_preservation_native(runner, params, peer_subject):
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}
+    try:
+        receipt = _preservation_receipt(params)
+    except (TypeError, ValueError, KeyError):
+        return {'status': 'refused', 'reason': 'invalid_params'}
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    ownership_reason = _preservation_ownership_reason(runner, require_running=False)
+    if ownership_reason is not None:
+        return {'status': 'refused', 'reason': ownership_reason}
+    result = coordinator.acknowledge_native(receipt)
+    if hasattr(result, 'as_wire'):
+        return result.as_wire()
+    return {'status': 'refused', 'reason': getattr(result, 'code', 'native_ack_mismatch')}
 
 
 def _withdraw_profile_home(runner, home):
@@ -298,6 +729,10 @@ async def _retire_profile_authority(authority, timeout=None):
         task.cancel()
     if rest:
         await asyncio.gather(*rest, return_exceptions=True)
+    if not _settle_external_process_finalizers(authority):
+        logger.error('Profile %s external process finalizers did not settle; ownership retained',
+                     authority.profile_id)
+        return False
     unbind_owner(authority)
     # Ownership is released next; until a successor bumps the epoch, A's epoch still fences its
     # writes as current, so a stale connection to A must find it retired instead.
@@ -590,6 +1025,9 @@ async def settle_gateway_runtime(runner, budget=None):
             await join_authority_work(authority, 0)
         except TimeoutError:
             logger.warning('Profile %s still has live writers at shutdown; its admissions stay for recovery',
+                           getattr(authority, 'profile_id', '?'))
+        if not _settle_external_process_finalizers(authority):
+            logger.warning('Profile %s external process finalizers remain retained at shutdown',
                            getattr(authority, 'profile_id', '?'))
     # Work settled above. ACP has no per-session destroy,
     # so the stop is the end of every ACP session nobody is viewing (#118216).

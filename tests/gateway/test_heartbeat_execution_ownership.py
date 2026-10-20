@@ -7,6 +7,7 @@ import pytest
 
 from evals.heartbeat_idle_wire import WireAdapter
 from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
 from hermes_cli.heartbeat import HeartbeatState, migrate_heartbeat_to_session, save_heartbeat
@@ -98,5 +99,226 @@ async def test_restart_does_not_restore_suspended_heartbeat(tmp_path):
         assert runner._heartbeat_watch == {}
         restored = runner.session_store.lookup_by_session_key(entry.session_key)
         assert restored.suspended and restored.session_id == entry.session_id
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+async def _real_goal_owner(tmp_path, monkeypatch, *, enable_drain=False, seed_native=True):
+    """A real GatewayRunner/SessionAuthority/SQLite producer fixture for loop fallback controls."""
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_ingress_context import native_callback
+    from gateway.session_automation_custody import automation_source_identity
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.discord.adapter import DiscordAdapter
+
+    schedule = SessionAuthority._schedule
+    monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)
+    monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
+    runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / "sessions"))
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="fixture-token", typing_indicator=False),
+    )
+    runner.adapters = {Platform.DISCORD: adapter}
+    authority = await initialize_session_authority(
+        runner, profile_id="default", instance_id="goal-fallback-owner",
+    )
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id,
+        authority_epoch=authority.epoch,
+        fence=RetirementFence(),
+    )
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id="42", chat_type="dm", user_id="42")
+    if seed_native:
+        human = MessageEvent(text="seed", source=source, message_id="human-seed")
+        with native_callback(runner, human, get_hermes_home()):
+            await authority.admit_native(human)
+    else:
+        authority._reserve_route(source)
+    if enable_drain:
+        monkeypatch.setattr(SessionAuthority, "_schedule", schedule)
+    key = runner.session_store._generate_session_key(source)
+    entry = runner.session_store.lookup_by_session_key(key)
+    assert entry is not None
+    request_id = "goal-fallback-real-request"
+    event = MessageEvent(
+        text="check the current state",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id=request_id,
+        internal=True,
+        metadata={"gateway_session_key": key, "gateway_session_id": entry.session_id},
+    )
+    handle = authority._preservation_automation_root(
+        request_id=request_id,
+        principal_id="automation:" + key,
+        session_id=authority.logical_owner(entry.session_id),
+        source_identity=automation_source_identity(event, key),
+        owner_class="I08_goals_loops_heartbeat",
+    )
+    from gateway.session_ingress import PreservedAutomationHandoff
+    handoff = PreservedAutomationHandoff(
+        authority=authority,
+        handle=handle,
+        owner_class="I08_goals_loops_heartbeat",
+        request_id=request_id,
+        principal_id="automation:" + key,
+        session_id=authority.logical_owner(entry.session_id),
+        source_identity=automation_source_identity(event, key),
+    )
+    return runner, adapter, authority, key, entry, event, handoff
+
+
+@pytest.mark.asyncio
+async def test_goal_fallback_consumes_real_sqlite_automation_writer(tmp_path, monkeypatch):
+    """The fired-loop handoff reaches the production automation writer and durable FIFO row."""
+    from gateway.session_ingress import admit_preserved_automation
+    from hermes_state_runtime import list_session_admissions
+
+    runner, adapter, authority, _key, entry, event, handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        receipt = await admit_preserved_automation(authority, adapter, event, handoff)
+        rows = list_session_admissions(
+            authority.db, session_id=authority.logical_owner(entry.session_id), pending_only=False,
+        )
+        wake = next(row for row in rows if row["request_id"] == handoff.request_id)
+        assert receipt is not None
+        assert wake["status"] == "queued"
+        descriptor = wake["payload"]["native_text_v1"]["automation"]["custody"]
+        assert descriptor["owner_class"] == "I08_goals_loops_heartbeat"
+        assert descriptor["request_id"] == handoff.request_id
+        assert descriptor["source_identity"] == handoff.source_identity
+        assert authority._preservation_handles[wake["admission_id"]] is handoff.handle
+        assert handoff.state == "admitted"
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_fallback_real_loop_tick_reaches_terminal_fifo(tmp_path, monkeypatch):
+    """A real LoopManager fire reaches the runner's route wake admission and FIFO settlement."""
+    import time
+
+    from gateway import session_finite
+    from hermes_cli import loops
+    from hermes_state_runtime import list_session_admissions
+
+    runner, _adapter, authority, _key, entry, event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch, enable_drain=True,
+    )
+    try:
+        monkeypatch.setattr(loops, "_get_session_db", lambda: authority.db)
+        monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda _sid: False)
+        manager = loops.LoopManager(session_id=entry.session_id)
+        manager.set(
+            "check the current state", interval_seconds=30,
+            route={"platform": "discord", "chat_id": "42", "chat_type": "dm", "user_id": "42"},
+        )
+        manager.state.next_due_at = time.time() - 1
+        loops.save_loop(entry.session_id, manager.state)
+
+        async def finite(_authority, _ref, _row):
+            return "loop terminal response"
+
+        monkeypatch.setattr(session_finite, "execute_finite_admission", finite)
+        await runner._loop_wakeup_fire_one(
+            entry.session_id, manager.state, time.time() + 1, set(),
+        )
+        live = authority.sessions[authority.logical_owner(entry.session_id)]
+        assert live.task is not None
+        await asyncio.wait_for(asyncio.shield(live.task), timeout=5)
+
+        rows = list_session_admissions(
+            authority.db, session_id=authority.logical_owner(entry.session_id), pending_only=False,
+        )
+        wake = next(row for row in rows if row["principal_id"].startswith("automation:"))
+        assert wake["status"] == "terminal"
+        await runner._post_turn_loop_completion(
+            session_entry=entry, source=event.source, final_response="loop terminal response",
+        )
+        settled = loops.load_loop(entry.session_id)
+        assert settled is not None and settled.awaiting_response is False
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_fallback_adapter_path_retains_same_handle_on_unbound_route(
+        tmp_path, monkeypatch):
+    """A false pre-effect route admission reaches the real adapter and stays unknown."""
+    import json
+    import time
+
+    from hermes_cli import loops
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, adapter, authority, key, entry, _event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch, enable_drain=True, seed_native=False,
+    )
+    observed = []
+
+    async def receive(event):
+        try:
+            await runner._hm_authority_admission(event, event.source, key, True)
+        except RuntimeStoreError as exc:
+            observed.append(exc.reason)
+
+    adapter.set_message_handler(receive)
+    try:
+        monkeypatch.setattr(loops, "_get_session_db", lambda: authority.db)
+        monkeypatch.setattr(loops, "goal_blocks_loop_tick", lambda _sid: False)
+        manager = loops.LoopManager(session_id=entry.session_id)
+        manager.set(
+            "check the current state", interval_seconds=30,
+            route={"platform": "discord", "chat_id": "42", "chat_type": "dm", "user_id": "42"},
+        )
+        manager.state.next_due_at = time.time() - 1
+        loops.save_loop(entry.session_id, manager.state)
+        await runner._loop_wakeup_fire_one(
+            entry.session_id, manager.state, time.time() + 1, set(),
+        )
+        await asyncio.gather(*list(adapter._background_tasks), return_exceptions=True)
+        request_id = json.dumps(
+            ["loop", entry.session_id, 1], separators=(",", ":"),
+        )
+        record = next(
+            item for item in authority._preservation_coordinator()._records.values()
+            if (getattr(item.handle, "owner_class", None) == "I08_goals_loops_heartbeat"
+                and getattr(item.handle, "owner_id", None)
+                == f"I08_goals_loops_heartbeat:{authority.profile_id}:{entry.session_id}:{request_id}")
+        )
+        assert observed == ["not_found"]
+        assert record.state == "unknown"
+        persisted = loops.load_loop(entry.session_id)
+        assert persisted is not None and persisted.awaiting_response is True
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_fallback_slash_keeps_command_route_and_retains_same_handle_unknown(
+        tmp_path, monkeypatch):
+    """Slash wakeups keep their command semantics while the fired handle stays explicitly unknown."""
+    runner, _adapter, authority, key, _entry, event, handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        event.text = "/goal status"
+        event.message_id = handoff.request_id
+        event.allow_gateway_control = True
+        event._preservation_handoff = handoff
+        owned, reply = await runner._hm_authority_admission(
+            event, event.source, key, True,
+        )
+        record = authority._preservation_coordinator()._records[handoff.handle.lease.lease_id]
+        assert (owned, reply) == (False, None)
+        assert event.is_command()
+        assert record.handle is handoff.handle
+        assert record.state == "unknown"
+        assert handoff.state == "unknown"
     finally:
         runner.session_store.close_all_db_handles()

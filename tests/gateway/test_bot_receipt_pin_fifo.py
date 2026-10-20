@@ -58,8 +58,8 @@ async def test_a_pin_whose_admission_committed_does_not_hold_the_queue(bot, monk
     from gateway.session_bot import recover_bot_deliveries
     bot.authority._schedule = lambda ref: None
     real, failing = type(bot.authority).admit_automation, [True]
-    async def committed_then_refused(self, *args):
-        receipt = await real(self, *args)
+    async def committed_then_refused(self, *args, **kwargs):
+        receipt = await real(self, *args, **kwargs)
         if failing:
             raise RuntimeStoreError('stale_epoch')
         return receipt
@@ -80,10 +80,10 @@ async def test_an_owner_state_refusal_mid_pass_stops_the_pass(bot, monkeypatch):
     from gateway.session_bot import recover_bot_deliveries
     bot.authority._schedule = lambda ref: None
     real, refusing = type(bot.authority).admit_automation, [True]
-    async def full_for_other(self, adapter, event, identity):
+    async def full_for_other(self, adapter, event, identity, **kwargs):
         if refusing and identity == 'bot:' + OTHER:
             raise RuntimeStoreError('queue_full')
-        return await real(self, adapter, event, identity)
+        return await real(self, adapter, event, identity, **kwargs)
     monkeypatch.setattr(type(bot.authority), 'admit_automation', full_for_other)
     _legacy(bot, KEY, 1, 'first')
     path = _legacy(bot, OTHER, 2, 'second')
