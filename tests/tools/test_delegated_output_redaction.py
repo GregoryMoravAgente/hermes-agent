@@ -74,6 +74,8 @@ def test_child_result_events_memory_hooks_and_spill_use_redacted_output(
 
 
 def _record():
+    from tests.gateway.test_completion_admission import prepared_execution
+
     record = {
         "delegation_id": "synthetic-delegation",
         "dispatched_at": time.time(),
@@ -83,6 +85,7 @@ def _record():
         "goal": "retain the parent goal",
         "context": "retain the parent context",
         "model": "test-model",
+        "execution": prepared_execution("synthetic-delegation"),
     }
     ad._persist_dispatch(record)
     return record

@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import tools.async_delegation as ad
+from tests.gateway.test_completion_admission import prepared_execution
 
 
 @pytest.fixture(autouse=True)
@@ -343,7 +344,8 @@ async def test_compression_uncertainty_keeps_durable_completion_retryable(
         runner.adapters[Platform.TELEGRAM] = cast(BasePlatformAdapter, SimpleNamespace(handle_message=accept))
         event: dict[str, Any] = {"type": "async_delegation", "delegation_id": "uncertain-compression",
                                 "session_key": entry.session_key, "parent_session_id": parent,
-                                "dispatched_at": 1.0, "summary": "completed result", "status": "completed"}
+                                "dispatched_at": 1.0, "summary": "completed result", "status": "completed",
+                                "execution": prepared_execution("uncertain-compression")}
         ad._persist_dispatch(event)
         ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
         assert await runner._deliver_completion_notification("completed result", event) is False
@@ -498,7 +500,8 @@ async def test_delegate_completion_preserves_real_route_ownership(
         for index in range(2 if delivery == "group" else 1):
             event: dict[str, Any] = {"type": "async_delegation", "delegation_id": f"deleg-{index}",
                      "session_key": entry.session_key, "parent_session_id": pinned,
-                     "dispatched_at": 1.0, "summary": "completed result", "status": "completed"}
+                     "dispatched_at": 1.0, "summary": "completed result", "status": "completed",
+                     "execution": prepared_execution(f"deleg-{index}")}
             ad._persist_dispatch(event)
             ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
             events.append(event)
