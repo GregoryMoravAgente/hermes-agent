@@ -26,24 +26,24 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
-    if not retirement.acquire():
+    lease = retirement.acquire()
+    if lease is None:
         return None
 
     def run():
-        try:
-            target()
-        finally:
-            retirement.release()
+        retirement.run_with_lease(lease, target)
 
     try:
         thread = spawn_context_thread(run, name=name)
         if session is not None:
             session["_run_thread"] = thread
-        thread.start()
-        return thread
     except BaseException:
-        retirement.release()
+        retirement.release(lease)
         raise
+    # A start exception can follow native launch. Keep the exact lease until the
+    # worker unwinds rather than publishing idle beside an unobserved worker.
+    thread.start()
+    return thread
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:

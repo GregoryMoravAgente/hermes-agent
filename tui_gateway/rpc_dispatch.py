@@ -64,7 +64,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         from hermes_cli.backend_retirement import retirement
 
         # Reserve BEFORE enqueueing: a queued handler has accepted work even though no worker runs yet.
-        if not retirement.acquire():
+        lease = retirement.acquire()
+        if lease is None:
             return _err(req.get("id"), 5035, "backend is retiring; reconnect to continue")
         try:
             ctx = contextvars.copy_context()  # the pool worker must see the bound transport
@@ -79,12 +80,13 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                     resp = _err(req.get("id"), -32000, f"handler error: {exc}")
                 if resp is not None:
                     t.write(resp)
-            future = _pool.submit(lambda: ctx.run(run))
         except BaseException:
-            retirement.release()
+            retirement.release(lease)
             raise
-        # Also releases cancelled queued futures; the worker's own finally would never execute.
-        future.add_done_callback(lambda _: retirement.release())
+        # submit() may raise after accepting the callable. Its wrapper owns the
+        # release; an ambiguous submission must keep custody until it unwinds.
+        future = _pool.submit(lambda: ctx.run(retirement.run_with_lease, lease, run))
+        retirement.observe_future_cancellation(future, lease)
         return None
     finally:
         reset_transport(token)
