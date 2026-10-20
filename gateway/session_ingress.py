@@ -510,7 +510,10 @@ async def execute_admission(authority, ref, row):
         home = restore_provenance(authority.runner, event.source, provenance)
     _turn_binding, turn_binding_token = _bind_process_route(authority, ref, row)
     from gateway.config import Platform
-    from gateway.session_api_turn import api_execution, prepare_api_execution
+    from gateway.session_api_turn import (
+        api_execution, apply_api_notification_presentation, bind_api_notification_metadata,
+        prepare_api_execution,
+    )
     from gateway.session_results import execution_result
     is_api = live.source.platform == Platform.API_SERVER
     author = event.metadata.get('turn_author')
@@ -530,6 +533,7 @@ async def execute_admission(authority, ref, row):
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
                 api_execution.set(prepared)
+                bind_api_notification_metadata(event, prepared)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
                     # ``[Image attached ...]`` hints native transports persist), not only the caption.
@@ -550,6 +554,11 @@ async def execute_admission(authority, ref, row):
                 if is_api or (row['payload'].get('finite') is True and not event.get_command()):
                     result = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
                               'error': response or 'The admitted turn failed.'}
+            if is_api:
+                # Project both real captured outcomes and no-run failures before the durable
+                # pending result is published. The helper uses the event's frozen mute snapshot
+                # when a turn ran and the canonical policy only for the no-run fallback.
+                result = apply_api_notification_presentation(event, result, captured)
             # The drain commits this under the stream lock so no viewer reads `terminal`
             # before the completion event exists in the replay ring.
             authority.pending_results[row['admission_id']] = {

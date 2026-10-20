@@ -21,7 +21,8 @@ _OBSERVER_KEYS = ('stream_delta_callback', 'tool_start_callback', 'tool_complete
 _SETTING_KEYS = ('ephemeral_system_prompt', 'requested_model', 'requested_provider',
                  'model_options', 'route', 'session_model', 'confirmed_runtime_lock',
                  'requested_runtime', 'route_source', 'room_dispatch', 'room_execution_policy',
-                 'session_history_delivery')
+                 'session_history_delivery', 'notification_category')
+_NOTIFICATION_CATEGORIES = frozenset({'result', 'diagnostic'})
 # The authenticated API producer owns this route descriptor; request JSON never selects it.
 _API_PRODUCER_PROCESS_MODE = 'managed_turn'
 _OWNER_SCOPE_RE = re.compile(r'[0-9a-f]{64}')
@@ -58,16 +59,21 @@ def check_api_turn(authority, ref, payload):
         if (set(data) - {'history', 'settings', 'turn_author', 'media', 'run_owner_scope', 'browser_control',
                          'relay_metadata', 'producer_process_mode'}
                 or not {'history', 'settings'} <= set(data)
+                or not isinstance(data.get('settings'), dict)
                 or not isinstance(data.get('relay_metadata', {}), dict)
                 or (data['history'] is not None and not isinstance(data['history'], list))
                 or ('run_owner_scope' in data and not _valid_owner_scope(data['run_owner_scope']))
                 or ('browser_control' in data and not _valid_browser_control(data['browser_control']))
                 or ('producer_process_mode' in data
-                    and data['producer_process_mode'] != _API_PRODUCER_PROCESS_MODE)):
+                    and data['producer_process_mode'] != _API_PRODUCER_PROCESS_MODE)
+                or data.get('settings', {}).get('notification_category', 'result') not in _NOTIFICATION_CATEGORIES):
             raise RuntimeStoreError('invalid_params')
         if set(data['settings']) - set(_SETTING_KEYS):
             raise RuntimeStoreError('invalid_params')
     settings = payload.get('api_turn_v1', {}).get('settings') or api_settings(authority, ref)
+    if (not isinstance(settings, dict)
+            or settings.get('notification_category', 'result') not in _NOTIFICATION_CATEGORIES):
+        raise RuntimeStoreError('invalid_params')
     check_api_settings(adapter, settings)
     return adapter
 
@@ -222,6 +228,10 @@ def admit_api_steps(adapter, **kwargs):
         request_id, preservation_handle, principal_id='api', session_id=sid)
     try:
         settings = {key: kwargs.get(key) for key in _SETTING_KEYS}
+        category = kwargs.get('notification_category') or 'result'
+        if category not in _NOTIFICATION_CATEGORIES:
+            raise RuntimeStoreError('invalid_params')
+        settings['notification_category'] = category
         # Route credentials remain in the server's configuration, never admission JSON.
         route = settings.get('route')
         if route and route.get('api_key'):
@@ -541,6 +551,43 @@ def observe_api_controls(admitted, sink):
             events.observers.discard(observer)
 
 
+def bind_api_notification_metadata(event, prepared):
+    """Attach the validated API notification category to the admitted event."""
+    category = prepared.get('notification_category', 'result')
+    if category not in _NOTIFICATION_CATEGORIES:
+        category = 'result'
+    event.metadata = {
+        **(event.metadata or {}),
+        'notification_category': category,
+    }
+
+
+def apply_api_notification_presentation(event, result, captured):
+    """Project category and the frozen presentation decision after the real result settles."""
+    if not isinstance(result, dict):
+        return result
+    prepared = api_execution.get()
+    category = prepared.get('notification_category') if isinstance(prepared, dict) else None
+    if category not in _NOTIFICATION_CATEGORIES:
+        category = (event.metadata or {}).get('notification_category')
+    if category not in _NOTIFICATION_CATEGORIES:
+        category = 'result'
+    muted = getattr(event, '_notification_reply_muted', None)
+    if not isinstance(muted, bool):
+        from gateway.warning_notifications import diagnostic_turn_muted
+        muted = diagnostic_turn_muted(
+            {'notification_category': category}, event.source.platform)
+    result = {
+        **result,
+        '_notification_category': category,
+        '_notification_presentation_suppressed': category == 'diagnostic' and bool(muted),
+    }
+    for key in ('terminal_result', 'result'):
+        if key in captured:
+            captured[key] = result
+    return result
+
+
 def prepare_api_execution(authority, ref, payload):
     adapter = check_api_turn(authority, ref, payload)
     data = payload.get('api_turn_v1')
@@ -552,6 +599,7 @@ def prepare_api_execution(authority, ref, payload):
     return {'adapter': adapter, 'settings': settings, 'history': data['history'] if data else None,
             'content': content, 'turn_author': data.get('turn_author') if data else None,
             'relay_metadata': data.get('relay_metadata') if data else None,
+            'notification_category': settings.get('notification_category', 'result'),
             'browser_control': _rebind_browser_control(adapter, data)}
 
 

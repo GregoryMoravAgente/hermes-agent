@@ -643,6 +643,91 @@ def _write_guard_cache_atomic(cache_file: Path, content: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def bind_authority_runtime_custody(runner, authority):
+    """Bind a real authority's epoch and identity to the test runner's custody seam."""
+    from pathlib import Path
+
+    from gateway.runtime_custody import install_runtime_custody
+
+    home = str(Path(authority.db.db_path).resolve().parent)
+    runner.session_runtime_descriptor = {
+        'instance_id': authority.instance_id,
+        'authority_epoch': authority.epoch,
+        'profile_id': authority.profile_id,
+        'served_profiles': [{'profile_id': authority.profile_id, 'home': home}],
+    }
+    return install_runtime_custody(runner)
+
+
+def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False):
+    """Yield an API adapter after the real single-profile runtime bootstrap has completed.
+
+    This is an explicit context manager for tests that intentionally construct their own adapter;
+    it is never autouse. The adapter receives the production descriptor, authority registry,
+    process ownership, and coordinator before the test patches only its model boundary.
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def owned():
+        import hermes_state
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.run import GatewayRunner
+        from gateway.run_runtime import initialize_gateway_runtime
+        from gateway.runtime_ownership import process_ownership
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+
+        home = (tmp_path / 'api-profile').resolve()
+        requested_config = (tmp_path / 'config.yaml').read_text() if (tmp_path / 'config.yaml').exists() else None
+        monkeypatch.setenv('HERMES_HOME', str(home))
+        monkeypatch.setattr('gateway.run._hermes_home', home)
+        monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+        home_token = set_hermes_home_override(home)
+        reserved = False
+        runner = None
+        adapter = None
+        try:
+            with FakeLLMServer(default_text='runtime-custody-fixture-ok') as provider:
+                extra_config = requested_config or ''
+                if extra_config.strip() == '{}':
+                    extra_config = ''
+                write_hermes_home(home, provider.base_url, extra_config=extra_config)
+                process_ownership.reserve([home])
+                reserved = True
+                runner = GatewayRunner(GatewayConfig(sessions_dir=home / 'sessions'))
+                extra = {'key': api_key} if api_key else {}
+                adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+                adapter.gateway_runner = runner
+                runner.adapters = {Platform.API_SERVER: adapter}
+                await initialize_gateway_runtime(runner)
+                runner._wire_adapter_handlers(adapter)
+                if legacy:
+                    # The pre-authority route is supported only after the real bootstrap has
+                    # installed process ownership, descriptor, database, and coordinator.
+                    runner.session_authority = None
+                    runner.session_authorities = None
+                yield adapter
+        finally:
+            if adapter is not None:
+                adapter._response_store.close()
+                adapter._run_idempotency_store.close()
+            if runner is not None:
+                runner.session_store.close_all_db_handles()
+                runner.close_all_session_db_handles()
+            if reserved:
+                process_ownership.close()
+            reset_hermes_home_override(home_token)
+
+    return owned()
+
+
+def runtime_owned_legacy_api(tmp_path, monkeypatch, *, api_key=None):
+    """Real API bootstrap followed by the explicit supported pre-authority topology."""
+    return runtime_owned_api(tmp_path, monkeypatch, api_key=api_key, legacy=True)
+
+
 @pytest.fixture
 def owner(tmp_path):
     """A canonical ``SessionAuthority`` over a fresh profile ``state.db``."""
@@ -651,8 +736,6 @@ def owner(tmp_path):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
-    from hermes_cli.backend_retirement import RetirementFence
     from hermes_state import SessionDB
     from hermes_state_runtime import begin_runtime_epoch
 
@@ -663,8 +746,7 @@ def owner(tmp_path):
     authority = SessionAuthority(runner, profile_id='default', instance_id='first', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='first'))
     runner.session_authority = authority
-    runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
+    bind_authority_runtime_custody(runner, authority)
     yield authority
     db.close()
 

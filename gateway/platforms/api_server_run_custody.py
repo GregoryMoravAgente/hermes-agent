@@ -211,7 +211,7 @@ _LEGACY_AUTHORITY_KEYS = frozenset({
     "requested_runtime", "route_source", "confirmed_runtime_lock", "bind_declared_conversation",
     "request_id", "run_owner_scope", "history_from_session", "session_history_delivery",
     "turn_author", "resume_unanswered_turn", "relay_metadata", "approval_notify_callback",
-    "approval_session_key",
+    "approval_session_key", "notification_category",
 })
 
 
