@@ -8,9 +8,11 @@ boundary in the test output.
 
 from __future__ import annotations
 
+import atexit
 import ctypes
 import hashlib
 import json
+import os
 from pathlib import Path
 import shlex
 import sys
@@ -23,15 +25,78 @@ _MAX_ATTACHED_BYTES = 8192
 _MAX_JOB_QUERY_BYTES = 1024 * 1024
 
 
-def encoded_python_source(source: str) -> str:
-    """Return an argv-safe Python wrapper preserving generated source text."""
-    return "exec(compile(" + repr(source) + ",'<hermes-custody-generated>','exec'))"
+_GENERATED_SOURCE_FILES: set[Path] = set()
+_GENERATED_SOURCE_DIRECTORIES: set[Path] = set()
 
 
-def shell_python_command(source: str) -> str:
-    """Build the existing Bash command with a literal Python source payload."""
-    return f"{shlex.quote(sys.executable)} -c {shlex.quote(encoded_python_source(source))}"
+def _cleanup_generated_source_files() -> None:
+    """Remove generated files only after the test process has finished its work."""
+    for path in tuple(_GENERATED_SOURCE_FILES):
+        try:
+            path.unlink()
+        except OSError:
+            pass
+    for directory in tuple(_GENERATED_SOURCE_DIRECTORIES):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
+
+atexit.register(_cleanup_generated_source_files)
+
+
+def _bash_arg(value: Path | str) -> str:
+    """Quote one path for Bash after normalizing native Windows separators."""
+    return shlex.quote(os.fspath(value).replace("\\", "/"))
+
+
+def _write_generated_source(source: str, temp_dir: Path | str | None = None) -> Path:
+    """Write exact UTF-8 source to a private file that remains until process exit."""
+    if not isinstance(source, str):
+        raise TypeError("generated source must be text")
+    owned_directory = temp_dir is None
+    if owned_directory:
+        directory = Path(tempfile.mkdtemp(prefix="hermes-custody-source-"))
+    else:
+        directory = Path(temp_dir)
+    if owned_directory:
+        _GENERATED_SOURCE_DIRECTORIES.add(directory)
+    descriptor, raw_path = tempfile.mkstemp(
+        prefix=".hermes-custody-", suffix=".py", dir=directory,
+    )
+    path = Path(raw_path)
+    try:
+        os.chmod(path, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(source.encode("utf-8"))
+            stream.flush()
+    except BaseException:
+        if descriptor >= 0:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if owned_directory:
+            _GENERATED_SOURCE_DIRECTORIES.discard(directory)
+            try:
+                directory.rmdir()
+            except OSError:
+                pass
+        raise
+    _GENERATED_SOURCE_FILES.add(path)
+    return path
+
+
+def shell_python_command(source: str, *, temp_dir: Path | str | None = None) -> str:
+    """Build a Bash command that runs exact source from a closed UTF-8 file."""
+    source_path = _write_generated_source(source, temp_dir)
+    return f"{_bash_arg(sys.executable)} {_bash_arg(source_path)}"
 
 
 def child_phase_prefix(path: Path) -> str:

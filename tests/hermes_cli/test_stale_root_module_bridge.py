@@ -56,6 +56,21 @@ def test_fresh_hermes_cli_import_heals_stale_utils_missing_file_signature(
     assert hasattr(sys.modules["utils"], "file_signature")
 
 
+def test_fresh_backup_restore_import_heals_stale_utils_missing_mkstemp_beside(
+    monkeypatch, pre_handoff_purge
+):
+    """A pre-handoff updater retains root utils while importing the new backup consumer."""
+    import utils
+
+    monkeypatch.delattr(utils, "mkstemp_beside")
+    pre_handoff_purge()
+    assert "hermes_cli.backup_restore" not in sys.modules
+
+    module = importlib.import_module("hermes_cli.backup_restore")
+    assert callable(module.mkstemp_beside)
+    assert hasattr(sys.modules["utils"], "mkstemp_beside")
+
+
 def test_drop_stale_root_modules_leaves_complete_utils_alone():
     import utils
     from hermes_cli.stale_modules import drop_stale_root_modules
