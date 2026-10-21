@@ -17,7 +17,13 @@ from typing import Any
 
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from hermes_state_common import _placeholders
-
+from agent.session_persistence_physical_tip import (
+    _gateway_writer_physical_witness_valid,
+    _is_direct_physical_tip_witness,
+    _is_managed_receipt_witness,
+    _managed_physical_tip_valid,
+    _physical_tip_value,
+)
 
 @dataclass(frozen=True)
 class SessionDBWriteProof:
@@ -33,7 +39,6 @@ class SessionDBWriteProof:
     # such a proof cannot cross the managed custody terminal fence.
     result_row_ids: tuple[int, ...] = ()
 
-
 @dataclass(frozen=True)
 class GatewayWriterProofHandoff:
     """Private one-turn handoff of the canonical writer proof to Gateway.
@@ -46,7 +51,7 @@ class GatewayWriterProofHandoff:
     writer_proof: SessionDBWriteProof
     binding: Any
     turn_id: str
-
+    physical_tip_witness: Any = None
 
 @dataclass(frozen=True)
 class ManagedIntermediateWriterFence:
@@ -75,7 +80,6 @@ class ManagedIntermediateWriterFence:
     state: str = "pending"
     reason: str = ""
 
-
 _GATEWAY_WRITER_PROOF_REQUEST = "_classic_writer_proof_requested"
 _GATEWAY_WRITER_PROOF_HANDOFF = "_classic_writer_proof_handoff"
 _GATEWAY_WRITER_PROOF_BINDING = "_classic_writer_proof_binding"
@@ -89,7 +93,6 @@ _GATEWAY_WRITER_INTERMEDIATE_SEAL = "_classic_writer_intermediate_fence_seal"
 _GATEWAY_WRITER_INTERMEDIATE_PREFIX_HANDOFF = "_classic_writer_intermediate_prefix_handoff"
 _GATEWAY_WRITER_UNKNOWN = object()
 _UNSET = object()
-
 
 def _set_managed_intermediate_fence_aliases(
     agent: Any, parent: Any, receipt: Any, fence: ManagedIntermediateWriterFence,
@@ -176,12 +179,13 @@ def _managed_intermediate_context(agent: Any, client: Any):
         or getattr(receipt, "state", None) in {"unknown", "closed", "released"}
         or request is None
         or getattr(receipt, "ephemeral_process", False) is not True
-        or getattr(agent, "session_id", None) != getattr(binding, "session_id", None)
     ):
         return None
     try:
         validate_turn_binding(binding)
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _managed_physical_tip_valid(agent, binding):
         return None
     lease_id = getattr(getattr(request, "lease", None), "lease_id", None)
     if type(lease_id) is not str or not lease_id:
@@ -247,6 +251,10 @@ def _managed_intermediate_recovery_context(
         _require_authoritative_row(binding, row, status="started")
         _require_live_execution(binding)
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _managed_physical_tip_valid(
+        agent, binding, _physical_tip_value(fence.physical_witness),
+    ):
         return None
     return parent, service, request, receipt, binding
 
@@ -471,6 +479,9 @@ def managed_intermediate_writer_fence(agent: Any, client: Any):
         or fence.writer_proof.session_id != getattr(agent, "session_id", None)
         or fence.writer_proof.store_path != _store_path(agent)
         or not _managed_intermediate_fence_aliases_match(agent, parent, receipt, fence)
+        or not _managed_physical_tip_valid(
+            agent, binding, _physical_tip_value(fence.physical_witness),
+        )
         or not _managed_intermediate_prefix_identity_matches(agent, client, fence)
         or not _managed_intermediate_witness_shape(fence)
         or not _managed_writer_proof_readback(agent, fence.writer_proof)
@@ -900,6 +911,12 @@ def prepare_gateway_writer_proof_recovery(
         or getattr(receipt, "external_publication_proof", None) is not None
     ):
         return False
+    if not _managed_physical_tip_valid(
+        agent, binding, _physical_tip_value(
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        ),
+    ):
+        return False
     expected = tuple(zip(proof.row_ids, proof.row_roles, proof.row_snapshots))
     if (
         not expected
@@ -1019,15 +1036,28 @@ def prepare_gateway_writer_postcommit_recovery(
     if not _gateway_proof_rows_match(agent, messages, proof, proof.session_id):
         return None
     capture = getattr(client, "capture_managed_durable_receipt_witness", None)
-    validate = getattr(client, "validate_managed_durable_receipt_witness", None)
-    if not callable(capture) or not callable(validate):
-        return None
+    if _is_direct_physical_tip_witness(retained_witness):
+        if not _gateway_writer_physical_witness_valid(
+            agent, binding, proof, retained_witness,
+        ):
+            return None
+        physical_witness = retained_witness
+    else:
+        if not callable(capture):
+            return None
+        try:
+            physical_witness = capture(agent, proof)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            not _is_managed_receipt_witness(physical_witness)
+            or getattr(physical_witness, "writer_proof", None) is not proof
+            or not _gateway_writer_physical_witness_valid(
+                agent, binding, proof, physical_witness,
+            )
+        ):
+            return None
     try:
-        physical_witness = capture(agent, proof)
-        if physical_witness is None or physical_witness.writer_proof is not proof:
-            return None
-        if validate(agent, proof, physical_witness) is not True:
-            return None
         if any(
             getattr(physical_witness, field, None) is not getattr(retained_witness, field, None)
             for field in (
@@ -1040,6 +1070,7 @@ def prepare_gateway_writer_postcommit_recovery(
             getattr(physical_witness, field, None) != getattr(retained_witness, field, None)
             for field in (
                 "provider_identity", "binding_snapshot_identity", "durable_identity", "binding_identity",
+                "physical_tip_witness",
             )
         ):
             return None
@@ -1117,13 +1148,44 @@ def remember_gateway_writer_proof(
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
         return False
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+    except (AttributeError, ImportError):
+        TurnCustodyBinding = None
+    if TurnCustodyBinding is not None and isinstance(binding, TurnCustodyBinding):
+        try:
+            from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+            current_witness = resolve_physical_tip_witness(binding, session_id, _store_path(agent))
+        except (
+            AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error,
+        ):
+            current_witness = None
+        supplied_witness = _physical_tip_value(physical_witness)
+        if current_witness is None or (
+            physical_witness is not None and supplied_witness != current_witness
+        ):
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_TURN_ID, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_BOUND_BINDING, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
+            return False
     setattr(agent, _GATEWAY_WRITER_PROOF_TURN_ID, turn_id)
     setattr(agent, _GATEWAY_WRITER_PROOF_BOUND_BINDING, binding)
     if explicit:
         # Preserve the exact binding for the later Gateway handoff even when the
         # finalizer runs outside the original ContextVar scope.
         setattr(agent, _GATEWAY_WRITER_PROOF_BINDING, binding)
-    if physical_witness is None:
+    if TurnCustodyBinding is not None and isinstance(binding, TurnCustodyBinding):
+        # Direct writers have no ACP receipt wrapper, so retain the raw canonical witness.
+        # Managed ACP writers retain their receipt witness, whose physical-tip member was
+        # checked against this same immutable value above.
+        setattr(
+            agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS,
+            physical_witness if physical_witness is not None else current_witness,
+        )
+        setattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, True)
+    elif physical_witness is None:
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
     else:
@@ -1170,6 +1232,10 @@ def _gateway_proof_reuse_context(
         or proof.session_id != session_id
         or proof.store_path != _store_path(agent)
         or not _classic_binding_is_current(binding, session_id)
+        or not _managed_physical_tip_valid(
+            agent, binding,
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        )
     ):
         return None
     return turn_id, binding, session_id
@@ -1200,6 +1266,140 @@ def _gateway_proof_rows_match(
     return validated == proof
 
 
+def _gateway_writer_prefix_matches(
+    agent: Any, messages: Any, proof: SessionDBWriteProof, binding: Any,
+) -> bool:
+    """Recognize the same I04 writer's staged prefix before its terminal result rows.
+
+    The first user row may be flushed before the model answer exists.  That prefix is still
+    owned by this exact managed turn; the terminal flush must extend it with the new assistant
+    rows instead of classifying the expected suffix as a second writer or as UNKNOWN.
+    """
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+    except (AttributeError, ImportError):
+        return False
+    if not isinstance(binding, TurnCustodyBinding):
+        return False
+    prefix = _managed_current_turn_prefix(agent, messages)
+    if prefix is None:
+        return False
+    expected = tuple(_persisted_row_spec(message) for message in prefix)
+    if any(row is None for row in expected):
+        return False
+    typed = tuple(row for row in expected if row is not None)
+    if (
+        proof.store_path != _store_path(agent)
+        or proof.session_id != getattr(agent, "session_id", None)
+        or proof.row_ids != tuple(row_id for row_id, _role, _snapshot in typed)
+        or proof.row_roles != tuple(role for _row_id, role, _snapshot in typed)
+        or proof.row_snapshots != tuple(snapshot for _row_id, _role, snapshot in typed)
+        or proof.row_sessions != tuple(proof.session_id for _row_id, _role, _snapshot in typed)
+        or not typed
+    ):
+        return False
+    try:
+        return _read_expected_rows(agent, proof.session_id, typed) == typed
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return False
+
+
+def _gateway_writer_merged_prefix_matches(
+    agent: Any, messages: Any, proof: SessionDBWriteProof, binding: Any,
+) -> bool:
+    """Recognize a current user row folded by the canonical alternation-repair pass.
+
+    A detached delivery is a durable user row.  When the next client prompt is loaded, the
+    repair belt may merge that delivery row with the newly staged user row.  The repair removes
+    the live persisted marker and carries the staged row's physical id in its existing merge
+    witness.  Continue only when that witness, the exact active DB rows, and their durable UIDs
+    all identify the retained proof; a copied or marker-less message cannot take this path.
+    """
+    try:
+        from agent.context_compressor import _DB_PERSISTED_MARKER
+        from agent.conversation_compression_archive import ABSORBED_ROW_IDS, MERGED_DURABLE_ROWS
+        from agent.message_metadata import ABSORBED_MESSAGE_UIDS
+        from gateway.runtime_service_custody import TurnCustodyBinding
+    except (AttributeError, ImportError):
+        return False
+    if not isinstance(binding, TurnCustodyBinding):
+        return False
+    session_id = getattr(agent, "session_id", None)
+    if (
+        type(proof) is not SessionDBWriteProof
+        or proof.store_path != _store_path(agent)
+        or not isinstance(session_id, str)
+        or not session_id
+        or proof.session_id != session_id
+        or not proof.row_ids
+        or any(role != "user" for role in proof.row_roles)
+        or len(proof.row_ids) != len(proof.row_roles)
+        or len(proof.row_ids) != len(proof.row_snapshots)
+        or proof.row_sessions != tuple(session_id for _row_id in proof.row_ids)
+        or proof.result_row_ids
+    ):
+        return False
+    anchor_index = _latest_user_index(messages) if isinstance(messages, list) else None
+    if anchor_index is None:
+        return False
+    anchor = messages[anchor_index]
+    if (
+        not isinstance(anchor, dict)
+        or anchor.get("role") != "user"
+        or anchor.get(_DB_PERSISTED_MARKER) is True
+        or type(anchor.get(MERGED_DURABLE_ROWS)) is not int
+        or anchor.get(MERGED_DURABLE_ROWS) < len(proof.row_ids) + 1
+    ):
+        return False
+    absorbed_ids = anchor.get(ABSORBED_ROW_IDS)
+    if (
+        type(absorbed_ids) is not list
+        or any(type(row_id) is not int or row_id <= 0 for row_id in absorbed_ids)
+        or tuple(absorbed_ids) != tuple(proof.row_ids)
+    ):
+        return False
+    absorbed_uids = anchor.get(ABSORBED_MESSAGE_UIDS)
+    if type(absorbed_uids) is not list or any(type(uid) is not str or not uid for uid in absorbed_uids):
+        return False
+    tail = messages[anchor_index:]
+    if (
+        len(tail) < 2
+        or any(not isinstance(message, dict) for message in tail)
+        or any(message.get(_DB_PERSISTED_MARKER) is True for message in tail)
+        or any(message.get("role") not in {"user", "assistant", "tool"} for message in tail)
+        or any(message.get("role") == "user" for message in tail[1:])
+    ):
+        return False
+    intended = _intended_messages(messages)
+    if not intended or intended[0] is not anchor or any(
+        id(message) in {id(item) for item in intended} for message in messages[:anchor_index]
+    ):
+        return False
+    expected = tuple(zip(proof.row_ids, proof.row_roles, proof.row_snapshots))
+    try:
+        stored = _read_committed_rows(agent._session_db, session_id, proof.row_ids)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return False
+    if len(stored) != len(expected):
+        return False
+    for row, (row_id, role, snapshot) in zip(stored, expected):
+        try:
+            from agent.transcript_repair import transcript_row_snapshot
+            if (
+                row["id"] != row_id
+                or row["session_id"] != session_id
+                or row["role"] != role
+                or row["active"] != 1
+                or transcript_row_snapshot(row) != snapshot
+                or type(row["message_uid"]) is not str
+                or row["message_uid"] not in absorbed_uids
+            ):
+                return False
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return False
+    return True
+
+
 def reuse_gateway_writer_proof(
     agent: Any, messages: Any, proof: Any, requested: Any, explicit: bool,
 ) -> SessionDBWriteProof | None:
@@ -1219,17 +1419,31 @@ def reuse_gateway_writer_proof(
         return _GATEWAY_WRITER_UNKNOWN if managed_witness_required else None
     turn_id, _binding, session_id = context
     if managed_witness_required:
-        acp = getattr(agent, "_managed_acp_client", None)
-        validator = getattr(acp, "validate_managed_durable_receipt_witness", None)
         physical_witness = getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
-        if not callable(validator) or physical_witness is None or validator(
-            agent, proof, physical_witness,
-        ) is not True:
+        if not _gateway_writer_physical_witness_valid(
+            agent, _binding, proof, physical_witness,
+        ):
             return _GATEWAY_WRITER_UNKNOWN
     # Reuse the existing handoff validator for current-turn row identity, exact binding type, and
     # active I04 validation.  Its result is intentionally discarded: publication must still add
     # the result suffix once at the original terminal boundary.
     if _gateway_writer_handoff(agent, messages, proof, turn_id) is None:
+        # Managed ACP retains a physical receipt across its staged prefix.  Only its canonical
+        # terminal finalizer may extend that proof; direct/classic writers retain the existing
+        # prefix-repair route used by the I04 delivery boundary.
+        prefix_repair_allowed = (
+            getattr(agent, "_managed_acp_client", None) is None
+            or getattr(agent, "_managed_finalize_shell_turn", False) is True
+        )
+        if prefix_repair_allowed and _gateway_writer_prefix_matches(agent, messages, proof, _binding):
+            # The initial user-prefix proof is the same authenticated writer occurrence.  Let
+            # the staged writer append the terminal rows and remember the combined readback.
+            return None
+        if prefix_repair_allowed and _gateway_writer_merged_prefix_matches(agent, messages, proof, _binding):
+            # The canonical alternation repair folded the same authenticated user row into its
+            # current delivery carrier.  Let the source writer rewrite that carrier and append
+            # the terminal rows under the same binding instead of opening a second writer.
+            return None
         return _GATEWAY_WRITER_UNKNOWN if managed_witness_required else None
     if _gateway_proof_rows_match(agent, messages, proof, session_id):
         return proof
@@ -1318,17 +1532,35 @@ def _gateway_writer_handoff(
             # Validate the real I04 parent, authoritative admission row, and live execution before
             # the writer proof can be published. Scalar fields are never an ownership proof.
             validate_turn_binding(binding)
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
             return None
     elif not isinstance(binding, ClassicWriterBinding):
         return None
-    if getattr(binding, "session_id", None) != session_id:
+    physical_tip_witness = None
+    if isinstance(binding, TurnCustodyBinding):
+        try:
+            from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+            physical_tip_witness = resolve_physical_tip_witness(
+                binding, session_id, _store_path(agent),
+            )
+        except (
+            AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error,
+        ):
+            return None
+        retained_tip = _physical_tip_value(
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        )
+        if physical_tip_witness is None or retained_tip is None or retained_tip != physical_tip_witness:
+            return None
+    if (getattr(binding, "session_id", None) != session_id
+            and not isinstance(binding, TurnCustodyBinding)):
         return None
     result_row_ids = row_ids[1:]
     if not result_row_ids:
         return None
     bound_proof = replace(proof, result_row_ids=result_row_ids)
-    return GatewayWriterProofHandoff(bound_proof, binding, turn_id)
+    return GatewayWriterProofHandoff(bound_proof, binding, turn_id, physical_tip_witness)
 
 
 def publish_gateway_writer_proof(
@@ -1344,7 +1576,6 @@ def publish_gateway_writer_proof(
     setattr(agent, _GATEWAY_WRITER_PROOF_HANDOFF, handoff)
     _clear_gateway_writer_proof_request(agent)
     return handoff
-
 
 def peek_gateway_writer_proof(agent: Any) -> GatewayWriterProofHandoff | None:
     handoff = getattr(agent, _GATEWAY_WRITER_PROOF_HANDOFF, None)
@@ -1369,26 +1600,28 @@ def _store_path(agent: Any) -> str | None:
     except (OSError, TypeError, ValueError):
         return None
 
-
-def _intended_messages(messages: list[dict[str, Any]]) -> tuple[dict[str, Any], ...]:
-    """Select the exact unpersisted application messages the canonical writer must consume."""
+def _intended_messages(
+    messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None = None,
+    *, replay_history: bool = False,
+) -> tuple[dict[str, Any], ...]:
+    """Select rows the canonical writer will consume, honoring its history identity boundary."""
     from agent.context_compressor import _DB_PERSISTED_MARKER
     from agent.session_persistence import _is_ephemeral_scaffolding
-
+    history_ids = ({id(item) for item in conversation_history if isinstance(item, dict)}
+                   if conversation_history is not None and not replay_history else set())
     return tuple(
         message for message in messages
         if isinstance(message, dict)
         and not _is_ephemeral_scaffolding(message)
         and not message.get(_DB_PERSISTED_MARKER)
+        and id(message) not in history_ids
     )
-
 
 def _restore_capture_attribute(agent: Any, name: str, sentinel: object, previous: Any) -> None:
     if previous is sentinel:
         agent.__dict__.pop(name, None)
     else:
         setattr(agent, name, previous)
-
 
 def _read_committed_rows(db: Any, session_id: str, row_ids: tuple[int, ...]) -> list[Any]:
     """Read the exact writer-issued rows through SessionDB's canonical raw read guard."""
@@ -1407,7 +1640,6 @@ def _read_committed_rows(db: Any, session_id: str, row_ids: tuple[int, ...]) -> 
             if row_id in chunk:
                 selected[row_id] = row
     return [selected[row_id] for row_id in row_ids if row_id in selected]
-
 
 def _captured_writer_row(item: Any) -> tuple[int, str, str] | None:
     if type(item) is not tuple or len(item) != 3:
@@ -1431,7 +1663,6 @@ def _captured_writer_row(item: Any) -> tuple[int, str, str] | None:
         return None
     return row_id, role, marker
 
-
 def _captured_writer_rows(
     captured: Any, intended: tuple[dict[str, Any], ...],
 ) -> tuple[tuple[int, str, str], ...] | None:
@@ -1447,7 +1678,6 @@ def _captured_writer_rows(
         return None
     return typed_rows
 
-
 def _capture_writer_batch(
     agent: Any, messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None,
 ) -> tuple[Any, Any]:
@@ -1462,7 +1692,6 @@ def _capture_writer_batch(
     finally:
         _restore_capture_attribute(agent, "_managed_proof_capture", sentinel, previous_capture)
         _restore_capture_attribute(agent, "_managed_proof_batch", sentinel, previous_batch)
-
 
 
 def _latest_user_index(messages: list[dict[str, Any]]) -> int | None:
@@ -1597,13 +1826,29 @@ def _proof_from_writer_rows(
     return None if checked is None else _proof_from_validated_rows(store_path, session_id, checked)
 
 
+def _managed_writer_history(
+    messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None,
+    merged_prefix: SessionDBWriteProof | None,
+) -> tuple[bool, list[dict[str, Any]] | None]:
+    if merged_prefix is None:
+        return True, conversation_history
+    anchor_index = _latest_user_index(messages)
+    if anchor_index is None:
+        return False, None
+    if conversation_history is None:
+        return True, None
+    anchor = messages[anchor_index]
+    return True, [item for item in conversation_history if item is not anchor]
+
+
 def flush_messages_with_proof(
     agent: Any, messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None = None,
 ) -> SessionDBWriteProof | None:
     """Flush once, then prove every intended writer-issued row through SessionDB readback."""
     if getattr(agent, "_persist_disabled", False) or getattr(agent, "_session_db", None) is None:
         return None
-    intended = _intended_messages(messages)
+    replay_history = getattr(agent, "_session_row_replay_pending", None) == getattr(agent, "session_id", None)
+    intended = _intended_messages(messages, conversation_history, replay_history=replay_history)
     if not intended:
         return None
     result, captured = _capture_writer_batch(agent, messages, conversation_history)
@@ -1623,38 +1868,61 @@ def flush_messages_with_proof(
 def flush_messages_with_managed_current_turn_proof(
     agent: Any, messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None = None,
 ) -> SessionDBWriteProof | None:
-    """Read back the staged current-turn prefix, then flush and prove one fresh writer batch."""
+    """Read back a staged prefix, then flush and prove one fresh writer batch.
+
+    A canonical user repair may carry the authenticated prior row as a markerless merge carrier;
+    remove that carrier from the history identity set so the DB writer emits the repaired user
+    row before the terminal assistant row.
+    """
     if getattr(agent, "_persist_disabled", False) or getattr(agent, "_session_db", None) is None:
         return None
     prefix = _managed_current_turn_prefix(agent, messages)
+    merged_prefix: SessionDBWriteProof | None = None
     if prefix is None:
-        return None
-    intended = _intended_messages(messages)
+        previous = getattr(agent, "_managed_shell_writer_proof", None)
+        requested, explicit = _requested_gateway_binding(agent)
+        binding = _active_gateway_binding(requested, explicit)
+        if _gateway_writer_merged_prefix_matches(agent, messages, previous, binding):
+            merged_prefix = previous
+        else:
+            return None
     store_path = _store_path(agent)
     session_id = getattr(agent, "session_id", None)
-    if (
-        not intended or store_path is None
-        or type(session_id) is not str or not session_id
-    ):
+    if store_path is None or type(session_id) is not str or not session_id:
         return None
-    prefix_rows = tuple(_persisted_row_spec(message) for message in prefix)
-    if any(row is None for row in prefix_rows):
+    typed_prefix: tuple[tuple[int, str, str], ...] = ()
+    if merged_prefix is None:
+        prefix_rows = tuple(_persisted_row_spec(message) for message in prefix)
+        if any(row is None for row in prefix_rows):
+            return None
+        typed_prefix = tuple(row for row in prefix_rows if row is not None)
+        prefix_ids = tuple(row_id for row_id, _role, _marker in typed_prefix)
+        if len(set(prefix_ids)) != len(prefix_ids):
+            return None
+        if _read_expected_rows(agent, session_id, typed_prefix) is None:
+            return None
+    writer_valid, writer_history = _managed_writer_history(messages, conversation_history, merged_prefix)
+    if not writer_valid:
         return None
-    typed_prefix = tuple(row for row in prefix_rows if row is not None)
-    prefix_ids = tuple(row_id for row_id, _role, _marker in typed_prefix)
-    if len(set(prefix_ids)) != len(prefix_ids):
+    replay_history = getattr(agent, "_session_row_replay_pending", None) == session_id
+    intended = _intended_messages(messages, writer_history, replay_history=replay_history)
+    if not intended:
         return None
-    if _read_expected_rows(agent, session_id, typed_prefix) is None:
-        return None
-    result, captured = _capture_writer_batch(agent, messages, conversation_history)
+    result, captured = _capture_writer_batch(agent, messages, writer_history)
     if result is not True:
         return None
     writer_rows = _captured_writer_rows(captured, intended)
     if writer_rows is None:
         return None
     typed_writer = _read_expected_rows(agent, session_id, writer_rows)
+    if typed_writer is None:
+        return None
+    if merged_prefix is not None:
+        if _current_turn_row_specs(messages) != typed_writer:
+            return None
+        return _proof_from_validated_rows(store_path, session_id, typed_writer)
     checked_prefix = _read_expected_rows(agent, session_id, typed_prefix)
-    if typed_writer is None or checked_prefix is None:
+    if checked_prefix is None:
         return None
     prefix_id_set = {row_id for row_id, _role, _marker in checked_prefix}
     writer_ids = tuple(row_id for row_id, _role, _marker in typed_writer)

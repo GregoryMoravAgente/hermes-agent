@@ -1822,4 +1822,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 await self._send_watcher_message(
                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
                 )
+        from gateway.session_recovery_custody import observe_consumer_rows
+        authority = getattr(self, 'session_authority', None)
+        if (
+            authority is not None
+            and isinstance(getattr(authority, 'instance_id', None), str)
+            and isinstance(getattr(authority, 'profile_id', None), str)
+            and isinstance(getattr(authority, 'epoch', None), int)
+            and hasattr(authority, 'db')
+        ):
+            from hermes_state_runtime import list_session_admissions
+            rows = list_session_admissions(authority.db, session_id=session_id, pending_only=False)
+            observe_consumer_rows(
+                authority, 'completion_notification', rows=rows,
+                reason='completion watcher found no accepted admission',
+            )
         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)

@@ -1,5 +1,6 @@
 """Admitted heartbeat work belongs to a conversation, not a reusable route."""
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -169,6 +170,156 @@ async def _real_goal_owner(tmp_path, monkeypatch, *, enable_drain=False, seed_na
         source_identity=automation_source_identity(event, key),
     )
     return runner, adapter, authority, key, entry, event, handoff
+
+
+@pytest.mark.asyncio
+async def test_unbound_goal_tick_delivery_callback_releases_real_reservation(tmp_path, monkeypatch):
+    """A no-child goal decision settles its source-owned tick at the real adapter boundary."""
+    from gateway.session_goal_tick_custody import (
+        attach_tick_handle, reserve_tick, view_for_handle,
+    )
+    from gateway.session_goal_tick_runtime import register_tick_delivery_finalizer
+    from gateway.session_automation_custody import automation_source_identity
+
+    runner, adapter, authority, key, entry, event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        tick = reserve_tick(
+            authority,
+            request_id="goal-no-child-delivery",
+            principal_id="automation:" + key,
+            session_id=authority.logical_owner(entry.session_id),
+            source_identity=automation_source_identity(event, key),
+            kind="goal",
+        )
+        assert tick is not None
+        attach_tick_handle(event, tick, "goal")
+        assert register_tick_delivery_finalizer(runner, event.source, event) is True
+        assert key in adapter._post_delivery_callbacks
+
+        await adapter._fire_post_delivery_callback(key, asyncio.Event())
+
+        assert view_for_handle(authority, tick.handle) is None
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_tick_unknown_does_not_release_sibling_or_accept_stale_handle(tmp_path, monkeypatch):
+    """UNKNOWN custody stays attached to its exact tick while a sibling can settle independently."""
+    from gateway.session_automation_custody import automation_source_identity
+    from gateway.session_goal_tick_custody import (
+        finish_unbound, mark_unknown, reserve_tick, view_for_handle,
+    )
+
+    runner, _adapter, authority, key, entry, event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        source_identity = automation_source_identity(event, key)
+        first = reserve_tick(
+            authority, request_id="goal-unknown-first", principal_id="automation:" + key,
+            session_id=authority.logical_owner(entry.session_id), source_identity=source_identity,
+            kind="goal",
+        )
+        sibling = reserve_tick(
+            authority, request_id="goal-sibling", principal_id="automation:" + key,
+            session_id=authority.logical_owner(entry.session_id), source_identity=source_identity,
+            kind="heartbeat",
+        )
+        assert first is not None and sibling is not None
+
+        mark_unknown(first, "join_failed")
+        assert finish_unbound(first, success=True) is False
+        assert view_for_handle(authority, first.handle) is not None
+
+        assert finish_unbound(sibling, success=True) is True
+        assert view_for_handle(authority, sibling.handle) is None
+        assert view_for_handle(authority, first.handle) is not None
+
+        stale = replace(first.handle, owner_id="goal-stale-copy")
+        refusal = authority._preservation_coordinator().release_unaccepted(stale)
+        assert refusal is not None and refusal.code == "stale_lease"
+        assert view_for_handle(authority, first.handle) is not None
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_tick_close_generation_refuses_late_registration_and_callback(
+    tmp_path, monkeypatch,
+):
+    """Close seals intake: late watchers/ticks and delivery callbacks stay UNKNOWN."""
+    from hermes_state_runtime import RuntimeStoreError
+    from gateway.session_automation_custody import automation_source_identity
+    from gateway.session_goal_tick_custody import (
+        attach_tick_handle, owner_ready, register_watcher, reserve_tick, view_for_handle,
+    )
+    from gateway.session_goal_tick_runtime import register_tick_delivery_finalizer
+
+    runner, adapter, authority, key, entry, event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        source_identity = automation_source_identity(event, key)
+        tick = reserve_tick(
+            authority, request_id="goal-close-race", principal_id="automation:" + key,
+            session_id=authority.logical_owner(entry.session_id), source_identity=source_identity,
+            kind="goal",
+        )
+        assert tick is not None
+        close = authority._preservation_coordinator().begin_close(
+            owner_id="goal-close-owner", scope="process", deadline_s=30,
+        )
+        assert close is not None and close.close_generation >= 1
+
+        assert register_watcher(
+            authority, "late-goal-watcher", "goal", session_id=entry.session_id,
+        ) is None
+        with pytest.raises(RuntimeStoreError, match="runtime_draining"):
+            reserve_tick(
+                authority, request_id="goal-too-late", principal_id="automation:" + key,
+                session_id=authority.logical_owner(entry.session_id), source_identity=source_identity,
+                kind="goal",
+            )
+
+        attach_tick_handle(event, tick, "goal")
+        assert register_tick_delivery_finalizer(runner, event.source, event) is False
+        assert view_for_handle(authority, tick.handle) is not None
+        status = authority._preservation_coordinator().status()
+        record = authority._preservation_coordinator()._records[tick.handle.lease.lease_id]
+        assert record.state == "unknown" and record.reason == "custody_unknown"
+        assert "I08_goals_loops_heartbeat" in status["active_owner_classes"]
+        assert owner_ready(authority, close_generation=close.close_generation) is False
+        assert not adapter._post_delivery_callbacks
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_owner_ready_retains_live_i04_parent_until_post_turn_hook(
+    tmp_path, monkeypatch,
+):
+    """An observed goal source cannot seal while its real managed I04 parent is still live."""
+    from gateway.session_goal_tick_custody import mark_source_observed, owner_ready
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
+
+    fixture = await real_runtime_binding(tmp_path, monkeypatch, include_probe=False)
+    try:
+        binding = await fixture.claim("goal-close-held-parent")
+        authority = fixture.authority
+        mark_source_observed(authority, "producer:goal")
+        close = authority._preservation_coordinator().begin_close(
+            owner_id="goal-close-held-parent-owner", scope="process", deadline_s=30,
+        )
+        assert close is not None and close.close_generation >= 1
+        status = authority._preservation_coordinator().status()
+        assert "I04_fifo_turn_execution" in status["active_owner_classes"]
+        assert binding.parent_handle is authority._preservation_children[binding.admission_id]
+        assert owner_ready(authority, close_generation=close.close_generation) is False
+    finally:
+        fixture.cleanup()
 
 
 @pytest.mark.asyncio

@@ -3,16 +3,20 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
 
 from gateway.platforms.api_server import APIServerAdapter
 from gateway.session_context import clear_session_vars
 from gateway.wake import persist_delegation_delivery
 from hermes_state import SessionDB
+from tests.gateway.conftest import runtime_owned_api
 from tools.delegate_tool_dispatch import _resolve_async_wake_sid
 
 
 @pytest.mark.asyncio
-async def test_detached_dispatch_requires_a_declared_consumer(monkeypatch):
+async def test_detached_dispatch_requires_a_declared_consumer(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SESSION_HISTORY_DELIVERY", "1")
     for capability in (None, "", "1"):
         kw = dict(chat_id="api-parent", session_id="api-parent")
@@ -88,3 +92,38 @@ async def test_delivery_replay_is_atomic_across_continuation_and_busy_turn(tmp_p
     finally:
         peer.close()
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_error_header_controls_are_sanitized_without_changing_body(
+    tmp_path, monkeypatch
+):
+    """The real HTTP route keeps JSON error text while making its header wire-safe."""
+    async with runtime_owned_api(tmp_path, monkeypatch, api_key="header-test-key") as adapter:
+        async def partial_error(**_kwargs):
+            return ({
+                "final_response": "partial answer",
+                "completed": False,
+                "partial": True,
+                "failed": False,
+                "error": "provider failed\r\nX-Injected: yes\x01",
+                "messages": [],
+            }, {})
+
+        adapter._run_agent = partial_error
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        async with TestClient(TestServer(app)) as client:
+            response = await client.post(
+                "/v1/chat/completions",
+                headers={"Authorization": "Bearer header-test-key"},
+                json={"messages": [{"role": "user", "content": "header probe"}]},
+            )
+            assert response.status == 200
+            error_header = response.headers["X-Hermes-Error"]
+            assert "\r" not in error_header
+            assert "\n" not in error_header
+            assert "\x01" not in error_header
+            body = await response.json()
+            assert body["choices"][0]["message"]["content"] == "partial answer"
+            assert body["hermes"]["error"] == "provider failed\r\nX-Injected: yes\x01"

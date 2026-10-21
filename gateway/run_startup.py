@@ -753,6 +753,10 @@ class GatewayStartupMixin:
             ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+        from gateway.session_recovery_custody import observe_consumer_rows
+        authority = getattr(self, 'session_authority', None)
+        if authority is not None:
+            observe_consumer_rows(authority, 'startup', reason='startup recovery found no accepted native row')
         return resumed, ledgered
 
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:

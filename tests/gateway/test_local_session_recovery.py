@@ -116,6 +116,7 @@ async def test_branch_and_local_entries_keep_the_routing_prune_sweep_running(tmp
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
+    from gateway.runtime_custody import install_runtime_custody
     from gateway.session_mutations import mutate_session
     from gateway import run
 
@@ -123,6 +124,11 @@ async def test_branch_and_local_entries_keep_the_routing_prune_sweep_running(tmp
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    runner.session_runtime_descriptor = {
+        'instance_id': authority.instance_id,
+        'authority_epoch': authority.epoch,
+    }
+    install_runtime_custody(runner)
     actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read', 'session:control'}), 'socket')
     ref = create_local_session(authority, actor, {'request_id': 'r', 'source': 'gui', 'cwd': str(tmp_path),
                                                   'model': 'frozen', 'toolsets': []})
@@ -152,6 +158,7 @@ async def test_delete_retires_owner_receipts_and_never_resurrects_the_id(tmp_pat
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
+    from gateway.runtime_custody import install_runtime_custody
     from gateway.session_mutations import mutate_session
     from gateway import run
     from hermes_state_runtime import RuntimeStoreError
@@ -160,6 +167,11 @@ async def test_delete_retires_owner_receipts_and_never_resurrects_the_id(tmp_pat
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    runner.session_runtime_descriptor = {
+        'instance_id': authority.instance_id,
+        'authority_epoch': authority.epoch,
+    }
+    install_runtime_custody(runner)
     actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read', 'session:control'}), 'socket')
     params = {'request_id': 'r', 'source': 'gui', 'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []}
     local = create_local_session(authority, actor, params)

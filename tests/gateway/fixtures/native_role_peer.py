@@ -18,6 +18,7 @@ async def probe(peer):
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
+    from gateway.runtime_custody import install_runtime_custody
     from gateway.session_authority import initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
     from hermes_state_runtime import list_session_admissions
@@ -58,6 +59,14 @@ async def probe(peer):
 
     runner = GatewayRunner()
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='role-peer')
+    state = Path(os.environ['HERMES_HOME']).resolve()
+    runner.session_runtime_descriptor = {
+        'instance_id': authority.instance_id,
+        'authority_epoch': authority.epoch,
+        'profile_id': authority.profile_id,
+        'served_profiles': [{'profile_id': authority.profile_id, 'home': str(state)}],
+    }
+    install_runtime_custody(runner)
     adapter = Adapter(PlatformConfig(enabled=True, token='owned-discord-peer'))
     adapter.deliveries = []
     guild = Guild()
@@ -160,6 +169,8 @@ async def probe(peer):
 
 
 if __name__ == '__main__':
+    from gateway.runtime_ownership import process_ownership
+
     peer = ThreadingHTTPServer(('127.0.0.1', 0), ModelPeer)
     peer.requests, peer.metadata_requests = [], []
     peer.blocked, peer.release = threading.Event(), threading.Event()
@@ -171,6 +182,7 @@ if __name__ == '__main__':
         f'model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {base_url}\n'
         f'auxiliary:\n  title_generation:\n    enabled: false\nterminal:\n  cwd: {os.environ["HERMES_HOME"]}\n')
     status = 0
+    process_ownership.reserve([Path(os.environ['HERMES_HOME']).resolve()])
     try:
         asyncio.run(probe(peer))
     except BaseException:
@@ -179,4 +191,5 @@ if __name__ == '__main__':
     finally:
         peer.shutdown()
         peer.server_close()
+        process_ownership.close()
     os._exit(status)

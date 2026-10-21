@@ -33,14 +33,19 @@ def _parent(coordinator, admission_id):
     )
 
 
-async def real_runtime_binding(tmp_path, monkeypatch):
+async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
     """Build one actual claimed SessionAuthority admission for custody-boundary tests."""
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.run_runtime import initialize_gateway_runtime
     from gateway.runtime_ownership import process_ownership
-    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import (
+        get_hermes_home,
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
     import hermes_state
     from hermes_state_runtime import get_session_admission
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
@@ -86,24 +91,28 @@ async def real_runtime_binding(tmp_path, monkeypatch):
             user_id="15551234567@s.whatsapp.net",
             chat_type="dm",
         )
-        # Keep one independently claimed producer edge for the legacy custody
-        # oracles that inspect an active binding before they exercise a service.
-        # The actual Codex controls below use the primary source and run their
-        # admissions through the real drain, so this probe never settles a
-        # positive result or stands in for the managed turn.
-        probe_source = adapter.build_source(
-            chat_id="agc1723-probe@g.us",
-            user_id="15551234567@s.whatsapp.net",
-            chat_type="group",
-        )
+        # Keep the source-owned scheduler fence for every caller; the unrelated probe is
+        # optional because the I02 readiness helper must inspect its own current row.
         authority._schedule = lambda _ref: None
+        probe_binding = None
+        if include_probe:
+            # Keep one independently claimed producer edge for the legacy custody
+            # oracles that inspect an active binding before they exercise a service.
+            # The actual Codex controls below use the primary source and run their
+            # admissions through the real drain, so this probe never settles a
+            # positive result or stands in for the managed turn.
+            probe_source = adapter.build_source(
+                chat_id="agc1723-probe@g.us",
+                user_id="15551234567@s.whatsapp.net",
+                chat_type="group",
+            )
 
         async def claim(request_id):
             # Use the real native producer: it reserves/binds the I01 parent around the durable
             # admission before the FIFO claim can reserve its exact I04 child.
-            receipt = await authority.admit_native(
-                MessageEvent(text=request_id, source=source, message_id=request_id)
-            )
+            native_event = MessageEvent(text=request_id, source=source, message_id=request_id)
+            with native_callback(runner, native_event, get_hermes_home()):
+                receipt = await authority.admit_native(native_event)
             assert receipt.status == "queued"
             ref = receipt.ref
             live = authority.sessions[ref.session_id]
@@ -124,17 +133,20 @@ async def real_runtime_binding(tmp_path, monkeypatch):
             binding = admission_binding(authority, ref, row)
             return binding
 
-        probe_receipt = await authority.admit_native(
-            MessageEvent(text="fixture-probe", source=probe_source, message_id="fixture-probe")
-        )
-        assert probe_receipt.status == "queued"
-        probe_ref = probe_receipt.ref
-        probe_live = authority.sessions[probe_ref.session_id]
-        probe_row, _probe_first = await authority._claim_next(probe_ref, probe_live)
-        assert isinstance(probe_row, dict) and probe_row["status"] == "started"
-        probe_row = get_session_admission(authority.db, admission_id=probe_row["admission_id"])
-        assert probe_row is not None
-        probe_binding = admission_binding(authority, probe_ref, probe_row)
+        if include_probe:
+            probe_event = MessageEvent(
+                text="fixture-probe", source=probe_source, message_id="fixture-probe",
+            )
+            with native_callback(runner, probe_event, get_hermes_home()):
+                probe_receipt = await authority.admit_native(probe_event)
+            assert probe_receipt.status == "queued"
+            probe_ref = probe_receipt.ref
+            probe_live = authority.sessions[probe_ref.session_id]
+            probe_row, _probe_first = await authority._claim_next(probe_ref, probe_live)
+            assert isinstance(probe_row, dict) and probe_row["status"] == "started"
+            probe_row = get_session_admission(authority.db, admission_id=probe_row["admission_id"])
+            assert probe_row is not None
+            probe_binding = admission_binding(authority, probe_ref, probe_row)
 
         async def run_real_admission(
             session, writer, text, *, fail_delivery=False, use_native_waiter=True,
@@ -144,9 +156,9 @@ async def real_runtime_binding(tmp_path, monkeypatch):
             from gateway.runtime_service_custody import current_turn_binding
             from gateway.session_results import execution_result
 
-            receipt = await authority.admit_native(
-                MessageEvent(text=text, source=source, message_id=text)
-            )
+            native_event = MessageEvent(text=text, source=source, message_id=text)
+            with native_callback(runner, native_event, get_hermes_home()):
+                receipt = await authority.admit_native(native_event)
             assert receipt.status == "queued"
             # The native waiter is optional: finalizer-only controls use it to avoid a
             # platform send, while the pre-effect retry control reaches deliver_settled.
@@ -317,8 +329,32 @@ def test_atomic_request_refuses_stale_secondary_before_accepting_child():
     assert status["active_secondary_child_parents"] == []
 
 
+def _physical_close_diagnostic(physical):
+    """Read retained failure evidence without advancing any reconciliation state."""
+    transaction = physical.transaction
+    job = getattr(transaction, "job", None)
+    return {
+        "physical_state": physical.state,
+        "unknown_reason": physical.unknown_reason,
+        "process_returncode": getattr(physical.process, "returncode", None),
+        "eof_streams": sorted(physical.eof_streams),
+        "joined_streams": sorted(physical.joined_streams),
+        "completed_requests": len(physical.completed_requests),
+        "delivery_requests": len(physical.delivery_requests),
+        "durable_proofs": len(physical.durable_proofs),
+        "transaction_state": getattr(transaction, "state", None),
+        "scope_observation": getattr(transaction, "scope_observation", None),
+        "native_empty_observed": getattr(transaction, "native_empty_observed", None),
+        "process_handle_closed": getattr(transaction, "process_handle_closed", None),
+        "job_handle_closed": getattr(transaction, "job_handle_closed", None),
+        "job_active_processes": job.active_processes() if job is not None else None,
+    }
+
+
 @pytest.mark.asyncio
 async def test_service_lease_reuses_one_root_across_two_exact_admissions(tmp_path, monkeypatch):
+    import json
+    from agent.transports.codex_app_server import CodexAppServerTransportError
     from agent.transports.codex_app_server_session import CodexAppServerSession
     from tests.agent.transports.test_codex_physical_custody import (
         _RealProofAgent,
@@ -349,7 +385,13 @@ async def test_service_lease_reuses_one_root_across_two_exact_admissions(tmp_pat
         assert physical2 is physical
         assert writer.flush_count == 2
         assert service.requests == {}
-        session.close()
+        try:
+            session.close()
+        except CodexAppServerTransportError:
+            print("native-physical-close-diagnostic: " + json.dumps(
+                _physical_close_diagnostic(physical), sort_keys=True,
+            ))
+            raise
     finally:
         if session is not None and session._client is not None and session._client._proc.poll() is None:
             session._client._proc.kill()

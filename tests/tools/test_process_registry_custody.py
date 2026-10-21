@@ -52,6 +52,23 @@ def _wait_for_delivery(registry: ProcessRegistry, session, timeout: float = 10.0
         timeout=timeout,
         poll_interval=0.1,
     )
+    if not session._completion_event.is_set():
+        reader = session._reader_thread
+        print("native-completion-diagnostic: " + json.dumps({
+            "pid": session.pid,
+            "returncode": getattr(session.process, "returncode", None),
+            "reader_alive": reader.is_alive() if reader is not None else None,
+            "reader_phase": session.reader_phase,
+            "reader_finish_requested": session._reader_finish_requested.is_set(),
+            "exited": session.exited,
+            "custody_state": session.custody_state,
+            "custody_error": session.custody_error,
+            "reader_eof": session.custody_reader_eof,
+            "scope_settled": session.custody_scope_settled,
+            "durable": session.custody_durable,
+            "handle_closed": session.custody_handle_closed,
+            "output_chars": session.total_output_chars,
+        }, sort_keys=True))
     assert session._completion_event.is_set(), (
         f"real child did not reach terminal reader path: {waited}"
     )

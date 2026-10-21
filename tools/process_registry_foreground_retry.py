@@ -70,7 +70,11 @@ def managed_retry_identity_valid(
             and type(handle.close_generation) is int,
             handle.coordinator_id == coordinator._coordinator_id
             and coordinator.process_instance == custody.process_instance
-            and coordinator.authority_epoch == custody.authority_epoch,
+            and coordinator.profile_scope_valid(
+                custody.profile_id, custody.authority_epoch,
+                require_serving=False, allow_retiring=True,
+                physical_owner_epoch=handle.physical_owner_epoch,
+            ),
             binding is custody.foreground_binding and binding is not None
             and record is not None and record.binding is binding
             and isinstance(binding.session_id, str) and bool(binding.session_id)
@@ -278,7 +282,11 @@ def reconcile_native_foreground_retry(
             and type(record.delivery_close_generation) is int
             and handle.close_generation == record.delivery_close_generation,
             coordinator.process_instance == custody.process_instance
-            and coordinator.authority_epoch == custody.authority_epoch,
+            and coordinator.profile_scope_valid(
+                custody.profile_id, custody.authority_epoch,
+                require_serving=False, allow_retiring=True,
+                physical_owner_epoch=handle.physical_owner_epoch,
+            ),
         )):
             return False
         if not native_scope_observation_ready(custody):
@@ -328,7 +336,11 @@ def native_scope_observation_retry_ready(custody: Any) -> bool:
             and handle.authority_epoch == custody.authority_epoch
             and handle.coordinator_id == coordinator._coordinator_id,
             coordinator.process_instance == custody.process_instance
-            and coordinator.authority_epoch == custody.authority_epoch,
+            and coordinator.profile_scope_valid(
+                custody.profile_id, custody.authority_epoch,
+                require_serving=False, allow_retiring=True,
+                physical_owner_epoch=handle.physical_owner_epoch,
+            ),
         ))
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return False
@@ -359,7 +371,11 @@ def foreground_delivery_retry_ready(custody: Any, record: Any) -> bool:
             and handle.coordinator_id == coordinator._coordinator_id
             and handle.close_generation == record.delivery_close_generation,
             coordinator.process_instance == custody.process_instance
-            and coordinator.authority_epoch == custody.authority_epoch,
+            and coordinator.profile_scope_valid(
+                custody.profile_id, custody.authority_epoch,
+                require_serving=False, allow_retiring=True,
+                physical_owner_epoch=handle.physical_owner_epoch,
+            ),
         ))
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return False

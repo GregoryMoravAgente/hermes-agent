@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import logging
 import sys
 import subprocess
+import time
+import threading
 from ctypes import wintypes
 from typing import Any, Optional
 
@@ -184,6 +186,7 @@ class WindowsLaunchTransaction:
             self.host_start_time = get_process_start_time(self.pid)
             if type(self.pid) is not int or self.pid <= 0 or type(self.host_start_time) is not int:
                 raise WindowsCustodyUnavailable("windows_process_identity_unavailable")
+            self._retain_launch_identity()
             # Publish the exact Popen/transaction before any fallible Job or custody
             # operation.  The callback never claims process_bound or resumed.
             if on_process_bound is not None:
@@ -265,6 +268,7 @@ class WindowsLaunchTransaction:
             or job is None
             or getattr(custody, "native_scope", None) is not self
             or not self.matches(process, self.pid, self.host_start_time)
+            or not self._retained_scope_matches()
             or (require_scope and (self.assigned is not True or self.scope_captured is not True))
             or (not require_scope and (self.assignment_attempted is not True or not assignment_proven))
             or getattr(job, "_recovery_only", True) is True
@@ -397,6 +401,37 @@ class WindowsLaunchTransaction:
         """
         return self._terminate_exact_job(require_scope=True, exit_code=exit_code)
 
+    def drain_after_process_exit(self, timeout: float) -> bool:
+        """Drain this retained Job after root exit without closing reader-owned handles."""
+        process = self.process
+        if (
+            process is None or process.poll() is None
+            or self.custody.native_scope is not self
+            or not self.matches(process, self.pid, self.host_start_time)
+            or not self._retained_scope_matches()
+            or (self.assigned and not self.scope_captured)
+        ):
+            return False
+        if self.native_empty_observed:
+            return True
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        if self.observe_empty() is True:
+            return True
+        if self.scope_observation != "nonempty":
+            return False
+        try:
+            self.terminate_owned_tree()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        wake = threading.Event()
+        while True:
+            if self.observe_empty() is True:
+                return True
+            remaining = deadline - time.monotonic()
+            if self.scope_observation != "nonempty" or remaining <= 0:
+                return False
+            wake.wait(min(0.01, remaining))
+
     def _rebind_observed_member(self) -> None:
         """Re-capture and bind the original Job member before partial termination.
 
@@ -476,19 +511,47 @@ class WindowsLaunchTransaction:
             raise WindowsCustodyUnavailable("windows_assignment_effect_unknown")
         return self._terminate_exact_process()
 
-    def _capture_scope_identity(self) -> None:
-        """Bind scope observations to the Job and process created by this launch."""
+    def _retain_launch_identity(self) -> None:
+        """Anchor native objects before the assignment attempt can become ambiguous."""
         job_handle = getattr(self.job, "_handle", None)
         if (
-            self.job is None or self.process is None or not self.assigned
+            self.job is None or self.process is None
             or job_handle is None or not self.matches(self.process, self.pid, self.host_start_time)
         ):
             raise WindowsCustodyUnavailable("windows_scope_identity_unavailable")
+        if self.scope_observation_job is not None:
+            if not self._retained_scope_matches():
+                raise WindowsCustodyUnavailable("windows_scope_identity_changed")
+            return
         self.scope_observation_job = self.job
         self.scope_observation_job_handle = job_handle
         self.scope_observation_process = self.process
         self.scope_observation_pid = self.pid
         self.scope_observation_start_time = self.host_start_time
+
+    def _retained_scope_matches(self) -> bool:
+        job_handle_matches = (
+            self.job_handle_closed is False
+            and getattr(self.job, "_handle", None) is self.scope_observation_job_handle
+        ) or (
+            self.job_handle_closed is True
+            and self.close_job is self.scope_observation_job
+            and self.close_job_handle is self.scope_observation_job_handle
+            and getattr(self.job, "_handle", None) is None
+        )
+        return bool(
+            self.scope_observation_job is not None
+            and self.scope_observation_job_handle is not None
+            and self.job is self.scope_observation_job
+            and self.process is self.scope_observation_process
+            and self.matches(self.process, self.scope_observation_pid, self.scope_observation_start_time)
+            and job_handle_matches
+        )
+
+    def _capture_scope_identity(self) -> None:
+        """Mark assigned custody only for the original captured native objects."""
+        if not self.assigned or not self._retained_scope_matches():
+            raise WindowsCustodyUnavailable("windows_scope_identity_unavailable")
         self.scope_captured = True
 
     def _observe_unassigned_empty(self) -> Optional[bool]:
@@ -498,7 +561,7 @@ class WindowsLaunchTransaction:
         that this process is not a member and that the Job is empty.  A Job-empty result without
         the per-process nonmembership observation is deliberately insufficient.
         """
-        if self.job is None or self.process is None or not self.matches(self.process, self.pid, self.host_start_time):
+        if not self._retained_scope_matches():
             self.scope_observation = "unavailable"
             return None
         process_ref = self.process_ref
@@ -534,7 +597,7 @@ class WindowsLaunchTransaction:
         """Return true only for the exact retained process handle and Job."""
         if self.assignment_observation == "nonmember":
             return self._observe_unassigned_empty()
-        if self.job is None or self.process is None or not self.assigned:
+        if self.job is None or self.process is None or not self.assigned or not self.scope_captured:
             self.scope_observation = "unavailable"
             return None
         process_ref = self.process_ref
@@ -574,6 +637,10 @@ class WindowsLaunchTransaction:
 
     def close_after_observed_empty(self) -> bool:
         """Close the Job and retained process handle after the exact empty proof."""
+        if not self._retained_scope_matches():
+            self.scope_observation = "foreign"
+            self._record_unknown("foreign_custody")
+            return False
         if not self.native_empty_observed and self.observe_empty() is not True:
             return False
         if self.state == "closed":

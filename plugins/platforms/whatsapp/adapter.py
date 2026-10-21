@@ -2,13 +2,18 @@
 client; messages are polled over a local HTTP API and responses are posted back through it."""
 
 import asyncio
+import base64
+import hashlib
+import json
 import logging
 import mimetypes
 import os
 import platform
 import re
 import signal
+import struct
 import subprocess
+from uuid import uuid4
 from contextlib import suppress
 from functools import wraps
 from pathlib import Path
@@ -18,8 +23,9 @@ from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
 )
 from gateway.platforms.send_targets import StandaloneSendPolicy, regex_stripped_parser
-from hermes_cli._subprocess_compat import windows_detach_popen_kwargs
 from hermes_constants import (find_node_executable, get_hermes_dir, with_hermes_node_path)
+from .bridge_connect import WhatsAppBridgeConnectMixin
+from .bridge_preservation import BridgePreservationMixin
 
 _IS_WINDOWS = platform.system() == "Windows"
 
@@ -34,6 +40,65 @@ logger = logging.getLogger(__name__)
 _OWNER_REPLY_PREFIX = "[owner reply] "
 
 _RUN_TEXT = dict(capture_output=True, text=True, encoding='utf-8', errors='replace', stdin=subprocess.DEVNULL)
+
+_ACK_PAYLOAD_MAX_BYTES = 1024 * 1024
+
+
+def _encode_ack_payload_snapshot(payload: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Encode one bounded ACK body for same-occurrence response-loss replay."""
+    try:
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+        )
+        if len(encoded.encode("utf-8")) > _ACK_PAYLOAD_MAX_BYTES:
+            return None
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return None
+    return (encoded, decoded) if isinstance(decoded, dict) else None
+
+
+def _load_ack_payload_snapshot(
+    delivery: dict[str, Any], request_id: str,
+) -> tuple[str, dict[str, Any]] | None:
+    """Load only an intact source-owned ACK body for its original request id."""
+    encoded = delivery.get("_ack_payload_snapshot")
+    digest = delivery.get("_ack_payload_snapshot_digest")
+    if (
+        not isinstance(encoded, str)
+        or len(encoded.encode("utf-8")) > _ACK_PAYLOAD_MAX_BYTES
+        or not isinstance(digest, str)
+        or delivery.get("_ack_payload_request_id") != request_id
+    ):
+        return None
+    try:
+        if hashlib.sha256(encoded.encode("utf-8")).hexdigest() != digest:
+            return None
+        payload = json.loads(encoded)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("request_id") != request_id
+        or payload.get("op") != "ack"
+        or not isinstance(payload.get("settlement"), dict)
+    ):
+        return None
+    return encoded, payload
+
+
+def _bridge_boundary_errors():
+    """Return only expected HTTP, transport, and response-decoding failures."""
+    import aiohttp
+
+    return (
+        aiohttp.ClientError,
+        asyncio.TimeoutError,
+        OSError,
+        RuntimeError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+    )
 
 
 def _listener_pids_on_port(port: int) -> list:
@@ -344,9 +409,15 @@ def _needs_bridge(method):
     return _guarded
 
 
-class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
+class WhatsAppAdapter(
+    WhatsAppBehaviorMixin, WhatsAppBridgeConnectMixin, BridgePreservationMixin, BasePlatformAdapter
+):
     """Transport over a local Node.js (Baileys) HTTP bridge; behavior lives in ``WhatsAppBehaviorMixin``. config.extra: bridge_script /
     bridge_port (3000) / session_path, dm_policy / group_policy (open|allowlist|disabled|pairing), allow_from / group_allow_from, send_read_receipts."""
+
+    def _preservation_source_contract(self):
+        from gateway.preservation_source_close import SourceCloseContract
+        return SourceCloseContract.for_adapter(self, name="whatsapp-poll-source")
 
     _DEFAULT_BRIDGE_DIR = None  # resolved in __init__
     splits_long_messages = True  # send() chunks via truncate_message()
@@ -386,6 +457,20 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
         self._bridge_log_fh = self._bridge_log = self._poll_task = self._http_session = None
+        self._bridge_log_open_task = None
+        self._bridge_log_open_close_requested = False
+        self._bridge_binding = None
+        self._bridge_authority = None
+        self._bridge_capability: Optional[str] = None
+        self._bridge_witness_key: Optional[bytes] = None
+        self._bridge_capability_required = False
+        self._consumer_id = uuid4().hex
+        self._consumer_epoch = 1
+        self._preservation_bridge_close_task = None
+        self._preservation_bridge_resume_task = None
+        self._preservation_bridge_resume_result = False
+        self._preservation_bridge_snapshot = None
+        self._preservation_bridge_close_generation = None
         # Set by disconnect() before SIGTERMing so _check_managed_bridge_exit() can tell an intentional exit (-15/-2/0) from a crash.
         self._shutting_down = False
         # Text debounce batching: rapid bursts (forwards, paste-splits) would otherwise each trigger a separate agent turn.
@@ -395,9 +480,42 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     def _bridge_url(self, path: str) -> str:
         return f"http://127.0.0.1:{self._bridge_port}/{path}"
 
+    def _bridge_identity(self) -> dict[str, Any]:
+        return {
+            "session_digest": hashlib.sha256(str(self._session_path.resolve()).encode()).hexdigest(),
+            "profile_digest": hashlib.sha256(str(self._profile_home.resolve()).encode()).hexdigest(),
+            "canonical_port": self._bridge_port,
+            "script_sha256": _file_content_hash(Path(self._bridge_script)),
+        }
+
+    def _load_bridge_authority(self, process_start: int | None = None) -> dict[str, Any] | None:
+        from .bridge_ownership import load_bridge_authority
+        identity = self._bridge_identity()
+        try:
+            authority = load_bridge_authority(
+                self._session_path,
+                **identity,
+                process_start=process_start,
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            logger.warning("[%s] Managed WhatsApp bridge authority is unavailable", self.name)
+            return None
+        self._bridge_authority = authority
+        self._bridge_capability = authority.get("attach_key_b64url")
+        witness = authority.get("source_witness_key_b64url")
+        self._bridge_witness_key = witness.encode("utf-8") if isinstance(witness, str) else None
+        self._bridge_capability_required = True
+        return authority
+
     def _bridge_req(self, method: str, path: str, timeout: float, **kwargs):
         """``session.<method>`` context manager for a bridge endpoint (caller must ``async with``)."""
         import aiohttp
+        headers = dict(kwargs.pop("headers", {}) or {})
+        capability = getattr(self, "_bridge_capability", None)
+        if capability:
+            headers.setdefault("X-Hermes-Bridge-Capability", capability)
+        if headers:
+            kwargs["headers"] = headers
         return getattr(self._http_session, method)(self._bridge_url(path), **kwargs, timeout=aiohttp.ClientTimeout(total=timeout))
 
     async def _probe_bridge_health(self) -> tuple[bool, Any]:
@@ -452,19 +570,385 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                               "Run `hermes whatsapp`, then restart `hermes gateway`.", retryable=False)
         return False
 
-    def _attach_to_bridge(self, managed_process) -> None:
+    def _start_bridge_polling(self) -> None:
+        poll_task = getattr(self, "_poll_task", None)
+        if poll_task is None or poll_task.done():
+            self._poll_task = asyncio.create_task(self._poll_messages())
+
+    def _attach_to_bridge(self, managed_process, *, start_polling: bool = True) -> None:
         import aiohttp
         self._bridge_process = managed_process
         self._http_session = aiohttp.ClientSession()
-        self._poll_task = asyncio.create_task(self._poll_messages())
+        self._consumer_id = uuid4().hex
+        self._consumer_epoch += 1
+        self._bridge_binding = None
+        self._bridge_producer_generation = None
+        self._preservation_bridge_resume_result = False
+        self._poll_task = None
+        if start_polling:
+            self._start_bridge_polling()
+
+    def _queue_binding(self) -> Optional[dict[str, Any]]:
+        binding = getattr(self, "_bridge_binding", None)
+        if not isinstance(binding, dict):
+            return None
+        return {
+            **binding,
+            "session_path": str(self._session_path.resolve()),
+            "profile": getattr(self, "_preservation_source_profile", None),
+            "consumer_id": getattr(self, "_consumer_id", None),
+            "consumer_epoch": getattr(self, "_consumer_epoch", None),
+        }
+
+    async def _ensure_queue_binding(self) -> Optional[dict[str, Any]]:
+        binding = self._queue_binding()
+        if binding is not None:
+            return binding
+        if not getattr(self, "_http_session", None):
+            return None
+        ok, data = await self._probe_bridge_health()
+        queue = data.get("queue") if isinstance(data, dict) else None
+        if not ok or not isinstance(queue, dict):
+            return None
+        if (
+            not queue.get("queue_epoch")
+            or not queue.get("bridge_instance")
+            or not isinstance(queue.get("owner_epoch"), int)
+            or queue.get("owner_epoch") < 1
+        ):
+            return None
+        self._bridge_binding = {
+            "queue_epoch": str(queue["queue_epoch"]),
+            "bridge_instance": str(queue["bridge_instance"]),
+            "owner_epoch": queue.get("owner_epoch"),
+        }
+        if queue.get("capability_required"):
+            self._bridge_capability_required = True
+            capability = getattr(self, "_bridge_capability", None)
+            if not isinstance(capability, str) or len(capability) < 24:
+                return None
+            if queue.get("capability_digest") and hashlib.sha256(capability.encode("utf-8")).hexdigest() != queue.get("capability_digest"):
+                return None
+            if isinstance(queue.get("consumer_id"), str) and isinstance(queue.get("consumer_epoch"), int):
+                self._consumer_id = queue["consumer_id"]
+                self._consumer_epoch = queue["consumer_epoch"]
+        else:
+            self._bridge_capability_required = False
+            self._bridge_capability = None
+        self._bridge_binding.update({
+            "session_digest": queue.get("session_digest"),
+            "profile_digest": queue.get("profile_digest"),
+            "canonical_port": queue.get("canonical_port"),
+            "script_sha256": queue.get("script_sha256"),
+            "process_start": queue.get("process_start"),
+            "producer_generation": queue.get("producer_generation"),
+            "listener_ready": queue.get("listener_ready") is True,
+            "owner_ready": queue.get("owner_ready") is True,
+        })
+        # Close snapshots and source finalizer receipts must be checked against
+        # the generation observed from this authenticated bridge, never a
+        # predecessor cached on the adapter object.
+        self._bridge_producer_generation = queue.get("producer_generation")
+        return self._queue_binding()
+
+    async def _bridge_json(self, method: str, path: str, *, timeout: float, payload=None):
+        bridge_errors = _bridge_boundary_errors()
+        kwargs = {} if payload is None else {"json": payload}
+        async with self._bridge_req(method, path, timeout, **kwargs) as resp:
+            try:
+                data = await resp.json()
+            except bridge_errors:
+                data = None
+            return resp.status, data
+
+    async def _bridge_operation(self, path: str, payload: dict[str, Any], *, timeout: float = 30) -> Optional[dict[str, Any]]:
+        request_id = payload.get("request_id")
+        bridge_errors = _bridge_boundary_errors()
+        try:
+            status, data = await self._bridge_json("post", path, timeout=timeout, payload=payload)
+            if status == 200 and isinstance(data, dict):
+                if request_id and data.get("request_id") != request_id:
+                    return None
+                if data.get("status") == "request_result":
+                    result = data.get("result")
+                    return result if isinstance(result, dict) and (not request_id or result.get("request_id") == request_id) else None
+                return data
+            # Retry only a decoded-empty 200 body or retryable transport statuses; a
+            # malformed successful body (list/string) and 409 identity conflicts remain
+            # fail-closed rather than looking up foreign input.
+            if status == 200:
+                if data is not None:
+                    return None
+            elif status not in {408, 503}:
+                return None
+        except bridge_errors:
+            status = None
+            data = None
+        if not request_id or not getattr(self, "_http_session", None):
+            return None
+        try:
+            status, data = await self._bridge_json(
+                "get", f"messages/requests/{request_id}", timeout=min(timeout, 10),
+            )
+            if (
+                status == 200
+                and isinstance(data, dict)
+                and data.get("status") == "request_result"
+                and data.get("request_id") == request_id
+                and isinstance(data.get("result"), dict)
+                and data["result"].get("request_id") == request_id
+            ):
+                return data["result"]
+        except bridge_errors:
+            return None
+        return None
+
+    async def _bridge_control(self, operation: str, generation: int) -> Optional[dict[str, Any]]:
+        binding = await self._ensure_queue_binding()
+        if binding is None:
+            return None
+        operation_identity = {
+            "operation": operation,
+            "close_generation": generation,
+            "binding": binding,
+        }
+        request_id = "control-" + hashlib.sha256(json.dumps(
+            operation_identity, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        return await self._bridge_operation(
+            "messages/control",
+            {"request_id": request_id, "op": operation, "close_generation": generation, "binding": binding},
+        )
+
+    async def _bridge_transition(
+        self, operation: str, delivery: dict[str, Any], *, expected_state: str,
+        custody_ref: Optional[str] = None, reason: Optional[str] = None,
+        settlement: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        binding = await self._ensure_queue_binding()
+        if binding is None:
+            return None
+        request_key = f"{operation}_request_id"
+        if request_key not in delivery:
+            operation_identity = {
+                "operation": operation,
+                "queue_epoch": delivery.get("queue_epoch"),
+                "bridge_instance": delivery.get("bridge_instance"),
+                "owner_epoch": delivery.get("owner_epoch"),
+                "item_id": delivery.get("item_id"),
+                "sequence": delivery.get("sequence"),
+                "claim_id": delivery.get("claim_id"),
+                "custody_ref": custody_ref or delivery.get("custody_ref"),
+                "settlement_challenge": delivery.get("settlement_challenge"),
+                "finalizer_receipt_digest": delivery.get("finalizer_receipt_digest"),
+                "reason": reason,
+            }
+            operation_digest = hashlib.sha256(json.dumps(
+                operation_identity, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")).hexdigest()
+            request_id = f"{operation}-{operation_digest}"
+            delivery[request_key] = request_id
+        else:
+            request_id = delivery[request_key]
+        snapshot_present = operation == "ack" and any(
+            key in delivery
+            for key in (
+                "_ack_payload_snapshot",
+                "_ack_payload_snapshot_digest",
+                "_ack_payload_request_id",
+            )
+        )
+        stored_snapshot = _load_ack_payload_snapshot(delivery, request_id) if snapshot_present else None
+        if snapshot_present and stored_snapshot is None:
+            return None
+        replaying_snapshot = stored_snapshot is not None and settlement is None
+        if replaying_snapshot:
+            settlement = stored_snapshot[1]["settlement"]
+        payload = {
+            "request_id": request_id,
+            "op": operation,
+            "binding": binding,
+            "item_id": delivery.get("item_id"),
+            "sequence": delivery.get("sequence"),
+            "claim_id": delivery.get("claim_id"),
+            "expected_state": expected_state,
+            "source_identity": delivery.get("source_identity"),
+            "registration_generation": delivery.get("registration_generation"),
+            "custody_ref": custody_ref or delivery.get("custody_ref"),
+            "settlement_challenge": delivery.get("settlement_challenge"),
+            "reason": reason,
+            "settlement": settlement,
+            "settlement_fields": delivery.get("_settlement_fields"),
+            "producer_generation": delivery.get("producer_generation"),
+            "finalizer_receipt_digest": delivery.get("finalizer_receipt_digest"),
+            "finalizer_status": delivery.get("finalizer_status"),
+        }
+        if operation == "ack":
+            encoded_payload = _encode_ack_payload_snapshot(payload)
+            if encoded_payload is None:
+                return None
+            if replaying_snapshot and encoded_payload[0] != stored_snapshot[0]:
+                # An omitted-settlement replay is valid only for the intact
+                # same-occurrence body.
+                return None
+            # An explicit changed body is never replaced by the retained snapshot.
+            # Let the durable journal see the same request id and return its
+            # request_conflict; only the omitted-settlement replay may reuse the
+            # exact source-owned body above.
+            if stored_snapshot is None and isinstance(settlement, dict) and not snapshot_present:
+                encoded = encoded_payload[0]
+                delivery["_ack_payload_snapshot"] = encoded
+                delivery["_ack_payload_snapshot_digest"] = hashlib.sha256(
+                    encoded.encode("utf-8")
+                ).hexdigest()
+                delivery["_ack_payload_request_id"] = request_id
+        return await self._bridge_operation("messages/transition", payload)
+
+    @staticmethod
+    def _source_identity(event: object) -> object:
+        source = getattr(event, "source", None)
+        to_dict = getattr(source, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return tuple(sorted(to_dict().items()))
+            except (AttributeError, TypeError, ValueError):
+                pass
+        return source
+
+    async def _settle_bridge_delivery(self, token, custody_ref: Optional[str]) -> object:
+        delivery = getattr(token, "transport_receipt", None)
+        if not isinstance(delivery, dict):
+            return False
+        finalizer = getattr(token, "finalizer_receipt", None)
+        finalizer_digest = getattr(finalizer, "finalizer_digest", None)
+        if getattr(finalizer, "status", None) != "success" or not isinstance(finalizer_digest, str):
+            return False
+        settlement = {
+            "producer_done": bool(getattr(token, "producer_done", False)),
+            "native_exited": bool(getattr(token, "native_exited", False)),
+            "transport_settled": True,
+            "producer_generation": getattr(token, "producer_generation", None)
+            or delivery.get("producer_generation"),
+            "finalizer_receipt_digest": finalizer_digest,
+            "finalizer_status": "success",
+        }
+        witness_key = getattr(self, "_bridge_witness_key", None)
+        witness = None
+        delivery["producer_generation"] = settlement["producer_generation"]
+        settle_identity = {
+            "operation": "settle",
+            "queue_epoch": delivery.get("queue_epoch"),
+            "bridge_instance": delivery.get("bridge_instance"),
+            "owner_epoch": delivery.get("owner_epoch"),
+            "item_id": delivery.get("item_id"),
+            "sequence": delivery.get("sequence"),
+            "claim_id": delivery.get("claim_id"),
+            "custody_ref": custody_ref or delivery.get("custody_ref"),
+            "settlement_challenge": delivery.get("settlement_challenge"),
+            "finalizer_receipt_digest": finalizer_digest,
+            "reason": None,
+        }
+        delivery.setdefault("settle_request_id", "settle-" + hashlib.sha256(
+            json.dumps(settle_identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest())
+        if getattr(self, "_bridge_capability_required", False):
+            if not isinstance(witness_key, bytes) or len(witness_key) < 16:
+                return False
+            if not isinstance(settlement["producer_generation"], str) or not settlement["producer_generation"]:
+                return False
+            try:
+                token.transport_status = "success"
+                captured = getattr(token, "_settlement_fields", None)
+                if isinstance(captured, dict):
+                    captured["transport_status"] = "success"
+                    captured["producer_generation"] = settlement["producer_generation"]
+                    captured["finalizer_receipt_digest"] = finalizer_digest
+                    captured["finalizer_status"] = "success"
+                    delivery["_settlement_fields"] = captured
+                witness = token.build_settlement_witness(
+                    witness_key,
+                    receipt={"status": "success", "request_id": delivery.get("settle_request_id")},
+                ).envelope()
+            except (TypeError, ValueError):
+                return False
+            settlement["witness"] = witness
+        delivery["finalizer_receipt_digest"] = finalizer_digest
+        delivery["finalizer_status"] = "success"
+        settled = await self._bridge_transition(
+            "settle",
+            delivery,
+            expected_state="accepted",
+            custody_ref=custody_ref,
+            settlement=settlement,
+        )
+        if not isinstance(settled, dict) or settled.get("status") != "transitioned":
+            return False
+        settlement["settlement_receipt"] = settled.get("item", {}).get("settlement_record")
+        result = await self._bridge_transition(
+            "ack", delivery, expected_state="accepted", custody_ref=custody_ref, settlement=settlement,
+        )
+        if isinstance(result, dict) and result.get("status") == "transitioned":
+            if witness:
+                return {"settled": True, "witness_digest": witness.get("witness_digest")}
+            if not getattr(self, "_bridge_capability_required", False):
+                return True
+        return False
+
+    async def _hold_bridge_delivery(self, delivery: dict[str, Any], reason: str) -> bool:
+        state = str(delivery.get("state") or "claimed")
+        result = await self._bridge_transition(
+            "hold", delivery, expected_state=state, reason=reason,
+        )
+        return isinstance(result, dict) and result.get("status") == "transitioned"
+
+    @staticmethod
+    def _delivery_payload(msg_data: dict[str, Any]) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        delivery = msg_data.get("_bridge_delivery")
+        payload = msg_data.get("_bridge_payload")
+        if isinstance(delivery, dict) and isinstance(payload, dict):
+            return payload, delivery
+        return msg_data, delivery if isinstance(delivery, dict) else None
 
     async def _reuse_running_bridge(self, bridge_path: Path) -> bool:
         """Adopt a connected bridge serving the on-disk bridge.js + same read-receipt config; else say why it restarts."""
         self._foreign_bridge_session = None
         self._bridge_probe_timed_out = False
         try:
+            from .bridge_ownership import check_bridge_owner, port_is_free
+            if port_is_free(self._bridge_port):
+                return False
+            # A running process is attachable only when this profile already has its
+            # durable private authority.  Do not create a new key in response to a
+            # listener that has not first proved the session/profile identity.
+            authority_path = self._session_path.resolve() / "bridge.authority.json"
+            if not authority_path.exists():
+                self._foreign_bridge_session = "private_authority_missing"
+                return False
+            authority = self._load_bridge_authority()
+            if authority is None:
+                self._foreign_bridge_session = "private_authority_unavailable"
+                return False
+            physical = check_bridge_owner(
+                self._session_path,
+                self._bridge_port,
+                profile_digest=hashlib.sha256(str(self._profile_home.resolve()).encode()).hexdigest(),
+                script_sha256=_file_content_hash(bridge_path),
+            )
+            if physical.get("status") not in {"owned", "owned_physical"}:
+                self._foreign_bridge_session = "foreign_or_ambiguous"
+                return False
             ok, data = await self._probe_bridge_health()
             if not ok or data is None:
+                return False
+            physical = check_bridge_owner(
+                self._session_path,
+                self._bridge_port,
+                profile_digest=hashlib.sha256(str(self._profile_home.resolve()).encode()).hexdigest(),
+                script_sha256=_file_content_hash(bridge_path),
+                health=data,
+            )
+            if physical.get("status") != "owned":
+                self._foreign_bridge_session = str(data.get("session") or "foreign_or_ambiguous")
                 return False
             # Another profile's bridge (same default port) is neither adopted, which would answer as that
             # profile's phone, nor killed: connect() reports it. Checked before status because a bridge in
@@ -480,6 +964,9 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
             running_hash, disk_hash = data.get("scriptHash", ""), _file_content_hash(bridge_path)
             if running_hash and disk_hash and running_hash == disk_hash and bool(data.get("sendReadReceipts", False)) == self._send_read_receipts:
+                if not await self._adopt_running_bridge(data, authority):
+                    self._foreign_bridge_session = "private_attach_refused"
+                    return False
                 print(f"[{self.name}] Using existing bridge (status: {bridge_status})")
                 self._mark_connected()
                 self._attach_to_bridge(None)  # Not managed by us
@@ -492,6 +979,123 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         except Exception:
             pass  # Bridge not running, start a new one
         return False
+
+    async def _adopt_running_bridge(self, health: dict[str, Any], authority: dict[str, Any]) -> bool:
+        """Attach and, when present, consume the durable predecessor handoff."""
+        from .bridge_ownership import read_bridge_handoff
+
+        queue = health.get("queue") if isinstance(health, dict) else None
+        if not isinstance(queue, dict):
+            return False
+        binding = {
+            "session_digest": authority.get("session_digest"),
+            "profile_digest": authority.get("profile_digest"),
+            "canonical_port": authority.get("canonical_port"),
+            "script_sha256": authority.get("script_sha256"),
+            "process_start": queue.get("process_start") or queue.get("owner_start")
+            or (queue.get("owner_binding") or {}).get("owner_start"),
+            "queue_epoch": queue.get("queue_epoch"),
+            "bridge_instance": queue.get("bridge_instance"),
+            "owner_epoch": queue.get("owner_epoch"),
+            "attach_key_id": authority.get("attach_key_id"),
+            "source_witness_key_id": authority.get("source_witness_key_id"),
+            "listener_ready": queue.get("listener_ready") is True,
+            "owner_ready": queue.get("owner_ready") is True,
+        }
+        if not all(isinstance(binding.get(key), (str, int, bool)) for key in (
+            "session_digest", "profile_digest", "canonical_port", "script_sha256",
+            "queue_epoch", "bridge_instance", "owner_epoch", "attach_key_id",
+            "source_witness_key_id",
+        )):
+            return False
+        handoff = read_bridge_handoff(self._session_path)
+        predecessor_digest = handoff.get("predecessor_digest") if isinstance(handoff, dict) else None
+        attach_identity = {
+            "queue_epoch": binding.get("queue_epoch"),
+            "bridge_instance": binding.get("bridge_instance"),
+            "owner_epoch": binding.get("owner_epoch"),
+            "process_start": binding.get("process_start"),
+            "predecessor_digest": predecessor_digest,
+        }
+        attach_id = "attach-" + hashlib.sha256(
+            json.dumps(attach_identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        nonce = base64.urlsafe_b64encode(hashlib.sha256(
+            json.dumps({**attach_identity, "attach_request_id": attach_id},
+                       sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).digest()[:18]).decode().rstrip("=")
+        digest_binding = {key: binding.get(key) for key in (
+            "session_digest", "profile_digest", "canonical_port", "script_sha256", "process_start",
+            "queue_epoch", "bridge_instance", "owner_epoch", "attach_key_id", "source_witness_key_id",
+        )}
+        attach_payload = {
+            "protocol": "hermes.whatsapp.attach.v2",
+            "request_id": attach_id,
+            "challenge_nonce": nonce,
+            "binding": binding,
+            "binding_digest": hashlib.sha256(json.dumps(digest_binding, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+            "predecessor_digest": predecessor_digest,
+            "attach_key_id": authority.get("attach_key_id"),
+            "source_witness_key_id": authority.get("source_witness_key_id"),
+        }
+        attached = await self._bridge_operation("messages/attach", attach_payload)
+        if not isinstance(attached, dict) or attached.get("status") != "attached":
+            return False
+        if isinstance(handoff, dict) and handoff.get("state") == "pending":
+            adoption_identity = {
+                "queue_epoch": handoff.get("queue_epoch") or queue.get("queue_epoch"),
+                "predecessor_digest": handoff.get("predecessor_digest"),
+                "adoption_nonce": handoff.get("adoption_nonce"),
+            }
+            adoption_id = "adopt-" + hashlib.sha256(
+                json.dumps(adoption_identity, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            adoption = await self._bridge_operation("messages/adopt", {
+                "protocol": "hermes.whatsapp.adoption.v1",
+                "request_id": adoption_id,
+                "predecessor_digest": handoff.get("predecessor_digest"),
+                "adoption_nonce": handoff.get("adoption_nonce"),
+                "queue_epoch": handoff.get("queue_epoch") or queue.get("queue_epoch"),
+                "binding": binding,
+                "attach_proof": attached.get("attach_proof"),
+            })
+            if not isinstance(adoption, dict) or adoption.get("status") != "adopted":
+                return False
+        self._bridge_binding = {
+            "queue_epoch": queue.get("queue_epoch"),
+            "bridge_instance": queue.get("bridge_instance"),
+            "owner_epoch": queue.get("owner_epoch"),
+            "session_digest": authority.get("session_digest"),
+            "profile_digest": authority.get("profile_digest"),
+            "canonical_port": authority.get("canonical_port"),
+            "script_sha256": authority.get("script_sha256"),
+            "process_start": binding.get("process_start"),
+            "producer_generation": queue.get("producer_generation"),
+            "listener_ready": binding.get("listener_ready"),
+            "owner_ready": binding.get("owner_ready"),
+        }
+        self._bridge_producer_generation = queue.get("producer_generation")
+        self._consumer_id = str(queue.get("consumer_id") or uuid4().hex)
+        self._consumer_epoch = int(queue.get("consumer_epoch") or (self._consumer_epoch + 1))
+        self._bridge_capability_required = True
+        return True
+
+    async def _prepare_spawned_bridge_startup(self, authority: dict[str, Any], startup_mode: str) -> bool:
+        """Authenticate a spawned queue owner before its poller can claim anything."""
+        ok, health = await self._probe_bridge_health()
+        if not ok or not isinstance(health, dict):
+            return False
+        queue = health.get("queue")
+        handoff = queue.get("owner_handoff") if isinstance(queue, dict) else None
+        handoff_pending = isinstance(handoff, dict) and handoff.get("state") == "pending"
+        if startup_mode == "adopt" and not handoff_pending:
+            return False
+        # A successor creates the durable predecessor envelope while it opens the
+        # existing queue.  Consume it before polling even when the bootstrap had
+        # to be sent as ``fresh`` because no envelope existed before spawn.
+        if handoff_pending and not await self._adopt_running_bridge(health, authority):
+            return False
+        return True
 
     def _bridge_env(self) -> dict:
         """Subprocess env: the adapter's EFFECTIVE profile policy + profile-resolved WHATSAPP_* values + cache dirs."""
@@ -526,6 +1130,51 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         img_dir, audio_dir, _video_dir, doc_dir = _cache_dirs()
         bridge_env.update(HERMES_IMAGE_CACHE_DIR=str(img_dir), HERMES_AUDIO_CACHE_DIR=str(audio_dir), HERMES_DOCUMENT_CACHE_DIR=str(doc_dir))
         return bridge_env
+
+    def _send_bridge_bootstrap(self, process: subprocess.Popen) -> tuple[dict[str, Any], str]:
+        """Send the managed owner frame after the kernel start token exists."""
+        start = None
+        try:
+            from gateway.status import get_process_start_time
+            start = get_process_start_time(process.pid)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            start = None
+        if start is None:
+            raise RuntimeError("WhatsApp bridge process-start proof unavailable")
+        script_bytes = Path(self._bridge_script).read_bytes()
+        authority = self._load_bridge_authority(start)
+        if authority is None:
+            raise RuntimeError("WhatsApp bridge private authority unavailable")
+        from .bridge_ownership import read_bridge_handoff
+        handoff = read_bridge_handoff(self._session_path)
+        startup_mode = "adopt" if isinstance(handoff, dict) and handoff.get("state") == "pending" else "fresh"
+        attach_key = authority["attach_key_b64url"]
+        witness_key = authority["source_witness_key_b64url"]
+        self._bridge_capability = attach_key
+        self._bridge_witness_key = witness_key.encode("utf-8")
+        identity = self._bridge_identity()
+        frame = {
+            "protocol": "hermes.whatsapp.bridge.bootstrap.v1",
+            "session_digest": identity["session_digest"],
+            "profile_digest": identity["profile_digest"],
+            "canonical_port": self._bridge_port,
+            "script_sha256": hashlib.sha256(script_bytes).hexdigest(),
+            "startup_mode": startup_mode,
+            "predecessor_digest": handoff.get("predecessor_digest", "") if startup_mode == "adopt" else "",
+            "adoption_nonce": handoff.get("adoption_nonce", "") if startup_mode == "adopt" else "",
+            "key_id": authority["attach_key_id"],
+            "attach_key_b64url": attach_key,
+            "source_witness_key_id": authority["source_witness_key_id"],
+            "source_witness_key_b64url": witness_key,
+            "process_start": start,
+        }
+        encoded = json.dumps(frame, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(encoded) > 16384 or process.stdin is None:
+            raise RuntimeError("WhatsApp bridge bootstrap frame is unavailable")
+        process.stdin.write(struct.pack(">I", len(encoded)) + encoded)
+        process.stdin.flush()
+        process.stdin.close()
+        return authority, startup_mode
 
     def _bridge_died(self, detail: str, code: str = "whatsapp_bridge_exited") -> bool:
         print(f"[{self.name}] {detail}")
@@ -603,110 +1252,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         logger.info("[%s] Bridge found at %s", self.name, bridge_path)
         return True
 
-    async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Start (or adopt) the Node.js bridge and wait for it to be ready."""
-        if find_node_executable("node") is None:
-            import pm
-
-            try:
-                await asyncio.to_thread(pm.ensure, "node")
-            except pm.InstallError as exc:
-                self._set_fatal_error("whatsapp_node_missing", str(exc), retryable=False)
-                return False
-        secondary = bool(getattr(self, "_runtime_status_platform_key", ""))
-        prior_bridge_is_ours = False
-        if secondary:
-            from .bridge_ownership import secondary_bridge_port, check_secondary_ownership
-            try:
-                self._bridge_port = secondary_bridge_port(self._profile_home, self.config.extra.get("bridge_port"))
-                prior_bridge_is_ours = check_secondary_ownership(self._session_path, self._bridge_port) == "ours"
-            except (OSError, ValueError) as exc:
-                self._set_fatal_error(
-                    "whatsapp_bridge_conflict",
-                    f"{exc}. Set platforms.whatsapp.extra.bridge_port to a distinct free port; "
-                    "or stop the process holding it.", retryable=False)
-                return False
-        if not await asyncio.to_thread(self._preflight):
-            return False
-        bridge_path = Path(self._bridge_script)
-        lock_acquired = False
-        try:
-            if not self._acquire_platform_lock('whatsapp-session', str(self._session_path), 'WhatsApp session'):
-                return False
-            lock_acquired = True
-        except Exception as e:
-            logger.warning("[%s] Could not acquire session lock (non-fatal): %s", self.name, e)
-        try:
-            if not self._ensure_bridge_deps(bridge_path.parent):
-                return False
-            self._session_path.mkdir(parents=True, exist_ok=True)
-            # A secondary adopts or reaps only a bridge its own pidfile identifies (crash restart);
-            # the default keeps its historical adopt-or-clear-the-port path.
-            if (not secondary or prior_bridge_is_ours) and await self._reuse_running_bridge(bridge_path):
-                return True
-            if self._foreign_bridge_session:
-                # The port is served by another profile's bridge. Never adopt
-                # it and never kill it: it belongs to a live session.
-                foreign = self._foreign_bridge_session
-                self._set_fatal_error(
-                    "whatsapp_bridge_foreign_session",
-                    f"Port {self._bridge_port} is already served by a WhatsApp bridge for a different session "
-                    f"({foreign}). Give this profile its own port via platforms.whatsapp.extra.bridge_port "
-                    f"(one distinct bridge_port per profile); nothing on port {self._bridge_port} was stopped.",
-                    retryable=False,
-                )
-                return False
-            if not secondary or prior_bridge_is_ours:
-                _kill_stale_bridge_by_pidfile(self._session_path)
-            if not secondary:
-                if self._bridge_probe_timed_out:
-                    # No /health answer is no ownership evidence (another profile's busy bridge looks the same), and
-                    # our own stale bridge was just reaped by its pidfile: a holder that remains is left running.
-                    await asyncio.sleep(1)
-                    try:
-                        held = bool(_port_listener_pids(self._bridge_port))
-                    except Exception:
-                        held = True  # listeners could not be listed: still no evidence to kill on
-                    if held:
-                        self._set_fatal_error(
-                            "whatsapp_bridge_unresponsive",
-                            f"Port {self._bridge_port} is held by a process that did not answer /health in time, so "
-                            f"Hermes cannot tell whose WhatsApp bridge it is; nothing on port {self._bridge_port} was "
-                            "stopped. Stop that process, or give this profile its own port via "
-                            "platforms.whatsapp.extra.bridge_port.",
-                            retryable=True,
-                        )
-                        return False
-                _kill_port_process(self._bridge_port)
-            if not secondary or prior_bridge_is_ours:
-                await asyncio.sleep(1)
-            # Bridge output goes to a log file so QR codes, errors, and reconnection messages survive for troubleshooting.
-            self._bridge_log = self._session_path.parent / "bridge.log"
-            self._bridge_log_fh = bridge_log_fh = open(self._bridge_log, "a", encoding="utf-8")  # noqa: ASYNC230 -- long-lived log handle handed to the bridge subprocess
-            node = find_node_executable("node")
-            if node is None:
-                raise RuntimeError("Node.js is no longer available; run `hermes pm install`")
-            self._bridge_process = subprocess.Popen(  # noqa: ASYNC220 -- persistent bridge; callers use the Popen object (pid, poll)
-                [node, str(bridge_path), "--port", str(self._bridge_port), "--session", str(self._session_path),
-                 "--mode", _wenv("WHATSAPP_MODE", "self-chat")], stdin=subprocess.DEVNULL, stdout=bridge_log_fh, stderr=bridge_log_fh, env=self._bridge_env(), **windows_detach_popen_kwargs())
-            _write_bridge_pidfile(self._session_path, self._bridge_process.pid, self._bridge_port)
-            if not await self._wait_for_bridge():
-                return False
-            self._attach_to_bridge(self._bridge_process)
-            self._mark_connected()
-            print(f"[{self.name}] Bridge started on port {self._bridge_port}")
-            self._wire_plugin_handlers(None)
-            return True
-        except Exception as e:
-            logger.error("[%s] Failed to start bridge: %s", self.name, e, exc_info=True)
-            return False
-        finally:
-            if not self._running:
-                if lock_acquired:
-                    self._release_platform_lock()
-                self._close_bridge_log()
-
     def _close_bridge_log(self) -> None:
+        # Mark the tracked worker before closing the current handle.  If the
+        # worker completes later, its callback closes that late handle instead
+        # of publishing it after disconnect/finalizer cleanup.
+        self._request_bridge_log_open_close()
         if self._bridge_log_fh:
             with suppress(Exception):
                 self._bridge_log_fh.close()
@@ -912,17 +1462,47 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             if not self._http_session or await self._report_bridge_exit():
                 break
             try:
-                async with self._bridge_req("get", "messages", 30) as resp:
-                    if resp.status == 200:
-                        for msg_data in await resp.json():
-                            event = await self._build_message_event(msg_data)
-                            if event:
-                                # Fire-and-forget: a slow bridge /read must not delay dispatch.
-                                asyncio.create_task(self._send_read_receipt(msg_data))
-                                if event.message_type == MessageType.TEXT:
-                                    self._enqueue_text_event(event)
-                                else:
-                                    await self.handle_message(event)
+                binding = await self._ensure_queue_binding()
+                if binding is None:
+                    await asyncio.sleep(1)
+                    continue
+                request_id = getattr(self, "_bridge_claim_request_id", None)
+                if not request_id:
+                    request_id = uuid4().hex
+                    self._bridge_claim_request_id = request_id
+                result = await self._bridge_operation(
+                    "messages/claim",
+                    {"request_id": request_id, "binding": binding, "limit": 1},
+                )
+                if isinstance(result, dict) and result.get("status") in {"claimed", "empty", "blocked"}:
+                    self._bridge_claim_request_id = None
+                if isinstance(result, dict) and result.get("status") == "claimed":
+                    item = result.get("item") or {}
+                    payload = item.get("payload") if isinstance(item, dict) else None
+                    if not isinstance(payload, dict):
+                        await asyncio.sleep(1)
+                        continue
+                    delivery = {
+                        "queue_epoch": result.get("binding", {}).get("queue_epoch", binding.get("queue_epoch")),
+                        "bridge_instance": result.get("binding", {}).get("bridge_instance", binding.get("bridge_instance")),
+                        "owner_epoch": result.get("binding", {}).get("owner_epoch", binding.get("owner_epoch")),
+                        "consumer_id": result.get("binding", {}).get("consumer_id", binding.get("consumer_id")),
+                        "consumer_epoch": result.get("binding", {}).get("consumer_epoch", binding.get("consumer_epoch")),
+                        "producer_generation": result.get("binding", {}).get("producer_generation", binding.get("producer_generation")),
+                        "item_id": item.get("item_id"),
+                        "sequence": item.get("sequence"),
+                        "close_generation": item.get("close_generation"),
+                        "claim_id": result.get("claim_id"),
+                        "custody_ref": result.get("custody_ref"),
+                        "settlement_challenge": result.get("settlement_challenge", item.get("settlement_challenge")),
+                        "wire_identity": item.get("wire_identity"),
+                        "state": "claimed",
+                    }
+                    await self._dispatch_polled_message({
+                        **payload,
+                        "_bridge_payload": payload,
+                        "_bridge_delivery": delivery,
+                    })
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -931,6 +1511,126 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 print(f"[{self.name}] Poll error: {e}")
                 await asyncio.sleep(5)
             await asyncio.sleep(1)  # Poll interval
+
+    @staticmethod
+    def _poll_source_marker(msg_data: dict[str, Any]) -> tuple[str, ...] | None:
+        message_id = str(msg_data.get("messageId") or "").strip()
+        if not message_id:
+            return None
+        chat_id = str(msg_data.get("chatId") or "").strip()
+        delivery = msg_data.get("_bridge_delivery")
+        if isinstance(delivery, dict):
+            return (
+                "whatsapp-poll",
+                str(delivery.get("queue_epoch") or ""),
+                str(delivery.get("sequence") or ""),
+                str(delivery.get("item_id") or ""),
+                chat_id,
+                message_id,
+            )
+        return ("whatsapp-poll", chat_id, message_id)
+
+    async def _dispatch_polled_message(self, msg_data: dict[str, Any]) -> None:
+        wire_data, delivery = self._delivery_payload(msg_data)
+        event = await self._build_message_event(wire_data)
+        if event is None:
+            if delivery is not None:
+                await self._hold_bridge_delivery(delivery, "event_build_failed")
+            return
+        from hermes_state_runtime import RuntimeStoreError
+
+        source_marker = self._poll_source_marker(msg_data)
+        prior_event_tokens = self._preservation_source_tokens(event)
+        try:
+            token = self._preservation_source_admit(
+                source_marker or event, event=event, phase="whatsapp-poll-callback",
+            )
+            if prior_event_tokens:
+                self._preservation_source_unknown(token, "ambiguous_event_source_tokens")
+                if delivery is not None:
+                    await self._hold_bridge_delivery(delivery, "ambiguous_event_source_tokens")
+                return
+            if delivery is not None:
+                delivery["source_identity"] = self._source_identity(event)
+                delivery["registration_generation"] = getattr(token, "registration_generation", None)
+                custody_ref = self._preservation_source_attach_transport(
+                    token, delivery, self._settle_bridge_delivery, delivery.get("custody_ref"),
+                )
+                if not custody_ref:
+                    self._preservation_source_unknown(token, "transport_custody_missing")
+                    await self._hold_bridge_delivery(delivery, "transport_custody_missing")
+                    return
+                delivery["custody_ref"] = custody_ref
+                capture = getattr(token, "capture_bridge_delivery", None)
+                if callable(capture):
+                    capture(delivery)
+                event._preservation_bridge_delivery = delivery
+                event._preservation_bridge_deliveries = [delivery]
+                accepted = await self._bridge_transition(
+                    "accept", delivery, expected_state="claimed", custody_ref=custody_ref,
+                )
+                if not isinstance(accepted, dict) or accepted.get("status") != "transitioned":
+                    self._preservation_source_unknown(token, "bridge_accept_failed")
+                    await self._hold_bridge_delivery(delivery, "bridge_accept_failed")
+                    return
+                delivery["state"] = "accepted"
+        except RuntimeStoreError as exc:
+            if str(exc) == "runtime_draining" and source_marker is not None:
+                self._preservation_source_refused(
+                    event, marker=source_marker, reason="runtime_draining",
+                )
+                if delivery is not None:
+                    released = await self._bridge_transition(
+                        "release", delivery, expected_state="claimed", reason="runtime_draining",
+                    )
+                    if not isinstance(released, dict) or released.get("status") != "transitioned":
+                        await self._hold_bridge_delivery(delivery, "runtime_draining_release_ambiguous")
+            else:
+                self._preservation_source_unknown(event, "whatsapp_poll_source_refused")
+                if delivery is not None:
+                    await self._hold_bridge_delivery(delivery, "whatsapp_poll_source_refused")
+            logger.debug("[%s] Source-close refused polled message: %s", self.name, exc)
+            return
+        read_receipt_task = asyncio.create_task(self._send_read_receipt(msg_data))
+        self._background_tasks.add(read_receipt_task)
+        read_receipt_task.add_done_callback(self._background_tasks.discard)
+        try:
+            if event.message_type == MessageType.TEXT:
+                self._enqueue_text_event(event)
+                if getattr(event, "_preservation_source_deferred", False):
+                    self._preservation_source_producer_done(event)
+                else:
+                    self._preservation_source_unknown(event, "whatsapp_text_enqueue_refused")
+                    if delivery is not None:
+                        await self._hold_bridge_delivery(delivery, "whatsapp_text_enqueue_refused")
+            else:
+                await self.handle_message(
+                    event, source_tokens=(token,) if token is not None else (),
+                )
+                self._preservation_source_producer_done(event)
+        except (asyncio.CancelledError, Exception):
+            self._preservation_source_unknown(event, "whatsapp_dispatch_failed")
+            if delivery is not None:
+                await self._hold_bridge_delivery(delivery, "whatsapp_dispatch_failed")
+            raise
+
+    async def _dispatch_text_batch(self, event: MessageEvent) -> None:
+        """Finalize the poll-source token after a buffered text reaches the base handler."""
+        event._preservation_source_deferred = False
+        source_tokens = self._preservation_source_tokens(event)
+        try:
+            await self.handle_message(event, source_tokens=source_tokens)
+        except (asyncio.CancelledError, Exception):
+            self._preservation_source_unknown(event, "whatsapp_text_batch_failed")
+            deliveries = getattr(event, "_preservation_bridge_deliveries", None)
+            if not deliveries:
+                deliveries = (getattr(event, "_preservation_bridge_delivery", None),)
+            for delivery in deliveries:
+                if isinstance(delivery, dict):
+                    await self._hold_bridge_delivery(delivery, "whatsapp_text_batch_failed")
+            raise
+        finally:
+            self._preservation_source_producer_done(source_tokens or event)
 
     async def _send_read_receipt(self, data: dict[str, Any]) -> None:
         key = data.get("readReceiptKey")

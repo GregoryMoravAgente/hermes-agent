@@ -3535,7 +3535,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             binding_token = None
             try:
                 from gateway.platforms.api_server_run_execution import (
-                    begin_legacy_stream_turn, finish_legacy_stream_custody,
+                    begin_legacy_stream_turn, finish_legacy_stream_source,
                     submit_legacy_stream_worker,
                 )
                 binding_token = begin_legacy_stream_turn(
@@ -3655,9 +3655,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 legacy_custody.mark_control_finalizers()
                 if not legacy_custody.worker_done and not legacy_custody.worker_submitted:
                     legacy_custody.request_no_worker()
-                finish_legacy_stream_custody(legacy_custody, session_id or legacy_custody.run_id, binding_token)
-                from gateway.platforms.api_server_run_custody import retire_legacy_source
-                retire_legacy_source(legacy_custody)
+                finish_legacy_stream_source(legacy_custody, session_id or legacy_custody.run_id, binding_token)
                 self._release_run_owner_if_forgotten(run_id)
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.

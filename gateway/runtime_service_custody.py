@@ -322,15 +322,11 @@ class DurableResultProof:
 
 
 def _canonical_store_path(authority: Any) -> str:
-    db = getattr(authority, "db", None)
-    path = getattr(db, "db_path", None)
-    if path is None or isinstance(path, bool):
+    from gateway.session_turn_physical_tip import canonical_store_path
+    path = canonical_store_path(authority)
+    if path is None:
         raise ServiceCustodyError("durable_store_identity_missing")
-    from pathlib import Path
-    try:
-        return str(Path(path).expanduser().resolve())
-    except (OSError, TypeError, ValueError) as exc:
-        raise ServiceCustodyError("durable_store_identity_missing") from exc
+    return path
 
 
 @dataclass
@@ -794,9 +790,14 @@ class ServiceProcessReceipt:
         if type(request_id) is not str or not request_id:
             self.mark_unknown("durable_request_identity_missing")
             raise ServiceCustodyError("durable_request_identity_missing")
+        from gateway.session_turn_physical_tip import physical_proof_session
+        physical_session_id = physical_proof_session(binding, proof)
+        if physical_session_id is None:
+            self.mark_unknown("durable_result_identity_mismatch")
+            raise ServiceCustodyError("durable_result_identity_mismatch")
         if (
             proof.store_path != _canonical_store_path(binding.authority)
-            or proof.session_id != binding.session_id
+            or proof.session_id != physical_session_id
             or proof.admission_id != binding.admission_id
             or proof.execution_generation != binding.execution_generation
             or type(proof.row_ids) is not tuple
@@ -807,7 +808,7 @@ class ServiceProcessReceipt:
             or any(type(snapshot) is not str or not snapshot for snapshot in proof.row_snapshots)
             or type(proof.row_sessions) is not tuple
             or len(proof.row_sessions) != len(proof.row_ids)
-            or any(session != binding.session_id for session in proof.row_sessions)
+            or any(session != physical_session_id for session in proof.row_sessions)
             or type(proof.row_roles) is not tuple
             or len(proof.row_roles) != len(proof.row_ids)
             or any(type(role) is not str or not role for role in proof.row_roles)
@@ -1014,10 +1015,12 @@ class ServiceProcessReceipt:
         return True
 
     def close_after_delivery(self) -> bool:
+        from gateway.runtime_service_native_close import can_retry_managed_native_close
+        managed_native_retry = can_retry_managed_native_close(self)
         external_unknown = self.unknown_reason in (
             {"catalog_discovery_failed", "cache_readback_unknown"}
             | _EXTERNAL_CLOSE_RETRY_REASONS
-        )
+        ) and not managed_native_retry
         if external_unknown:
             proof = self.external_publication_proof
             if (
@@ -1074,7 +1077,7 @@ class ServiceProcessReceipt:
                 # A native close can fail after the exact empty proof while the retained
                 # handle and generation remain valid. Re-open only this same handle after
                 # the close retry succeeds; identity/reader uncertainty stays sticky.
-                if self.unknown_reason not in _EXTERNAL_CLOSE_RETRY_REASONS:
+                if self.unknown_reason not in _EXTERNAL_CLOSE_RETRY_REASONS and not managed_native_retry:
                     return False
                 reconciled = self.service.coordinator.reconcile_unknown(
                     self.handle, owner_id=self.handle.owner_id, profile_id=self.handle.profile_id,
@@ -1091,7 +1094,7 @@ class ServiceProcessReceipt:
             if self.unknown_reason not in (
                 {"catalog_discovery_failed", "cache_readback_unknown"}
                 | _EXTERNAL_CLOSE_RETRY_REASONS
-            ):
+            ) and not managed_native_retry:
                 return False
             reconciled = self.service.coordinator.reconcile_unknown(
                 self.handle, owner_id=self.handle.owner_id, profile_id=self.handle.profile_id,
@@ -1528,9 +1531,12 @@ class ServiceLease:
         ):
             raise ServiceCustodyError("physical_receipt_identity_mismatch")
         proof = physical.durable_proofs.get(lease_id)
+        from gateway.session_turn_physical_tip import physical_proof_session
+        physical_session_id = physical_proof_session(binding, proof)
         if (
             proof is None
-            or proof.session_id != binding.session_id
+            or physical_session_id is None
+            or proof.session_id != physical_session_id
             or proof.admission_id != binding.admission_id
             or proof.execution_generation != binding.execution_generation
             or proof.store_path != _canonical_store_path(binding.authority)

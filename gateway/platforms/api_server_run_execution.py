@@ -92,11 +92,55 @@ def submit_legacy_stream_worker(custody: Any, worker_task: Any) -> None:
 def finish_legacy_stream_custody(custody: Any, task_id: str, binding_token: Any) -> None:
     """Apply the terminal scope receipt after status, delivery, and control receipts."""
     try:
-        refusal = finalize_legacy_stream_custody(custody, task_id)
+        try:
+            refusal = finalize_legacy_stream_custody(custody, task_id)
+        except BaseException:
+            completion = getattr(custody, "finalizer_completion", None)
+            if completion is not None:
+                completion.fail("stream_custody_finalization_error")
+            raise
         if refusal is not None:
-            custody.mark_unknown(getattr(refusal, "code", "stream_custody_finalization_unknown"))
+            reason = getattr(refusal, "code", "stream_custody_finalization_unknown")
+            custody.mark_unknown(reason)
+            completion = getattr(custody, "finalizer_completion", None)
+            if completion is not None:
+                completion.fail(reason)
+            return
+        # The stream worker deliberately passes active_run_id through the observer path, so its
+        # I03 child cannot close in run_legacy_authority_turn.  At this existing physical stream
+        # close boundary, consume the canonical status receipt and settle the exact I02 completion.
+        completion = getattr(custody, "finalizer_completion", None)
+        if completion is not None:
+            from gateway.platforms.api_server_run_custody import (
+                complete_legacy_source, retire_legacy_source_with_completion,
+            )
+            try:
+                refusal = complete_legacy_source(custody, active_run_id=None)
+            except BaseException:
+                completion.fail("stream_completion_error")
+                raise
+            if refusal is not None:
+                reason = getattr(refusal, "code", "stream_completion_unknown")
+                custody.mark_unknown(reason)
+                completion.fail(reason)
+            elif getattr(getattr(completion, "receipt", None), "state", None) == "complete":
+                # The outer session-stream caller also retires its legacy source.  Retire the
+                # completion registry only after this exact source-map preflight succeeds; a
+                # missing map/registry retains both references for reconciliation.
+                if not retire_legacy_source_with_completion(custody):
+                    custody.mark_completion_unknown("stream_completion_retire_pending")
     finally:
         reset_legacy_process_custody(binding_token)
+
+
+def finish_legacy_stream_source(custody: Any, task_id: str, binding_token: Any) -> None:
+    """Finish the stream before retiring only its non-completion legacy source."""
+    finish_legacy_stream_custody(custody, task_id, binding_token)
+    # Managed I02 streams retain their maps until the typed completion fence settles.
+    # A second plain retirement would discard the evidence needed for reconciliation.
+    if getattr(custody, "finalizer_completion", None) is None:
+        from gateway.platforms.api_server_run_custody import retire_legacy_source
+        retire_legacy_source(custody)
 
 
 def begin_legacy_direct_turn(

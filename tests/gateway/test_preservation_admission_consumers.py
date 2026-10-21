@@ -7,23 +7,65 @@ admission or claim produced by an existing production entrypoint.
 import asyncio
 import shlex
 import sys
+from contextlib import contextmanager
 from functools import partial
+from pathlib import Path
 
 import pytest
 
 from tests.waiting import async_wait_until
 
 
-def _install_custody(authority):
+def _install_custody(authority, *source_adapters):
     from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.runtime_custody_profiles import ProfileScopeResolver
+    from gateway.preservation_source_close import register_source_adapter
     from hermes_cli.backend_retirement import RetirementFence
 
     authority.runner.runtime_custody = RuntimeCustodyCoordinator(
         process_instance=authority.instance_id,
         authority_epoch=authority.epoch,
         fence=RetirementFence(),
+        profile_scope=(ProfileScopeResolver(authority.runner)
+                       if getattr(authority.runner, 'session_authorities', None) is not None else None),
     )
+    # These consumer fixtures use the canonical owner fixture, which intentionally does not
+    # run the full GatewayRunner adapter bootstrap. Register the real adapter instance through
+    # the production source-close seam so begin_preservation_drain observes the same source
+    # ownership that a wired runner would install. The adapter itself remains the real test
+    # transport; no registry state is fabricated here.
+    for adapter in source_adapters:
+        register_source_adapter(authority.runner, adapter, getattr(adapter, '_owner_profile', None))
     return authority.runner.runtime_custody
+
+
+@contextmanager
+def _reserved_profile_owner(authority, monkeypatch):
+    """Keep the real profile lock incarnation through the native process evidence consumer."""
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session_authorities import SessionAuthorities
+    from gateway.session_authority import SessionAuthority
+
+    home = Path(authority.db.db_path).resolve().parent
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    authority = SessionAuthority(
+        authority.runner, profile_id=str(home), instance_id=authority.instance_id,
+        db=authority.db, epoch=authority.epoch,
+    )
+    monkeypatch.setattr(authority.runner, 'session_authority', authority)
+    authorities = SessionAuthorities(home)
+    authorities.add(home, authority)
+    monkeypatch.setattr(authority.runner, 'session_authorities', authorities, raising=False)
+    process_ownership.reserve([home])
+    try:
+        yield authority
+    finally:
+        coordinator = getattr(authority.runner, 'runtime_custody', None)
+        # A failed native proof retains its real lock until this isolated test process exits.
+        # Only a settled source graph permits the explicit fixture release.
+        if coordinator is not None and not coordinator.status()['active_owner_classes']:
+            if not process_ownership.release(home):
+                raise RuntimeError('native consumer profile ownership was not released')
 
 
 @pytest.mark.asyncio
@@ -118,7 +160,7 @@ async def test_real_api_waiter_settles_under_close_and_aborts_with_active_custod
     from gateway.session_results import execution_result
     from hermes_state_runtime import RuntimeStoreError, get_session_admission
 
-    coordinator = _install_custody(owner)
+    coordinator = _install_custody(owner, api)
     owner.runner.session_runtime_descriptor = {
         'instance_id': owner.instance_id,
         'authority_epoch': owner.epoch,
@@ -212,174 +254,177 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
     R3 synthetic ``marker_adopters``/``Event.set`` shortcut and supplies the source-backed I01
     evidence used by preservation handoff.
     """
-    from gateway import delivery_ledger as dl, run_runtime
-    from gateway.config import GatewayConfig, Platform, PlatformConfig
-    from gateway.platforms.base import BasePlatformAdapter, SendResult
-    from gateway.platforms.event import MessageEvent
-    from gateway.run import GatewayRunner
-    from gateway.session_contract import SessionRef
-    from gateway.session_ingress import admit_message
-    from gateway.session_results import execution_result
-    from gateway.session import AsyncSessionStore, SessionSource
-    from hermes_state_runtime import get_session_admission
+    with _reserved_profile_owner(owner, monkeypatch) as owner:
+        from gateway import delivery_ledger as dl, run_runtime
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.platforms.base import BasePlatformAdapter, SendResult
+        from gateway.platforms.event import MessageEvent
+        from gateway.run import GatewayRunner
+        from gateway.session_contract import SessionRef
+        from gateway.session_ingress import admit_message
+        from gateway.session_results import execution_result
+        from gateway.session import AsyncSessionStore, SessionSource
+        from hermes_state_runtime import get_session_admission
 
-    class LedgerAdapter(BasePlatformAdapter):
-        def __init__(self):
-            super().__init__(PlatformConfig(enabled=True, typing_indicator=False), Platform.SLACK)
-            self.send_started = asyncio.Event()
-            self.send_release = asyncio.Event()
+        class LedgerAdapter(BasePlatformAdapter):
+            def __init__(self):
+                super().__init__(PlatformConfig(enabled=True, typing_indicator=False), Platform.SLACK)
+                self.send_started = asyncio.Event()
+                self.send_release = asyncio.Event()
 
-        async def connect(self, *, is_reconnect=False):
-            return True
+            async def connect(self, *, is_reconnect=False):
+                return True
 
-        async def disconnect(self):
-            return None
+            async def disconnect(self):
+                return None
 
-        async def get_chat_info(self, chat_id):
-            return None
+            async def get_chat_info(self, chat_id):
+                return None
 
-        async def send(self, chat_id, content, reply_to=None, metadata=None):
-            self.send_started.set()
-            await self.send_release.wait()
-            return SendResult(success=True, message_id='native-r4-delivery')
+            async def send(self, chat_id, content, reply_to=None, metadata=None):
+                self.send_started.set()
+                await self.send_release.wait()
+                return SendResult(success=True, message_id='native-r4-delivery')
 
-    coordinator = _install_custody(owner)
-    owner.runner.config = GatewayConfig(sessions_dir=tmp_path / 'sessions')
-    owner.runner.session_runtime_descriptor = {
-        'instance_id': owner.instance_id,
-        'authority_epoch': owner.epoch,
-    }
-    owner.runner._external_drain_active = False
-    owner.runner._preservation_drain_active = False
-    owner.runner._draining = False
-    adapter = LedgerAdapter()
-    adapter.gateway_runner = owner.runner
-    adapter._owner_profile = 'default'
-    owner.runner.adapters = {Platform.SLACK: adapter}
-    owner.runner._delivery_adapter_for = lambda _source: adapter
-    owner.runner._adapter_for_source = lambda _source: adapter
-    owner.runner._is_user_authorized_for_source = lambda _source, allow_adapter_delegation=False: True
-    owner.runner._adapter_flag = lambda *_args, **_kwargs: False
-    owner.runner._adapter_profile_for_source = lambda _source: None
-    owner.runner._cached_agent_for = lambda _route: None
-    owner.runner._is_session_running = lambda _route: False
-    owner.runner.async_session_store = AsyncSessionStore(owner.runner.session_store)
-    owner.runner._mark_durable_active_turn = partial(GatewayRunner._mark_durable_active_turn, owner.runner)
-    owner.runner._clear_durable_active_turn = partial(GatewayRunner._clear_durable_active_turn, owner.runner)
-    monkeypatch.setattr(owner, '_schedule', lambda _ref: None)
-    monkeypatch.setattr(run_runtime, '_authorities', lambda _runner: [owner])
-    monkeypatch.setattr(run_runtime, '_preservation_ownership_reason',
-                        lambda _runner, **_kwargs: None)
-    ledger_path = tmp_path / 'delivery-ledger.db'
-    monkeypatch.setattr(dl, '_db_path', lambda: ledger_path)
+        coordinator = _install_custody(owner)
+        owner.runner.config = GatewayConfig(sessions_dir=tmp_path / 'sessions')
+        owner.runner.session_runtime_descriptor = {
+            'instance_id': owner.instance_id,
+            'authority_epoch': owner.epoch,
+        }
+        owner.runner._external_drain_active = False
+        owner.runner._preservation_drain_active = False
+        owner.runner._draining = False
+        adapter = LedgerAdapter()
+        adapter.gateway_runner = owner.runner
+        adapter._owner_profile = 'default'
+        from gateway.preservation_source_close import register_source_adapter
+        register_source_adapter(owner.runner, adapter, adapter._owner_profile)
+        owner.runner.adapters = {Platform.SLACK: adapter}
+        owner.runner._delivery_adapter_for = lambda _source: adapter
+        owner.runner._adapter_for_source = lambda _source: adapter
+        owner.runner._is_user_authorized_for_source = lambda _source, allow_adapter_delegation=False: True
+        owner.runner._adapter_flag = lambda *_args, **_kwargs: False
+        owner.runner._adapter_profile_for_source = lambda _source: None
+        owner.runner._cached_agent_for = lambda _route: None
+        owner.runner._is_session_running = lambda _route: False
+        owner.runner.async_session_store = AsyncSessionStore(owner.runner.session_store)
+        owner.runner._mark_durable_active_turn = partial(GatewayRunner._mark_durable_active_turn, owner.runner)
+        owner.runner._clear_durable_active_turn = partial(GatewayRunner._clear_durable_active_turn, owner.runner)
+        monkeypatch.setattr(owner, '_schedule', lambda _ref: None)
+        monkeypatch.setattr(run_runtime, '_authorities', lambda _runner: [owner])
+        monkeypatch.setattr(run_runtime, '_preservation_ownership_reason',
+                            lambda _runner, **_kwargs: None)
+        ledger_path = tmp_path / 'delivery-ledger.db'
+        monkeypatch.setattr(dl, '_db_path', lambda: ledger_path)
 
-    # I15 evidence must come from a real ProcessRegistry reader/terminal/delivery cycle.
-    # The adapter ledger above only proves I01; an empty registry cannot be sealed as I15.
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'hermes-home'))
-    import tools.process_registry as process_registry_module
-    from tools.process_registry import ProcessRegistry
+        # I15 evidence must come from a real ProcessRegistry reader/terminal/delivery cycle.
+        # The adapter ledger above only proves I01; an empty registry cannot be sealed as I15.
+        monkeypatch.setenv('HERMES_HOME', str(Path(owner.db.db_path).resolve().parent))
+        import tools.process_registry as process_registry_module
+        from tools.process_registry import ProcessRegistry
 
-    monkeypatch.setattr(process_registry_module, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
-    monkeypatch.setattr(process_registry_module, '_SYSTEMD_SCOPE_AVAILABLE', False, raising=False)
-    registry = ProcessRegistry()
-    registry.bind_runtime_custody(coordinator)
-    monkeypatch.setattr(process_registry_module, 'process_registry', registry)
-    child_code = "print('i15-preservation', flush=True)"
-    registry_session = registry.spawn_local(
-        f'{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}',
-        cwd=str(tmp_path), task_id='i15-preservation', session_key='i15-preservation',
-        notify_on_complete=True,
-    )
-    waited = registry.wait_for_pending_completions(
-        task_id=registry_session.owner_task_id, timeout=10, poll_interval=0.1,
-    )
-    assert registry_session._completion_event.is_set(), waited
-    delivered = registry.drain_notifications(
-        session_key=registry_session.session_key, skip_poll_observed=False,
-    )
-    assert delivered and delivered[0][0]['session_id'] == registry_session.id
-    delivery_token = delivered[0][0].get('delivery_token', '')
-    assert delivery_token
-    registry.acknowledge_completion_delivery(delivery_token)
-    assert registry_session.custody_delivery_acked is True
+        monkeypatch.setattr(process_registry_module, 'CHECKPOINT_PATH', tmp_path / 'processes.json')
+        monkeypatch.setattr(process_registry_module, '_SYSTEMD_SCOPE_AVAILABLE', False, raising=False)
+        registry = ProcessRegistry()
+        registry.bind_runtime_custody(coordinator)
+        monkeypatch.setattr(process_registry_module, 'process_registry', registry)
+        child_code = "print('i15-preservation', flush=True)"
+        registry_session = registry.spawn_local(
+            f'{shlex.quote(sys.executable)} -c {shlex.quote(child_code)}',
+            cwd=str(tmp_path), task_id='i15-preservation', session_key='i15-preservation',
+            notify_on_complete=True,
+        )
+        waited = registry.wait_for_pending_completions(
+            task_id=registry_session.owner_task_id, timeout=10, poll_interval=0.1,
+        )
+        assert registry_session._completion_event.is_set(), waited
+        delivered = registry.drain_notifications(
+            session_key=registry_session.session_key, skip_poll_observed=False,
+        )
+        assert delivered and delivered[0][0]['session_id'] == registry_session.id
+        delivery_token = delivered[0][0].get('delivery_token', '')
+        assert delivery_token
+        registry.acknowledge_completion_delivery(delivery_token)
+        assert registry_session.custody_delivery_acked is True
 
-    provider_started, provider_release = asyncio.Event(), asyncio.Event()
+        provider_started, provider_release = asyncio.Event(), asyncio.Event()
 
-    async def bounded_provider(event):
-        provider_started.set()
-        await provider_release.wait()
-        result = {'final_response': 'native reply', 'messages': [], 'completed': True}
-        captured = execution_result.get()
-        captured['terminal_result'] = result
-        captured['result'] = result
-        await owner.runner._mark_durable_active_turn(event, adapter._event_session_key(event))
-        return result['final_response']
+        async def bounded_provider(event):
+            provider_started.set()
+            await provider_release.wait()
+            result = {'final_response': 'native reply', 'messages': [], 'completed': True}
+            captured = execution_result.get()
+            captured['terminal_result'] = result
+            captured['result'] = result
+            await owner.runner._mark_durable_active_turn(event, adapter._event_session_key(event))
+            return result['final_response']
 
-    owner.runner._handle_message = bounded_provider
-    adapter.set_message_handler(partial(admit_message, owner))
-    source = SessionSource(platform=Platform.SLACK, chat_id='r4-native-chat', chat_type='dm',
-                           user_id='r4-native-user')
-    event = MessageEvent(text='native preservation', source=source, message_id='native-r4')
-    session_key = adapter._event_session_key(event)
-    inbound = asyncio.create_task(adapter._process_message_background(event, session_key))
-    await async_wait_until(lambda: bool(owner._preservation_handles), timeout=5,
-                           what='the native admission lease')
-    admission_id = next(iter(owner._preservation_handles))
-    await async_wait_until(lambda: admission_id in owner.native_waiters, timeout=5,
-                           what='the native delivery waiter')
-    row = get_session_admission(owner.db, admission_id=admission_id)
-    ref = SessionRef(owner.profile_id, row['target_session_id'])
-    params = {
-        'instance_id': owner.instance_id,
-        'authority_epoch': owner.epoch,
-        'owner_id': 'native-r4', 'scope': 'process', 'deadline_s': 30,
-    }
-    receipt = await run_runtime.begin_preservation_drain(owner.runner, params, 'test-peer')
-    assert receipt['status'] == 'closing'
-    drain = asyncio.create_task(owner._drain(ref))
-    await asyncio.wait_for(provider_started.wait(), 5)
-    # The live native waiter removes its admission-keyed registry entry in its finally block
-    # immediately after the settlement waiter resolves. Capture the actual adopter before releasing
-    # the provider; the adapter keeps this same event object through ledger ownership.
-    adopter = owner.marker_adopters[admission_id]
-    provider_release.set()
-    await async_wait_until(lambda: adapter.send_started.is_set(), timeout=10,
-                           what='the ledgered native send')
-    with dl._connect() as conn:
-        state = conn.execute(
-            'SELECT state FROM delivery_obligations WHERE obligation_id IS NOT NULL'
-        ).fetchone()[0]
-    assert state == 'attempting'
-    assert adopter._gateway_marker_released.is_set(), 'marker releases after ledger ownership'
-    adapter.send_release.set()
-    await asyncio.wait_for(asyncio.gather(inbound, drain), 15)
-    settled = get_session_admission(owner.db, admission_id=admission_id)
-    assert settled is not None and settled['status'] == 'terminal'
-    with dl._connect() as conn:
-        assert conn.execute(
-            'SELECT state FROM delivery_obligations WHERE obligation_id IS NOT NULL'
-        ).fetchone()[0] == 'delivered'
-    assert coordinator.status()['active_owner_classes'] == []
-    prepared = await run_runtime.prepare_preservation_handoff(
-        owner.runner, {'receipt': receipt}, 'test-peer')
-    assert prepared == {'status': 'refused', 'reason': 'unknown_owner', 'owner_class': 'I03_api_run_direct'}
-    states = coordinator.status()['owner_states']
-    assert states['I01_native_inbound'] == 'sealed'
-    assert states['I02_api_session_turn'] == 'sealed'
-    assert states['I04_fifo_turn_execution'] == 'sealed'
-    from gateway.runtime_custody import OWNER_CLASSES
-    assert set(states) == set(OWNER_CLASSES)
-    # I15 is already wired by the existing process-registry integration.  Keep the assertion
-    # causal and roster-based: the remaining first unclaimed owner is the I03 route, and a stale
-    # aggregate count must not be updated whenever another owner is added to the graph.
-    assert states['I15_process_registry_terminal'] == 'sealed'
-    assert states['I03_api_run_direct'] == 'unwired'
-    assert {owner for owner, state in states.items() if state == 'sealed'} == {
-        'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution',
-        'I15_process_registry_terminal'}
-    reopened = await run_runtime.abort_preservation_drain(
-        owner.runner, {'receipt': receipt}, 'test-peer')
-    assert reopened['status'] == 'open'
+        owner.runner._handle_message = bounded_provider
+        adapter.set_message_handler(partial(admit_message, owner))
+        source = SessionSource(platform=Platform.SLACK, chat_id='r4-native-chat', chat_type='dm',
+                               user_id='r4-native-user')
+        event = MessageEvent(text='native preservation', source=source, message_id='native-r4')
+        session_key = adapter._event_session_key(event)
+        inbound = asyncio.create_task(adapter._process_message_background(event, session_key))
+        await async_wait_until(lambda: bool(owner._preservation_handles), timeout=5,
+                               what='the native admission lease')
+        admission_id = next(iter(owner._preservation_handles))
+        await async_wait_until(lambda: admission_id in owner.native_waiters, timeout=5,
+                               what='the native delivery waiter')
+        row = get_session_admission(owner.db, admission_id=admission_id)
+        ref = SessionRef(owner.profile_id, row['target_session_id'])
+        params = {
+            'instance_id': owner.instance_id,
+            'authority_epoch': owner.epoch,
+            'owner_id': 'native-r4', 'scope': 'process', 'deadline_s': 30,
+        }
+        receipt = await run_runtime.begin_preservation_drain(owner.runner, params, 'test-peer')
+        assert receipt['status'] == 'closing'
+        drain = asyncio.create_task(owner._drain(ref))
+        await asyncio.wait_for(provider_started.wait(), 5)
+        # The live native waiter removes its admission-keyed registry entry in its finally block
+        # immediately after the settlement waiter resolves. Capture the actual adopter before releasing
+        # the provider; the adapter keeps this same event object through ledger ownership.
+        adopter = owner.marker_adopters[admission_id]
+        provider_release.set()
+        await async_wait_until(lambda: adapter.send_started.is_set(), timeout=10,
+                               what='the ledgered native send')
+        with dl._connect() as conn:
+            state = conn.execute(
+                'SELECT state FROM delivery_obligations WHERE obligation_id IS NOT NULL'
+            ).fetchone()[0]
+        assert state == 'attempting'
+        assert adopter._gateway_marker_released.is_set(), 'marker releases after ledger ownership'
+        adapter.send_release.set()
+        await asyncio.wait_for(asyncio.gather(inbound, drain), 15)
+        settled = get_session_admission(owner.db, admission_id=admission_id)
+        assert settled is not None and settled['status'] == 'terminal'
+        with dl._connect() as conn:
+            assert conn.execute(
+                'SELECT state FROM delivery_obligations WHERE obligation_id IS NOT NULL'
+            ).fetchone()[0] == 'delivered'
+        assert coordinator.status()['active_owner_classes'] == []
+        prepared = await run_runtime.prepare_preservation_handoff(
+            owner.runner, {'receipt': receipt}, 'test-peer')
+        assert prepared == {'status': 'refused', 'reason': 'unknown_owner', 'owner_class': 'I03_api_run_direct'}
+        states = coordinator.status()['owner_states']
+        assert states['I01_native_inbound'] == 'sealed'
+        assert states['I02_api_session_turn'] == 'sealed'
+        assert states['I04_fifo_turn_execution'] == 'sealed'
+        from gateway.runtime_custody import OWNER_CLASSES
+        assert set(states) == set(OWNER_CLASSES)
+        # I15 is already wired by the existing process-registry integration.  Keep the assertion
+        # causal and roster-based: the remaining first unclaimed owner is the I03 route, and a stale
+        # aggregate count must not be updated whenever another owner is added to the graph.
+        assert states['I15_process_registry_terminal'] == 'sealed'
+        assert states['I03_api_run_direct'] == 'unwired'
+        assert {owner for owner, state in states.items() if state == 'sealed'} == {
+            'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution',
+            'I15_process_registry_terminal'}
+        reopened = await run_runtime.abort_preservation_drain(
+            owner.runner, {'receipt': receipt}, 'test-peer')
+        assert reopened['status'] == 'open'
 
 
 @pytest.mark.asyncio
@@ -452,7 +497,7 @@ async def test_hosted_room_binding_refuses_fresh_close_before_sql_write(api, own
     from gateway.session_api import hosted_member_session
     from hermes_state_runtime import RuntimeStoreError
 
-    coordinator = _install_custody(owner)
+    coordinator = _install_custody(owner, api)
     owner.runner.session_runtime_descriptor = {
         'instance_id': owner.instance_id,
         'authority_epoch': owner.epoch,

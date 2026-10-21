@@ -45,7 +45,7 @@ def _valid_event_digest(value):
             and all(character in '0123456789abcdef' for character in value))
 
 
-def _automation_generation_valid(row):
+def _automation_generation_valid(row, *, allow_terminal=False, allow_preclaim_cancel=False):
     """Validate the durable row's execution-generation state before any successor effect."""
     if not isinstance(row, dict):
         return False
@@ -53,9 +53,21 @@ def _automation_generation_valid(row):
     generation = row.get('generation')
     if status == 'queued':
         return generation is None
+    terminal_witness = (allow_terminal and status == 'terminal'
+                        and row.get('outcome') in {
+                            'completed', 'failed', 'interrupted', 'rejected', 'cancelled', 'steered'})
     if status in {'started', 'unknown'}:
         return type(generation) is int and generation >= 1
-    return False
+    if terminal_witness and type(generation) is int and generation >= 1:
+        return True
+    # A queued producer can be cancelled before an I04 claim.  This is a callback-only witness,
+    # never an admission/recovery generation and never a generic terminal-row waiver.
+    return (
+        allow_preclaim_cancel
+        and terminal_witness
+        and row.get('outcome') == 'cancelled'
+        and generation is None
+    )
 
 
 def _automation_descriptor_complete(descriptor):
@@ -205,6 +217,9 @@ class AutomationCustodyMixin:
             raise RuntimeStoreError('invalid_params')
         if owner_class not in _AUTOMATION_OWNER_CLASSES:
             raise RuntimeStoreError('preservation_owner_unmapped')
+        if owner_class == 'I08_goals_loops_heartbeat':
+            from gateway.session_goal_tick_custody import mark_source_observed
+            mark_source_observed(self, 'automation-root')
         root_key = delivery_id or request_id
         existing = self._preservation_automation_roots.get(root_key)
         coordinator = self._preservation_coordinator()
@@ -331,17 +346,33 @@ class AutomationCustodyMixin:
         from gateway.session_automation_custody import row_descriptor
         return row_descriptor(row)
 
-    def _preservation_automation_row_matches(self, row, handle):
+    def _preservation_automation_row_matches(
+            self, row, handle, *, allow_terminal=False, allow_preclaim_cancel=False):
         descriptor = self._preservation_automation_row_descriptor(row)
         owner_class = getattr(handle, 'owner_class', None)
         pending = self._preservation_pending_roots.get(id(handle))
         binding = self._preservation_automation_bindings.get(row.get('admission_id')) if isinstance(row, dict) else None
         descriptor_valid = _automation_descriptor_complete(descriptor)
+        preclaim_cancel = (
+            allow_preclaim_cancel
+            and isinstance(row, dict)
+            and row.get('status') == 'terminal'
+            and row.get('outcome') == 'cancelled'
+            and row.get('generation') is None
+        )
+        if preclaim_cancel:
+            # A cancellation witness is valid only before the exact FIFO child was reserved.
+            children = getattr(self, '_preservation_children', None)
+            claiming = getattr(self, '_preservation_claiming', None)
+            if ((isinstance(children, dict) and children.get(row.get('admission_id')) is not None)
+                    or (isinstance(claiming, dict) and row.get('admission_id') in claiming)):
+                return False
         if (owner_class not in _AUTOMATION_OWNER_CLASSES
                 or (owner_class in _AUTOMATION_OWNER_CLASSES and not descriptor_valid)
                 or (pending is None and binding is None)
                 or type(row.get('owner_epoch')) is not int or row['owner_epoch'] < 1
-                or not _automation_generation_valid(row)):
+                or not _automation_generation_valid(
+                    row, allow_terminal=allow_terminal, allow_preclaim_cancel=preclaim_cancel)):
             return False
         if pending is not None and pending.get('handle') is not handle:
             pending = None
@@ -366,7 +397,8 @@ class AutomationCustodyMixin:
                 and type(bound_row.get('owner_epoch')) is int
                 and bound_row['owner_epoch'] >= 1
                 and bound_row['owner_epoch'] == expected_bound_epoch
-                and row.get('status') in {'started', 'unknown'}
+                and (row.get('status') in {'started', 'unknown'}
+                     or (allow_terminal and row.get('status') == 'terminal'))
                 and row.get('owner_epoch') == self.epoch
                 and type(row.get('generation')) is int
                 and row['generation'] >= 1
@@ -738,6 +770,200 @@ class AutomationCustodyMixin:
         self._route_wake_inbound_seen |= owner_class == 'I07_automation_route_wakes'
         return admission_id
 
+    def _preservation_automation_terminal_witness_ready(self, admission_id):
+        """Require the canonical preclaim boundary or a real typed transport receipt."""
+        bindings = getattr(self, '_preservation_automation_bindings', None)
+        binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+        handle = binding.get('handle') if isinstance(binding, dict) else None
+        if getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES:
+            return True
+
+        # Cancellation is the one terminal path with no producer transport.  It is accepted only
+        # from the canonical row after the queued producer was cancelled before an I04 child or
+        # claim existed; no in-memory witness is minted for this case.
+        try:
+            from hermes_state_runtime import get_session_admission
+            row = get_session_admission(self.db, admission_id=admission_id)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        preclaim_cancel = (
+            isinstance(row, dict)
+            and row.get('admission_id') == admission_id
+            and row.get('status') == 'terminal'
+            and row.get('outcome') == 'cancelled'
+            and row.get('generation') is None
+        )
+        if preclaim_cancel and isinstance(binding, dict):
+            bound_row = binding.get('row')
+            if (isinstance(bound_row, dict)
+                    and all(row.get(field) == bound_row.get(field) for field in (
+                        'admission_id', 'target_session_id', 'principal_id', 'request_id'))
+                    and _automation_generation_valid(
+                        row, allow_terminal=True, allow_preclaim_cancel=True)
+                    and self._preservation_automation_row_matches(
+                        row, handle, allow_terminal=True, allow_preclaim_cancel=True)):
+                children = getattr(self, '_preservation_children', {})
+                claiming = getattr(self, '_preservation_claiming', {})
+                if (not isinstance(children, dict) or children.get(admission_id) is None) and (
+                        not isinstance(claiming, dict) or admission_id not in claiming):
+                    return True
+
+        # A waiter completing only proves that a local future was resolved.  The release fence
+        # consumes the typed receipt returned by the source-owned transport path instead.
+        try:
+            from gateway.session_ingress import DeliveryReceipt
+        except ImportError:
+            return False
+        receipt = binding.get('terminal_delivery_receipt') if isinstance(binding, dict) else None
+        if (not isinstance(receipt, DeliveryReceipt)
+                or receipt.admission_id != admission_id
+                or receipt.attempted is not True
+                or receipt.delivered is not True
+                or receipt.reason is not None
+                or receipt.effect_state != 'delivered'):
+            return False
+        sidecars = [entry for entry in getattr(self, '_preservation_sidecars', {}).values()
+                    if entry.get('admission_id') == admission_id]
+        return not sidecars or all(
+            entry.get('delivery_complete') is True and entry.get('terminal') is True
+            for entry in sidecars
+        )
+
+    def _preservation_automation_no_delivery_terminal_witness(
+            self, admission_id, delivery_receipt):
+        """Accept the durable terminal row when this producer has no outbound recipient.
+
+        Heartbeat and direct A2A/Kanban admissions can complete without a waiter or a
+        ``pending_deliveries`` entry.  That source-owned path has no transport receipt to
+        record; the committed result plus the exact automation binding is its terminal
+        witness.  A no-delivery receipt that followed an actual pending delivery remains
+        unqualified and keeps the original custody fence.
+        """
+        if (
+            getattr(delivery_receipt, 'admission_id', None) != admission_id
+            or getattr(delivery_receipt, 'attempted', None) is not False
+            or getattr(delivery_receipt, 'delivered', None) is not False
+            or getattr(delivery_receipt, 'reason', None) != 'no_delivery'
+            or getattr(delivery_receipt, 'effect_state', None) != 'none'
+        ):
+            return False
+        bindings = getattr(self, '_preservation_automation_bindings', None)
+        binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+        handle = binding.get('handle') if isinstance(binding, dict) else None
+        if getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES:
+            return False
+        if binding.get('terminal_delivery_receipt') is not None:
+            return False
+        if self._preservation_has_sidecar(admission_id):
+            return False
+        if admission_id in getattr(self, 'pending_deliveries', {}):
+            return False
+        if admission_id in getattr(self, 'native_waiters', set()):
+            return False
+        if admission_id in getattr(self, 'waiters', {}):
+            return False
+        for registry_name in (
+                'marker_adopters', 'held_turn_markers', 'unsettled_deliveries'):
+            registry = getattr(self, registry_name, {})
+            if admission_id in registry:
+                return False
+        try:
+            from hermes_state_runtime import get_session_admission
+            row = get_session_admission(self.db, admission_id=admission_id)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        if (
+            not isinstance(row, dict)
+            or row.get('admission_id') != admission_id
+            or row.get('status') != 'terminal'
+            or row.get('outcome') == 'cancelled'
+            or type(row.get('generation')) is not int
+            or row.get('generation') < 1
+            or not self._preservation_automation_row_matches(
+                row, handle, allow_terminal=True,
+            )
+        ):
+            return False
+        try:
+            from gateway.session_results import admission_result
+            return admission_result(self.db, admission_id) is not None
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    def _preservation_accept_automation_direct_delivery(
+            self, admission_id, delivery_receipt, *, physical_delivery, waiter_delivered):
+        if physical_delivery:
+            return self._preservation_record_automation_terminal_witness(
+                admission_id, delivery_receipt=delivery_receipt,
+                waiter_delivered=waiter_delivered, finalizer_outcome='direct_delivery')
+        return self._preservation_automation_no_delivery_terminal_witness(
+            admission_id, delivery_receipt)
+
+    def _preservation_record_automation_terminal_witness(
+        self, admission_id, *, delivery_receipt=None, waiter_delivered=False,
+        finalizer_outcome=None,
+    ):
+        """Bind the source-owned typed transport receipt after the canonical finalizer boundary."""
+        bindings = getattr(self, '_preservation_automation_bindings', None)
+        binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+        handle = binding.get('handle') if isinstance(binding, dict) else None
+        if getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES:
+            return True
+
+        def reject(reason='delivery_reconcile_failed'):
+            self._preservation_mark_unknown(admission_id, reason)
+            return False
+
+        try:
+            from hermes_state_runtime import get_session_admission
+            row = get_session_admission(self.db, admission_id=admission_id)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return reject()
+        if not isinstance(row, dict) or row.get('admission_id') != admission_id:
+            return reject('unmapped_writer')
+        preclaim_cancel = row.get('outcome') == 'cancelled' and row.get('generation') is None
+        if preclaim_cancel:
+            # The cancellation caller is the sole consumer of this boundary.  A delivery recorder
+            # must never turn a no-execution cancellation into a fabricated transport witness.
+            return reject('unmapped_writer')
+        if row.get('status') != 'terminal' or not _automation_generation_valid(
+                row, allow_terminal=True):
+            return reject('unmapped_writer')
+        descriptor = self._preservation_automation_row_descriptor(row)
+        if (not _automation_descriptor_complete(descriptor)
+                or descriptor != binding.get('descriptor')
+                or not self._preservation_automation_row_matches(
+                    row, handle, allow_terminal=True)):
+            return reject('unmapped_writer')
+        bound_row = binding.get('row')
+        if isinstance(bound_row, dict) and any(
+                row.get(field) != bound_row.get(field)
+                for field in ('admission_id', 'target_session_id', 'principal_id', 'request_id')):
+            return reject('unmapped_writer')
+        try:
+            from gateway.session_ingress import DeliveryReceipt
+        except ImportError:
+            return reject()
+        if (not isinstance(delivery_receipt, DeliveryReceipt)
+                or delivery_receipt.admission_id != admission_id
+                or delivery_receipt.attempted is not True
+                or delivery_receipt.delivered is not True
+                or delivery_receipt.reason is not None
+                or delivery_receipt.effect_state != 'delivered'):
+            return reject('delivery_reconcile_failed')
+        sidecars = [entry for entry in getattr(self, '_preservation_sidecars', {}).values()
+                    if entry.get('admission_id') == admission_id]
+        expected_finalizer = 'complete' if sidecars else 'direct_delivery'
+        if finalizer_outcome != expected_finalizer:
+            return reject('delivery_reconcile_failed')
+        existing = binding.get('terminal_delivery_receipt')
+        if existing is not None and existing != delivery_receipt:
+            return reject('unmapped_writer')
+        # Keep the actual source-owned receipt object.  Do not project waiter state or booleans into
+        # a second terminal dictionary: readiness re-reads this typed receipt and live sidecars.
+        binding['terminal_delivery_receipt'] = delivery_receipt
+        return True
+
     def _preservation_prepare_automation_rehome(self, admission_id, row, new_session_id):
         """Hold one queued wake's I07 root while its durable row moves to a fresh route."""
         coordinator = self._preservation_coordinator()
@@ -895,6 +1121,7 @@ class AutomationCustodyMixin:
             # The FIFO's own I04 child may still be draining when the Bot receipt is published.
             # Keep the accepted I07 root finalizing; the existing release-terminal boundary will
             # retry it after that exact child is closed.  A temporary dependency is not unknown.
+            self._preservation_watch_fifo_close(admission_id)
             return
         else:
             coordinator.mark_unknown(handle, 'lease_release_failed')

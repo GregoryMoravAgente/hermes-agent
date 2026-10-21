@@ -67,6 +67,11 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
         lease = retirement.acquire()
         if lease is None:
             return _err(req.get("id"), 5035, "backend is retiring; reconnect to continue")
+        from tui_gateway.hosted_tui_custody import rpc_admission, rpc_settle
+        custody, custody_reason = rpc_admission(req)
+        if custody_reason is not None:
+            retirement.release(lease)
+            return _err(req.get("id"), 5035, custody_reason)
         try:
             ctx = contextvars.copy_context()  # the pool worker must see the bound transport
             owner = normalized[2].get("owner")
@@ -80,13 +85,29 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
                     resp = _err(req.get("id"), -32000, f"handler error: {exc}")
                 if resp is not None:
                     t.write(resp)
+                rpc_settle(custody, known=True)
+            def run_with_custody():
+                try:
+                    return ctx.run(retirement.run_with_lease, lease, run)
+                except BaseException:
+                    rpc_settle(custody, known=False)
+                    raise
         except BaseException:
+            rpc_settle(custody, known=False)
             retirement.release(lease)
             raise
         # submit() may raise after accepting the callable. Its wrapper owns the
         # release; an ambiguous submission must keep custody until it unwinds.
-        future = _pool.submit(lambda: ctx.run(retirement.run_with_lease, lease, run))
+        try:
+            future = _pool.submit(run_with_custody)
+        except BaseException:
+            rpc_settle(custody, known=False)
+            retirement.release(lease)
+            raise
         retirement.observe_future_cancellation(future, lease)
+        future.add_done_callback(
+            lambda done: rpc_settle(custody, known=False)
+            if done.cancelled() or done.exception() is not None else None)
         return None
     finally:
         reset_transport(token)

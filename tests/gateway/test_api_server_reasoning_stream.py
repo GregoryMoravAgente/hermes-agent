@@ -13,8 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter, ThreadSafeAsyncQueue
+from gateway.platforms.api_server import ThreadSafeAsyncQueue
 
 
 def _frames(payloads):
@@ -46,8 +45,9 @@ def _fake_writer_env():
 
 
 @pytest.fixture
-def adapter():
-    return APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+def adapter(runtime_owned_legacy_api_adapter):
+    """Use the supported pre-authority route while preserving real ownership/bootstrap."""
+    return runtime_owned_legacy_api_adapter
 
 
 def _stub_create_agent_runtime(monkeypatch, fake_agent_cls):
@@ -85,7 +85,6 @@ async def test_chat_completions_stream_forwards_agent_reasoning_callback(adapter
             return {"final_response": "answer", "completed": True}
 
     _stub_create_agent_runtime(monkeypatch, FakeAgent)
-    monkeypatch.setattr(adapter, "_ensure_session_db", lambda: None)
     request, written, fake_response = _fake_writer_env()
     stream_q = ThreadSafeAsyncQueue()
     agent_task, agent_ref = adapter._spawn_stream_agent(

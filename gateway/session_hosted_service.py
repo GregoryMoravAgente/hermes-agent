@@ -2,6 +2,8 @@
 import asyncio
 from contextlib import nullcontext
 from pathlib import Path
+import time
+from typing import Any
 
 from gateway.session_contract import Principal
 from gateway.session_authorities import active_authority, all_authorities, owner_scope, serving_authorities
@@ -17,6 +19,159 @@ class CanonicalHostedRoomService(HostedControls, HostedRoomService):
         self.authority, self.loop = authority, loop
         self.member_rpcs = {}
         super().__init__(None, db_path=authority.db.db_path)
+
+    def begin_preservation_close(self, close_generation: int) -> bool:
+        """Fence new hosted-room intake while accepted room work drains."""
+        if not getattr(self, '_transport_installed', False):
+            return False
+        return self.runtime.begin_preservation_close(close_generation)
+
+    def abort_preservation_close(self, close_generation: int) -> bool:
+        """Reopen the same hosted intake generation before handoff is committed."""
+        return self.runtime.abort_preservation_close(close_generation)
+
+    @staticmethod
+    def _pending_callbacks(rpc: Any) -> int:
+        """Count callbacks whose exact hosted admission has not been acknowledged.
+
+        Hosted member RPCs retain the callback until the callback consumer has returned and
+        the operation finalizer has released the same durable admission.  Reading this map is
+        therefore stronger than treating a terminal driver row as an acknowledged delivery.
+        The owner RPC protects its map with ``_lock``; the in-process RPC is only touched by the
+        authority loop, so its snapshot is taken directly.
+        """
+        callbacks = getattr(rpc, 'callbacks', None)
+        if not isinstance(callbacks, dict):
+            return 0
+        lock = getattr(rpc, '_lock', None)
+        if lock is None:
+            return len(callbacks)
+        with lock:
+            return len(callbacks)
+
+    def _preservation_pending_acks(self) -> int:
+        """Observe local callback and remote run receipts owned by this room service."""
+        pending = 0
+        rpcs = [self]
+        rpcs.extend(getattr(self, 'member_rpcs', {}).values())
+        for rpc in rpcs:
+            pending += self._pending_callbacks(rpc)
+        # A peer client keeps the exact run receipt until its terminal status is observed.  A
+        # durable terminal room task can outlive that in-memory receipt, so this remains a
+        # conservative close fence: an unobserved peer ACK always blocks handoff.
+        for client in getattr(self, 'peer_clients', {}).values():
+            runs = getattr(client, '_runs', None)
+            if not isinstance(runs, dict):
+                continue
+            terminal = getattr(client, '_terminal_receipts', ())
+            pending += sum(key not in terminal for key in runs)
+        return pending
+
+    def _preservation_active_operations(self) -> int:
+        """Count canonical I09 handles that still need their task/no-task finalizer."""
+        records = getattr(getattr(self, 'authority', None), '_preservation_operations', None)
+        if not isinstance(records, dict):
+            return 0
+        return sum(
+            isinstance(record, dict)
+            and record.get('owner_class') == 'I09_a2a_hosted_kanban'
+            for record in records.values()
+        )
+
+    def _preservation_inventory(self, close_generation: int) -> dict[str, Any] | None:
+        if not getattr(self, '_transport_installed', False):
+            return None
+        runtime = self.runtime.status()
+        if (runtime.get('preservation_close_generation') != close_generation
+                or runtime.get('intake_closed') is not True
+                or runtime.get('stopping') is True
+                or runtime.get('running') is not True
+                or any(runtime.get(name) for name in (
+                    'current_tasks', 'room_threads', 'leased_rooms', 'blocked_rooms',
+                    'ambiguous_rooms', 'unavailable_route_retries',
+                    'preservation_close_scan_rooms'))):
+            return None
+        with self._policy_lock:
+            if self._pending_actions or self._link_load_error:
+                return None
+            route_statuses = tuple(sorted(
+                (room_id, member_id, self._peer_route_status.get((room_id, member_id), 'ready'))
+                for room_id, member_id in self.peer_routes))
+        if any(status != 'ready' for _room_id, _member_id, status in route_statuses):
+            return None
+        from gateway import hosted_rooms
+        from gateway import hosted_room_driver as driver
+        limit = hosted_rooms.MAX_ROOM_LIST_LIMIT
+        rooms, offset = [], 0
+        while True:
+            page = hosted_rooms.list_rooms(
+                self.db_path, include_disbanded=True, limit=limit, offset=offset)
+            rooms.extend(page)
+            if len(page) < limit:
+                break
+            offset += len(page)
+        local_gateway_id = hosted_rooms.local_authority_gateway_id()
+        rooms = [room for room in rooms
+                 if str(room.get('authority_gateway_id')) == local_gateway_id]
+        terminal_tasks = 0
+        active_tasks = 0
+        for room in rooms:
+            room_id = str(room['room_id'])
+            tasks = driver.list_tasks(self.db_path, room_id=room_id)
+            for task in tasks:
+                status = task['status']
+                if status not in driver.TERMINAL_STATUSES:
+                    active_tasks += 1
+                    continue
+                if not self.policy_checkpoint.publication_exists(
+                        room_id=room_id, task_id=task['identity'].task_id,
+                        status=status, execution_generation=int(task['execution_generation'] or 0)):
+                    return None
+                terminal_tasks += 1
+        pending_acks = self._preservation_pending_acks()
+        active_operations = self._preservation_active_operations()
+        if active_tasks or pending_acks or active_operations:
+            return None
+        return {
+            'registered_rooms': tuple(sorted(str(room['room_id']) for room in rooms)),
+            'registered_peer_routes': route_statuses,
+            'terminal_tasks_published': terminal_tasks,
+            'active_tasks': active_tasks,
+            'pending_acks': pending_acks,
+            'active_operations': active_operations,
+            'worker_process_generation': runtime['process_generation'],
+            'intake_closed': True,
+            'close_generation': close_generation,
+        }
+
+    def await_preservation_close(self, close_generation: int, timeout: float) -> bool:
+        """Wait for the hosted producer, rooms, leases and terminal publications to quiesce."""
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            if self._preservation_inventory(close_generation) is not None:
+                return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.05, remaining))
+
+    def preservation_owner_evidence(
+        self, *, process_instance: str, authority_epoch: int,
+        close_generation: int, owner_id: str,
+    ) -> dict[str, Any] | None:
+        inventory = self._preservation_inventory(close_generation)
+        if inventory is None:
+            return None
+        from gateway.runtime_custody import OWNER_SPECS
+        return {
+            'source': OWNER_SPECS['I09_a2a_hosted_kanban'].source,
+            'process_instance': process_instance,
+            'authority_epoch': authority_epoch,
+            'close_generation': close_generation,
+            'owner_id': owner_id,
+            'observed': True,
+            **inventory,
+        }
 
     def _make_rpc(self, server):
         # Member-specific canonical transports retain exact durable history. They
@@ -237,7 +392,14 @@ async def ensure_hosted_service(runner):
     active = active_authority(runner)
     if active is None:
         raise RuntimeStoreError('profile_mismatch')
+    coordinator = getattr(runner, 'runtime_custody', None)
     for authority in serving_authorities(runner):
+        # This is the source-owned declaration that the profile will host TUI/room work.  Reserve
+        # its exact I17 root before constructing the service or installing its transport, while a
+        # reversible preservation close can still observe a real parent for a cold profile.
+        if coordinator is not None:
+            from tui_gateway.hosted_tui_custody import bind_authority
+            bind_authority(authority, runner=runner, coordinator=coordinator)
         await _ensure_hosted_service(runner, authority)
     start_ready_hosted_services(runner)
     return active.hosted_room_service
@@ -267,7 +429,14 @@ def start_ready_hosted_services(runner):
         return
     for service in services:
         # start() only releases its thread; preparation and disk access happened above.
-        service.start()
+        from tui_gateway.hosted_tui_custody import bind_room_service, room_service_start_failed
+        bind_room_service(service, service.authority)
+        try:
+            service.start()
+        except BaseException:
+            room_service_start_failed(service)
+            raise
+        service._i17_room_started = True
 
 
 async def stop_hosted_service(runner, timeout=5):
@@ -277,5 +446,82 @@ async def stop_hosted_service(runner, timeout=5):
         service = getattr(authority, 'hosted_room_service', None)
         if service is not None:
             result = await asyncio.to_thread(service.stop, timeout=max(0, deadline - loop.time()))
-            stopped = result and stopped
+            from tui_gateway.hosted_tui_custody import room_service_stop
+            stopped = room_service_stop(service, result) and stopped
     return stopped
+
+
+def _i09_service_pairs(runner):
+    authorities = tuple(serving_authorities(runner))
+    pairs = tuple((authority, getattr(authority, 'hosted_room_service', None))
+                  for authority in authorities)
+    if pairs and all(service is None for _authority, service in pairs):
+        return ()
+    if any(service is None for _authority, service in pairs):
+        return None
+    return pairs
+
+
+def begin_i09_source_close(runner, close_generation: int) -> bool:
+    """Close every configured hosted producer at the coordinator's exact generation."""
+    pairs = _i09_service_pairs(runner)
+    if pairs is None:
+        return False
+    begun = []
+    for _authority, service in pairs:
+        begin = getattr(service, 'begin_preservation_close', None)
+        if not callable(begin) or not begin(close_generation):
+            for previous in begun:
+                previous.abort_preservation_close(close_generation)
+            return False
+        begun.append(service)
+    return True
+
+
+def abort_i09_source_close(runner, close_generation: int) -> bool:
+    pairs = _i09_service_pairs(runner)
+    if pairs is None:
+        return False
+    result = True
+    for _authority, service in pairs:
+        abort = getattr(service, 'abort_preservation_close', None)
+        result = bool(callable(abort) and abort(close_generation)) and result
+    return result
+
+
+async def await_i09_source_close(runner, close_generation: int, timeout: float) -> bool:
+    pairs = _i09_service_pairs(runner)
+    if pairs is None:
+        return False
+    deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout))
+    for _authority, service in pairs:
+        wait = getattr(service, 'await_preservation_close', None)
+        if not callable(wait):
+            return False
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0 or not await asyncio.to_thread(wait, close_generation, remaining):
+            return False
+    return True
+
+
+def preservation_i09_owner_ready(authority, custody: dict[str, Any]) -> bool:
+    service = getattr(authority, 'hosted_room_service', None)
+    generation = custody.get('close_generation') if isinstance(custody, dict) else None
+    if service is None or type(generation) is not int:
+        return False
+    evidence = service.preservation_owner_evidence(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch,
+        close_generation=generation, owner_id=f'{authority.instance_id}:I09_a2a_hosted_kanban')
+    return evidence is not None
+
+
+def preservation_i09_owner_evidence(
+    authority, *, process_instance: str, authority_epoch: int,
+    close_generation: int, owner_id: str,
+) -> dict[str, Any] | None:
+    service = getattr(authority, 'hosted_room_service', None)
+    if service is None:
+        return None
+    return service.preservation_owner_evidence(
+        process_instance=process_instance, authority_epoch=authority_epoch,
+        close_generation=close_generation, owner_id=owner_id)

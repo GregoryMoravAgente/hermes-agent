@@ -610,6 +610,10 @@ async def test_real_classic_fifo_keeps_two_occurrence_identities_and_terminal_re
     original_classic_finish = authority._classic_finish
     original_classic_begin = authority._classic_begin
     original_handle_message_with_agent = fixture.runner._handle_message_with_agent
+    callback_observations: list[tuple] = []
+    original_register_callback = adapter.register_post_delivery_callback
+    original_pop_callback = adapter.pop_post_delivery_callback
+    original_fire_callback = adapter._fire_post_delivery_callback
 
     def _observe_classic_finish(event, *, success, reason='join_failed', receipt=None):
         finished.append((event, success))
@@ -629,9 +633,33 @@ async def test_real_classic_fifo_keeps_two_occurrence_identities_and_terminal_re
         await release_first.wait()
         return result
 
+    def _observe_register_callback(key, callback, **kwargs):
+        callback_observations.append(("register", key, kwargs.get("generation")))
+        return original_register_callback(key, callback, **kwargs)
+
+    def _observe_pop_callback(key, **kwargs):
+        result = original_pop_callback(key, **kwargs)
+        callback_observations.append(("pop", key, kwargs.get("generation"), result is not None))
+        return result
+
+    async def _observe_fire_callback(key, interrupt_event):
+        from gateway.session_classic_custody import classic_execution_owner_for_event
+
+        owner = classic_execution_owner_for_event(interrupt_event)
+        owner_key = getattr(owner, "_classic_custody_key", None)
+        record = authority._preservation_operations.get(owner_key)
+        callback_observations.append((
+            "fire", key, getattr(interrupt_event, "_hermes_run_generation", None),
+            owner_key, isinstance(record, dict) and record.get("parent_handle") is not None,
+        ))
+        return await original_fire_callback(key, interrupt_event)
+
     monkeypatch.setattr(authority, "_classic_finish", _observe_classic_finish)
     monkeypatch.setattr(authority, "_classic_begin", _observe_classic_begin)
     monkeypatch.setattr(fixture.runner, "_handle_message_with_agent", _hold_after_real_turn)
+    monkeypatch.setattr(adapter, "register_post_delivery_callback", _observe_register_callback)
+    monkeypatch.setattr(adapter, "pop_post_delivery_callback", _observe_pop_callback)
+    monkeypatch.setattr(adapter, "_fire_post_delivery_callback", _observe_fire_callback)
 
     async def _send(*args, content=None, **_kwargs):
         if content is None and len(args) >= 2:
@@ -677,6 +705,13 @@ async def test_real_classic_fifo_keeps_two_occurrence_identities_and_terminal_re
         assert begins[0][1] != begins[1][1]
         assert [event for event, success in finished if success] == [first, second]
         assert not authority._preservation_operations
+        assert len([item for item in callback_observations if item[0] == "register"]) >= 2
+        assert len([item for item in callback_observations if item[0] == "pop" and item[3]]) >= 2
+        assert len([item for item in callback_observations if item[0] == "fire"]) >= 2
+        assert any(
+            item[0] == "fire" and item[3] == begins[1][1] and item[4]
+            for item in callback_observations
+        )
     finally:
         fixture.cleanup()
 
@@ -768,8 +803,8 @@ async def test_real_nested_i04_gateway_route_keeps_authoritative_binding_and_del
 ):
     """Consume a real FIFO/I04 admission through the public GatewayRunner route.
 
-    ``bind_turn`` carries the actual admission binding into the task context; it is not a
-    fabricated parent or an I06 helper.  The response still travels through the real AIAgent,
+    The actual authority executor installs the admission binding and execution ContextVar before
+    the nested public adapter route.  The response still travels through the real AIAgent,
     SessionDB and adapter delivery path, and the exact admission row remains the authority for
     the writer handoff.
     """
@@ -779,15 +814,16 @@ async def test_real_nested_i04_gateway_route_keeps_authoritative_binding_and_del
     from gateway.config import Platform
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
-    from gateway.runtime_service_custody import bind_turn, reset_turn
+    from gateway.runtime_service_custody import current_turn_binding
     from tests.fakes.fake_llm_provider import FakeLLMServer, Text
     from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
 
     fixture = await real_runtime_binding(tmp_path, monkeypatch)
     adapter = fixture.runner.adapters[Platform.WHATSAPP]
-    binding = await fixture.claim("nested-public-route")
     _restore_production_scheduler(fixture.authority, monkeypatch)
     sent: list[str] = []
+    captured_binding = {}
+    nested_started = False
 
     async def _send(*args, content=None, **_kwargs):
         if content is None and len(args) >= 2:
@@ -812,19 +848,36 @@ async def test_real_nested_i04_gateway_route_keeps_authoritative_binding_and_del
     monkeypatch.setattr("gateway.run._current_max_iterations", lambda: 4)
     monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", lambda *_: {"terminal"})
 
-    source = fixture.authority.sessions[binding.session_id].source
+    source = adapter.build_source(
+        chat_id="15551234567@s.whatsapp.net", user_id="15551234567@s.whatsapp.net", chat_type="dm",
+    )
     _configure_whatsapp_home(fixture, source)
     session_key = fixture.runner.session_store._generate_session_key(source)
-    entry = fixture.runner.session_store.lookup_by_session_key(session_key)
-    assert entry is not None and entry.session_id == binding.session_id
     event = MessageEvent(text="nested public turn", source=source, message_id="nested-public-1")
-    token = bind_turn(binding)
+    original_handle_message = fixture.runner._handle_message
+
+    async def _run_nested_public_route(outer_event):
+        nonlocal nested_started
+        if nested_started:
+            return await original_handle_message(outer_event)
+        nested_started = True
+        captured_binding["binding"] = current_turn_binding()
+        await adapter.handle_message(event)
+        task = adapter._session_tasks.get(session_key)
+        assert task is not None
+        await asyncio.wait_for(task, 30)
+        return None
+
+    monkeypatch.setattr(fixture.runner, "_handle_message", _run_nested_public_route)
+    outer = MessageEvent(text="nested-public-route", source=source, message_id="nested-public-route")
     try:
         with FakeLLMServer([Text("nested public reply")]) as llm:
-            await adapter.handle_message(event)
-            task = adapter._session_tasks.get(session_key)
-            assert task is not None
-            await asyncio.wait_for(task, 30)
+            receipt = await fixture.authority.admit_native(outer)
+            drain = fixture.authority.sessions[receipt.ref.session_id].task
+            await drain
+        binding = captured_binding["binding"]
+        entry = fixture.runner.session_store.lookup_by_session_key(session_key)
+        assert entry is not None and entry.session_id == binding.session_id
         assert sent == ["nested public reply"]
         rows = fixture.authority.db.get_messages(entry.session_id)
         assert any(row.get("role") == "assistant" and row.get("content") == "nested public reply" for row in rows)
@@ -846,5 +899,134 @@ async def test_real_nested_i04_gateway_route_keeps_authoritative_binding_and_del
         assert binding.session_id == entry.session_id
         assert type(binding.execution_generation) is int and binding.execution_generation >= 1
     finally:
-        reset_turn(token)
+        fixture.cleanup()
+
+
+async def _admit_real_parented_classic_occurrence(fixture, request_id):
+    """Create one real parented I06 admission and return its durable row and owner."""
+    from hermes_constants import get_hermes_home
+    from gateway.platforms.event import MessageEvent
+    from gateway.run_busy_custody import begin_classic_event
+    from gateway.session_ingress_context import native_callback
+    from hermes_state_runtime import get_session_admission
+
+    binding = await fixture.claim(f"parent-{request_id}")
+    authority = fixture.authority
+    source = authority.sessions[binding.session_id].source
+    session_key = fixture.runner.session_store._generate_session_key(source)
+    event = MessageEvent(
+        text=f"parented {request_id}", source=source, message_id=request_id,
+    )
+    assert begin_classic_event(
+        fixture.runner, event, session_key, "fifo", state="queued",
+    ) is True
+    key = event._classic_custody_key
+    record = authority._preservation_operations[key]
+    assert record["parent_handle"] is binding.parent_handle
+    with native_callback(fixture.runner, event, get_hermes_home()):
+        receipt = await authority.admit_native(event)
+    assert receipt.status == "queued"
+    row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+    assert isinstance(row, dict)
+    assert row["admission_id"] == receipt.admission_id
+    assert row["status"] == "queued"
+    assert authority._preservation_operations[key]["admission_id"] == receipt.admission_id
+    return binding, event, session_key, key, row
+
+
+@pytest.mark.asyncio
+async def test_real_parented_classic_occurrence_durable_bind_and_reread(
+    tmp_path, monkeypatch,
+):
+    """A real second occurrence binds its durable row to the existing managed parent."""
+    from gateway.session_envelope import restore_native
+    from gateway.session_ingress import _bind_classic_execution_event
+    from gateway.session_classic_custody import classic_execution_owner_for_event
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
+
+    fixture = await real_runtime_binding(tmp_path, monkeypatch)
+    try:
+        binding, owner, _session_key, key, row = await _admit_real_parented_classic_occurrence(
+            fixture, "parented-classic-positive",
+        )
+        authority = fixture.authority
+        record = authority._preservation_operations[key]
+        assert record["parent_handle"] is binding.parent_handle
+        assert authority._preservation_operation_row(
+            key, expected_parent=binding.parent_handle,
+        ) is not None
+
+        restored = restore_native(row["payload"], authority.runner)
+        _bind_classic_execution_event(authority, row, restored)
+        resolved, error = authority._classic_execution_owner_for_admission(row)
+        assert resolved is owner
+        assert error is None
+        bridge = getattr(restored, "_classic_execution_bridge", None)
+        assert bridge is not None
+        assert bridge.owner_event is owner
+        assert bridge.execution_event is restored
+        assert bridge.operation_key == key
+        assert bridge.admission_id == row["admission_id"]
+        assert classic_execution_owner_for_event(restored) is owner
+        reread = authority._preservation_operation_row(
+            key, expected_parent=binding.parent_handle,
+        )
+        assert reread is not None
+        assert reread["admission_id"] == row["admission_id"]
+    finally:
+        fixture.cleanup()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_variant", ["foreign", "stale", "invalid"])
+async def test_real_parented_classic_foreign_stale_invalid_parent_keeps_unknown_retryable(
+    tmp_path, monkeypatch, parent_variant,
+):
+    """A copied, stale, or malformed parent cannot acquire a writer or release the row."""
+    from gateway.session_envelope import restore_native
+    from gateway.session_ingress import _bind_classic_execution_event
+    from gateway.session_managed_worker import ManagedExecutionUnknown
+    from gateway.session_classic_custody import classic_writer_binding_for_event
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
+
+    fixture = await real_runtime_binding(tmp_path, monkeypatch)
+    try:
+        _binding, owner, session_key, key, row = await _admit_real_parented_classic_occurrence(
+            fixture, f"parented-classic-{parent_variant}",
+        )
+        authority = fixture.authority
+        record = authority._preservation_operations[key]
+        original_parent = record["parent_handle"]
+        if parent_variant == "foreign":
+            record["parent_handle"] = replace(original_parent, owner_id="foreign-parent")
+        elif parent_variant == "stale":
+            record["parent_handle"] = replace(
+                original_parent, authority_epoch=authority.epoch - 1,
+            )
+        else:
+            record["parent_handle"] = replace(
+                original_parent, owner_class="I05_controls_and_unknown",
+            )
+
+        restored = restore_native(row["payload"], authority.runner)
+        with pytest.raises(ManagedExecutionUnknown):
+            _bind_classic_execution_event(authority, row, restored)
+
+        retained = authority._preservation_operations[key]
+        assert retained["unknown"] is True
+        assert key in authority._preservation_operations
+        assert getattr(restored, "_classic_execution_bridge", None) is None
+        adopters = getattr(authority, "marker_adopters", None)
+        assert not isinstance(adopters, dict) or row["admission_id"] not in adopters
+        resolved, error = authority._classic_execution_owner_for_admission(row)
+        assert resolved is None
+        assert error == "classic_owner_unknown"
+
+        # Restore the exact source-owned parent and exercise the existing same-owner retry.
+        retained["parent_handle"] = original_parent
+        assert authority._classic_begin(owner, session_key, "fifo") is True
+        assert authority._preservation_operations[key]["unknown"] is False
+        assert authority._preservation_operations[key]["parent_handle"] is original_parent
+        assert classic_writer_binding_for_event(owner) is None
+    finally:
         fixture.cleanup()

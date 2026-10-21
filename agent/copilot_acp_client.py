@@ -1297,6 +1297,11 @@ class CopilotACPClient:
                 or getattr(service, "physical", None) is not receipt
                 or getattr(parent, "_owner_agent", agent) is not agent):
             raise ServiceCustodyError("managed_acp_owner_mismatch")
+        from gateway.runtime_service_custody import TurnCustodyBinding
+        if isinstance(binding, TurnCustodyBinding) or proof.session_id != binding.session_id:
+            from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+            if resolve_physical_tip_witness(binding, proof.session_id, proof.store_path) is None:
+                raise ServiceCustodyError("managed_acp_physical_tip_unknown")
         durable = DurableResultProof(
             store_path=proof.store_path, session_id=proof.session_id,
             admission_id=binding.admission_id, execution_generation=binding.execution_generation,

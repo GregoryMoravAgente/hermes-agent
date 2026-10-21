@@ -3,6 +3,106 @@
 from __future__ import annotations
 
 
+def _recovery_error(api_server, code: str):
+    from gateway.platforms.api_server_runs import _json_error
+
+    return _json_error(
+        api_server._openai_error,
+        "The exact API finalizer completion could not be reconciled.",
+        code=code,
+        status=409,
+    )
+
+
+def _replay_completion_for_run(adapter, run_id, *, return_conflict=False):
+    runner = getattr(adapter, "gateway_runner", None)
+    from gateway.platforms.api_server_run_completion import (
+        _replay_completion_for_authority, prune_replay_registry,
+    )
+    from gateway.session_authorities import all_authorities
+    registry_owner = getattr(runner, "session_authorities", None)
+    if registry_owner is not None and not isinstance(registry_owner, (dict, tuple, list, set)):
+        # The production SessionAuthorities object is iterable and owns every served profile;
+        # never reduce it to the launch authority or a dict/list-only view.
+        authorities = tuple(all_authorities(runner))
+    elif isinstance(registry_owner, dict):
+        authorities = tuple(registry_owner.values())
+    elif isinstance(registry_owner, (tuple, list, set)):
+        authorities = tuple(registry_owner)
+    else:
+        authorities = tuple(all_authorities(runner))
+    if registry_owner is None and not authorities:
+        authority = getattr(runner, "session_authority", None)
+        authorities = (authority,) if authority is not None else ()
+    matches = []
+    conflict = False
+    for authority in authorities:
+        registry = getattr(authority, "_api_finalizer_completions", None)
+        if not isinstance(registry, dict):
+            continue
+        prune_replay_registry(registry)
+        for completion in tuple(registry.values()):
+            custody = getattr(completion, "custody", None)
+            if getattr(custody, "run_id", None) != run_id:
+                continue
+            if _replay_completion_for_authority(completion, authority, adapter, run_id):
+                matches.append(completion)
+            else:
+                conflict = True
+    replay = matches[0] if len(matches) == 1 and not conflict else None
+    if return_conflict:
+        return replay, conflict
+    return replay
+
+
+async def _resolve_i02_finalizer_replay(adapter, request, *, api_server, completion):
+    custody = getattr(completion, "custody", None)
+    expected = custody.recovery_identity() if custody is not None else None
+    try:
+        body = await request.json()
+    except (ValueError, LookupError):
+        body = None
+    if not isinstance(expected, dict) or not isinstance(body, dict) or set(body) != set(expected) or any(
+        body.get(key) != value for key, value in expected.items()
+    ):
+        return _recovery_error(api_server, "api_finalizer_identity_mismatch")
+    replay = completion.consume_replay(expected)
+    if replay is None:
+        return _recovery_error(api_server, "api_finalizer_replay_expired")
+    from aiohttp import web
+
+    return web.json_response({"run_id": custody.run_id, **replay.as_wire()})
+
+
+async def _resolve_i02_finalizer_unknown(adapter, request, *, api_server, custody, completion):
+    """Retry one authenticated I02 finalizer fence using its original source objects."""
+    try:
+        body = await request.json()
+    except (ValueError, LookupError):
+        body = None
+    expected = custody.recovery_identity()
+    if not isinstance(body, dict) or set(body) != set(expected) or any(
+        body.get(key) != value for key, value in expected.items()
+    ):
+        return _recovery_error(api_server, "api_finalizer_identity_mismatch")
+    recovered = completion.recover_unknown(adapter, expected)
+    if recovered is None:
+        return _recovery_error(api_server, "api_finalizer_recovery_unproven")
+    # Retire the source maps before constructing the response while retaining a bounded exact
+    # completion replay.  A lost first response can therefore be replayed without leaving live
+    # custody indefinitely; any retirement fault restores the original source-owned references.
+    from gateway.platforms.api_server_run_completion import prune_replay_registry
+    from gateway.platforms.api_server_run_custody import retire_legacy_source_with_completion
+    if not completion.retain_replay():
+        return _recovery_error(api_server, "api_finalizer_replay_unavailable")
+    if not retire_legacy_source_with_completion(custody):
+        return _recovery_error(api_server, "api_finalizer_replay_retirement_pending")
+    prune_replay_registry(getattr(completion.authority, "_api_finalizer_completions", None))
+    from aiohttp import web
+
+    return web.json_response({"run_id": custody.run_id, **recovered.as_wire()})
+
+
 async def resolve_local_unknown(adapter, request, *, api_server):
     """Resolve only a still-live original I03 handle; return ``None`` for canonical I02 runs."""
     auth_error = adapter._check_run_auth(request, permission="stop")
@@ -13,7 +113,35 @@ async def resolve_local_unknown(adapter, request, *, api_server):
     if not _request_owns_run(adapter, request, run_id):
         return _run_not_found(api_server._openai_error, run_id)
     custody = getattr(adapter, "_run_custody", {}).get(run_id)
-    if custody is None or not getattr(custody, "unknown_reason", None):
+    if custody is None:
+        replay, conflict = _replay_completion_for_run(
+            adapter, run_id, return_conflict=True)
+        if conflict:
+            return _recovery_error(api_server, "api_finalizer_source_identity_mismatch")
+        if replay is not None:
+            return await _resolve_i02_finalizer_replay(
+                adapter, request, api_server=api_server, completion=replay,
+            )
+        return None
+    from gateway.platforms.api_server_run_completion import (
+        api_i02_completion_required,
+        completion_for_custody,
+    )
+    if getattr(custody, "producer_phase", None) == "api_i02":
+        completion = completion_for_custody(custody)
+        if completion is None:
+            if api_i02_completion_required(
+                getattr(custody, "admission_authority", None), custody.admission_id
+            ):
+                return _recovery_error(api_server, "api_finalizer_completion_registry_missing")
+        elif (
+            getattr(getattr(completion, "receipt", None), "state", None) == "unknown"
+            or getattr(completion, "recovery_receipt", None) is not None
+        ):
+            return await _resolve_i02_finalizer_unknown(
+                adapter, request, api_server=api_server, custody=custody, completion=completion
+            )
+    if not getattr(custody, "unknown_reason", None):
         return None
     try:
         body = await request.json()

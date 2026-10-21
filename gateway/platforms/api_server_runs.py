@@ -708,6 +708,48 @@ def _enqueue_terminal_sentinel(run: _RunLaunch) -> None:
         # Keep the lifecycle fence source-owned even when a test or transport wrapper declines
         # the sentinel before the launch method can record its own close receipt.
         run.custody.mark_stream_closed(False)
+    if (run.execution_task is not None
+            and run.execution_task.done()):
+        _retire_live_run(run.owner, run.run_id)
+
+
+def _settle_structured_run_after_task(self, launch: _RunLaunch, task: Any) -> None:
+    """Consume an I02 completion only after the structured task and transport are terminal."""
+    task = task or getattr(launch, "execution_task", None)
+    custody = getattr(launch, "custody", None)
+    if (task is None or not task.done() or getattr(launch, "queue", None) is None
+            or custody is None or getattr(custody, "producer_phase", None) != "api_i02"
+            or launch.terminal_event_outcome is not True
+            or launch.stream_close_outcome is not True
+            or custody.worker_done is not True
+            or custody.control_finalizers is not True):
+        return
+    from gateway.platforms.api_server_run_custody import (
+        complete_legacy_source, retire_legacy_source_with_completion,
+    )
+    try:
+        refusal = complete_legacy_source(custody, active_run_id=None)
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "structured_completion_unknown"))
+            return
+        completion = getattr(custody, "finalizer_completion", None)
+        if (getattr(completion, "receipt", None) is None
+                and getattr(completion, "_pending_parent_release", False)):
+            return
+        if getattr(getattr(completion, "receipt", None), "state", None) != "complete":
+            custody.mark_completion_unknown("structured_finalizer_completion_unknown")
+            return
+        if getattr(custody, "reservation_key", None) is None:
+            # An unkeyed run has only the in-memory status/event projection as its public
+            # readback boundary. Keep the exact source launch until the status TTL sweep;
+            # keyed runs have the durable idempotency receipt and can retire immediately.
+            return
+        if not retire_legacy_source_with_completion(custody):
+            custody.mark_completion_unknown("structured_completion_retire_pending")
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            TypeError, ValueError, sqlite3.Error):
+        logger.exception("[api_server] structured finalizer failed for run %s", launch.run_id)
+        custody.mark_unknown("structured_completion_error")
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -734,8 +776,40 @@ def _retire_live_run(self, run_id: str) -> None:
         self._active_run_agents, self._run_approval_sessions,
         self._stopping_run_ids, self._shutdown_interrupted_run_ids)
     if task is None or task.done():
+        if launch is not None:
+            _settle_structured_run_after_task(self, launch, task)
         active_tables = (*active_tables, self._active_run_tasks)
     _forget_run(self, run_id, *active_tables)
+
+
+def _preclaim_cancel_readback(custody: Any) -> bool:
+    """Authenticate a queued API run cancelled before any execution generation was claimed."""
+    if (getattr(custody, "producer_phase", None) != "api_i02"
+            or getattr(custody, "producer_principal", None) != "api"
+            or getattr(custody, "execution_generation", None) is not None):
+        return False
+    authority = getattr(custody, "admission_authority", None)
+    admission_id = getattr(custody, "admission_id", None)
+    db = getattr(authority, "db", None)
+    if db is None or not isinstance(admission_id, str) or not admission_id:
+        return False
+    try:
+        from hermes_state_runtime import get_session_admission
+        row = get_session_admission(db, admission_id=admission_id)
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            sqlite3.Error, TypeError, ValueError):
+        return False
+    return (
+        isinstance(row, dict)
+        and row.get("admission_id") == admission_id
+        and row.get("status") == "terminal"
+        and row.get("outcome") == "cancelled"
+        and row.get("generation") is None
+        and row.get("owner_epoch") == getattr(custody, "authority_epoch", None)
+        and row.get("principal_id") == "api"
+        and row.get("target_session_id") == getattr(custody, "admission_session_id", None)
+        and getattr(authority, "epoch", None) == getattr(custody, "authority_epoch", None)
+    )
 
 
 async def _await_original_work(run: _RunLaunch):
@@ -1335,7 +1409,9 @@ async def _execute_run_worker(
                 run.custody.worker_task = run.worker_future
             result, usage = await asyncio.shield(run.worker_future)
         if run.custody is not None:
-            refusal = run.custody.refresh_admission_generation()
+            refusal = None
+            if not _preclaim_cancel_readback(run.custody):
+                refusal = run.custody.refresh_admission_generation()
             if refusal is not None:
                 run.custody.mark_unknown(getattr(refusal, "code", "admission_generation_missing"))
                 finish("failed", error="API admission generation could not be read back.")
@@ -1905,8 +1981,16 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
                 and (custody is None
                      or (getattr(custody, "released", False)
                          and not getattr(custody, "unknown_reason", None)))):
+            # The source launch and custody are retained for recovery only through the public
+            # status TTL.  Retire the exact source-owned pair before dropping the projection;
+            # a failed retirement keeps the ownership maps available for reconciliation.
+            if custody is None:
+                launch = getattr(self, "_run_launches", {}).get(run_id)
+                if launch is not None:
+                    continue
+                _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+                continue
+            from gateway.platforms.api_server_run_custody import retire_legacy_source
+            if not retire_legacy_source(custody):
+                continue
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
-            # The source launch is retained for recovery only through the public status TTL.  Once
-            # the status and its durable idempotency retention have aged out, drop the original
-            # witness together with the projection; a missing witness then fails closed.
-            getattr(self, "_run_launches", {}).pop(run_id, None)

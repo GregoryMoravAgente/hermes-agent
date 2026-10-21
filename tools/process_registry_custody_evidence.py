@@ -135,6 +135,10 @@ def preservation_owner_evidence(
             return None
         if self._runtime_custody is None or not self._custody_observed:
             return None
+        if not self._runtime_custody.profile_scope_valid(
+            profile_id, authority_epoch, require_serving=False, allow_retiring=True,
+        ):
+            return None
         if self._custody_unbound_sessions or not self._custody_terminal_count or not sessions:
             return None
         if any(session.custody_state not in {"terminal", "not_accepted"} for session in sessions):
@@ -150,6 +154,13 @@ def preservation_owner_evidence(
             session.process_instance != process_instance
             or session.authority_epoch != authority_epoch
             or session.profile_id != profile_id
+            or not self._runtime_custody.profile_scope_valid(
+                profile_id, session.authority_epoch,
+                require_serving=False, allow_retiring=True,
+                physical_owner_epoch=getattr(
+                    getattr(session, "custody", None), "physical_owner_epoch", None,
+                ),
+            )
             or not session.custody_process_bound
             or not session.custody_reader_eof
             or not session.custody_scope_settled
@@ -179,7 +190,253 @@ def preservation_owner_evidence(
             "cross_process_proof": terminal[-1].custody.cross_process_proven,
             "settled_processes": len(terminal),
             "terminal_session_ids": tuple(session.id for session in terminal),
+            "physical_owner_epochs": tuple(
+                session.custody.physical_owner_epoch for session in terminal
+            ),
         }
+
+
+
+
+def _session_profile_identity(session, process_instance: str):
+    profile_id = getattr(session, "profile_id", None)
+    authority_epoch = getattr(session, "authority_epoch", None)
+    if (
+        getattr(session, "process_instance", None) != process_instance
+        or not isinstance(profile_id, str)
+        or not profile_id
+        or type(authority_epoch) is not int
+        or authority_epoch < 1
+    ):
+        return None
+    return profile_id, authority_epoch
+
+
+
+def _terminal_custody_observations_valid(session, custody) -> bool:
+    for field_name in (
+        "custody_process_bound", "custody_reader_eof", "custody_scope_settled",
+        "custody_durable", "custody_handle_closed", "custody_delivery_acked",
+    ):
+        if getattr(session, field_name, False) is not True:
+            return False
+    for field_name in (
+        "process_bound", "reader_eof", "scope_settled", "durable", "streams_closed",
+        "handle_closed", "delivery_acked", "cross_process_proven",
+    ):
+        if getattr(custody, field_name, False) is not True:
+            return False
+    return True
+
+
+def _terminal_profile_receipt(registry, session, process_instance: str) -> Optional[dict[str, Any]]:
+    """Return the source-owned closed receipt for one terminal session."""
+    custody = getattr(session, "custody", None)
+    coordinator = getattr(registry, "_runtime_custody", None)
+    identity = _session_profile_identity(session, process_instance)
+    if (
+        coordinator is None
+        or identity is None
+        or custody is None
+        or getattr(session, "custody_state", None) != "terminal"
+        or getattr(custody, "state", None) != "terminal"
+        or getattr(custody, "coordinator", None) is not coordinator
+        or getattr(custody, "process_instance", None) != process_instance
+    ):
+        return None
+    profile_id, authority_epoch = identity
+    physical_owner_epoch = getattr(custody, "physical_owner_epoch", None)
+    owner_id = getattr(session, "custody_owner_id", None)
+    if (
+        getattr(custody, "profile_id", None) != profile_id
+        or getattr(custody, "authority_epoch", None) != authority_epoch
+        or not isinstance(physical_owner_epoch, str)
+        or not physical_owner_epoch
+        or not isinstance(owner_id, str)
+        or not owner_id.startswith(f"{process_instance}:process:")
+        or getattr(custody, "owner_id", None) != owner_id
+        or getattr(session, "custody_error", "")
+        or getattr(custody, "reason", "")
+        or not _terminal_custody_observations_valid(session, custody)
+    ):
+        return None
+    return {
+        "session_id": getattr(session, "id", ""),
+        "profile_id": profile_id,
+        "authority_epoch": authority_epoch,
+        "physical_owner_epoch": physical_owner_epoch,
+        "owner_id": owner_id,
+        "cross_process_proof": True,
+        "closed_receipt": True,
+    }
+
+
+def _not_accepted_profile_receipt(session, process_instance: str) -> Optional[dict[str, Any]]:
+    """Return the no-effect receipt for an authenticated pre-effect session."""
+    identity = _session_profile_identity(session, process_instance)
+    custody = getattr(session, "custody", None)
+    if (
+        identity is None
+        or getattr(session, "custody_state", None) != "not_accepted"
+        or getattr(session, "custody_error", "")
+        or (custody is not None and getattr(custody, "state", None) != "not_accepted")
+    ):
+        return None
+    profile_id, authority_epoch = identity
+    return {
+        "session_id": getattr(session, "id", ""),
+        "profile_id": profile_id,
+        "authority_epoch": authority_epoch,
+        "physical_owner_epoch": None,
+        "owner_id": getattr(session, "custody_owner_id", ""),
+        "cross_process_proof": True,
+        "closed_receipt": False,
+    }
+
+
+def _mixed_close_inputs(
+    registry, *, process_instance: str, authority_epoch: int, close_generation: int,
+    owner_id: str, launch_profile_id: str,
+):
+    coordinator = getattr(registry, "_runtime_custody", None)
+    if coordinator is None or not registry._custody_observed or registry._custody_unbound_sessions:
+        return None
+    if not isinstance(process_instance, str) or not process_instance:
+        return None
+    if getattr(coordinator, "process_instance", None) != process_instance:
+        return None
+    if type(authority_epoch) is not int or authority_epoch < 1:
+        return None
+    if getattr(coordinator, "authority_epoch", None) != authority_epoch:
+        return None
+    if type(close_generation) is not int or close_generation < 1:
+        return None
+    if owner_id != f"{process_instance}:I15_process_registry_terminal":
+        return None
+    if not isinstance(launch_profile_id, str) or not launch_profile_id:
+        return None
+    if launch_profile_id != registry._process_profile_id():
+        return None
+    return coordinator
+
+
+def _collect_mixed_profile_sessions(registry, process_instance: str):
+    sessions = [*registry._running.values(), *registry._finished.values()]
+    if not sessions or not registry._custody_terminal_count:
+        return None
+    grouped: dict[str, dict[str, Any]] = {}
+    terminal_count = 0
+    for session in sessions:
+        state = getattr(session, "custody_state", None)
+        if state == "terminal":
+            proof = _terminal_profile_receipt(registry, session, process_instance)
+            terminal_count += 1
+        elif state == "not_accepted":
+            proof = _not_accepted_profile_receipt(session, process_instance)
+        else:
+            return None
+        if proof is None:
+            return None
+        profile_id = proof["profile_id"]
+        group = grouped.setdefault(
+            profile_id,
+            {"terminal": [], "not_accepted": [], "authority_epochs": set(),
+             "physical_owner_epochs": set()},
+        )
+        group[state].append(proof)
+        group["authority_epochs"].add(proof["authority_epoch"])
+        if proof["physical_owner_epoch"] is not None:
+            group["physical_owner_epochs"].add(proof["physical_owner_epoch"])
+    return (grouped, terminal_count) if grouped and terminal_count else None
+
+
+def _build_mixed_profile_evidence(
+    grouped: dict[str, dict[str, Any]], *, process_instance: str, authority_epoch: int,
+    close_generation: int, owner_id: str, launch_profile_id: str,
+) -> dict[str, Any]:
+    profile_evidence = []
+    terminal_session_ids = []
+    physical_owner_epochs = []
+    terminal_count = 0
+    for profile_id in sorted(grouped):
+        group = grouped[profile_id]
+        terminal = group["terminal"]
+        terminal_count += len(terminal)
+        terminal_session_ids.extend(proof["session_id"] for proof in terminal)
+        physical_owner_epochs.extend(proof["physical_owner_epoch"] for proof in terminal)
+        profile_evidence.append({
+            "profile_id": profile_id,
+            "authority_epochs": tuple(sorted(group["authority_epochs"])),
+            "physical_owner_epochs": tuple(sorted(group["physical_owner_epochs"])),
+            "terminal_session_ids": tuple(proof["session_id"] for proof in terminal),
+            "not_accepted_session_ids": tuple(
+                proof["session_id"] for proof in group["not_accepted"]
+            ),
+            "terminal_receipts": tuple(terminal),
+            "observed": True,
+            "cross_process_proof": (
+                all(proof["cross_process_proof"] for proof in terminal)
+                if terminal else True
+            ),
+        })
+    return {
+        "source": (
+            "tools.process_registry_custody_evidence.py:107-439;"
+            "tools.process_registry_custody.py:119-312,1517-1586,1615-1630,1750-1780;"
+            "tools.process_registry.py:545-627,1572-1613"
+        ),
+        "process_instance": process_instance,
+        "authority_epoch": authority_epoch,
+        "close_generation": close_generation,
+        "owner_id": owner_id,
+        "profile_id": launch_profile_id,
+        "profile_ids": tuple(sorted(grouped)),
+        "profile_evidence": tuple(profile_evidence),
+        "observed": True,
+        "cross_process_proof": True,
+        "settled_processes": terminal_count,
+        "terminal_session_ids": tuple(terminal_session_ids),
+        "physical_owner_epochs": tuple(physical_owner_epochs),
+    }
+
+
+def preservation_owner_evidence_for_profiles(
+    registry, *, process_instance: str, authority_epoch: int, close_generation: int,
+    owner_id: str, launch_profile_id: str,
+) -> Optional[dict[str, Any]]:
+    """Return one I15 close proof covering every authenticated profile in this process.
+
+    A process close has one launch epoch at the coordinator envelope, but multiplexed profiles
+    may have older, already-retired authority epochs.  A terminal ProcessCustody object retains
+    the source-owned physical incarnation and all native/durable/reader/delivery observations,
+    so a closed historical profile can contribute without pretending that the current serving
+    epoch was its terminal epoch.  Active, unknown, unbound, foreign, malformed, or incomplete
+    sessions remain refusal evidence; absence is never completion.
+    """
+    registry._retry_foreground_records()
+    with registry._lock:
+        _mixed_close_inputs_result = _mixed_close_inputs(
+            registry,
+            process_instance=process_instance,
+            authority_epoch=authority_epoch,
+            close_generation=close_generation,
+            owner_id=owner_id,
+            launch_profile_id=launch_profile_id,
+        )
+        if _mixed_close_inputs_result is None:
+            return None
+        collected = _collect_mixed_profile_sessions(registry, process_instance)
+        if collected is None:
+            return None
+        grouped, _terminal_count = collected
+        return _build_mixed_profile_evidence(
+            grouped,
+            process_instance=process_instance,
+            authority_epoch=authority_epoch,
+            close_generation=close_generation,
+            owner_id=owner_id,
+            launch_profile_id=launch_profile_id,
+        )
 
 
 def open_process_scope(
@@ -191,8 +448,9 @@ def open_process_scope(
         coordinator is None
         or not isinstance(owner_task_id, str) or not owner_task_id
         or not isinstance(profile_id, str) or not profile_id
-        or profile_id != registry._process_profile_id()
-        or authority_epoch != coordinator.authority_epoch
+        or not coordinator.profile_scope_valid(
+            profile_id, authority_epoch, require_serving=True, allow_retiring=False,
+        )
     ):
         return None
     return ProcessScopeFence(

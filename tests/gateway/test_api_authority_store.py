@@ -1,32 +1,19 @@
 """API storage selection borrows the runtime's store, never another profile's."""
-from types import SimpleNamespace
-
 import pytest
+import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
-from gateway.session_authority import SessionAuthority
-from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.gateway.conftest import runtime_owned_api
 
 
-@pytest.fixture
-def owned_api(tmp_path, monkeypatch):
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(tmp_path / 'state.db')
-    runner = SimpleNamespace(_draining=False)
-    runner.session_authority = SessionAuthority(
-        runner, profile_id='default', instance_id='api-test', db=db,
-        epoch=begin_runtime_epoch(db, instance_id='api-test'))
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'owned-api-test-secret'}))
-    adapter.gateway_runner = runner
-    yield adapter, db
-    adapter._close_cached_session_dbs()
-    adapter._response_store.close()
-    adapter._run_idempotency_store.close()
-    db.close()
+@pytest_asyncio.fixture
+async def owned_api(tmp_path, monkeypatch):
+    """Use the production profile selection after the real custody bootstrap."""
+    async with runtime_owned_api(
+        tmp_path, monkeypatch, api_key='owned-api-test-secret'
+    ) as adapter:
+        yield adapter, adapter.gateway_runner.session_authority.db
 
 
 @pytest.mark.asyncio
@@ -53,12 +40,18 @@ async def test_bound_api_never_opens_unserved_home(owned_api, tmp_path, monkeypa
     adapter, db = owned_api
     other = tmp_path / 'unserved'
     monkeypatch.setenv('HERMES_HOME', str(other))
-    # Even an explicit legacy override cannot bypass runtime profile selection.
-    adapter._session_db = db
-    assert adapter._ensure_session_db() is None
-    assert await adapter._ensure_session_db_async() is None
-    assert not (other / 'state.db').exists()
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    other_token = set_hermes_home_override(other)
+    try:
+        # Even an explicit legacy override cannot bypass runtime profile selection.
+        adapter._session_db = db
+        assert adapter._ensure_session_db() is None
+        assert await adapter._ensure_session_db_async() is None
+        assert not (other / 'state.db').exists()
+    finally:
+        reset_hermes_home_override(other_token)
     adapter.gateway_runner.session_authority = None
+    adapter.gateway_runner.session_authorities = None
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     assert adapter._ensure_session_db() is None
     assert await adapter._ensure_session_db_async() is None

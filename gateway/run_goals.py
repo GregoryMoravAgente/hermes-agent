@@ -131,10 +131,16 @@ class GatewayGoalsMixin:
         if watch is None:
             watch = self._heartbeat_watch = {}
         watch[quick_key] = (source, session_id)
+        from gateway.session_authorities import active_authority
+        from gateway.session_goal_tick_custody import register_watcher
+        register_watcher(active_authority(self), quick_key, "heartbeat", session_id=session_id)
         self._start_heartbeat_poller()
 
     def _unregister_heartbeat_watch(self, quick_key: str) -> None:
         (getattr(self, "_heartbeat_watch", None) or {}).pop(quick_key, None)
+        from gateway.session_authorities import active_authority
+        from gateway.session_goal_tick_custody import unregister_watcher
+        unregister_watcher(active_authority(self), quick_key, "heartbeat")
 
     async def _heartbeat_poll_once(self, watch: dict) -> None:
         """Wake each idle watched session once; leave busy sessions' ticks unclaimed."""
@@ -225,6 +231,8 @@ class GatewayGoalsMixin:
             if _bg is not None:
                 _bg.add(task)
                 task.add_done_callback(_bg.discard)
+            from gateway.session_goal_tick_custody import register_runner_watcher
+            register_runner_watcher(self, "heartbeat", task)
         except Exception:
             logger.debug("Failed to start heartbeat poller", exc_info=True)
 
@@ -258,7 +266,9 @@ class GatewayGoalsMixin:
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, on_complete=None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
@@ -266,13 +276,23 @@ class GatewayGoalsMixin:
         """
         adapter = self._goal_notice_adapter(source)
         if not adapter:
+            if on_complete is not None:
+                result = on_complete(False)
+                if asyncio.iscoroutine(result):
+                    await result
             return
 
         async def _deliver() -> None:
+            completed = False
             try:
                 await self._send_goal_status_notice(source, message)
+                completed = True
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
+            if on_complete is not None:
+                result = on_complete(completed)
+                if asyncio.iscoroutine(result):
+                    await result
 
         session_key = None
         with suppress(Exception):
@@ -303,7 +323,7 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -314,6 +334,11 @@ class GatewayGoalsMixin:
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
+            return
+
+        from gateway.session_goal_tick_runtime import reserve_goal_tick, apply_goal_decision
+        _authority, goal_tick, custody_refused = reserve_goal_tick(self, session_entry, source, event)
+        if custody_refused:
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -327,36 +352,24 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
-            ),
-        )
+        try:
+            decision = await self._run_in_executor_with_context(
+                lambda: mgr.evaluate_after_turn(
+                    final_response or "", user_initiated=True, background_processes=_bg_procs,
+                    active_delegations=_active_deleg,
+                ),
+            )
+        except BaseException:
+            if goal_tick is not None:
+                from gateway.session_goal_tick_custody import mark_unknown
+                mark_unknown(goal_tick, 'join_failed')
+            raise
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
-        if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
-            return
-        if getattr(source, "platform", None) == Platform.LOCAL:
-            # A local session's adapter FIFO has no reader: its turns are authority admissions.
-            # Commit the continuation there, as main's TUI chained it after the turn.
-            from gateway.session_automation import admit_route_wake
-            try:
-                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")
-            except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
-                logger.debug("goal continuation: local admission failed", exc_info=True)
-            return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
-        try:
-            adapter = self._delivery_adapter_for(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
-        except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+        if not decision.get("should_continue"):
+            prompt = ""
+        await apply_goal_decision(self, source, msg, prompt, goal_tick)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
@@ -381,9 +394,14 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response=final_text)
+                await hook(
+                    session_entry=session_entry, source=source, final_response=final_text,
+                    event=event,
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
+        from gateway.session_goal_tick_runtime import register_tick_delivery_finalizer
+        register_tick_delivery_finalizer(self, source, event)
         self._publish_local_control(source, only_if_present=True)
 
     def _publish_local_control(self, source: Any, *, only_if_present: bool = False) -> None:
@@ -410,7 +428,7 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -426,8 +444,29 @@ class GatewayGoalsMixin:
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        try:
+            decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        except BaseException:
+            from gateway.session_authorities import active_authority
+            from gateway.session_goal_tick_custody import mark_unknown, view_for_handle
+            handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
+            tick = view_for_handle(active_authority(self), handle)
+            if tick is not None:
+                mark_unknown(tick, 'join_failed')
+            raise
         msg = decision.get("message") or ""
+        from gateway.session_authorities import active_authority
+        from gateway.session_goal_tick_custody import (
+            handle_for_admission, mark_unknown, view_for_handle,
+        )
+        authority = active_authority(self)
+        handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
+        if handle is None and authority is not None:
+            live = authority.sessions.get(session_entry.session_id)
+            execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
+            handle = handle_for_admission(authority, execution.get('admission_id'))
+        tick = view_for_handle(authority, handle)
+
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
@@ -437,22 +476,31 @@ class GatewayGoalsMixin:
             return None
         import json
         from gateway.session_automation_custody import automation_source_identity
+        from gateway.session_goal_tick_custody import reserve_tick
         prior = manager.state
         next_tick = (getattr(prior, 'ticks_fired', 0) + 1) if prior is not None else 1
         source_event = GatewayGoalsMixin._synthetic_prompt_event(source, "", internal=True)
-        return authority._preservation_automation_root(
-            request_id=json.dumps(['loop', sid, next_tick], separators=(',', ':')),
+        request_id = json.dumps(['loop', sid, next_tick], separators=(',', ':'))
+        tick = reserve_tick(
+            authority,
+            request_id=request_id,
             principal_id='automation:' + entry.session_key,
             session_id=authority.logical_owner(entry.session_id),
             # This is the same source-owned digest that admit_automation stamps into the durable
             # descriptor.  A route label alone is not an authenticated source identity.
             source_identity=automation_source_identity(source_event, entry.session_key),
-            owner_class='I08_goals_loops_heartbeat',
+            kind='loop', watcher_key=entry.session_key,
         )
+        return tick.handle if tick is not None else None
 
     @staticmethod
     def _loop_custody_unknown(authority, handle, reason):
         if authority is None or handle is None:
+            return
+        from gateway.session_goal_tick_custody import mark_unknown, view_for_handle
+        tick = handle if hasattr(handle, 'handle') else view_for_handle(authority, handle)
+        if tick is not None:
+            mark_unknown(tick, reason)
             return
         coordinator = authority._preservation_coordinator()
         if coordinator is not None:
@@ -491,6 +539,8 @@ class GatewayGoalsMixin:
             event = self._synthetic_prompt_event(
                 source, wakeup, internal=True, _preservation_handoff=handoff,
             )
+            from gateway.session_goal_tick_custody import attach_tick_handle
+            attach_tick_handle(event, handle, 'loop')
             if entry is not None:
                 event.metadata.update({
                     "gateway_session_key": self._session_key_for_source(source),
@@ -502,6 +552,11 @@ class GatewayGoalsMixin:
                 await adapter.handle_message(event)
         if is_command:
             await self._run_in_executor_with_context(mgr.complete_tick, "")
+            from gateway.session_goal_tick_custody import finish_unbound, view_for_handle
+            from gateway.session_authorities import active_authority
+            tick = view_for_handle(active_authority(self), handle)
+            if tick is not None:
+                finish_unbound(tick, success=True)
 
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
@@ -572,7 +627,12 @@ class GatewayGoalsMixin:
             raise
         if not wakeup:
             if handle is not None:
-                authority._preservation_release_unaccepted(handle)
+                from gateway.session_goal_tick_custody import release_unaccepted, view_for_handle
+                tick = view_for_handle(authority, handle)
+                if tick is not None:
+                    release_unaccepted(tick)
+                else:
+                    authority._preservation_release_unaccepted(handle)
             return
         handoff = self._loop_custody_handoff(authority, entry, handle)
         if handle is not None and handoff is None:
@@ -613,6 +673,8 @@ class GatewayGoalsMixin:
         and each hit is fired against that profile's adapters."""
         from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop
+        from gateway.session_goal_tick_custody import register_runner_watcher
+        register_runner_watcher(self, 'loop', asyncio.current_task())
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 

@@ -90,8 +90,32 @@ class GatewayTurnPersistenceMixin:
             return
         if result.get("_classic_writer_proof") is None:
             return
+
+        async def _consume_registered_classic_callback() -> bool:
+            """Consume the outer turn's real callback before this queued lane finishes its owner.
+
+            The queued first reply is delivered inside ``_run_agent`` before the outer Base
+            task reaches its finally block.  Waiting for that finally to pop the callback would
+            leave the first I06 operation open while the recursive follow-up claims the FIFO.
+            The adapter's existing callback consumer is therefore invoked at this actual queued
+            delivery boundary; if the outer active-turn event is unavailable, leave the owner
+            for Base's normal finalizer instead of manufacturing a callback context.
+            """
+            bridge = getattr(event, '_classic_execution_bridge', None)
+            if not getattr(bridge, 'post_delivery_callback_expected', False):
+                return True
+            active = getattr(adapter, '_active_sessions', None)
+            interrupt_event = active.get(turn_ctx.session_key) if isinstance(active, dict) else None
+            fire = getattr(adapter, '_fire_post_delivery_callback', None)
+            if interrupt_event is None or not callable(fire):
+                return False
+            await fire(turn_ctx.session_key, interrupt_event)
+            return bool(getattr(bridge, 'post_delivery_callback_executed', False))
+
         try:
             if not delivered:
+                if not await _consume_registered_classic_callback():
+                    return
                 authority._classic_finish(event, success=False, reason="delivery_proof_missing")
                 return
             if isinstance(response, dict):
@@ -109,6 +133,8 @@ class GatewayTurnPersistenceMixin:
                 from gateway import delivery_ledger
                 inbound_id = getattr(turn_ctx, "inbound_message_id", None) or getattr(event, "message_id", None)
                 if not inbound_id:
+                    if not await _consume_registered_classic_callback():
+                        return
                     authority._classic_finish(event, success=False, reason="delivery_proof_missing")
                     return
                 obligation_id = delivery_ledger.compute_obligation_id(
@@ -127,6 +153,8 @@ class GatewayTurnPersistenceMixin:
                         expected_state="delivered",
                     )
                 if proof is None:
+                    if not await _consume_registered_classic_callback():
+                        return
                     authority._classic_finish(event, success=False, reason="delivery_proof_missing")
                     return
                 event._classic_delivery_proof = proof
@@ -135,7 +163,11 @@ class GatewayTurnPersistenceMixin:
             from gateway.session_classic_custody import attach_classic_execution_receipt
             receipt = attach_classic_execution_receipt(self, event, entry, result) if entry is not None else None
             if receipt is None:
+                if not await _consume_registered_classic_callback():
+                    return
                 authority._classic_finish(event, success=False, reason="completion_receipt_missing")
+                return
+            if not await _consume_registered_classic_callback():
                 return
             authority._classic_finish(event, success=True, receipt=receipt)
         except Exception:

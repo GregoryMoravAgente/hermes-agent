@@ -192,9 +192,19 @@ def _classic_writer_proof_request_context(ctx: TurnContext) -> tuple[Any, bool]:
     if getattr(ctx, "classic_writer_binding", None) is not None:
         return event, True
     # A nested I04/I07 turn deliberately has no direct classic binding.  Its existing
-    # authenticated ContextVar is the only valid way to arm the typed writer seam.
+    # authenticated bridge and ContextVar are the only valid way to arm the typed writer
+    # seam.  A native managed admission also has an I04 ContextVar, but without the
+    # source-owned classic bridge it has no writer/physical-tip witness to publish here.
     try:
+        from gateway.session_classic_custody import ClassicExecutionEventBridge
         from gateway.runtime_service_custody import current_turn_binding
+        bridge = getattr(event, "_classic_execution_bridge", None)
+        if (
+            not isinstance(bridge, ClassicExecutionEventBridge)
+            or bridge.owner_event is not event
+            or bridge.execution_event is None
+        ):
+            return event, False
         return event, current_turn_binding() is not None
     except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
         return event, False

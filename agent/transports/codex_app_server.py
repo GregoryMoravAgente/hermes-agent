@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
@@ -112,14 +113,22 @@ def _force_close_process(client: Any) -> None:
 
 
 def _settle_physical_receipt(client: Any, timeout: float) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    receipt = getattr(client, "_physical_receipt", None)
+    transaction = getattr(receipt, "transaction", None)
+    if transaction is not None:
+        if transaction.process is not client._proc or not transaction.drain_after_process_exit(timeout):
+            receipt.mark_unknown("native_job_nonempty" if transaction.scope_observation == "nonempty"
+                                 else "native_job_state_unknown")
+            raise CodexAppServerTransportError(
+                code=_TRANSPORT_LOST_CODE, message="codex app-server native Job did not settle",
+            )
     reader = getattr(client, "_reader", None)
     stderr_reader = getattr(client, "_stderr_reader", None)
-    join_timeout = max(0.0, min(float(timeout), 1.0))
     if reader is not None:
-        reader.join(timeout=join_timeout)
+        reader.join(timeout=max(0.0, min(deadline - time.monotonic(), 1.0)))
     if stderr_reader is not None:
-        stderr_reader.join(timeout=join_timeout)
-    receipt = getattr(client, "_physical_receipt", None)
+        stderr_reader.join(timeout=max(0.0, min(deadline - time.monotonic(), 1.0)))
     if receipt is None:
         return
     if reader is None or stderr_reader is None or reader.is_alive() or stderr_reader.is_alive():
@@ -380,6 +389,7 @@ class CodexAppServerClient:
             if getattr(self, "_close_complete", False):
                 return
             self._closed = True  # reject new requests, even if termination needs a retry
+            deadline = time.monotonic() + max(0.0, float(timeout))
             self._fail_pending_requests("codex app-server client is closing")
             managed_physical = _managed_physical(self)
             descendants = _close_descendants(self, managed_physical)
@@ -389,7 +399,7 @@ class CodexAppServerClient:
             try:
                 if self._proc.poll() is None:
                     self._proc.terminate()
-                self._proc.wait(timeout=timeout)
+                self._proc.wait(timeout=max(0.0, deadline - time.monotonic()))
             except subprocess.TimeoutExpired:
                 # Popen retains the child identity and guards signaling after exit. Do not
                 # rediscover a process tree from a PID that may have been recycled on retry.
@@ -397,7 +407,7 @@ class CodexAppServerClient:
             finally:
                 if not managed_physical:
                     _reap_snapshotted(descendants)
-            _settle_physical_receipt(self, timeout)
+            _settle_physical_receipt(self, max(0.0, deadline - time.monotonic()))
             self._close_complete = True
         finally:
             close_lock.release()

@@ -67,17 +67,33 @@ def register_transport_home(runner, profile, home):
 
 
 @contextmanager
-def native_callback(runner, event, transport_home, profile=None):
+def native_callback(runner, event, transport_home, profile=None, source_token=None):
+    source_close = getattr(runner, '_preservation_source_close', None)
+    if source_token is None:
+        from gateway.preservation_source_close import current_source_handoff
+        handoff = current_source_handoff()
+        if handoff:
+            source_token = handoff
+    source_lease = None
     if transport_home is None:
         if getattr(runner, 'session_authority', None) is not None:
+            if source_close is not None:
+                source_close.mark_unknown(event, 'transport_home_missing')
             raise RuntimeStoreError('profile_mismatch')
-        yield
-        return
-    token = _callback.set((runner, event, Path(transport_home).resolve(), profile))
+        if source_close is None:
+            yield
+            return
+        source_lease = source_close.enter_native(event, profile, source_token=source_token)
+    elif source_close is not None:
+        source_lease = source_close.enter_native(event, profile, source_token=source_token)
+    callback_home = Path(transport_home).resolve() if transport_home is not None else None
+    token = _callback.set((runner, event, callback_home, profile))
     try:
         yield
     finally:
         _callback.reset(token)
+        if source_lease is not None:
+            source_close.release(source_lease)
 
 
 def carry_callback(event, rewritten):

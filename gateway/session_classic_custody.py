@@ -11,7 +11,7 @@ import hashlib
 import json
 import sqlite3
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 import uuid
@@ -93,7 +93,25 @@ class ClassicExecutionEventBridge:
     principal_id: str
     request_id: str
     occurrence_id: str
+    operation_key: Optional[str] = None
     terminal_inbound_id: Optional[str] = None
+    post_delivery_callback: Any = None
+    # Exact Base-owned occurrence handle; never a mutable adapter dispatch owner.
+    post_delivery_callback_handle: Any = None
+    post_delivery_callback_expected: bool = False
+    post_delivery_callback_pending: bool = False
+    post_delivery_callback_authority: bool = False
+    post_delivery_callback_done: Any = None
+    post_delivery_callback_executed: bool = False
+    post_delivery_callback_settled: bool = False
+    post_delivery_callback_state: str = 'unclassified'
+    post_delivery_callback_expectation: Any = None
+    post_delivery_callback_delivery_witness: Any = None
+    post_delivery_callback_settlement: Any = None
+    # A terminal I06 row may retire from the operation index before the existing busy finalizer
+    # performs its durable readback. Keep that exact authenticated record on the one-use bridge;
+    # this is a witness carrier, not a second ownership index.
+    retired_operation_record: Any = None
 
 
 def _profile_home(authority):
@@ -257,15 +275,21 @@ def _exact_parent(authority, identity):
     admission_id = execution.get('admission_id')
     if not admission_id:
         return None
-    # Connector identities use the source principal (user/chat), while the durable admission
-    # authenticates the same source in the server-owned ``messaging:<json>`` namespace.  Keep the
-    # strict row comparison, but compare like-for-like rather than treating the connector spelling
-    # as a different principal.
-    principal_id = _classic_admission_principal(getattr(live, 'source', None))
+    # A shared session's live source is the currently executing sender, not necessarily the sender
+    # whose new busy occurrence is being admitted.  Use the already authenticated occurrence
+    # principal and retain the durable row/epoch/profile checks in _preservation_operation_parent.
+    principal_id = identity.get('principal_id')
+    if not isinstance(principal_id, str) or not principal_id:
+        return _PARENT_UNAVAILABLE
     parent = authority._preservation_operation_parent(
         identity['session_id'], admission_id=admission_id,
         generation=execution.get('execution_generation'),
-        principal_id=principal_id)
+        principal_id=principal_id,
+        shared_group_principal=(
+            getattr(getattr(live, 'source', None), 'chat_type', None) == 'group'
+            and getattr(getattr(authority, 'runner', None), 'config', None) is not None
+            and getattr(authority.runner.config, 'group_sessions_per_user', True) is False
+        ))
     return parent if _valid_parent(authority, parent) else _PARENT_UNAVAILABLE
 
 
@@ -452,8 +476,13 @@ def _classic_writer_handoff(event, _agent_result):
     would cross the settlement and JSON boundaries. The caller clears both event holders on every exit.
     """
     owner, execution = _classic_event_pair(event)
-    handoff = (getattr(owner, '_classic_writer_handoff', None)
-               or getattr(execution, '_classic_writer_handoff', None))
+    terminal = getattr(execution, '_classic_terminal_event', None)
+    handoff = next(
+        (getattr(holder, '_classic_writer_handoff', None)
+         for holder in (owner, execution, terminal)
+         if holder is not None and getattr(holder, '_classic_writer_handoff', None) is not None),
+        None,
+    )
     if handoff is None:
         return None, None
     try:
@@ -538,37 +567,332 @@ def _classic_writer_binding_valid(
             binding, identity, expected_record, allow_terminal=allow_terminal,
         )
     try:
-        from gateway.runtime_service_custody import TurnCustodyBinding, validate_turn_binding
+        from gateway.runtime_service_custody import (
+            TurnCustodyBinding, _authoritative_admission_row,
+            _require_terminal_binding, validate_turn_binding,
+        )
     except (ImportError, AttributeError):
         return False
     if not isinstance(binding, TurnCustodyBinding):
         return False
     try:
-        # This rereads the authoritative I04 admission row and exact parent/live execution. The
-        # scalar comparisons below are only redundant identity checks for the classic receipt.
-        validate_turn_binding(binding)
+        # A settled drain clears live execution before the writer callback consumes its
+        # authenticated receipt; terminal mode rereads the same authoritative binding.
+        if (allow_terminal and _authoritative_admission_row(
+                binding.authority, binding.admission_id).get('status') == 'terminal'):
+            _require_terminal_binding(binding)
+        else:
+            validate_turn_binding(binding)
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
         return False
-    fields = {
-        'session_id': 'session_id',
-        'profile_id': 'profile_id',
-        'authority_epoch': 'authority_epoch',
-        'process_instance': 'process_instance',
-        'principal_id': 'principal_id',
-        'source_identity': 'source_identity',
-    }
-    for binding_field, identity_field in fields.items():
+    return _classic_binding_identity_matches(binding, identity)
+
+
+def _classic_binding_identity_matches(binding, identity) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    for binding_field, identity_field in (
+        ('session_id', 'session_id'),
+        ('profile_id', 'profile_id'),
+        ('authority_epoch', 'authority_epoch'),
+        ('process_instance', 'process_instance'),
+        ('principal_id', 'principal_id'),
+        ('source_identity', 'source_identity'),
+    ):
         actual = getattr(binding, binding_field, None)
-        expected = identity.get(identity_field)
+        # TurnCustodyBinding's source_identity is the canonical admission principal; the
+        # classic occurrence digest remains record-owned and is carried by ClassicWriterBinding.
+        expected_field = (
+            'principal_id'
+            if binding_field == 'source_identity' and not isinstance(binding, ClassicWriterBinding)
+            else identity_field
+        )
+        expected = identity.get(expected_field)
         if actual is None or expected is None or actual != expected:
             return False
     admission_id = getattr(binding, 'admission_id', None)
     execution_generation = getattr(binding, 'execution_generation', None)
-    if not isinstance(admission_id, str) or not admission_id:
+    return (
+        isinstance(admission_id, str)
+        and bool(admission_id)
+        and type(execution_generation) is int
+        and execution_generation >= 1
+    )
+
+
+def classic_writer_parent_relation(record, binding, authority=None):
+    """Return the authenticated inline parent or a candidate managed-child carrier route."""
+    try:
+        from gateway.runtime_custody import CustodyHandle
+        from gateway.runtime_service_custody import TurnCustodyBinding
+    except (ImportError, AttributeError):
+        return None
+    if not isinstance(record, dict) or not isinstance(binding, TurnCustodyBinding):
+        return None
+    admission_id = record.get('admission_id')
+    parent = record.get('parent_handle')
+    owner_id = getattr(parent, 'owner_id', None)
+    if (
+        not isinstance(admission_id, str)
+        or not admission_id
+        or not isinstance(parent, CustodyHandle)
+        or parent.owner_class != 'I04_fifo_turn_execution'
+        or type(owner_id) is not str
+        or not owner_id.startswith('claim:')
+        or owner_id == 'claim:'
+    ):
+        return None
+    if binding.parent_handle is not parent:
+        children = getattr(authority, '_preservation_children', None) if authority is not None else None
+        if (
+            not isinstance(children, dict)
+            or children.get(admission_id) is not binding.parent_handle
+            or binding.admission_id != admission_id
+        ):
+            return None
+        return 'claimed_child_carrier', admission_id
+    parent_admission_id = owner_id[len('claim:'):]
+    if binding.admission_id == parent_admission_id and parent_admission_id != admission_id:
+        return 'inline_parent', parent_admission_id
+    if binding.admission_id == admission_id and parent_admission_id == admission_id:
+        return 'claimed_child', parent_admission_id
+    return None
+
+
+def _classic_inline_parent_row_valid(parent_admission_id, identity, binding, parent_row) -> bool:
+    if not isinstance(identity, dict) or not isinstance(parent_row, dict):
         return False
-    if type(execution_generation) is not int or execution_generation < 1:
+    status = parent_row.get('status')
+    generation = parent_row.get('generation')
+    return (
+        parent_row.get('admission_id') == parent_admission_id
+        and parent_row.get('target_session_id') == identity.get('session_id')
+        and parent_row.get('principal_id') == identity.get('principal_id')
+        and parent_row.get('owner_epoch') == binding.authority_epoch
+        and generation == binding.execution_generation
+        and status in {'started', 'terminal'}
+        and type(generation) is int
+        and generation >= 1
+        and type(parent_row.get('request_id')) is str
+        and bool(parent_row.get('request_id'))
+        and (status != 'terminal' or parent_row.get('outcome') == 'completed')
+        and _classic_binding_identity_matches(binding, identity)
+    )
+
+
+def _classic_inline_parent_authority_valid(binding, parent_row) -> bool:
+    try:
+        from gateway.runtime_service_custody import (
+            _require_terminal_binding,
+            validate_turn_binding,
+        )
+        if parent_row.get('status') == 'terminal':
+            verified = _require_terminal_binding(binding, allow_unknown_parent=True)
+            if verified.get('admission_id') != parent_row.get('admission_id'):
+                return False
+            if verified.get('generation') != parent_row.get('generation'):
+                return False
+            return verified.get('principal_id') == parent_row.get('principal_id')
+        validate_turn_binding(binding)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return False
     return True
+
+
+def _classic_inline_parent_edge_valid(authority, binding, parent, parent_admission_id) -> bool:
+    coordinator = binding.coordinator
+    children = getattr(authority, '_preservation_children', None)
+    parent_edge = getattr(coordinator, '_parent', None)
+    try:
+        from gateway.runtime_custody import CustodyHandle
+    except (ImportError, AttributeError):
+        return False
+    coordinator_getter = getattr(authority, '_preservation_coordinator', None)
+    expected_coordinator = coordinator_getter() if callable(coordinator_getter) else None
+    return (
+        isinstance(parent, CustodyHandle)
+        and binding.authority is authority
+        and binding.coordinator is expected_coordinator
+        and parent.owner_class == 'I04_fifo_turn_execution'
+        and parent.owner_id == f'claim:{parent_admission_id}'
+        and parent.profile_id == getattr(authority, 'profile_id', None)
+        and parent.authority_epoch == getattr(authority, 'epoch', None)
+        and parent.process_instance == getattr(authority, 'instance_id', None)
+        and parent.coordinator_id == getattr(expected_coordinator, '_coordinator_id', None)
+        and isinstance(children, dict)
+        and children.get(parent_admission_id) is parent
+        and callable(parent_edge)
+        and parent_edge(parent) is not None
+    )
+
+
+def classic_inline_parent_binding_valid(
+    authority, record, identity, binding, parent_row=None,
+) -> bool:
+    """Validate a recursive child carried by the authenticated outer I04 binding."""
+    relation = classic_writer_parent_relation(record, binding)
+    if relation is None or relation[0] != 'inline_parent' or not isinstance(identity, dict):
+        return False
+    if parent_row is None:
+        try:
+            from hermes_state_runtime import get_session_admission
+            parent_row = get_session_admission(
+                authority.db, admission_id=relation[1],
+            )
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            return False
+    if binding.authority is not authority:
+        return False
+    if not _classic_inline_parent_row_valid(relation[1], identity, binding, parent_row):
+        return False
+    if not _classic_inline_parent_authority_valid(binding, parent_row):
+        return False
+    return _classic_inline_parent_edge_valid(
+        authority, binding, record.get('parent_handle'), relation[1],
+    )
+
+
+def _classic_claimed_child_operation_valid(authority, record, identity, admission_id):
+    """Join the exact operation record/producer to A and retain its independent P proof."""
+    from gateway.session_classic_delivery import _classic_source_parent_valid
+    if not isinstance(record, dict) or not isinstance(identity, dict):
+        return False
+    if not all((
+        record.get('owner_class') == _CLASSIC_OWNER,
+        record.get('unknown') is not True,
+        record.get('admission_id') == admission_id,
+        _identity_matches(record, identity),
+    )):
+        return False
+    from gateway.session_classic_writer_parent import (
+        _classic_claimed_child_operation_match,
+    )
+    operation = _classic_claimed_child_operation_match(authority, record, admission_id)
+    if operation is None:
+        return False
+    key, producer, retired = operation
+    if not all((
+        producer is not None,
+        getattr(producer, '_classic_custody_authority', None) is authority,
+        retired or getattr(producer, '_classic_custody_key', None) == key,
+    )):
+        return False
+    parent = record.get('parent_handle')
+    owner_id = getattr(parent, 'owner_id', None)
+    if not isinstance(owner_id, str) or not owner_id.startswith('claim:'):
+        return False
+    parent_admission_id = owner_id[len('claim:'):]
+    if not parent_admission_id or parent_admission_id == admission_id:
+        return False
+    if not _classic_source_parent_valid(authority, parent, parent_admission_id):
+        return False
+    try:
+        row = authority._preservation_operation_row(key, expected_parent=parent)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    if not isinstance(row, dict):
+        return False
+    return (
+        row.get('admission_id') == admission_id
+        and _classic_admission_row_matches(authority, record, row, allow_terminal=True)
+    )
+
+
+def _classic_claimed_child_edge_identity_valid(authority, coordinator, root, child, admission_id):
+    root_owner_id, child_owner_id = getattr(root, 'owner_id', None), getattr(child, 'owner_id', None)
+    if (
+        getattr(root, 'owner_class', None) != 'I01_native_inbound'
+        or type(root_owner_id) is not str or not root_owner_id.startswith('native:')
+        or getattr(child, 'owner_class', None) != 'I04_fifo_turn_execution'
+        or child_owner_id != f'claim:{admission_id}'
+    ):
+        return None
+    profile_id, epoch = getattr(authority, 'profile_id', None), getattr(authority, 'epoch', None)
+    process, coordinator_id = getattr(authority, 'instance_id', None), getattr(coordinator, '_coordinator_id', None)
+    for handle in (root, child):
+        if any((
+            getattr(handle, 'profile_id', None) != profile_id,
+            getattr(handle, 'authority_epoch', None) != epoch,
+            getattr(handle, 'process_instance', None) != process,
+            getattr(handle, 'coordinator_id', None) != coordinator_id,
+        )):
+            return None
+    root_lease, child_lease = getattr(root, 'lease', None), getattr(child, 'lease', None)
+    root_id, child_id = getattr(root_lease, 'lease_id', None), getattr(child_lease, 'lease_id', None)
+    if (
+        type(root_id) is not str or not root_id or type(child_id) is not str or not child_id
+        or getattr(root_lease, 'parent_lease_id', None) is not None
+        or getattr(child_lease, 'parent_lease_id', None) != root_id
+    ):
+        return None
+    return root_id, child_id
+
+
+def _classic_claimed_child_records_valid(coordinator, root, child, root_id, child_id):
+    lock = getattr(coordinator, '_lock', None)
+    records = getattr(coordinator, '_records', None)
+    linked_by_parent = getattr(coordinator, '_children_by_parent', None)
+    if (
+        not isinstance(records, dict) or not isinstance(linked_by_parent, dict)
+        or not callable(getattr(lock, '__enter__', None))
+        or not callable(getattr(lock, '__exit__', None))
+    ):
+        return False
+    try:
+        with lock:
+            root_record, child_record = records.get(root_id), records.get(child_id)
+            linked = linked_by_parent.get(root_id)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    if root_record is None or child_record is None or not isinstance(linked, set):
+        return False
+    return (
+        getattr(root_record, 'handle', None) is root
+        and getattr(root_record, 'state', None) in {'accepted', 'finalizing'}
+        and getattr(child_record, 'handle', None) is child
+        and getattr(child_record, 'state', None) in {'accepted', 'finalizing'}
+        and child_id in linked
+    )
+
+
+def _classic_claimed_child_binding_valid(authority, record, identity, binding):
+    """Validate R->A, R->P, and A->H1->C as separate authenticated joins."""
+    from gateway.session_classic_writer_parent import _classic_claimed_child_edge_valid
+    admission_id = record.get('admission_id') if isinstance(record, dict) else None
+    if not isinstance(admission_id, str) or not admission_id:
+        return False
+    if not _classic_claimed_child_operation_valid(authority, record, identity, admission_id):
+        return False
+    if not _classic_claimed_child_edge_valid(authority, binding, admission_id):
+        return False
+    return _classic_writer_binding_valid(binding, identity, record, allow_terminal=True)
+
+def classic_record_writer_binding_valid(
+    authority, binding, identity, expected_record=None,
+) -> bool:
+    """Validate a receipt binding against the owning authority and explicit parent route."""
+    if authority is None or getattr(binding, 'authority', None) is not authority:
+        return False
+    if not isinstance(expected_record, dict) or expected_record.get('parent_handle') is None:
+        return _classic_writer_binding_valid(
+            binding, identity, expected_record, allow_terminal=True,
+        )
+    relation = classic_writer_parent_relation(expected_record, binding, authority)
+    if relation is None:
+        return False
+    if relation[0] == 'inline_parent':
+        return classic_inline_parent_binding_valid(
+            authority, expected_record, identity, binding,
+        )
+    if relation[0] == 'claimed_child_carrier':
+        return _classic_claimed_child_binding_valid(
+            authority, expected_record, identity, binding,
+        )
+    if relation[0] == 'claimed_child':
+        return _classic_writer_binding_valid(
+            binding, identity, expected_record, allow_terminal=True,
+        )
+    return False
 
 
 def _classic_delivery_proof_valid(proof, session_key: str) -> bool:
@@ -586,6 +910,106 @@ def _classic_delivery_proof_valid(proof, session_key: str) -> bool:
         return False
 
 
+def _classic_delivery_witness_receipt_valid(receipt, witness) -> bool:
+    proof = getattr(receipt, 'delivery_proof', None)
+    witness_proof = getattr(witness, 'proof', None)
+    expected = getattr(witness, 'expectation', None)
+    try:
+        from gateway.delivery_ledger import DeliveryObligationProof
+        proof_matches = (
+            isinstance(proof, DeliveryObligationProof)
+            and isinstance(witness_proof, DeliveryObligationProof)
+            and all(
+                getattr(proof, field, None) == getattr(witness_proof, field, None)
+                for field in (
+                    'obligation_id', 'session_key', 'platform', 'chat_id', 'thread_id',
+                    'content_digest', 'state', 'adapter_profile',
+                )
+            )
+            and proof.state == 'delivered'
+        )
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        proof_matches = False
+    return (
+        witness is not None
+        and proof_matches
+        and getattr(witness, 'obligation_id', None) == getattr(witness_proof, 'obligation_id', None)
+        and getattr(expected, 'owner_event', None) is not None
+        and getattr(expected, 'execution_event', None) is not None
+        and getattr(expected, 'operation_key', None)
+        and getattr(expected, 'admission_id', None)
+    )
+
+
+def _classic_callback_contract_valid(
+    authority, record, owner, bridge, key, *, bridge_present, expected, callback_expected, witness,
+) -> bool:
+    """Require the exact typed callback fence before consuming one classic receipt."""
+    if not isinstance(record, dict) or record.get('producer_object') is not owner:
+        return False
+    parented = record.get('parent_handle') is not None
+    if bridge is None:
+        # A bare direct root predates the callback bridge and may finish from its own receipt. Any
+        # managed/parented occurrence, or an explicitly present but missing bridge, stays unknown.
+        return not bridge_present and not parented
+    if not isinstance(bridge, ClassicExecutionEventBridge):
+        return False
+    identity = record.get('classic_identity')
+    execution = getattr(bridge, 'execution_event', None)
+    if (
+        bridge.owner_event is not owner
+        or bridge.operation_key != key
+        or getattr(owner, '_classic_custody_authority', None) is not authority
+        or getattr(owner, '_classic_custody_key', None) != key
+        or bridge.admission_id != record.get('admission_id')
+        or not isinstance(identity, dict)
+        or bridge.session_id != identity.get('session_id')
+        or bridge.principal_id != identity.get('principal_id')
+        or bridge.request_id != identity.get('request_id')
+        or bridge.occurrence_id != identity.get('occurrence_id')
+        or type(bridge.generation) is not int
+        or bridge.generation < 1
+        or record.get('generation') not in (None, 'pre-admission', bridge.generation)
+    ):
+        return False
+    if expected is None:
+        return False
+    try:
+        from gateway.session_classic_delivery import ClassicCallbackExpectation
+    except (ImportError, AttributeError):
+        return False
+    if not isinstance(expected, ClassicCallbackExpectation):
+        return False
+    if (
+        getattr(expected, 'authority', None) is not authority
+        or getattr(expected, 'owner_event', None) is not owner
+        or getattr(expected, 'execution_event', None) is not execution
+        or getattr(expected, 'operation_key', None) != key
+        or getattr(expected, 'admission_id', None) != bridge.admission_id
+        or getattr(expected, 'admission_generation', None) != bridge.generation
+        or getattr(expected, 'profile_id', None) != identity.get('profile_id')
+        or getattr(expected, 'profile_home', None) != identity.get('profile_home')
+        or getattr(expected, 'process_instance', None) != identity.get('process_instance')
+        or getattr(expected, 'authority_epoch', None) != identity.get('authority_epoch')
+        or getattr(expected, 'parent_handle', None) is not record.get('parent_handle')
+    ):
+        return False
+    state = getattr(bridge, 'post_delivery_callback_state', 'unclassified')
+    if callback_expected:
+        return (
+            bool(getattr(bridge, 'post_delivery_callback_expected', False))
+            and getattr(bridge, 'post_delivery_callback_executed', False)
+            and state in {'proof_recorded', 'settled'}
+            and witness is not None
+            and getattr(bridge, 'post_delivery_callback_delivery_witness', None) is witness
+        )
+    return (
+        not getattr(bridge, 'post_delivery_callback_expected', False)
+        and state == 'not_required'
+        and getattr(bridge, 'post_delivery_callback_settled', False)
+    )
+
+
 def build_classic_execution_receipt(runner, event, session_entry, agent_result):
     """Assemble exact witnesses from the authenticated owner/execution event pair."""
     sid = getattr(session_entry, 'session_id', None)
@@ -596,20 +1020,75 @@ def build_classic_execution_receipt(runner, event, session_entry, agent_result):
     identity = _classic_record_identity(owner)
     if identity is None:
         return None
-    transcript_rows = tuple(
-        getattr(execution, '_classic_transcript_write_proofs', ())
-        or getattr(owner, '_classic_transcript_write_proofs', ())
-        or ()
+    terminal = getattr(execution, '_classic_terminal_event', None)
+    holders = (owner, execution, terminal)
+    transcript_rows = next(
+        (tuple(getattr(holder, '_classic_transcript_write_proofs', ()))
+         for holder in holders
+         if holder is not None and getattr(holder, '_classic_transcript_write_proofs', ())),
+        (),
     )
     transcript_unknown = bool(
         getattr(execution, '_classic_transcript_write_unknown', False)
         or getattr(owner, '_classic_transcript_write_unknown', False)
+        or getattr(terminal, '_classic_transcript_write_unknown', False)
     )
     writer_proof, writer_binding = _classic_writer_handoff(owner, agent_result)
     agent_persisted = bool(
         getattr(execution, '_classic_agent_persisted', False)
         or getattr(owner, '_classic_agent_persisted', False)
+        or getattr(terminal, '_classic_agent_persisted', False)
     )
+    if transcript_unknown or (agent_persisted and writer_proof is None):
+        writer_proof = writer_binding = None
+    if writer_proof is None:
+        existing = next(
+            (
+                getattr(holder, '_classic_execution_receipt', None)
+                for holder in (
+                    owner, execution, getattr(execution, '_classic_terminal_event', None),
+                )
+                if isinstance(getattr(holder, '_classic_execution_receipt', None), ClassicExecutionReceipt)
+            ),
+            None,
+        )
+        existing_identity = tuple(identity.get(key) for key in _CLASSIC_IDENTITY_FIELDS)
+        reference = _classic_record_ref(owner)
+        record = reference[2] if reference is not None else None
+        existing_writer_ok = _classic_writer_proof_valid(
+            getattr(existing, 'writer_proof', None), sid,
+        ) if existing is not None else False
+        if existing_writer_ok:
+            existing_writer_ok = classic_record_writer_binding_valid(
+                reference[0] if reference is not None else None,
+                getattr(existing, 'writer_binding', None), identity, record,
+            )
+        existing_transcript_ok = (
+            existing is not None
+            and _classic_transcript_rows_valid(getattr(existing, 'transcript_rows', ()), sid)
+        )
+        if (
+            existing is not None
+            and not transcript_unknown
+            and existing.session_id == sid
+            and existing.session_key == session_key
+            and existing.identity == existing_identity
+            and (existing_transcript_ok or existing_writer_ok)
+            and (record is None or (
+                record.get('producer_object') is owner
+                and _identity_matches(record, identity)
+            ))
+        ):
+            delivery = _classic_delivery_proof_for_event(event)
+            if not _classic_delivery_proof_valid(delivery, session_key):
+                delivery = existing.delivery_proof
+            stream = next(
+                (getattr(holder, '_classic_stream_delivery_witness', None)
+                 for holder in holders
+                 if holder is not None and getattr(holder, '_classic_stream_delivery_witness', None) is not None),
+                existing.stream_witness,
+            )
+            return replace(existing, delivery_proof=delivery, stream_witness=stream)
     if transcript_unknown or (agent_persisted and writer_proof is None):
         return None
     if not agent_persisted and not transcript_rows and writer_proof is None:
@@ -621,21 +1100,28 @@ def build_classic_execution_receipt(runner, event, session_entry, agent_result):
         transcript_rows=transcript_rows,
         writer_proof=writer_proof,
         writer_binding=writer_binding,
-        delivery_proof=(getattr(execution, '_classic_delivery_proof', None)
-                        or getattr(owner, '_classic_delivery_proof', None)),
-        stream_witness=(getattr(execution, '_classic_stream_delivery_witness', None)
-                        or getattr(owner, '_classic_stream_delivery_witness', None)),
+        delivery_proof=_classic_delivery_proof_for_event(event),
+        stream_witness=next(
+            (getattr(holder, '_classic_stream_delivery_witness', None)
+             for holder in holders
+             if holder is not None and getattr(holder, '_classic_stream_delivery_witness', None) is not None),
+            None,
+        ),
     )
 
 
 def attach_classic_execution_receipt(runner, event, session_entry, agent_result):
-    """Attach one private receipt to both sides of the owner/execution handoff."""
+    """Attach one private receipt to every exact owner/execution/terminal holder."""
     owner, execution = _classic_event_pair(event)
+    terminal = getattr(execution, '_classic_terminal_event', None)
+    holders = []
+    for holder in (owner, execution, terminal):
+        if holder is not None and not any(holder is existing for existing in holders):
+            holders.append(holder)
     try:
         receipt = build_classic_execution_receipt(
             runner, execution, session_entry, agent_result,
         )
-        holders = (owner,) if owner is execution else (owner, execution)
         for holder in holders:
             holder._classic_execution_receipt = receipt
     except Exception as exc:
@@ -645,14 +1131,69 @@ def attach_classic_execution_receipt(runner, event, session_entry, agent_result)
         )
         return None
     finally:
-        holders = (owner,) if owner is execution else (owner, execution)
         for holder in holders:
             with suppress(AttributeError):
                 delattr(holder, '_classic_writer_handoff')
     return receipt
 
 
-def _classic_receipt_terminal(receipt, expected_identity=None, expected_record=None):
+def handoff_classic_execution_receipt(event, candidate) -> bool:
+    """Forward a typed receipt only between the exact accepted event holders.
+
+    The accepted busy event and restored execution event can cross different delivery helpers.
+    The candidate must be the exact owner, execution, or source-owned terminal event. Receipt
+    lookup is deliberately one-hop on that matched holder: a nested terminal holder cannot donate
+    a foreign receipt. This helper never creates a receipt, callback, or durable terminal result.
+    """
+    owner, execution = _classic_event_pair(event)
+    bridge = getattr(owner, '_classic_execution_bridge', None)
+    reference = _classic_record_ref(owner)
+    if (not isinstance(bridge, ClassicExecutionEventBridge)
+            or bridge.owner_event is not owner
+            or bridge.execution_event is not execution
+            or reference is None
+            or candidate is None
+            or bridge.operation_key != reference[1]):
+        return False
+    record = reference[2]
+    identity = record.get('classic_identity') if isinstance(record, dict) else None
+    terminal = getattr(execution, '_classic_terminal_event', None)
+    if candidate is not owner and candidate is not execution and candidate is not terminal:
+        return False
+    if (not isinstance(identity, dict)
+            or bridge.admission_id != record.get('admission_id')
+            or bridge.session_id != identity.get('session_id')
+            or bridge.principal_id != identity.get('principal_id')
+            or bridge.request_id != identity.get('request_id')
+            or bridge.occurrence_id != identity.get('occurrence_id')
+            or type(bridge.generation) is not int
+            or bridge.generation < 1
+            or record.get('generation') != bridge.generation):
+        return False
+    receipt = getattr(candidate, '_classic_execution_receipt', None)
+    if not isinstance(receipt, ClassicExecutionReceipt):
+        return False
+    expected_identity = (
+        tuple(identity.get(key) for key in _CLASSIC_IDENTITY_FIELDS)
+        if isinstance(identity, dict) else None
+    )
+    if (expected_identity is None
+            or receipt.identity != expected_identity
+            or receipt.session_id != identity.get('session_id')
+            or receipt.session_key != identity.get('session_key')):
+        return False
+    holders = []
+    for holder in (owner, execution, terminal):
+        if holder is not None and not any(holder is prior for prior in holders):
+            holders.append(holder)
+    for holder in holders:
+        holder._classic_execution_receipt = receipt
+    return True
+
+
+def _classic_receipt_terminal(
+    receipt, expected_identity=None, expected_record=None, delivery_witness=None, authority=None,
+):
     if not isinstance(receipt, ClassicExecutionReceipt):
         return False
     if not receipt.session_id or not receipt.session_key or not receipt.identity:
@@ -668,16 +1209,31 @@ def _classic_receipt_terminal(receipt, expected_identity=None, expected_record=N
         if expected_record is None and isinstance(receipt.writer_binding, ClassicWriterBinding):
             records = getattr(receipt.writer_binding.authority, '_preservation_operations', None)
             candidate = records.get(receipt.writer_binding.operation_key) if isinstance(records, dict) else None
-            if isinstance(candidate, dict):
+            if (
+                isinstance(candidate, dict)
+                and getattr(receipt.writer_binding, 'handle', None) is not None
+                and candidate.get('handle') is receipt.writer_binding.handle
+                and candidate.get('owner_class') == _CLASSIC_OWNER
+            ):
                 expected_record = candidate
+                if authority is None:
+                    authority = receipt.writer_binding.authority
         record_identity = expected_record.get('classic_identity') if isinstance(expected_record, dict) else None
         if isinstance(record_identity, dict):
             identity['session_key'] = record_identity.get('session_key')
-        writer_ok = writer_ok and _classic_writer_binding_valid(
-            receipt.writer_binding, identity, expected_record, allow_terminal=True,
+        writer_ok = writer_ok and classic_record_writer_binding_valid(
+            authority, receipt.writer_binding, identity, expected_record,
         )
-    durable_ok = transcript_ok or writer_ok
+    durable_ok = (
+        writer_ok
+        if isinstance(expected_record, dict) and expected_record.get('parent_handle') is not None
+        else transcript_ok or writer_ok
+    )
     delivery_ok = _classic_delivery_proof_valid(receipt.delivery_proof, receipt.session_key)
+    if delivery_witness is not None:
+        delivery_ok = delivery_ok and _classic_delivery_witness_receipt_valid(
+            receipt, delivery_witness,
+        )
     stream = receipt.stream_witness
     stream_ok = (
         isinstance(stream, ClassicStreamDeliveryWitness)
@@ -688,7 +1244,9 @@ def _classic_receipt_terminal(receipt, expected_identity=None, expected_record=N
         and isinstance(stream.payload_digest, str)
         and len(stream.payload_digest) == 64
     )
-    return durable_ok and (delivery_ok or stream_ok)
+    return durable_ok and (
+        delivery_ok if delivery_witness is not None else delivery_ok or stream_ok
+    )
 
 
 class ClassicCustodyMixin:
@@ -925,10 +1483,15 @@ class ClassicCustodyMixin:
             return None
         if record.get('owner_class') != _CLASSIC_OWNER:
             return None
-        # A classic record attached to a live I04/I07 parent remains on the existing managed
-        # TurnCustodyBinding route.  Binding its row to a direct writer would create two owners.
-        if record.get('parent_handle') is not None:
-            return None
+        # A classic record attached to a live I04/I07 parent keeps the existing managed
+        # TurnCustodyBinding writer.  It still needs the exact durable admission id bound before
+        # restore, otherwise the later occurrence cannot recover its bridge/receipt.  The parent
+        # is validated before that bind so this never creates a second writer owner.
+        parent_handle = record.get('parent_handle')
+        if parent_handle is not None and not _valid_parent(self, parent_handle):
+            self._preservation_operation_unknown(key, 'classic_parent_unknown')
+            event._classic_admission_owner_unknown = True
+            return False
         identity = record.get('classic_identity')
         if not isinstance(row, dict) or row.get('status') in {'terminal', 'unknown'}:
             # Exact terminal/unknown replay is handled by the admission ledger; it is not a new
@@ -948,8 +1511,10 @@ class ClassicCustodyMixin:
             event._classic_admission_owner_unknown = True
             return False
         try:
-            self._preservation_operation_bind_admission(key, admission_id)
-            bound = self._preservation_operation_row(key)
+            self._preservation_operation_bind_admission(
+                key, admission_id, expected_parent=parent_handle,
+            )
+            bound = self._preservation_operation_row(key, expected_parent=parent_handle)
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
             bound = None
         if bound is None or not _classic_admission_row_matches(self, record, bound):
@@ -967,6 +1532,11 @@ class ClassicCustodyMixin:
                 event._classic_admission_owner_unknown = True
                 return False
             adopters[admission_id] = event
+            from gateway.session_classic_delivery import bind_classic_marker_adoption
+            if not bind_classic_marker_adoption(self, key, admission_id, event):
+                self._preservation_operation_unknown(key, 'marker_adoption_unmapped')
+                event._classic_admission_owner_unknown = True
+                return False
         return True
 
     def _classic_execution_owner_for_admission(self, row):
@@ -984,9 +1554,12 @@ class ClassicCustodyMixin:
         for key, record in list(getattr(self, '_preservation_operations', {}).items()):
             if (not isinstance(record, dict)
                     or record.get('owner_class') != _CLASSIC_OWNER
-                    or record.get('admission_id') != admission_id
-                    or record.get('parent_handle') is not None):
+                    or record.get('admission_id') != admission_id):
                 continue
+            parent = record.get('parent_handle')
+            if parent is not None and not _valid_parent(self, parent):
+                self._preservation_operation_unknown(key, 'classic_parent_unknown')
+                return None, 'classic_owner_unknown'
             candidates.append((key, record))
         if not candidates:
             if classic_row_is_direct(row):
@@ -1005,7 +1578,9 @@ class ClassicCustodyMixin:
             self._preservation_operation_unknown(key, 'classic_owner_unmapped')
             return None, 'classic_owner_unknown'
         try:
-            reread = self._preservation_operation_row(key)
+            reread = self._preservation_operation_row(
+                key, expected_parent=record.get('parent_handle'),
+            )
         except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
             reread = None
         if reread is None or not _classic_admission_row_matches(self, record, reread):
@@ -1039,32 +1614,129 @@ class ClassicCustodyMixin:
         aggregate._classic_custody_events = events
         self._classic_mark_state(aggregate, 'handoff')
 
+    def _classic_finish_item(
+        self, item, *, success, reason, receipt, callback_key, callback_owner, callback_bridge,
+        callback_bridge_present, callback_expected, callback_witness, callback_failure_reason,
+    ):
+        """Apply the existing authenticated terminal/UNKNOWN decision to one custody event."""
+        key = getattr(item, '_classic_custody_key', None)
+        if key is None or key not in self._preservation_operations:
+            return False
+        record = self._preservation_operations.get(key)
+        expected_identity = record.get('classic_identity') if isinstance(record, dict) else None
+        parent_ok = True
+        if isinstance(record, dict) and record.get('parent_handle') is not None:
+            from gateway.session_classic_delivery import classic_parent_admission_proof
+            parent_ok = classic_parent_admission_proof(self, record) is not None
+        receipt_ok = _classic_receipt_terminal(
+            receipt, expected_identity, record,
+            callback_witness if key == callback_key else None, authority=self,
+        )
+        callback_ok = (
+            key != callback_key
+            or _classic_callback_contract_valid(
+                self,
+                record,
+                callback_owner,
+                callback_bridge,
+                key,
+                bridge_present=callback_bridge_present,
+                expected=getattr(callback_bridge, 'post_delivery_callback_expectation', None),
+                callback_expected=callback_expected,
+                witness=callback_witness,
+            )
+        )
+        if success and parent_ok and receipt_ok and callback_ok:
+            self._preservation_operation_terminal(key, f'classic:{item._classic_custody_key}')
+            callback_terminal = key == callback_key
+        elif success:
+            self._preservation_operation_unknown(
+                key, reason or callback_failure_reason
+                or ('post_delivery_callback_unsettled' if key == callback_key and callback_expected
+                    else 'completion_receipt_missing'))
+            callback_terminal = False
+            if key == callback_key and callback_expected:
+                with suppress(AttributeError):
+                    callback_bridge.post_delivery_callback_state = 'failed'
+        else:
+            self._preservation_operation_unknown(key, reason)
+            callback_terminal = False
+            if key == callback_key and callback_expected:
+                with suppress(AttributeError):
+                    callback_bridge.post_delivery_callback_state = 'failed'
+        if key not in self._preservation_operations:
+            item._classic_custody_key = None
+        return callback_terminal
+
     def _classic_finish(self, event, *, success, reason='join_failed', receipt=None):
         if event is None or getattr(event, '_classic_custody_authority', self) is not self:
-            return
+            return False
+        callback_owner, _callback_execution = _classic_event_pair(event)
+        callback_owner_key = getattr(callback_owner, '_classic_custody_key', None)
+        callback_bridge = getattr(callback_owner, '_classic_execution_bridge', None)
+        callback_bridge_present = hasattr(callback_owner, '_classic_execution_bridge')
+        callback_key = callback_owner_key
+        if isinstance(callback_bridge, ClassicExecutionEventBridge):
+            if callback_bridge.operation_key == callback_owner_key:
+                callback_key = callback_bridge.operation_key
+        callback_expected = bool(getattr(callback_bridge, 'post_delivery_callback_expected', False))
+        callback_witness = None
+        if callback_expected:
+            from gateway.session_classic_delivery import classic_delivery_proof_witness_for_event
+            callback_witness = classic_delivery_proof_witness_for_event(event)
+        callback_failure_reason = (
+            getattr(callback_owner, '_classic_delivery_failure_reason', None)
+            or getattr(event, '_classic_delivery_failure_reason', None)
+        )
+        if receipt is None:
+            from gateway.session_classic_delivery import _classic_receipt_for_event
+            receipt = _classic_receipt_for_event(event)
+        if success and isinstance(receipt, ClassicExecutionReceipt) and receipt.delivery_proof is None:
+            delivery_proof = getattr(callback_witness, 'proof', None) or _classic_delivery_proof_for_event(event)
+            if delivery_proof is not None:
+                receipt = replace(receipt, delivery_proof=delivery_proof)
         events = list(getattr(event, '_classic_custody_events', [event]))
+        callback_terminal = False
         for item in events:
-            key = getattr(item, '_classic_custody_key', None)
-            if key is None or key not in self._preservation_operations:
-                continue
-            record = self._preservation_operations.get(key)
-            expected_identity = record.get('classic_identity') if isinstance(record, dict) else None
-            if success and _classic_receipt_terminal(receipt, expected_identity, record):
-                self._preservation_operation_terminal(key, f'classic:{item._classic_custody_key}')
-            elif success:
-                self._preservation_operation_unknown(key, reason or 'completion_receipt_missing')
-            else:
-                self._preservation_operation_unknown(key, reason)
-            if key not in self._preservation_operations:
-                item._classic_custody_key = None
-        if not any(getattr(item, '_classic_custody_key', None) for item in events):
-            owner, execution = _classic_event_pair(event)
-            holders = (owner,) if owner is execution else (owner, execution)
-            for holder in holders:
-                with suppress(AttributeError):
-                    delattr(holder, '_classic_execution_bridge')
-                with suppress(AttributeError):
-                    delattr(holder, '_classic_execution_owner_event')
+            callback_terminal = self._classic_finish_item(
+                item,
+                success=success,
+                reason=reason,
+                receipt=receipt,
+                callback_key=callback_key,
+                callback_owner=callback_owner,
+                callback_bridge=callback_bridge,
+                callback_bridge_present=callback_bridge_present,
+                callback_expected=callback_expected,
+                callback_witness=callback_witness,
+                callback_failure_reason=callback_failure_reason,
+            ) or callback_terminal
+        settled = bool(
+            success
+            and callback_key is not None
+            and callback_key not in self._preservation_operations
+            and (not callback_expected or callback_terminal)
+        )
+        if settled:
+            with suppress(AttributeError):
+                callback_bridge.post_delivery_callback_settled = True
+                if callback_expected:
+                    with suppress(AttributeError):
+                        callback_bridge.post_delivery_callback_state = 'settled'
+                        from gateway.session_classic_delivery import ClassicCallbackSettlement
+                        callback_bridge.post_delivery_callback_settlement = ClassicCallbackSettlement(
+                            expectation=callback_bridge.post_delivery_callback_expectation,
+                            delivery=callback_witness,
+                        )
+        if getattr(callback_bridge, 'post_delivery_callback_pending', False):
+            callback_bridge.post_delivery_callback_pending = False
+            callback_bridge.post_delivery_callback_authority = False
+            callback_bridge.post_delivery_callback_executed = True
+            done = getattr(callback_bridge, 'post_delivery_callback_done', None)
+            if done is not None:
+                with suppress(Exception):
+                    done.set()
+        return settled
 
     def _classic_release_unaccepted(self, event):
         if event is None:
@@ -1167,17 +1839,33 @@ def _classic_event_pair(event):
     return owner, event
 
 
+def _classic_delivery_proof_for_event(event):
+    """Read the one delivery proof already attached to the exact event bridge."""
+    owner, execution = _classic_event_pair(event)
+    terminal = getattr(execution, '_classic_terminal_event', None)
+    seen = set()
+    for holder in (owner, execution, terminal):
+        if holder is None or id(holder) in seen:
+            continue
+        seen.add(id(holder))
+        proof = getattr(holder, '_classic_delivery_proof', None)
+        if proof is not None:
+            return proof
+    return None
+
+
 def bind_classic_execution_event(owner, event, row) -> bool:
     """Bind the restored event only to the authenticated direct owner and admission row."""
     reference = _classic_record_ref(owner)
     if reference is None or owner is None or event is None or not isinstance(row, dict):
         return False
-    authority, _key, record = reference
+    authority, key, record = reference
     identity = record.get('classic_identity')
     admission_id = row.get('admission_id')
+    parent = record.get('parent_handle')
     if (authority is not getattr(owner, '_classic_custody_authority', None)
             or record.get('producer_object') is not owner
-            or record.get('parent_handle') is not None
+            or (parent is not None and not _valid_parent(authority, parent))
             or record.get('admission_id') != admission_id
             or not isinstance(admission_id, str)
             or not _classic_admission_row_matches(authority, record, row)):
@@ -1187,6 +1875,7 @@ def bind_classic_execution_event(owner, event, row) -> bool:
     prior = getattr(owner, '_classic_execution_bridge', None)
     if isinstance(prior, ClassicExecutionEventBridge):
         if (prior.owner_event is not owner or prior.admission_id != admission_id
+                or prior.operation_key != key
                 or (prior.execution_event is not owner and prior.execution_event is not event)):
             return False
         if prior.execution_event is event:
@@ -1196,7 +1885,7 @@ def bind_classic_execution_event(owner, event, row) -> bool:
         owner_event=owner, execution_event=event, admission_id=admission_id,
         generation=row.get('generation'), session_id=identity.get('session_id'),
         principal_id=identity.get('principal_id'), request_id=identity.get('request_id'),
-        occurrence_id=identity.get('occurrence_id'),
+        occurrence_id=identity.get('occurrence_id'), operation_key=key,
     )
     if not all(isinstance(value, str) and value for value in (
         bridge.session_id, bridge.principal_id, bridge.request_id, bridge.occurrence_id,

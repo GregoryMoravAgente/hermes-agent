@@ -30,6 +30,9 @@ class HostedRoomAuthorityRPC:
         self.principal, self.authorizer, self.timeout = principal, authorize, timeout
         self.authorize_write = authorize_write
         self.callbacks = {}
+        # Request id -> the one retained I09 operation for this producer.  This is an in-memory
+        # index into the authority's canonical operation records, not a second custody ledger.
+        self._preservation_keys = {}
         binding = json.dumps([room_id, member_id, profile], separators=(',', ':'))
         self.creation_id = 'hosted:' + hashlib.sha256(binding.encode()).hexdigest()
         from gateway.session_local_recovery import local_identity
@@ -76,41 +79,61 @@ class HostedRoomAuthorityRPC:
         return await self._resume(params)
 
     async def _create(self, params):
-        if self.authority.db.get_session(self.ref.session_id) is not None:
-            return await self._resume(params)
-        from gateway.run import _load_gateway_config, _resolve_gateway_model
-        from gateway.session_policy import build_policy
-        from gateway.session_local import stage_local_session
-        from gateway.session_local_recovery import restore_local_session
-        from gateway.session_runtime_workers import tracked_write
-        from hermes_state_local import commit_local_session
-        from agent.skill_utils import parse_config_string_list
-        private = {}
-        config = _load_gateway_config()
-        # A room has no clarification reply (group controls expose approvals only), so a member
-        # turn that called clarify would block for clarify_timeout with its question unseen. As
-        # for cron, freeze it out; the member asks its question in the room reply instead.
-        agent = dict(config.get('agent') or {})
-        agent['disabled_toolsets'] = sorted(
-            set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
-        policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
-        policy = replace(policy, source='bot_room', platform='bot_room',
-                         model=policy.model or _resolve_gateway_model(policy.config()),
-                         toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
-        staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
-                                     trusted_policy=policy, trusted_secrets=private)
-        # Creation commit and label run off the owner loop (N90); a concurrent duplicate converges.
-        if isinstance(staged, dict):
-            await tracked_write(self.authority, partial(
-                commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=staged))
-            restore_local_session(self.authority, staged['session_id'])
-        from hermes_state_runtime import _epoch
-        def label(conn):
-            _epoch(conn, self.authority.epoch)
-            conn.execute('UPDATE sessions SET title=?, hidden=1 WHERE id=?',
-                         (f'Group: {self.room_id}', self.ref.session_id))
-        await tracked_write(self.authority, partial(self.authority.db._execute_write, label))
-        return await self._resume(params)
+        preservation_key, source_identity = self._preservation_prepare_create()
+        try:
+            if self.authority.db.get_session(self.ref.session_id) is not None:
+                result = await self._resume(params)
+            else:
+                from gateway.run import _load_gateway_config, _resolve_gateway_model
+                from gateway.session_policy import build_policy
+                from gateway.session_local import stage_local_session
+                from gateway.session_local_recovery import restore_local_session
+                from gateway.session_runtime_workers import tracked_write
+                from hermes_state_local import commit_local_session
+                from agent.skill_utils import parse_config_string_list
+                private = {}
+                config = _load_gateway_config()
+                # A room has no clarification reply (group controls expose approvals only), so a member
+                # turn that called clarify would block for clarify_timeout with its question unseen. As
+                # for cron, freeze it out; the member asks its question in the room reply instead.
+                agent = dict(config.get('agent') or {})
+                agent['disabled_toolsets'] = sorted(
+                    set(parse_config_string_list(agent.get('disabled_toolsets'))) | {'clarify'})
+                policy = build_policy({'source': 'gui'}, {**config, 'agent': agent}, private_secrets=private)
+                policy = replace(policy, source='bot_room', platform='bot_room',
+                                 model=policy.model or _resolve_gateway_model(policy.config()),
+                                 toolsets=tuple(sorted(set(policy.toolsets) | {'bot_room'})))
+                staged = stage_local_session(self.authority, self.principal, {'request_id': self.creation_id},
+                                             trusted_policy=policy, trusted_secrets=private)
+                # Creation commit and label run off the owner loop (N90); a concurrent duplicate converges.
+                if isinstance(staged, dict):
+                    await tracked_write(self.authority, partial(
+                        commit_local_session, self.authority.db, epoch=self.authority.epoch, receipt=staged))
+                    restore_local_session(self.authority, staged['session_id'])
+                from hermes_state_runtime import _epoch
+                def label(conn):
+                    _epoch(conn, self.authority.epoch)
+                    conn.execute('UPDATE sessions SET title=?, hidden=1 WHERE id=?',
+                                 (f'Group: {self.room_id}', self.ref.session_id))
+                await tracked_write(self.authority, partial(self.authority.db._execute_write, label))
+                result = await self._resume(params)
+            if preservation_key is not None:
+                self.authority._preservation_operation_terminal_after_exact_session(
+                    preservation_key, session_id=self.ref.session_id,
+                    principal_id=self.principal.subject, request_id=self.creation_id,
+                    source_identity=source_identity,
+                    finalizer_id=f'hosted-create:{self.ref.session_id}',
+                    source='bot_room', title=f'Group: {self.room_id}')
+                self._preservation_forget(self.creation_id, preservation_key)
+            return result
+        except asyncio.CancelledError:
+            if preservation_key is not None:
+                self.authority._preservation_operation_unknown(preservation_key, 'join_failed')
+            raise
+        except BaseException:
+            if preservation_key is not None:
+                self.authority._preservation_operation_unknown(preservation_key, 'read_failed')
+            raise
 
     async def _resume(self, params):
         await self.authority.resolve(self.principal, self.ref)
@@ -133,6 +156,154 @@ class HostedRoomAuthorityRPC:
             result.append((row, identity, generation))
         return result
 
+    def _preservation_source_identity(self, task, generation, request_id):
+        """Canonical hosted service tuple carried by the retained operation record."""
+        return json.dumps({
+            'service': 'hosted_room_member.v1',
+            'room_id': self.room_id,
+            'member_id': self.member_id,
+            'profile': self.profile,
+            'principal_id': self.principal.subject,
+            'principal_profile_id': self.principal.profile_id,
+            'target_session_id': self.ref.session_id,
+            'request_id': request_id,
+            'execution_generation': generation,
+            'task': asdict(task),
+        }, sort_keys=True, separators=(',', ':'))
+
+    def _preservation_create_source_identity(self):
+        """Canonical room/member/create tuple for the pre-admission hosted root."""
+        return json.dumps({
+            'service': 'hosted_room_member_create.v1',
+            'room_id': self.room_id,
+            'member_id': self.member_id,
+            'profile': self.profile,
+            'principal_id': self.principal.subject,
+            'principal_profile_id': self.principal.profile_id,
+            'target_session_id': self.ref.session_id,
+            'request_id': self.creation_id,
+            'execution_generation': None,
+            'operation': 'hosted-create',
+        }, sort_keys=True, separators=(',', ':'))
+
+    def _preservation_key_for_request(self, request_id, source_identity, *, operation='hosted-submit'):
+        records = getattr(self.authority, '_preservation_operations', {})
+        key = self._preservation_keys.get(request_id)
+        if key is not None:
+            record = records.get(key) if isinstance(records, dict) else None
+            if (isinstance(record, dict)
+                    and record.get('owner_class') == 'I09_a2a_hosted_kanban'
+                    and record.get('principal_id') == self.principal.subject
+                    and record.get('session_id') == self.ref.session_id
+                    and record.get('operation') == operation
+                    and record.get('request_id') == request_id
+                    and record.get('source_identity') == source_identity):
+                return key
+            self._preservation_keys.pop(request_id, None)
+        matches = []
+        if isinstance(records, dict):
+            for candidate, record in records.items():
+                if (isinstance(record, dict)
+                        and record.get('owner_class') == 'I09_a2a_hosted_kanban'
+                        and record.get('principal_id') == self.principal.subject
+                        and record.get('session_id') == self.ref.session_id
+                        and record.get('operation') == operation
+                        and record.get('request_id') == request_id
+                        and record.get('source_identity') == source_identity):
+                    matches.append(candidate)
+        if len(matches) > 1:
+            raise RuntimeStoreError('preservation_owner_unmapped')
+        if matches:
+            self._preservation_keys[request_id] = matches[0]
+            return matches[0]
+        return None
+
+    def _preservation_prepare_create(self):
+        """Reserve the exact hosted-create root before config, staging, or labeling effects."""
+        source_identity = self._preservation_create_source_identity()
+        require = getattr(self.authority, '_require_preservation_coordinator', None)
+        start = getattr(self.authority, '_preservation_operation_start', None)
+        if callable(require):
+            require()
+        elif not callable(start):
+            # An explicit legacy adapter predates the custody interface.  A current authority
+            # route takes the fail-closed branch above rather than silently becoming legacy.
+            return None, source_identity
+        if not callable(start):
+            raise RuntimeStoreError('runtime_custody_unavailable')
+        key = self._preservation_key_for_request(
+            self.creation_id, source_identity, operation='hosted-create')
+        if key is None:
+            key = start(
+                'I09_a2a_hosted_kanban', principal_id=self.principal.subject,
+                session_id=self.ref.session_id, operation='hosted-create',
+                request_id=self.creation_id, generation=None,
+                source_identity=source_identity)
+            if key is not None:
+                self._preservation_keys[self.creation_id] = key
+        else:
+            key = self.authority._preservation_operation_retry_without_admission(
+                key, owner_class='I09_a2a_hosted_kanban',
+                principal_id=self.principal.subject, session_id=self.ref.session_id,
+                operation='hosted-create', request_id=self.creation_id,
+                source_identity=source_identity)
+        return key, source_identity
+
+    def _preservation_prepare(self, task, generation, request_id, rows):
+        source_identity = self._preservation_source_identity(task, generation, request_id)
+        # Keep an explicit legacy adapter boundary, while an authority-backed runtime without its
+        # canonical coordinator refuses before the first durable admission effect.
+        require = getattr(self.authority, '_require_preservation_coordinator', None)
+        if callable(require):
+            require()
+        elif self.authority._preservation_coordinator() is None:
+            return None, source_identity
+        matching = [entry for entry in rows if entry[0].get('request_id') == request_id]
+        if len(matching) > 1:
+            raise RuntimeStoreError('storage_unavailable')
+        key = self._preservation_key_for_request(request_id, source_identity)
+        if key is None:
+            key = self.authority._preservation_operation_start(
+                'I09_a2a_hosted_kanban', principal_id=self.principal.subject,
+                session_id=self.ref.session_id, operation='hosted-submit',
+                request_id=request_id, generation=None, source_identity=source_identity)
+            if key is not None:
+                self._preservation_keys[request_id] = key
+        if key is not None and matching:
+            self.authority._preservation_operation_reconcile_exact_admission(
+                key, matching[0][0]['admission_id'], source_identity=source_identity)
+        return key, source_identity
+
+    def _preservation_bind_committed(self, key, row, source_identity):
+        if key is None:
+            return
+        if (not isinstance(row, dict)
+                or row.get('request_id') is None
+                or row.get('principal_id') != self.principal.subject
+                or row.get('target_session_id') != self.ref.session_id):
+            self.authority._preservation_operation_unknown(key, 'unmapped_writer')
+            raise RuntimeStoreError('preservation_owner_unmapped')
+        self.authority._preservation_operation_reconcile_exact_admission(
+            key, row.get('admission_id'), source_identity=source_identity)
+
+    def _preservation_key_for_row(self, row, source_identity):
+        request_id = row.get('request_id') if isinstance(row, dict) else None
+        if not isinstance(request_id, str):
+            return None
+        key = self._preservation_key_for_request(request_id, source_identity)
+        if key is None:
+            return None
+        record = self.authority._preservation_operations.get(key)
+        if (record is None
+                or record.get('admission_id') not in (None, row.get('admission_id'))):
+            self.authority._preservation_operation_unknown(key, 'unmapped_writer')
+            raise RuntimeStoreError('preservation_owner_unmapped')
+        return key
+
+    def _preservation_forget(self, request_id, key):
+        if self._preservation_keys.get(request_id) == key:
+            self._preservation_keys.pop(request_id, None)
+
     def _terminal(self, row, task, generation):
         from gateway.session_results import admission_result
         saved = admission_result(self.authority.db, row['admission_id'])
@@ -144,9 +315,34 @@ class HostedRoomAuthorityRPC:
         receipt = {'status': status, 'text': value.get('final_response', ''),
                    'message_id': row['admission_id'], 'settlement_id': row['admission_id'],
                    'task_id': task.task_id, 'execution_generation': generation}
-        callback = self.callbacks.pop(row['admission_id'], None)
+        source_identity = self._preservation_source_identity(
+            task, generation, row['request_id'])
+        key = self._preservation_key_for_row(row, source_identity)
+        callback = self.callbacks.get(row['admission_id'])
         if callback is not None:
-            callback(receipt)
+            if self.authorizer('terminal', task, generation) is not True:
+                if key is not None:
+                    self.authority._preservation_operation_unknown(key, 'permission_denied')
+                raise RuntimeStoreError('permission_denied')
+            try:
+                callback(receipt)
+            except BaseException:
+                if key is not None:
+                    self.authority._preservation_operation_unknown(key, 'join_failed')
+                raise
+            # Retain the callback until the consumer has acknowledged it.  A failed custody
+            # release must retry the exact durable row without replaying the external callback.
+            self.callbacks.pop(row['admission_id'], None)
+        if key is not None:
+            try:
+                self.authority._preservation_operation_terminal_after_exact_admission(
+                    key, row['admission_id'], f'hosted:{row["admission_id"]}',
+                    source_identity=source_identity)
+            except BaseException:
+                # The durable callback may already have been accepted.  Keep the exact operation
+                # record UNKNOWN for a later history/results retry; never manufacture a new root.
+                raise
+            self._preservation_forget(row['request_id'], key)
         return receipt
 
     async def _submit(self, params):
@@ -156,19 +352,43 @@ class HostedRoomAuthorityRPC:
         rows = self._rows()
         if any(row['status'] == 'unknown' for row, _, _ in rows):
             raise RuntimeStoreError('unknown_execution')
+        key, source_identity = self._preservation_prepare(task, generation, request_id, rows)
+        bound = any(row.get('request_id') == request_id for row, _, _ in rows)
         from gateway.session_hosted_attachments import submission_payload
         from gateway.session_ingress_media import capture_lease
         # One lease from capture through the admission commit: documents ride in the prompt text,
         # so submit's own lease does not hold them, and an older row's release could unlink a
         # shared content-addressed capture in between.
-        with capture_lease():
-            payload = await asyncio.to_thread(
-                submission_payload, self, params['prompt'], params.get('attachments'))
-            authorize_write = self.authorize_write
-            receipt = await self.authority.submit(self.principal, Submission(
-                request_id, self.ref, payload, 'queue'),
-                _authorize_write=(lambda conn: authorize_write(conn, task, generation))
-                if authorize_write is not None else None)
+        try:
+            with capture_lease():
+                payload = await asyncio.to_thread(
+                    submission_payload, self, params['prompt'], params.get('attachments'))
+                authorize_write = self.authorize_write
+                def committed(row):
+                    nonlocal bound
+                    self._preservation_bind_committed(key, row, source_identity)
+                    bound = True
+                receipt = await self.authority.submit(self.principal, Submission(
+                    request_id, self.ref, payload, 'queue'),
+                    _authorize_write=(lambda conn: authorize_write(conn, task, generation))
+                    if authorize_write is not None else None,
+                    _on_committed=committed)
+        except RuntimeStoreError as exc:
+            if key is not None:
+                if not bound and exc.reason in {
+                    'invalid_params', 'not_found', 'permission_denied', 'profile_mismatch',
+                    'runtime_draining', 'session_busy', 'stale_generation', 'queue_full',
+                    'admission_conflict',
+                }:
+                    self.authority._preservation_operation_release_unaccepted(key)
+                    self._preservation_forget(request_id, key)
+                elif not (bound and exc.reason == 'admission_conflict'):
+                    self.authority._preservation_operation_unknown(key, 'read_failed')
+            raise
+        except BaseException:
+            if key is not None:
+                self.authority._preservation_operation_unknown(key, 'join_failed')
+            raise
         self.callbacks[receipt.admission_id] = params['on_terminal']
         if receipt.status in {'queued', 'started'}:
             waiter = self.authority.waiters.get(receipt.admission_id)
@@ -183,14 +403,24 @@ class HostedRoomAuthorityRPC:
         return asdict(receipt)
 
     def _completed(self, admission_id, future):
-        if future.cancelled() or admission_id not in self.callbacks:
+        row_info = next((entry for entry in self._rows()
+                         if entry[0]['admission_id'] == admission_id), None)
+        key = None
+        if row_info is not None:
+            row, task, generation = row_info
+            key = self._preservation_key_for_row(
+                row, self._preservation_source_identity(task, generation, row['request_id']))
+        if future.cancelled():
+            if key is not None:
+                self.authority._preservation_operation_unknown(key, 'join_failed')
             return
         if future.exception() is not None:
             # A paused FIFO remains queued/unknown; polling or an explicit
             # resolution will publish its eventual durable terminal outcome.
+            if key is not None:
+                self.authority._preservation_operation_unknown(key, 'join_failed')
             return
-        if self.authorizer('terminal', None, None) is not True:
-            self.callbacks.pop(admission_id, None)
+        if admission_id not in self.callbacks:
             return
         for row, task, generation in self._rows():
             if row['admission_id'] == admission_id and row['status'] == 'terminal':

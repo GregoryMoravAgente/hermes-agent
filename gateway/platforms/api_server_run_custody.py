@@ -16,6 +16,10 @@ from contextlib import suppress
 from typing import Any, Optional
 
 from gateway.runtime_custody import CustodyHandle, CustodyRefusal
+from gateway.platforms.api_server_run_peer import (
+    peer_binding_identity as _peer_binding_identity,
+    peer_binding_source as _peer_binding_source,
+)
 
 
 class ApiRunCustodyError(RuntimeError):
@@ -92,6 +96,24 @@ def _authoritative_admission(authority: Any, admission_id: str):
     return row, None
 
 
+def _preclaim_cancel_matches(custody: Any, row: Any) -> bool:
+    """Validate the canonical no-generation cancellation boundary for an API observer."""
+    authority = getattr(custody, "admission_authority", None)
+    return (
+        isinstance(row, dict)
+        and row.get("status") == "terminal"
+        and row.get("outcome") == "cancelled"
+        and row.get("generation") is None
+        and row.get("principal_id") == "api"
+        and row.get("target_session_id") == getattr(custody, "admission_session_id", None)
+        and getattr(custody, "producer_phase", None) == "api_i02"
+        and getattr(custody, "producer_principal", None) == "api"
+        and getattr(custody, "execution_generation", None) is None
+        and row.get("owner_epoch") == getattr(custody, "authority_epoch", None)
+        and getattr(authority, "epoch", None) == getattr(custody, "authority_epoch", None)
+    )
+
+
 def _session_status_receipt(authority: Any, custody: Any, *, expected_session_id: Optional[str] = None):
     """Read one terminal admission and its stored result from the owning SessionDB.
 
@@ -119,16 +141,24 @@ def _session_status_receipt(authority: Any, custody: Any, *, expected_session_id
         return None
     if canonical.get("target_session_id") != getattr(custody, "admission_session_id", None):
         return None
-    if canonical.get("owner_epoch") != custody.authority_epoch:
+    # A terminal replay is a read-only receipt from an earlier owner epoch.  The exact durable
+    # admission id, principal, target and stored result remain the identity proof; requiring the
+    # successor epoch here would turn a lost response into a false ownership refusal.  Live I02
+    # completion still requires its current epoch.
+    if (canonical.get("owner_epoch") != custody.authority_epoch
+            and getattr(custody, "producer_phase", None) != "api_terminal_replay"):
         return None
+    preclaim_cancel = _preclaim_cancel_matches(custody, canonical)
     generation = canonical.get("generation")
-    if type(generation) is not int or generation < 0 or generation != custody.execution_generation:
+    if (not preclaim_cancel
+            and (type(generation) is not int or generation < 0
+                 or generation != custody.execution_generation)):
         return None
     principal = canonical.get("principal_id")
     if (not isinstance(principal, str) or not principal
             or principal != custody.producer_principal):
         return None
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) and not preclaim_cancel:
         return None
     return {
         "committed": True,
@@ -142,9 +172,10 @@ def _session_status_receipt(authority: Any, custody: Any, *, expected_session_id
         "status": canonical,
         "readback": True,
         "terminal_outcome": canonical.get("outcome"),
-        "terminal_result": result.get("result"),
-        "terminal_usage": result.get("usage"),
+        "terminal_result": result.get("result") if isinstance(result, dict) else None,
+        "terminal_usage": result.get("usage", {}) if isinstance(result, dict) else {},
         "result_readback": True,
+        "preclaim_cancel": preclaim_cancel,
     }
 
 
@@ -221,21 +252,74 @@ def legacy_authority_kwargs(values: dict[str, Any]) -> dict[str, Any]:
 
 
 def complete_legacy_source(custody: Any, *, active_run_id: Optional[str]):
-    """Consume the source receipt for a legacy result before its custody can settle."""
+    """Consume the source receipt, then settle the typed I02 parent after the I03 child closes."""
+    completion = None
+    if getattr(custody, "producer_phase", None) == "api_i02":
+        from gateway.platforms.api_server_run_completion import completion_for_custody
+        completion = completion_for_custody(custody)
+        if completion is None:
+            stale = getattr(custody, "finalizer_completion", None)
+            if callable(getattr(stale, "fail", None)):
+                stale.fail("finalizer_completion_registry_missing")
+            refusal = CustodyRefusal(
+                "finalizer_completion_registry_missing", "I02_api_session_turn")
+            custody.mark_unknown(refusal.code)
+            return refusal
     source_receipt = custody.authoritative_status_receipt()
+    # A session stream has both an outer keyed run-status row and the canonical I02 admission
+    # result.  The outer row is deliberately still ``running`` until the stream emits its
+    # terminal frame, while the authority waiter can only return after the I02 result is
+    # terminal/readable.  Consume that exact admission readback here; treating the outer
+    # projection as the source would reject a successful canonical turn as ``status_commit_unproven``.
+    if (getattr(custody, "producer_phase", None) == "api_i02"
+            and (not isinstance(source_receipt, dict)
+                 or source_receipt.get("result_readback") is not True)):
+        source_receipt = _session_status_receipt(
+            getattr(custody, "admission_authority", None), custody,
+            expected_session_id=getattr(custody, "admission_session_id", None),
+        )
     if source_receipt is None:
+        if completion is not None:
+            completion.fail("status_commit_unproven")
         return custody.mark_unknown("status_commit_unproven")
-    elif active_run_id:
+    preclaim_cancel = source_receipt.get("preclaim_cancel") is True
+    if completion is not None and preclaim_cancel and not active_run_id:
+        from gateway.session_ingress import DeliveryReceipt
+        if not completion.stage_delivery(
+                delivery_receipt=DeliveryReceipt(
+                    custody.admission_id, attempted=False, delivered=False,
+                    reason="no_delivery", effect_state="none",
+                ),
+                waiter_delivered=True, finalizer_ok=True):
+            reason = "finalizer_completion_cancelled_unknown"
+            completion.fail(reason)
+            custody.mark_unknown(reason)
+            return CustodyRefusal(reason, "I02_api_session_turn")
+    if active_run_id:
         refusal = custody.mark_status_receipt(source_receipt)
         if refusal is not None:
             custody.mark_unknown(getattr(refusal, "code", "status_commit_unproven"))
         return refusal
     refusal = custody.complete_from_source(source_receipt)
     if refusal is not None:
-        custody.mark_unknown(getattr(refusal, "code", "source_completion_unknown"))
-    else:
+        reason = getattr(refusal, "code", "source_completion_unknown")
+        if completion is not None:
+            completion.fail(reason)
+        custody.mark_unknown(reason)
+        return refusal
+    if completion is None:
         retire_legacy_source(custody)
-    return refusal
+        return None
+    receipt = completion.settle_after_child()
+    if receipt is None and getattr(completion, '_pending_parent_release', False):
+        return None
+    if getattr(receipt, "state", None) != "complete":
+        reason = getattr(receipt, "reason", None) or "finalizer_completion_unknown"
+        custody.mark_completion_unknown(reason)
+        return CustodyRefusal(reason, "I02_api_session_turn")
+    # The completion registry and launch index are retired by the owning task after its final
+    # receipt is complete; the drain itself never drops either source-owned reference early.
+    return None
 
 
 def retire_legacy_source(custody: Any) -> bool:
@@ -264,6 +348,130 @@ def retire_legacy_source(custody: Any) -> bool:
     if (isinstance(custody_table, dict) and not custody_table
             and isinstance(launch_table, dict) and not launch_table):
         owner._api_run_owner_registered = False
+    return True
+
+
+@dataclass(frozen=True)
+class _LegacySourceCompletionPreflight:
+    completion: Any
+    registry: dict[str, Any]
+    admission_id: str
+    launch: Any
+    owner: Any
+    run_id: str
+    custody_table: dict[str, Any]
+    launch_table: dict[str, Any]
+    custody: Any
+    retire_completion: Any
+    idempotency_ids: Any
+    had_idempotency: bool
+    owner_registered: Any
+
+
+def _preflight_legacy_source_completion(
+    custody: Any, completion: Any,
+) -> Optional[_LegacySourceCompletionPreflight]:
+    receipt = getattr(completion, "receipt", None)
+    if (not getattr(custody, "released", False)
+            or getattr(custody, "unknown_reason", None)
+            or getattr(receipt, "state", None) != "complete"):
+        return None
+    if getattr(completion, "custody", None) is not custody:
+        return None
+    authority = getattr(custody, "admission_authority", None)
+    registry = getattr(authority, "_api_finalizer_completions", None)
+    admission_id = getattr(custody, "admission_id", None)
+    if (not isinstance(registry, dict)
+            or not isinstance(admission_id, str)
+            or registry.get(admission_id) is not completion):
+        return None
+    launch = getattr(custody, "source_launch", None)
+    owner = getattr(launch, "owner", None)
+    run_id = getattr(custody, "run_id", None)
+    custody_table = getattr(owner, "_run_custody", None)
+    launch_table = getattr(owner, "_run_launches", None)
+    if (owner is None or not isinstance(run_id, str) or not run_id
+            or not isinstance(custody_table, dict)
+            or custody_table.get(run_id) is not custody
+            or not isinstance(launch_table, dict)
+            or launch_table.get(run_id) is not launch):
+        return None
+    retire_completion = getattr(completion, "retire", None)
+    if not callable(retire_completion):
+        return None
+    idempotency_ids = getattr(owner, "_run_idempotency_ids", None)
+    return _LegacySourceCompletionPreflight(
+        completion=completion, registry=registry, admission_id=admission_id,
+        launch=launch, owner=owner, run_id=run_id, custody_table=custody_table,
+        launch_table=launch_table, custody=custody, retire_completion=retire_completion,
+        idempotency_ids=idempotency_ids,
+        had_idempotency=isinstance(idempotency_ids, set) and run_id in idempotency_ids,
+        owner_registered=getattr(owner, "_api_run_owner_registered", None),
+    )
+
+
+def _restore_legacy_source_completion(
+    preflight: _LegacySourceCompletionPreflight,
+) -> bool:
+    restored = True
+    for table, key, value in (
+        (preflight.registry, preflight.admission_id, preflight.completion),
+        (preflight.custody_table, preflight.run_id, preflight.custody),
+        (preflight.launch_table, preflight.run_id, preflight.launch),
+    ):
+        if key not in table:
+            table[key] = value
+        elif table.get(key) is not value:
+            restored = False
+    if (preflight.had_idempotency and isinstance(preflight.idempotency_ids, set)
+            and preflight.run_id not in preflight.idempotency_ids):
+        preflight.idempotency_ids.add(preflight.run_id)
+    if (preflight.owner_registered is True
+            and getattr(preflight.owner, "_api_run_owner_registered", None) is False):
+        preflight.owner._api_run_owner_registered = True
+    return restored
+
+
+def _mark_source_completion_retirement_failure(custody: Any, rollback_ok: bool) -> None:
+    marker = getattr(custody, "mark_completion_unknown", None)
+    if callable(marker):
+        marker(
+            "stream_completion_retire_rollback_failed"
+            if not rollback_ok else "stream_completion_retire_failed"
+        )
+
+
+def retire_legacy_source_with_completion(custody: Any) -> bool:
+    """Retire a stream only after exact source and completion evidence agree.
+
+    Source maps and the typed completion registry are source-owned references.  The synchronous
+    close boundary retires source first, then completion, and restores only missing exact entries.
+    """
+    completion = getattr(custody, "finalizer_completion", None)
+    if completion is None:
+        return retire_legacy_source(custody)
+    preflight = _preflight_legacy_source_completion(custody, completion)
+    if preflight is None:
+        return False
+    try:
+        if not retire_legacy_source(custody):
+            _restore_legacy_source_completion(preflight)
+            return False
+        if not preflight.retire_completion():
+            rollback_ok = _restore_legacy_source_completion(preflight)
+            if not rollback_ok:
+                _mark_source_completion_retirement_failure(custody, False)
+            return False
+    except BaseException:  # health: allow BLE001 -- rollback must not replace first close error
+        try:
+            rollback_ok = _restore_legacy_source_completion(preflight)
+        except BaseException:  # health: allow BLE001 -- retain first close error
+            rollback_ok = False
+        try:
+            _mark_source_completion_retirement_failure(custody, rollback_ok)
+        except BaseException:  # health: allow BLE001 -- marker must not replace first close error
+            rollback_ok = False
+        raise
     return True
 
 
@@ -496,9 +704,32 @@ async def run_legacy_authority_turn(
             custody.mark_unknown(getattr(generation_refusal, "code", "admission_generation_missing"))
         refusal = complete_legacy_source(custody, active_run_id=active_run_id)
         if refusal is not None:
-            raise ApiRunCustodyError(refusal)
+            from gateway.platforms.api_server_run_completion import failed_api_response_or_raise
+            return failed_api_response_or_raise(custody, refusal, active_run_id=active_run_id)
+        completion = getattr(custody, "finalizer_completion", None)
+        if completion is not None and not active_run_id:
+            completion_receipt = await completion.wait()
+            if getattr(completion_receipt, "state", None) != "complete":
+                reason = getattr(completion_receipt, "reason", None) or "finalizer_completion_unknown"
+                custody.mark_completion_unknown(reason)
+                raise ApiRunCustodyError(
+                    CustodyRefusal("finalizer_completion_unknown", "I02_api_session_turn")
+                )
+            if not retire_legacy_source(custody):
+                custody.mark_completion_unknown("finalizer_completion_retire_failed")
+                raise ApiRunCustodyError(
+                    CustodyRefusal("finalizer_completion_retire_failed", "I02_api_session_turn")
+                )
+            if not completion.retire():
+                custody.mark_completion_unknown("finalizer_completion_registry_missing")
+                raise ApiRunCustodyError(
+                    CustodyRefusal("finalizer_completion_registry_missing", "I02_api_session_turn")
+                )
         return result
     except asyncio.CancelledError:
+        completion = getattr(custody, "finalizer_completion", None)
+        if completion is not None:
+            completion.fail("api_turn_cancelled")
         await finalize_legacy_cancelled(custody, finalize_source=active_run_id is None)
         raise
     except BaseException:
@@ -521,6 +752,9 @@ async def run_legacy_authority_turn(
                 return replay_result
             custody.mark_unknown("terminal_replay_unknown")
             raise
+        completion = getattr(custody, "finalizer_completion", None)
+        if completion is not None:
+            completion.fail("api_turn_failed")
         await finalize_legacy_failed(custody, finalize_source=active_run_id is None)
         raise
 
@@ -574,76 +808,6 @@ def preservation_owner_evidence(adapters: Any, runner: Any, *, process_instance:
     }
 
 
-def _peer_binding_identity(custody: Any, record: Any, authority: Any):
-    if not isinstance(record, dict):
-        return None, CustodyRefusal("peer_record_missing", "I03_api_run_direct")
-    admission_id = record.get("admission_id")
-    retry_id = record.get("retry_admission_id")
-    if retry_id is not None and (not isinstance(retry_id, str) or not retry_id):
-        return None, CustodyRefusal("peer_admission_missing", "I03_api_run_direct")
-    binding_id = retry_id or admission_id
-    generation = record.get("retry_execution_generation" if retry_id else "execution_generation")
-    if generation is not None and (type(generation) is not int or generation < 0):
-        return None, CustodyRefusal("peer_generation_missing", "I03_api_run_direct")
-    if generation is None and record.get("status") not in {"queued", "claimed", "canonical"}:
-        return None, CustodyRefusal("peer_generation_missing", "I03_api_run_direct")
-    if not isinstance(binding_id, str) or not binding_id:
-        return None, CustodyRefusal("peer_admission_missing", "I03_api_run_direct")
-    if (custody.admission_id is not None
-            and (binding_id != custody.admission_id or generation != custody.execution_generation)):
-        return None, CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
-    if record.get("profile_id") != custody.profile_id:
-        return None, CustodyRefusal("peer_profile_mismatch", "I03_api_run_direct")
-    if record.get("authority_epoch") != custody.authority_epoch:
-        return None, CustodyRefusal("peer_epoch_mismatch", "I03_api_run_direct")
-    if (getattr(authority, "profile_id", None) != custody.profile_id
-            or getattr(authority, "epoch", None) != custody.authority_epoch):
-        return None, CustodyRefusal("peer_authority_mismatch", "I03_api_run_direct")
-    return (admission_id, binding_id, generation), None
-
-
-def _peer_binding_source(custody: Any, record: dict[str, Any], authority: Any, binding_id: str, generation: Any):
-    db = getattr(authority, "db", None)
-    if db is None:
-        return None, CustodyRefusal("peer_durable_row_missing", "I03_api_run_direct")
-    try:
-        from hermes_state_runtime import get_session_admission
-        row = get_session_admission(db, admission_id=binding_id)
-    except Exception:  # health: allow BLE001 -- unreadable durable ownership stays retained
-        return None, CustodyRefusal("peer_durable_row_unavailable", "I03_api_run_direct")
-    if not isinstance(row, dict):
-        return None, CustodyRefusal("peer_durable_row_missing", "I03_api_run_direct")
-    if (
-        row.get("admission_id") != binding_id
-        or row.get("target_session_id") != record.get("session_id")
-        or row.get("generation") != generation
-        or row.get("owner_epoch") != custody.authority_epoch
-        or not isinstance(row.get("principal_id"), str)
-        or not row.get("principal_id")
-    ):
-        return None, CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
-    session = getattr(db, "get_session", lambda _id: None)(record.get("session_id"))
-    source = session.get("source") if isinstance(session, dict) else None
-    if source not in {"bot_room", "api_server"}:
-        return None, CustodyRefusal("peer_source_mismatch", "I03_api_run_direct")
-    principal = record.get("principal_id")
-    if principal is not None and principal != row.get("principal_id"):
-        return None, CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
-    if source == "bot_room":
-        if (record.get("_api_producer_phase") != "bot_i02"
-                or record.get("_api_producer_source") != "bot_chat"
-                or principal != row.get("principal_id")):
-            return None, CustodyRefusal("peer_source_mismatch", "I03_api_run_direct")
-    elif any(record.get(key) is not None for key in ("_api_producer_phase", "_api_producer_source")):
-        if (record.get("_api_producer_phase") != "api_i02"
-                or record.get("_api_producer_source") != "api_server"):
-            return None, CustodyRefusal("peer_source_mismatch", "I03_api_run_direct")
-    parent, parent_kind = custody._parent_from_authority(authority, binding_id)
-    if parent is None:
-        return None, CustodyRefusal("peer_parent_unmapped", "I03_api_run_direct")
-    return (row, source, parent, parent_kind), None
-
-
 @dataclass
 class ApiRunCustody:
     coordinator: Any
@@ -676,6 +840,9 @@ class ApiRunCustody:
     initial_admission_id: Optional[str] = None
     execution_generation: Optional[int] = None
     admission_authority: Any = field(default=None, repr=False, compare=False)
+    # Exact I02 completion fence; RuntimeCustodyCoordinator remains the only lease ledger.
+    finalizer_completion: Any = field(default=None, repr=False, compare=False)
+    finalizer_completion_receipt: Any = field(default=None, repr=False, compare=False)
     admission_session_id: Optional[str] = None
     producer_phase: str = "I15_direct"
     producer_principal: Optional[str] = None
@@ -691,6 +858,7 @@ class ApiRunCustody:
     source_launch: Any = field(default=None, repr=False, compare=False)
     process_scope: Any = field(default=None, repr=False, compare=False)
     process_scope_receipt: Any = field(default=None, repr=False, compare=False)
+    terminal_release_receipt: Any = field(default=None, repr=False, compare=False)
     _terminal_attempted: bool = field(default=False, init=False)
 
     @classmethod
@@ -817,11 +985,10 @@ class ApiRunCustody:
             return CustodyRefusal("admission_identity_mismatch", "I03_api_run_direct")
         session = getattr(getattr(authority, "db", None), "get_session", lambda _id: None)(target_session_id)
         source = session.get("source") if isinstance(session, dict) else None
-        if source not in {"api_server", "bot_room"}:
-            return CustodyRefusal("admission_source_mismatch", "I03_api_run_direct")
         if (supplied_row.get("profile_id", self.profile_id) != self.profile_id
                 or supplied_row.get("authority_epoch", self.authority_epoch) != self.authority_epoch
-                or row.get("owner_epoch") != self.authority_epoch):
+                or (row.get("status") != "terminal"
+                    and row.get("owner_epoch") != self.authority_epoch)):
             return CustodyRefusal("admission_identity_mismatch", "I03_api_run_direct")
         generation = row.get("generation")
         if generation is not None and (type(generation) is not int or generation < 0):
@@ -829,17 +996,23 @@ class ApiRunCustody:
         if generation is None and row.get("status") != "queued":
             return CustodyRefusal("admission_generation_missing", "I03_api_run_direct")
         if row.get("status") == "terminal":
+            # A terminal API admission is a durable read-only replay.  Its session may have
+            # been deleted after the result committed, so the live session source is no longer
+            # available; the exact row/principal/result readback below remains the ownership
+            # proof and this path never creates a new worker or parent edge.
             self.admission_id = admission_id
             self.execution_generation = generation
             self.admission_authority = authority
             self.admission_session_id = target_session_id
             self.producer_phase = "api_terminal_replay"
             self.producer_principal = "api"
-            self.producer_source = source
+            self.producer_source = source if source in {"api_server", "bot_room"} else None
             self.admission_pending = False
             # A terminal row is an exact canonical read-only replay. Do not attach this new
             # I03 reservation to the retired admission's old parent edge.
             return CustodyRefusal("terminal_replay_readonly", "I03_api_run_direct")
+        if source not in {"api_server", "bot_room"}:
+            return CustodyRefusal("admission_source_mismatch", "I03_api_run_direct")
         parent, parent_kind = self._parent_from_authority(authority, admission_id)
         if parent is None:
             return CustodyRefusal("parent_owner_unmapped", "I03_api_run_direct")
@@ -857,9 +1030,21 @@ class ApiRunCustody:
         refusal = self.bind_parent(parent, parent_kind)
         if refusal is not None:
             return refusal
+        # The caller may have proven before admission completed that no nested worker will run.
+        # Refuse at that pre-acceptance boundary before allocating an I02 finalizer completion;
+        # a missing event loop must not replace the original late-submission reason.
         if self.no_worker_requested or self.no_worker_finalized:
             self.mark_unknown("late_worker_submission")
             return CustodyRefusal("late_worker_submission", "I03_api_run_direct")
+        if parent_kind == "I02_api_session_turn":
+            from gateway.platforms.api_server_run_completion import begin_api_finalizer_completion
+            completion, completion_refusal = begin_api_finalizer_completion(
+                authority, self, parent, admission_id,
+            )
+            if completion_refusal is not None:
+                self.mark_unknown(getattr(completion_refusal, "code", "finalizer_completion_unknown"))
+                return completion_refusal
+            self.finalizer_completion = completion
         return None
 
     def refresh_admission_generation(self):
@@ -871,6 +1056,8 @@ class ApiRunCustody:
         row, refusal = _authoritative_admission(authority, admission_id)
         if refusal is not None:
             return refusal
+        if _preclaim_cancel_matches(self, row):
+            return None
         if (
             row.get("target_session_id") != self.admission_session_id
             or row.get("owner_epoch") != self.authority_epoch
@@ -1040,7 +1227,13 @@ class ApiRunCustody:
         }
 
     def mark_admission_started(self):
-        if self.no_worker_finalized or self.worker_submitted:
+        if self.no_worker_finalized:
+            return self.mark_unknown("launch_state_conflict")
+        # A session SSE owns one outer I03 worker task before its nested canonical I02
+        # admission starts. That submitted task is the source-owned wrapper, not a late
+        # admission submission; direct routes still refuse an already-submitted worker.
+        if (self.worker_submitted
+                and not getattr(getattr(self, "source_launch", None), "stream_owner", False)):
             return self.mark_unknown("launch_state_conflict")
         self.admission_pending = True
         self.launch_phase = "admission_pending"
@@ -1105,7 +1298,20 @@ class ApiRunCustody:
             and bool(receipt.get("principal_id"))
             and receipt.get("result_readback") is True
         )
-        if not (exact_reservation if require_store else (store_identity or canonical_result)):
+        canonical_cancel = (
+            common
+            and receipt.get("storage") == "session_admission"
+            and receipt.get("admission_id") == self.admission_id
+            and receipt.get("preclaim_cancel") is True
+            and receipt.get("generation") is None
+            and self.execution_generation is None
+            and receipt.get("principal_id") == self.producer_principal == "api"
+            and isinstance(receipt.get("status"), dict)
+            and receipt["status"].get("status") == "terminal"
+            and receipt["status"].get("outcome") == "cancelled"
+            and receipt.get("result_readback") is True
+        )
+        if not (exact_reservation if require_store else (store_identity or canonical_result or canonical_cancel)):
             return self.mark_unknown("status_commit_unproven")
         self.status_persisted = True
         self.status_receipt = receipt
@@ -1448,8 +1654,18 @@ class ApiRunCustody:
             return self.status_receipt_from_source()
         return self.status_receipt_from_source()
 
+    def _retained_terminal_release_is_exact(self) -> bool:
+        from gateway.platforms.api_server_run_completion import (
+            _retained_terminal_release_is_exact as check_retained_terminal_release,
+        )
+        return check_retained_terminal_release(self)
+
     def try_terminal(self):
         self._terminal_attempted = True
+        if self.released:
+            if not self._retained_terminal_release_is_exact():
+                return self.mark_unknown("terminal_release_receipt_missing")
+            return None
         publication_settled = self.transport_retired or (self.event_enqueued and self.stream_closed)
         if self.admission_pending or not all((self.status_persisted, publication_settled,
                     self.worker_done, self.control_finalizers)):
@@ -1487,12 +1703,27 @@ class ApiRunCustody:
                 return self.mark_unknown("process_scope_unavailable")
             if refusal is not None:
                 return refusal
+            self.terminal_release_receipt = self._terminal_release_evidence()
             self.released = True
             return None
         refusal = self.coordinator.mark_terminal(self.handle)
         if refusal is None:
+            self.terminal_release_receipt = self._terminal_release_evidence()
             self.released = True
         return refusal
+
+    def _terminal_release_evidence(self):
+        parent = self.parent_handle
+        return {
+            "child_owner_id": self.handle.owner_id,
+            "parent_owner_id": getattr(parent, "owner_id", None),
+            "profile_id": self.profile_id,
+            "authority_epoch": self.authority_epoch,
+            "process_instance": self.process_instance,
+            "close_generation": self.handle.close_generation,
+            "admission_id": self.admission_id,
+            "released": True,
+        }
 
     def recovery_identity(self) -> dict[str, Any]:
         """Return only the immutable identity a resolver may echo from its request."""
@@ -1507,7 +1738,11 @@ class ApiRunCustody:
 
     def source_recovery_receipt(self, adapter: Any):
         """Project a terminal receipt from retained source objects, never client claims."""
-        if not self.unknown_reason:
+        if (
+            not self.unknown_reason
+            and not getattr(self, "_finalizer_recovery_in_progress", False)
+            and getattr(self, "finalizer_recovery_receipt", None) is None
+        ):
             return CustodyRefusal("custody_not_unknown", "I03_api_run_direct")
         try:
             from gateway.platforms.api_server_run_witness import read_run_witness
@@ -1531,7 +1766,35 @@ class ApiRunCustody:
         if self.parent_bound:
             _, refusal = self.bound_parent_handle()
             if refusal is not None:
-                return refusal
+                parent = self.parent_handle
+                authority = self.admission_authority
+                handles = getattr(authority, "_preservation_handles", None)
+                child_receipt = self.terminal_release_receipt
+                child_released = (
+                    self.released is True
+                    and isinstance(child_receipt, dict)
+                    and child_receipt == self._terminal_release_evidence()
+                )
+                retained_parent = (
+                    child_released
+                    and isinstance(handles, dict)
+                    and handles.get(self.admission_id) is parent
+                )
+                parent_readback = getattr(
+                    authority, "_preservation_i02_parent_released", None,
+                )
+                recovery_receipt = getattr(self, "finalizer_recovery_receipt", None)
+                recovered_parent = (
+                    child_released
+                    and (
+                        getattr(self, "_finalizer_recovery_in_progress", False)
+                        or getattr(recovery_receipt, "recovered_completion", None) is not None
+                    )
+                    and callable(parent_readback)
+                    and parent_readback(self.admission_id, parent)
+                )
+                if not retained_parent and not recovered_parent:
+                    return refusal
         else:
             if not self.process_proof:
                 refusal = self.observe_process_owner()
@@ -1667,6 +1930,14 @@ class ApiRunCustody:
     def complete(self):
         """Reject completion without an authoritative status receipt."""
         return self.mark_unknown("status_commit_unproven")
+
+    def mark_completion_unknown(self, reason: str):
+        """Retain a released child while its authenticated I02 parent remains unknown."""
+        if not isinstance(reason, str) or not reason:
+            reason = "finalizer_completion_unknown"
+        if not self.unknown_reason:
+            self.unknown_reason = reason
+        self.launch_phase = "unknown"
 
     def complete_from_source(self, status_receipt: Any = None):
         """Finalize a synchronous legacy turn from canonical admission/result readback."""

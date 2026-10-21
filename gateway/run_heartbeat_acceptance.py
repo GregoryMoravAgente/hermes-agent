@@ -54,6 +54,7 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     from hermes_state_runtime import list_session_admissions
 
     from gateway.session_authorities import active_authority
+    from gateway.session_goal_tick_custody import reserve_tick, release_unaccepted
     authority = active_authority(runner)
     if authority is None:
         return
@@ -73,20 +74,23 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     identity = json.dumps(
         ['heartbeat', session_id, state.created_at, state.fire_count + 1], separators=(',', ':'))
     principal_id = 'automation:' + route
-    root = getattr(authority, '_preservation_automation_root', None)
-    if coordinator is not None and not callable(root):
+    if coordinator is not None and not callable(getattr(authority, '_preservation_automation_root', None)):
         raise RuntimeStoreError('runtime_custody_unavailable')
-    handle = (root(
-        request_id=identity, principal_id=principal_id, session_id=owner,
-        source_identity='heartbeat:' + route, owner_class='I08_goals_loops_heartbeat',
+    tick = (reserve_tick(
+        authority, request_id=identity, principal_id=principal_id, session_id=owner,
+        source_identity='heartbeat:' + route, kind='heartbeat', watcher_key=route,
     ) if coordinator is not None else None)
+    handle = tick.handle if tick is not None else None
     prompt = manager.due_prompt()
     if prompt is None:
-        authority._preservation_release_unaccepted(handle)
+        if tick is not None:
+            release_unaccepted(tick)
         return
     event = MessageEvent(text=prompt, source=source, internal=True, message_id=identity,
         metadata={'gateway_session_key': route, 'gateway_session_id': session_id})
     event._heartbeat_session_id = session_id
+    from gateway.session_goal_tick_custody import attach_tick_handle
+    attach_tick_handle(event, handle, 'heartbeat')
     event._preservation_effect_started = True
     try:
         await authority.admit_automation(

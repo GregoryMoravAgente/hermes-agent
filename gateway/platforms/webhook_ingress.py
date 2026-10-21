@@ -260,10 +260,12 @@ async def recover_webhook_finalizations(authority):
           AND json_extract(a.payload_json, '$.native_text_v1.automation') IS NULL
         """)
     results = {}
+    observed_rows = []
     for candidate in rows:
         row = get_session_admission(authority.db, admission_id=candidate['admission_id'])
         if row is None:
             continue
+        observed_rows.append(row)
         sid = row['target_session_id']
         try:
             envelope = row['payload']['native_text_v1']
@@ -277,4 +279,9 @@ async def recover_webhook_finalizations(authority):
                 authority, authority._receipt(row)) else 'unchanged'
         except (KeyError, RuntimeStoreError):
             results[sid] = 'unavailable'
+    from gateway.session_recovery_custody import observe_consumer_rows
+    observe_consumer_rows(
+        authority, 'webhook_replay', rows=observed_rows,
+        reason='webhook replay found no accepted admission',
+    )
     return results

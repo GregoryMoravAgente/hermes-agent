@@ -8,6 +8,7 @@ receipt-local DurableResultProof and owner identities.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import sqlite3
 from typing import Any
 
 
@@ -30,6 +31,7 @@ class _ManagedDurableReceiptWitness:
     binding_snapshot_identity: tuple[Any, ...]
     durable_identity: tuple[Any, ...]
     binding_identity: tuple[Any, ...]
+    physical_tip_witness: Any = None
 
 
 _MANAGED_PROVIDER_FIELDS = (
@@ -73,6 +75,23 @@ def _managed_writer_proof_matches(
     )
 
 
+def _managed_physical_tip(binding: Any, physical_session_id: Any, store_path: Any):
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+        from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+    except (AttributeError, ImportError):
+        return None
+    if not isinstance(binding, TurnCustodyBinding):
+        return None
+    try:
+        return resolve_physical_tip_witness(binding, physical_session_id, store_path)
+    except (
+        AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        sqlite3.Error,
+    ):
+        return None
+
+
 def _managed_result_suffix_matches(writer_proof: Any, durable_proof: Any) -> bool:
     """Require the durable result to be the exact non-empty suffix written for this turn."""
     writer_rows = getattr(writer_proof, "row_ids", None)
@@ -94,7 +113,7 @@ def capture_managed_durable_receipt_witness(
     """Capture the exact ACP/provider/receipt proof before a writer cache can be reused."""
     try:
         from agent.session_persistence_proof import SessionDBWriteProof
-        from gateway.runtime_service_custody import DurableResultProof
+        from gateway.runtime_service_custody import DurableResultProof, TurnCustodyBinding
     except (ImportError, AttributeError):
         return None
     if type(writer_proof) is not SessionDBWriteProof:
@@ -138,6 +157,20 @@ def capture_managed_durable_receipt_witness(
         or not _managed_result_suffix_matches(writer_proof, durable_proof)
     ):
         return None
+    if isinstance(binding, TurnCustodyBinding):
+        validator = getattr(service, "_validate_service_identity", None)
+        if not callable(validator):
+            return None
+        try:
+            # The physical witness is useful only while the canonical I16 sidecar lease
+            # still owns this exact retained receipt; fields on the receipt/row are not
+            # a substitute for the existing coordinator validator.
+            validator(binding)
+        except (
+            AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error,
+        ):
+            return None
     provider_identity = _managed_identity_values(
         witness, _MANAGED_PROVIDER_FIELDS, mapping=True,
     )
@@ -164,6 +197,17 @@ def capture_managed_durable_receipt_witness(
         or durable_proof.execution_generation != binding.execution_generation
     ):
         return None
+    physical_tip_witness = _managed_physical_tip(
+        binding, writer_proof.session_id, writer_proof.store_path,
+    )
+    if (
+        isinstance(binding, TurnCustodyBinding) and physical_tip_witness is None
+    ) or (
+        not isinstance(binding, TurnCustodyBinding)
+        and writer_proof.session_id != binding.session_id
+        and physical_tip_witness is None
+    ):
+        return None
     return _ManagedDurableReceiptWitness(
         client=client, parent=parent, service=service, request=request, binding=binding,
         receipt=receipt, managed_witness=witness, process=witness["_process"],
@@ -172,6 +216,7 @@ def capture_managed_durable_receipt_witness(
         provider_identity=provider_identity, durable_identity=durable_identity,
         binding_snapshot_identity=binding_snapshot_identity,
         binding_identity=binding_identity,
+        physical_tip_witness=physical_tip_witness,
     )
 
 
@@ -183,6 +228,7 @@ def validate_managed_durable_receipt_witness(
         return False
     try:
         from agent.session_persistence_proof import SessionDBWriteProof
+        from gateway.runtime_service_custody import TurnCustodyBinding
         if type(writer_proof) is not SessionDBWriteProof or writer_proof is not witness.writer_proof:
             return False
         parent = getattr(getattr(client, "_producer_policy", None), "parent", None)
@@ -224,6 +270,17 @@ def validate_managed_durable_receipt_witness(
             or not _managed_result_suffix_matches(writer_proof, witness.durable_proof)
         ):
             return False
+        if isinstance(binding, TurnCustodyBinding):
+            validator = getattr(service, "_validate_service_identity", None)
+            if not callable(validator):
+                return False
+            try:
+                validator(binding)
+            except (
+                AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+                sqlite3.Error,
+            ):
+                return False
         provider_identity = _managed_identity_values(
             current_managed, _MANAGED_PROVIDER_FIELDS, mapping=True,
         )
@@ -234,6 +291,14 @@ def validate_managed_durable_receipt_witness(
             current_managed.get("binding_snapshot"), _MANAGED_SNAPSHOT_FIELDS, mapping=True,
         )
         binding_identity = _managed_identity_values(binding, _MANAGED_BINDING_FIELDS)
+        physical_tip_witness = _managed_physical_tip(
+            binding, writer_proof.session_id, writer_proof.store_path,
+        )
+        if isinstance(binding, TurnCustodyBinding) or writer_proof.session_id != binding.session_id:
+            if physical_tip_witness is None or physical_tip_witness != witness.physical_tip_witness:
+                return False
+        elif witness.physical_tip_witness is not None:
+            return False
         return (
             provider_identity == witness.provider_identity
             and binding_snapshot_identity == witness.binding_snapshot_identity
@@ -242,7 +307,10 @@ def validate_managed_durable_receipt_witness(
             and current_managed.get("parent") is parent
             and current_managed.get("receipt") is receipt
         )
-    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+    except (
+        AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        sqlite3.Error,
+    ):
         return False
 
 

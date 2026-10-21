@@ -20,18 +20,61 @@ def reserve_peer_custody(self, profile_id: Optional[str], run_id: str):
     return reserve_legacy(self, profile_id, run_id)
 
 
+def _peer_source_entries(adapter, run_id: str, custody):
+    """Return the exact peer custody/launch entries, or refuse an ambiguous index."""
+    launch = getattr(custody, "source_launch", None)
+    if (
+        getattr(custody, "run_id", None) != run_id
+        or getattr(launch, "owner", None) is not adapter
+        or getattr(launch, "run_id", None) != run_id
+        or getattr(launch, "custody", None) is not custody
+    ):
+        return None
+    custody_table = getattr(adapter, "_run_custody", None)
+    launch_table = getattr(adapter, "_run_launches", None)
+    if (
+        not isinstance(custody_table, dict)
+        or not isinstance(launch_table, dict)
+        or custody_table.get(run_id) is not custody
+        or launch_table.get(run_id) is not launch
+    ):
+        return None
+    return custody_table, launch_table
+
+
+def _drop_peer_source_entries(adapter, run_id: str, custody) -> bool:
+    """Drop both exact peer indexes after a completed unaccepted/terminal release."""
+    entries = _peer_source_entries(adapter, run_id, custody)
+    if entries is None:
+        return False
+    custody_table, launch_table = entries
+    custody_table.pop(run_id, None)
+    launch_table.pop(run_id, None)
+    release_owner = getattr(adapter, "_release_run_owner_if_forgotten", None)
+    if callable(release_owner):
+        release_owner(run_id)
+    return True
+
+
 def release_peer_custody(self, run_id: str, custody) -> None:
     """Forget a pre-handoff reservation only when it was never accepted or is terminal."""
     if custody is None:
         return
-    if custody.released or (not custody.parent_bound and not custody.status_persisted
-                            and not custody.unknown_reason):
-        if not custody.released:
-            refusal = custody.release_unaccepted()
-            if refusal is not None:
-                custody.mark_unknown("accepted_row_unknown")
-                return
-        self._run_custody.pop(run_id, None)
+    if (getattr(custody, "unknown_reason", None)
+            or getattr(custody, "parent_bound", False)
+            or getattr(custody, "status_persisted", False)):
+        return
+    if custody.released:
+        _drop_peer_source_entries(self, run_id, custody)
+        return
+    if _peer_source_entries(self, run_id, custody) is None:
+        return
+    refusal = custody.release_unaccepted()
+    if refusal is not None:
+        custody.mark_unknown("accepted_row_unknown")
+        return
+    if not _drop_peer_source_entries(self, run_id, custody):
+        custody.mark_unknown("peer_source_index_changed")
 
 
 def _unknown(custody, reason: str):

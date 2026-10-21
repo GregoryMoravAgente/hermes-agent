@@ -324,18 +324,32 @@ def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, d
                         session_id=sid, request_id=request_id, payload=payload,
                         _authorize_write=authority._admission_gate(partial(
                             _admit_target, sid, request_id, payload['api_turn_v1']['settings'],
-                            client_key=bool(kwargs.get('request_id'))), fresh=True))
+                            db=authority.db, client_key=bool(kwargs.get('request_id'))), fresh=True))
     authority._preservation_bind_or_release(row, preservation_handle)
     return authority, ref, row
 
 
-def _admit_target(session_id, request_id, settings, conn, *, client_key=True):
+def _admit_target(session_id, request_id, settings, conn, *, client_key=True, db=None):
     """Inside the admission's own off-loop transaction: one target per request id, and the
     session's settings for its later payload-less (internal) turns, committed with the admitted
     turn rather than by the drain on the owner loop (N50)."""
-    target = conn.execute("SELECT ended_at FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    if target is None or target["ended_at"] is not None:
+    target = conn.execute(
+        "SELECT ended_at, end_reason FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if target is None:
         raise RuntimeStoreError('admission_conflict')
+    if target["ended_at"] is not None:
+        # Compression deliberately ends the logical root while its FIFO identity remains the
+        # admission target. Read the exact live tip in this write transaction; all other retired
+        # rows keep the normal refusal and the direct helper call remains strict when no db is bound.
+        if db is None or target["end_reason"] != "compression":
+            raise RuntimeStoreError('admission_conflict')
+        tip = db._compression_tip_on(conn, session_id)
+        tip_row = conn.execute(
+            "SELECT id, ended_at FROM sessions WHERE id = ?", (tip,)
+        ).fetchone()
+        if tip == session_id or tip_row is None or tip_row["ended_at"] is not None:
+            raise RuntimeStoreError('admission_conflict')
     _one_target(session_id, request_id, conn, client_key=client_key)
     conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                  (_SETTINGS_PREFIX + session_id, _json(settings)))
@@ -376,6 +390,45 @@ def owns_api_run(adapter, run_id, owner_scope):
     return _valid_owner_scope(stored) and hmac.compare_digest(stored, owner_scope)
 
 
+def recover_queued_api_admission_parent(authority, row):
+    """Bind a queued managed API admission to the current successor's real I02 lease.
+
+    A killed owner leaves the durable row behind but cannot leave its in-memory custody
+    object behind.  The successor may adopt a queued row only when the row names an older
+    epoch and the canonical managed producer marker is present; a current-epoch row with
+    no parent remains a fail-closed ownership error.  The root is the normal coordinator
+    handle and is bound through the same pending-root callback used by live admission.
+    """
+    if not isinstance(row, dict) or row.get('status') != 'queued':
+        return False
+    payload = row.get('payload') or {}
+    api_payload = payload.get('api_turn_v1') if isinstance(payload, dict) else None
+    if (row.get('principal_id') != 'api' or not isinstance(api_payload, dict)
+            or api_payload.get('producer_process_mode') != _API_PRODUCER_PROCESS_MODE):
+        return False
+    admission_id = row.get('admission_id')
+    request_id = row.get('request_id')
+    target_session_id = row.get('target_session_id')
+    old_epoch = row.get('owner_epoch')
+    if (not isinstance(admission_id, str) or not admission_id
+            or not isinstance(request_id, str) or not request_id
+            or not isinstance(target_session_id, str) or not target_session_id
+            or type(old_epoch) is not int or old_epoch < 1
+            or old_epoch == getattr(authority, 'epoch', None)):
+        return False
+    handles = getattr(authority, '_preservation_handles', None)
+    existing = handles.get(admission_id) if isinstance(handles, dict) else None
+    if existing is not None:
+        return True
+    root = authority._preservation_root('I02_api_session_turn', f'api:{request_id}')
+    if root is None:
+        return False
+    authority._preservation_pending_root(
+        request_id, root, principal_id='api', session_id=target_session_id)
+    authority._preservation_bind_or_release(row, root)
+    return getattr(authority, '_preservation_handles', {}).get(admission_id) is root
+
+
 def recover_api_turns(adapter):
     """Recover committed work only after the real API adapter is published. A parked profile's
     retained (retiring) authority is not served: its store is never read here."""
@@ -401,6 +454,16 @@ def recover_authority_api_turns(adapter, authority):
         try:
             ref = restore_api_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
+            for row in pending:
+                if row['status'] == 'queued':
+                    check_api_turn(authority, ref, row['payload'])
+                    # A queued managed admission carries the old producer epoch even when no
+                    # worker ever claimed it.  The successor must restore its exact I02 parent
+                    # before the FIFO can reserve the canonical I04 claim child; tying this to a
+                    # sibling UNKNOWN row left independently queued admissions without a parent.
+                    if (row.get('owner_epoch') != authority.epoch
+                            and not recover_queued_api_admission_parent(authority, row)):
+                        raise RuntimeStoreError('preservation_owner_unmapped')
             if any(row['status'] == 'unknown' for row in pending):
                 continue
             for row in pending:
@@ -420,6 +483,16 @@ async def run_api_turn(
         if custody is not None:
             custody.request_no_worker()
         raise
+    # A durable admission owned by an earlier runtime epoch is observable after restart, but
+    # cannot be rebound to the fresh I03 handle.  Classify that exact lost-owner state before
+    # custody identity validation; otherwise the current handle reports a generic epoch mismatch
+    # and callers lose the documented unknown-execution retry boundary.
+    if isinstance(admitted, tuple) and len(admitted) >= 3:
+        admitted_row = admitted[2]
+        if isinstance(admitted_row, dict) and admitted_row.get('status') == 'unknown':
+            if custody is not None:
+                custody.request_no_worker()
+            raise RuntimeStoreError('unknown_execution')
     if custody is not None:
         refusal = custody.bind_admission(admitted)
         if refusal is not None:
@@ -428,6 +501,7 @@ async def run_api_turn(
             # replay finalizer; do not poison that exact handle as unknown.
             if getattr(refusal, "code", None) == "terminal_replay_readonly":
                 custody.request_no_worker()
+                return await observe_api_turn(admitted, **kwargs)
             else:
                 custody.mark_unknown(getattr(refusal, "code", "parent_owner_unmapped"))
             raise RuntimeStoreError(getattr(refusal, "code", "parent_owner_unmapped"))
@@ -474,6 +548,8 @@ async def observe_api_turn(admitted, **kwargs):
             callback(result.get('final_response') or '')
         return result, usage
     waiter = authority.waiters.setdefault(row['admission_id'], asyncio.get_running_loop().create_future())
+    from gateway.platforms.api_server_run_completion import bind_api_response_waiter
+    bind_api_response_waiter(authority, row['admission_id'], waiter)
     observers = getattr(authority, 'api_observers', None)
     if observers is None:
         observers = authority.api_observers = {}
