@@ -722,10 +722,13 @@ def _watch_reply(authority, home, key, admission_id):
     track_receipt_task(authority, task)
 
 
-async def deliver(connection, params, *, on_admitted=None):
+async def deliver(connection, params, *, on_admitted=None, _peer_custody=None, _peer_parent=None):
     from gateway.session_runtime_workers import track_mutation
     connection.authority._require_admission_open()
-    task = track_mutation(connection.authority, _deliver(connection, params))
+    task = track_mutation(
+        connection.authority,
+        _deliver(connection, params, _peer_custody=_peer_custody, _peer_parent=_peer_parent),
+    )
     if on_admitted is not None:
         def _late_admission(done):
             if done.cancelled() or done.exception() is not None:
@@ -791,7 +794,7 @@ async def _receipt_answer(authority, actor, home, record, identity, retry_path=N
     return await _publish_result(authority, home, record)
 
 
-async def _deliver(connection, params):
+async def _deliver(connection, params, *, _peer_custody=None, _peer_parent=None):
     authority, actor = connection.authority, connection.actor
     home, key, message, author, category = _delivery_params(authority, actor, params)
     identity = (message, author, category)
@@ -813,8 +816,10 @@ async def _deliver(connection, params):
             ref, live, entry = await _target(authority, actor)
             if params.get('session_id', entry.session_id) != entry.session_id:
                 raise RuntimeStoreError('admission_conflict')
-            return await _admit(authority, actor, home, root, key, message, ref, live, entry, author=author,
-                                notification_category=category)
+            return await _admit(
+                authority, actor, home, root, key, message, ref, live, entry, author=author,
+                notification_category=category, _peer_custody=_peer_custody, _peer_parent=_peer_parent,
+            )
         except RuntimeStoreError as exc:
             raise await _held_by_another_writer(home, key, exc) or exc
 
@@ -894,7 +899,7 @@ async def _held_by_another_writer(home, key, exc):
 
 
 async def _admit(authority, actor, home, root, key, message, ref, live, entry, author=None, legacy=None,
-                 notification_category='result'):
+                 notification_category='result', _peer_custody=None, _peer_parent=None):
     from gateway.session_bot_custody import commit_bot_admission, prepare_bot_admission
     path, event, automation_root, child_key, record = prepare_bot_admission(
         authority, actor, home, root, key, message, ref, live, entry,
@@ -902,6 +907,7 @@ async def _admit(authority, actor, home, root, key, message, ref, live, entry, a
     )
     receipt = await commit_bot_admission(
         authority, home, key, ref, live, event, record, child_key, automation_root, legacy,
+        peer_custody=_peer_custody, peer_parent=_peer_parent,
     )
     if receipt is None:
         return None

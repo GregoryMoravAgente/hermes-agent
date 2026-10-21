@@ -6,7 +6,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -272,6 +272,62 @@ class TestStop:
 
     def test_stop_unknown_session_is_noop(self):
         lp.stop_lightpanda("lp_nope")  # must not raise
+
+    def test_managed_stop_retains_record_until_parent_finalizer_succeeds(self, _isolate):
+        """A closed child with an unresolved parent stays discoverable for reconciliation."""
+        proc = FakeProc(pid=778, exit_code=0)
+        receipt = MagicMock()
+        receipt.endpoint_identity = (778, 111, "127.0.0.1", 43111, 3)
+        receipt.close_server.return_value = True
+        receipt.finish_after_record_removal.return_value = False
+        server = lp.LightpandaServer(
+            "lp_managed", 43111, proc, str(_isolate / "lp_managed.log"), 111, receipt,
+        )
+        lp._write_record(server)
+        with lp._servers_lock:
+            lp._servers[server.session_name] = server
+
+        assert lp.stop_lightpanda(server.session_name) is False
+        assert lp.get_server(server.session_name) is server
+        assert (_isolate / "lp_managed.json").exists()
+        assert json.loads((_isolate / "lp_managed.json").read_text())["endpoint_identity"] == [
+            778, 111, "127.0.0.1", 43111, 3,
+        ]
+        receipt.close_server.assert_called_once_with(server, _isolate / "lp_managed.json")
+        receipt.finish_after_record_removal.assert_called_once_with()
+
+    def test_managed_stop_untracks_only_after_parent_finalizer_succeeds(self, _isolate):
+        proc = FakeProc(pid=779, exit_code=0)
+        receipt = MagicMock()
+        receipt.close_server.return_value = True
+        receipt.finish_after_record_removal.return_value = True
+        server = lp.LightpandaServer(
+            "lp_managed_ok", 43111, proc, str(_isolate / "lp_managed_ok.log"), 111, receipt,
+        )
+        lp._write_record(server)
+        with lp._servers_lock:
+            lp._servers[server.session_name] = server
+
+        assert lp.stop_lightpanda(server.session_name) is True
+        assert lp.get_server(server.session_name) is None
+        assert not (_isolate / "lp_managed_ok.json").exists()
+
+    def test_managed_close_retries_same_server_after_transient_refusal(self, _isolate):
+        proc = FakeProc(pid=780, exit_code=0)
+        receipt = MagicMock()
+        receipt.close_server.side_effect = [False, True]
+        receipt.finish_after_record_removal.return_value = True
+        server = lp.LightpandaServer(
+            "lp_retry", 43111, proc, str(_isolate / "lp_retry.log"), 111, receipt,
+        )
+        lp._write_record(server)
+        with lp._servers_lock:
+            lp._servers[server.session_name] = server
+
+        assert lp.stop_lightpanda(server.session_name) is False
+        assert lp.stop_lightpanda(server.session_name) is True
+        assert receipt.close_server.call_count == 2
+        assert lp.get_server(server.session_name) is None
 
     def test_stop_all(self, _isolate):
         self._seed(_isolate, "lp_a")

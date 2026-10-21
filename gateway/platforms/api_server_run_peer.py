@@ -10,10 +10,10 @@ from gateway.runtime_custody import CustodyRefusal
 def peer_source_kind(authority: Any, record: dict[str, Any]):
     """Return the authenticated producer kind for a peer record.
 
-    The peer Bot Chat is stored as a local GUI session.  Its canonical route is still the
-    Bot Chat FIFO, so the storage surface is normalized to ``bot_room`` only after the
-    existing Bot Chat lineage lookup proves that exact session is the titled Bot Chat tip.
-    A plain GUI session never receives this normalization.
+    The peer Bot Chat is stored as a local GUI or CLI-owned session.  Its canonical route is
+    still the Bot Chat FIFO, so the storage surface is normalized to ``bot_room`` only after the
+    existing Bot Chat lineage lookup proves that exact session is the titled Bot Chat tip.  A
+    plain GUI or CLI session never receives this normalization.
     """
     db = getattr(authority, "db", None)
     if db is None or not isinstance(record, dict):
@@ -23,7 +23,9 @@ def peer_source_kind(authority: Any, record: dict[str, Any]):
     source = session.get("source") if isinstance(session, dict) else None
     if source in {"bot_room", "api_server"}:
         return source
-    if source != "gui":
+    # Headless owner creation uses the existing CLI source; the Bot Chat tip and producer
+    # metadata checks below still authenticate this route before it is normalized.
+    if source not in {"gui", "cli"}:
         return None
     if (record.get("_api_producer_phase") != "bot_i02"
             or record.get("_api_producer_source") != "bot_chat"):
@@ -61,6 +63,11 @@ def peer_binding_identity(custody: Any, record: Any, authority: Any):
     if custody.admission_id is not None:
         if binding_id != custody.admission_id:
             return None, CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
+        pending_generation_promotion = (
+            custody.execution_generation is None
+            and type(generation) is int
+            and generation >= 0
+        )
         if (generation is None
                 and record.get("_api_producer_phase") == "bot_i02"
                 and record.get("_api_producer_source") == "bot_chat"
@@ -69,7 +76,7 @@ def peer_binding_identity(custody: Any, record: Any, authority: Any):
             # already-bound custody handle is the same opaque generation witness for replay; only
             # this typed Bot producer may fill the omitted projection field from that witness.
             generation = custody.execution_generation
-        elif generation != custody.execution_generation:
+        elif not pending_generation_promotion and generation != custody.execution_generation:
             return None, CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
     if record.get("profile_id") != custody.profile_id:
         return None, CustodyRefusal("peer_profile_mismatch", "I03_api_run_direct")
@@ -150,9 +157,15 @@ def peer_binding_replay(custody: Any, record: Any, authority: Any):
     if refusal is not None:
         return refusal
     admission_id, binding_id, generation = identity
+    pending_generation_promotion = (
+        custody.execution_generation is None
+        and type(generation) is int
+        and generation >= 0
+    )
     if (authority is not getattr(custody, 'admission_authority', None)
             or custody.admission_id != binding_id
-            or custody.execution_generation != generation
+            or (not pending_generation_promotion
+                and custody.execution_generation != generation)
             or custody.parent_bound is not True):
         return CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
     bound_parent, refusal = custody.bound_parent_handle()

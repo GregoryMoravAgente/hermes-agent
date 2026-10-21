@@ -1293,6 +1293,14 @@ class TestExecHybridPrivateUrlRouting:
 
     @pytest.fixture(autouse=True)
     def _cloud_with_hybrid(self, monkeypatch, tmp_path, _fake_managed_chromium):
+        original_getaddrinfo = socket.getaddrinfo
+
+        def resolve_fixture_host(host, *args, **kwargs):
+            if host == "example.com":
+                return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
+            return original_getaddrinfo(host, *args, **kwargs)
+
+        monkeypatch.setattr(socket, "getaddrinfo", resolve_fixture_host)
         monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
         monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: "")
         monkeypatch.setattr(bt_cloud, "_get_cloud_provider", lambda: object())

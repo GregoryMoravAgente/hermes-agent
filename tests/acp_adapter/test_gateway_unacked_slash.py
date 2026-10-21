@@ -9,6 +9,7 @@ from acp_adapter.gateway_server import GatewayACPAgent
 from gateway.config import GatewayConfig
 from gateway.session import SessionStore
 from gateway.session_authority import initialize_session_authority
+from tests.gateway.conftest import bind_authority_runtime_custody
 from gateway.session_controls import AuthorityConnection
 from hermes_cli.gateway_client import GatewayClientError
 from hermes_state_runtime import list_session_admissions
@@ -41,6 +42,7 @@ async def test_repeated_prompt_after_slash_command_is_new_work(tmp_path, monkeyp
                              _cached_agent_for=lambda route: None,
                              _resolve_session_agent_runtime=lambda **kwargs: ('frozen', {}))
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     wire = SlashWire(asyncio.get_running_loop())
     wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': 'p'})
     s = create_local_session(authority, wire.viewer.actor, {'request_id': 'editor', 'source': 'acp',

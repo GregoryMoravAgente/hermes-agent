@@ -195,6 +195,8 @@ class SessionAuthority(
         # One profile-scoped factory capability; accepted source parents remain
         # in the finalizer index above, never in a second ownership ledger.
         self._mcp_source_factory = None
+        # Profile browser capability; accepted parents stay in the existing finalizer index.
+        self._browser_source_factory = None
         # Source-backed evidence that this authority has actually consumed the native inbound
         # entrypoint.  An empty native registry is not evidence that the connector source is wired.
         self._native_inbound_seen = False
@@ -210,6 +212,20 @@ class SessionAuthority(
     def mcp_source_factory(self):
         """Return the exact profile factory, if bootstrap installed one."""
         return self._mcp_source_factory
+    def register_browser_source_factory(self, factory):
+        """Bind one profile browser factory before browser ingress."""
+        current = self._browser_source_factory
+        if current is not None and current is not factory:
+            raise RuntimeStoreError('browser_factory_registry_collision')
+        if getattr(factory, 'authority', None) is not self:
+            raise RuntimeStoreError('browser_factory_registry_mismatch')
+        self._browser_source_factory = factory
+        return factory
+
+    def browser_source_factory(self):
+        """Return the exact profile browser factory, if bootstrap installed one."""
+        return self._browser_source_factory
+
     def register_external_process_finalizer(self, operation_id, parent):
         """Register the exact external parent that profile retirement must consume."""
         if self.retiring or self.retired:
@@ -1006,12 +1022,14 @@ class SessionAuthority(
                 waiter.set_exception(RuntimeStoreError(reason))
 
     async def admit_automation(self, adapter, event, identity, replaces=None, *,
-                               _preservation_handle=None, _preservation_child_key=None):
+                               _preservation_handle=None, _preservation_child_key=None,
+                               _on_committed=None):
         from gateway.session_automation import admit_automation
         return await admit_automation(
             self, adapter, event, identity, replaces,
             _preservation_handle=_preservation_handle,
             _preservation_child_key=_preservation_child_key,
+            _on_committed=_on_committed,
         )
 
     async def admit_native(self, event, *, _preservation_handle=None):
@@ -1675,7 +1693,8 @@ class SessionAuthority(
                                                         session_id=ref.session_id, _guard=self._admission_gate(),
                                                         head=first['admission_id'] if first is not None else None),
                                           then=partial(self._stamp_claim, ref, live, claim_child,
-                                                       first['admission_id'] if first is not None else None))
+                                                       first['admission_id'] if first is not None else None),
+                                          ordered=True)
             except BaseException:
                 if claim_child is not None:
                     self._preservation_claiming.pop(first['admission_id'], None)

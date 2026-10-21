@@ -590,7 +590,8 @@ def _reconcile_automation_failure(authority, event, handle, principal_id, sessio
 
 
 async def admit_automation(authority, adapter, event, identity, replaces=None, *,
-                           _preservation_handle=None, _preservation_child_key=None):
+                           _preservation_handle=None, _preservation_child_key=None,
+                           _on_committed=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
@@ -663,6 +664,14 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, *
                     row['admission_id'], _preservation_child_key,
                 )
             return callback(row)
+    if _on_committed is not None:
+        callback = admitted
+        def admitted(row, callback=callback):
+            # This source-owned producer handoff runs before the FIFO scheduling callback.  The
+            # enclosing ordered admission operation keeps the per-authority write gate through
+            # this callback, so a drain cannot claim the newly committed row first.
+            _on_committed(row)
+            return callback(row)
     if replaces is not None:
         def admitted(row, admitted=admitted):
             if replaced:  # the guard ran in the committed write; an exact replay runs no guard
@@ -673,11 +682,31 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, *
         _reconcile_automation_failure(authority, event, handle, principal_id, ref.session_id, identity)
 
     try:
-        return await tracked_write(authority, partial(
+        write = partial(
             admit_session_input, authority.db, epoch=authority.epoch, principal_id=principal_id,
             session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-            _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
-            then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+            _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced)))
+        if _on_committed is None:
+            return await tracked_write(
+                authority, write, then=admitted, ordered=True,
+                after=partial(authority._schedule_admitted, ref))
+
+        async def ordered_commit():
+            # ``tracked_write(ordered=True)`` serializes only its worker-thread write; its ``then``
+            # callback runs after that lock is released.  Hold the same canonical gate around both
+            # the durable INSERT and this source-owned handoff, while claim writes use the gate too.
+            order = getattr(authority, '_ordered_writes', None)
+            if order is None:
+                order = authority._ordered_writes = asyncio.Lock()
+            async with order:
+                return await tracked_write(
+                    authority, write, then=admitted, ordered=False,
+                    after=partial(authority._schedule_admitted, ref))
+
+        from gateway.session_runtime_workers import track_mutation
+        # Shield the gate-holding operation so caller cancellation cannot release it before the
+        # canonical callback has either bound custody or retained the row as unknown.
+        return await asyncio.shield(track_mutation(authority, ordered_commit()))
     except asyncio.CancelledError:
         reconcile_failure()
         raise

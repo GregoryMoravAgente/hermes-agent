@@ -489,13 +489,56 @@ def bot_execution_binding_for_admission(authority, row):
     )
 
 
-async def _admit_bot_row(authority, home, key, ref, live, event, record, child_key, automation_root, legacy):
+async def _admit_bot_row(authority, home, key, ref, live, event, record, child_key, automation_root,
+                         legacy, *, peer_custody=None, peer_parent=None):
     """Commit the canonical row and retain exact custody on every refusal or unknown result."""
     from gateway.session_bot import _OWNER_STATE_REFUSALS, _admission_at
     from gateway.session_bot_mailbox import refuse_pin, withdraw_pin
+
+    def bind_peer_before_schedule(row):
+        """Bind the typed API peer owner from the canonical row before FIFO scheduling."""
+        if peer_custody is None:
+            return
+        from gateway.platforms.api_server_run_custody import ApiRunCustody
+        if not isinstance(peer_custody, ApiRunCustody) or peer_parent is None:
+            raise RuntimeStoreError('peer_parent_unmapped')
+        if not isinstance(row, dict) or row.get('status') != 'queued':
+            peer_custody.mark_unknown('peer_generation_mismatch')
+            raise RuntimeStoreError('peer_generation_mismatch')
+        row_admission = row.get('admission_id')
+        row_epoch = row.get('owner_epoch')
+        if (not isinstance(row_admission, str) or not row_admission
+                or type(row_epoch) is not int or row_epoch < 1):
+            peer_custody.mark_unknown('peer_durable_row_missing')
+            raise RuntimeStoreError('peer_durable_row_missing')
+        # The mailbox record is only a projection, but it is the source-owned identity object
+        # handed to the existing peer validator after these fields are read from the durable row.
+        record.update(
+            status='canonical', admission_id=row_admission,
+            profile_id=getattr(authority, 'profile_id', None), authority_epoch=row_epoch,
+            _api_producer_phase='bot_i02', _api_producer_source='bot_chat',
+        )
+        _validate_bot_admission_row(
+            authority, record, row, admission_id=row_admission,
+            request_id='bot:' + key, receipt_epoch=row_epoch, require_custody=True,
+        )
+        refusal = peer_custody.bind_peer_record(record, authority, expected_parent=peer_parent)
+        if refusal is not None:
+            reason = getattr(refusal, 'code', 'peer_parent_unmapped')
+            peer_custody.mark_unknown(reason)
+            raise RuntimeStoreError(reason)
+        authority._preservation_forget_pending_root(peer_parent)
+        refusal = peer_custody.mark_worker_submitted()
+        if refusal is not None:
+            reason = getattr(refusal, 'code', 'peer_worker_submission_unknown')
+            peer_custody.mark_unknown(reason)
+            raise RuntimeStoreError(reason)
+
     try:
         kwargs = ({'_preservation_handle': automation_root,
                    '_preservation_child_key': child_key} if automation_root is not None else {})
+        if peer_custody is not None:
+            kwargs['_on_committed'] = bind_peer_before_schedule
         receipt = await authority.admit_automation(
             authority.runner._adapter_for_source(live.source), event, 'bot:' + key, **kwargs)
         row = get_session_admission(authority.db, admission_id=receipt.admission_id)
@@ -556,11 +599,14 @@ async def _admit_bot_row(authority, home, key, ref, live, event, record, child_k
 
 
 async def commit_bot_admission(authority, home, key, ref, live, event, record, child_key,
-                               automation_root, legacy):
+                               automation_root, legacy, *, peer_custody=None, peer_parent=None):
     """Write the mailbox pin, then commit the canonical FIFO row with exact lease handoff."""
     if not await _write_bot_pin(authority, home, key, record, child_key, automation_root, legacy):
         return None
-    return await _admit_bot_row(authority, home, key, ref, live, event, record, child_key, automation_root, legacy)
+    return await _admit_bot_row(
+        authority, home, key, ref, live, event, record, child_key, automation_root, legacy,
+        peer_custody=peer_custody, peer_parent=peer_parent,
+    )
 
 
 def _managed_bot_projection_binding(authority, admission_id, record):

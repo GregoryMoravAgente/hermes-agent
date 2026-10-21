@@ -15,6 +15,7 @@ async def test_operators_share_local_sessions_without_reassigning_receipts(tmp_p
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_local import create_local_session
     from gateway.session_local_title import resolve_titled_session
     from gateway.session_mutations import mutate_session
@@ -24,6 +25,7 @@ async def test_operators_share_local_sessions_without_reassigning_receipts(tmp_p
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='fixture')
+    bind_authority_runtime_custody(runner, authority)
     caps = frozenset({'session:create', 'session:read', 'session:submit', 'session:control', 'session:operator'})
     native = Principal('uid:1000', str(tmp_path), caps, 'native')
     remote = Principal('auth:v1:remote', str(tmp_path), caps, 'remote')
@@ -69,6 +71,7 @@ async def test_operators_share_local_sessions_without_reassigning_receipts(tmp_p
     receipt = await authority.submit(peer, Submission('restart', ref, {'text': 'after restart'}, 'queue'))
     runner.adapters = {}
     cold = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='restarted')
+    bind_authority_runtime_custody(runner, cold)
     await cold._drain(ref)
     assert (await cold.receipt(peer, ref, receipt.admission_id)).status == 'terminal'
     assert executed[-1] == (peer.subject, 'after restart')

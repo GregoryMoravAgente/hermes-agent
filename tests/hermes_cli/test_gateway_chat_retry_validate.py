@@ -33,6 +33,7 @@ async def test_retry_refuses_an_unresendable_turn_before_rewinding(tmp_path, mon
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_cli.gateway_chat_commands import run_command
@@ -46,6 +47,7 @@ async def test_retry_refuses_an_unresendable_turn_before_rewinding(tmp_path, mon
                              _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     db = authority.db
     try:
         connection = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})

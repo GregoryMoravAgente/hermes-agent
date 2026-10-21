@@ -188,7 +188,10 @@ async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     try:
         record = await deliver(
             SimpleNamespace(authority=authority, actor=actor), params,
-            on_admitted=_bind_admitted if custody is not None else None)
+            on_admitted=_bind_admitted if custody is not None else None,
+            _peer_custody=custody if custody is not None else None,
+            _peer_parent=parent_handle if custody is not None else None,
+        )
     except asyncio.CancelledError:
         if custody is not None:
             # ``deliver`` shields the tracked mutation.  Keep this handle unknown while the

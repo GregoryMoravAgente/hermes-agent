@@ -41,6 +41,7 @@ class LightpandaServer:
     proc: subprocess.Popen
     log_path: str
     start_time: Optional[int] = None
+    receipt: object = None
 
     @property
     def cdp_url(self) -> str:
@@ -187,22 +188,52 @@ def _tree_kill(pid: int, expected_start) -> None:
     ProcessRegistry._terminate_host_pid(pid, expected_start=expected_start)
 
 
-def _write_record(server: LightpandaServer) -> None:
+def _write_record(server: LightpandaServer) -> bool:
     record = {"pid": server.proc.pid, "port": server.port, "owner_pid": os.getpid(),
               "start_time": server.start_time, "started_at": time.time()}
+    receipt = server.receipt
+    endpoint_identity = getattr(receipt, "endpoint_identity", None)
+    if endpoint_identity is not None:
+        try:
+            record["endpoint_identity"] = list(endpoint_identity)
+        except (TypeError, ValueError):
+            logger.debug("invalid endpoint identity for lightpanda record %s", server.session_name)
+            return False
     try:
         # Temp + rename: an orphan sweep (another Hermes, or a cleanup thread) unlinks a record it
         # cannot parse, so a torn in-place write would drop a live server's record.
         atomic_json_write(_state_dir() / f"{server.session_name}.json", record, indent=None)
     except OSError as e:
         logger.debug("could not write lightpanda record for %s: %s", server.session_name, e)
+        return False
+    return True
 
 
-def launch_lightpanda(session_name: str, *, block_private_networks: bool = False) -> tuple[Optional[LightpandaServer], Optional[str]]:
+def _bind_lightpanda_server(session_name, port, proc, log_path, source_receipt, binary):
+    """Bind the exact launched server before probing its native endpoint."""
+    try:
+        server = LightpandaServer(session_name, port, proc, log_path, _safe_start_time(proc.pid), source_receipt)
+        if source_receipt is not None:
+            source_receipt.bind_server(server)
+    except (OSError, RuntimeError, TypeError, ValueError) as e:
+        if source_receipt is not None:
+            source_receipt.abort_process()
+            source_receipt._mark_unknown("lightpanda_server_identity_unknown")
+        else:
+            _terminate(proc)
+        return None, f"Failed to bind lightpanda server identity ({binary}): {e}"
+    return server, None
+
+
+def launch_lightpanda(
+    session_name: str, *, block_private_networks: bool = False, source_receipt: object = None,
+) -> tuple[Optional[LightpandaServer], Optional[str]]:
     """Start ``lightpanda serve`` on a free loopback port; ``(server, None)`` once ``/json/version`` answers,
     else ``(None, error)``. stderr goes to ``<state_dir>/<session>.log`` so a chatty child never blocks on a pipe."""
     binary = find_lightpanda_binary()
     if not binary:
+        if source_receipt is not None:
+            source_receipt._mark_unknown("lightpanda_binary_missing")
         if os.name == "nt":
             return None, ("browser.engine is 'lightpanda' but Lightpanda has no Windows "
                           "build. Set browser.engine to auto (or run Hermes under WSL2).")
@@ -217,30 +248,59 @@ def launch_lightpanda(session_name: str, *, block_private_networks: bool = False
         argv.append("--block-private-networks")
     log_path = str(_state_dir() / f"{session_name}.log")
     try:
-        with open(log_path, "wb") as log_file:
-            proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                    stderr=log_file, env=_browser_env(), start_new_session=True)
-    except (OSError, subprocess.SubprocessError) as e:
+        if source_receipt is None:
+            with open(log_path, "wb") as log_file:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=log_file, env=_browser_env(), start_new_session=True)
+        else:
+            proc = source_receipt.launch(argv, log_path=log_path, env=_browser_env())
+    except (OSError, subprocess.SubprocessError, RuntimeError) as e:
+        if source_receipt is not None:
+            source_receipt._mark_unknown("lightpanda_launch_failed")
         return None, f"Failed to launch lightpanda serve ({binary}): {e}"
 
     url = f"http://127.0.0.1:{port}"
+    server, bind_error = _bind_lightpanda_server(
+        session_name, port, proc, log_path, source_receipt, binary,
+    )
+    if bind_error is not None:
+        return None, bind_error
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while True:
         rc = proc.poll()
         if rc is not None:
             tail = _read_log_tail(log_path)
+            if source_receipt is not None:
+                source_receipt.abort_process()
+                source_receipt._mark_unknown("lightpanda_exited_before_ready")
             return None, f"lightpanda serve exited with code {rc} before {url}/json/version answered{f': {tail}' if tail else ''}"
         if _cdp_ready(url):
+            if source_receipt is not None:
+                try:
+                    source_receipt.capture_cdp_readback()
+                except (OSError, RuntimeError, TypeError, ValueError):
+                    source_receipt.abort_process()
+                    source_receipt._mark_unknown("lightpanda_cdp_readback_unknown")
+                    return None, f"lightpanda serve exposed {url} without a verified /json/version response"
             break
         if time.monotonic() >= deadline:
-            _terminate(proc)
+            if source_receipt is None:
+                _terminate(proc)
+            else:
+                source_receipt.abort_process()
+                source_receipt._mark_unknown("lightpanda_ready_timeout")
             tail = _read_log_tail(log_path)
             detail = f" (last stderr line: {tail})" if tail else ""
             return None, f"lightpanda serve did not expose {url}/json/version within {int(_READY_TIMEOUT_S)}s{detail}"
         time.sleep(_POLL_INTERVAL_S)
 
-    server = LightpandaServer(session_name, port, proc, log_path, _safe_start_time(proc.pid))
-    _write_record(server)
+    if not _write_record(server):
+        if source_receipt is not None:
+            source_receipt.abort_process()
+            source_receipt._mark_unknown("lightpanda_record_write_unknown")
+        else:
+            _terminate(proc)
+        return None, f"Failed to persist lightpanda server record for {session_name}"
     with _servers_lock:
         _servers[session_name] = server
     logger.info("Started lightpanda serve (pid %s, port %s) for session %s", proc.pid, port, session_name)
@@ -252,11 +312,23 @@ def get_server(session_name: str) -> Optional[LightpandaServer]:
         return _servers.get(session_name)
 
 
-def stop_lightpanda(session_name: str) -> None:
-    """Stop the server for ``session_name`` (tree-kill, plain terminate on failure) and drop its record."""
+def stop_lightpanda(session_name: str) -> bool:
+    """Stop one server, retaining its exact record and parent on any custody ambiguity."""
     with _servers_lock:
-        server = _servers.pop(session_name, None)
-    if server is not None and server.is_alive():
+        server = _servers.get(session_name)
+    if server is None:
+        return False
+    receipt = None if server is None else server.receipt
+    record_path = _record_path(session_name)
+    if server is not None and receipt is not None:
+        retry_native_close = (
+            getattr(receipt, "state", None) in {"native_closed", "closed"}
+            and getattr(receipt, "_readback", None) is not None
+        )
+        if not retry_native_close and not receipt.close_server(server, record_path):
+            logger.warning("retaining UNKNOWN Lightpanda custody for session %s", session_name)
+            return False
+    elif server is not None and server.is_alive():
         try:
             _tree_kill(server.proc.pid, server.start_time)
         except Exception as e:
@@ -266,12 +338,22 @@ def stop_lightpanda(session_name: str) -> None:
             server.proc.wait(timeout=5)
         except Exception:
             _terminate(server.proc)
-    try:
-        (_state_dir() / f"{session_name}.json").unlink(missing_ok=True)
-    except OSError as e:
-        logger.debug("could not remove lightpanda record for %s: %s", session_name, e)
     if server is not None:
+        if receipt is not None and not receipt.finish_after_record_removal():
+            logger.warning("retaining UNKNOWN Lightpanda parent for session %s", session_name)
+            return False
+        try:
+            record_path.unlink(missing_ok=True)
+        except OSError as e:
+            if receipt is not None:
+                logger.warning("retaining UNKNOWN Lightpanda record for session %s: %s", session_name, e)
+                return False
+            logger.debug("could not remove lightpanda record for %s: %s", session_name, e)
+        with _servers_lock:
+            if _servers.get(session_name) is server:
+                _servers.pop(session_name, None)
         logger.debug("Stopped lightpanda serve for session %s", session_name)
+    return True
 
 
 def stop_all_lightpanda() -> None:
