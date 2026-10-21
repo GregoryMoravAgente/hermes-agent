@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 _PAUSED_RUNTIME_REASONS = frozenset({
     'join_failed', 'read_failed', 'runtime_draining', 'stale_generation',
-    'storage_unavailable', 'stale_epoch',
+    'storage_unavailable', 'stale_epoch', 'profile_mismatch',
 })
 
 
@@ -276,7 +276,10 @@ async def adopt_before_restore(authority, sid, *, tracked=True):
         candidate = _due(authority, sid, strict=_managed(authority))
     except RuntimeStoreError as exc:
         if _supported_pause(exc):
-            logger.warning('Local session %s remains paused before managed catch-up: %s', sid, exc.reason)
+            # Receipt-shape failures are logged by the recovery pass with their chained check;
+            # logging the bounded code here would duplicate that one refusal during boot.
+            if exc.__cause__ is None:
+                logger.warning('Local session %s remains paused before managed catch-up: %s', sid, exc.reason)
             return
         raise
     if candidate is None:

@@ -3,6 +3,7 @@
 No paid model calls. Captures what the runtime hands the model, not provider behavior.
 """
 import asyncio
+import copy
 import json
 import os
 from pathlib import Path
@@ -74,17 +75,30 @@ async def _join_real_run_tasks(tasks):
 
 
 def _capture_real_run_tasks(adapter, retained):
-    """Retain source-owned task objects before the adapter can retire their run keys."""
+    """Retain exact source-owned asyncio tasks and return newly retained objects."""
+    added = []
     for task in getattr(adapter, "_active_run_tasks", {}).values():
+        if not isinstance(task, asyncio.Task):
+            continue
         if not any(task is previous for previous in retained):
             retained.append(task)
+            added.append(task)
+    return tuple(added)
+
+
+async def _join_session_run_tasks(tasks):
+    """Require and join the exact source tasks before the next chat is accepted."""
+    if not tasks:
+        raise AssertionError("session /v1/runs accepted without a source-owned task")
+    await _join_real_run_tasks(tasks)
+    return all(task.done() for task in tasks)
 
 
 async def probe():
     import hermes_state
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
-    from gateway.run import GatewayRunner
+    from gateway.run import GatewayRunner, _build_gateway_agent_history
     from gateway.run_runtime import initialize_gateway_runtime
     from gateway.runtime_ownership import process_ownership
     from gateway.wake import persist_delegation_delivery
@@ -116,6 +130,13 @@ async def probe():
         app.router.add_post("/v1/runs", adapter._handle_runs)
         records = []
         runs = []
+        session_run_input = "session-run-accepted"
+        session_run_reply = "delegation-http-probe"
+        session_run_raw_history = None
+        session_run_expected_history = None
+        session_run_resolved_session_id = None
+        chat_resumed_history = None
+        session_run_task_joined = False
         with _observe_real_agent_runs(captured):
             try:
                 async with TestClient(TestServer(app)) as client:
@@ -135,13 +156,29 @@ async def probe():
                     except Exception as exc:  # health: allow BLE001 -- diagnostic preserves the opaque delivery failure class alongside the remaining behavioral observations
                         delivery_error = type(exc).__name__
                     calls_after = len(captured)
-                    response = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer fixture-api-key", "X-Hermes-Session-Id": "parent"}, json={"messages": [{"role": "user", "content": "read result"}]})
-                    await response.read()
-                    resumed_history = captured[-1]["history"]
+                    # The /v1/runs session path must be compared with the canonical durable
+                    # history it will load immediately before admission. Keep this snapshot
+                    # independent of the AIAgent observer; the later chat turn is intentionally
+                    # accepted after the first run and is checked separately.
+                    session_run_resolved_session_id = await asyncio.to_thread(
+                        db.resolve_resume_session_id, "parent")
+                    # Keep the durable DB projection independent from the model-history
+                    # projection.  The latter is derived by the same canonical serializer
+                    # used by GatewayRunner, never from the observed runtime history.
+                    session_run_raw_history = copy.deepcopy(await asyncio.to_thread(
+                        db.get_messages_as_conversation, session_run_resolved_session_id))
+                    session_run_expected_history, observed_context = _build_gateway_agent_history(
+                        copy.deepcopy(session_run_raw_history),
+                        channel_prompt=None,
+                        inject_timestamps=False,
+                    )
+                    assert observed_context is None
+                    resumed_history = copy.deepcopy(session_run_expected_history)
                     snapshot = [{"role": "user", "content": "caller snapshot"}]
                     adapter._response_store.put("resp-seed", {"conversation_history": snapshot, "session_id": "parent"})
                     db.create_session("declared", source="api_server", session_key="fixture-key")
                     db.append_message("declared", "assistant", "DECLARED_HISTORY")
+                    session_run_tasks = ()
                     for name, body, extra_headers in (
                         ("session", {"session_id": "parent"}, {}),
                         ("caller_history", {"session_id": "parent", "conversation_history": snapshot}, {}),
@@ -149,17 +186,29 @@ async def probe():
                         ("declared_key", {}, {"X-Hermes-Session-Key": "fixture-key"}),
                     ):
                         count = len(captured)
-                        response = await client.post("/v1/runs", headers={"Authorization": "Bearer fixture-api-key", **extra_headers}, json={"input": "continue", **body})
+                        source_tasks = []
+                        run_input = session_run_input if name == "session" else "continue"
+                        response = await client.post("/v1/runs", headers={"Authorization": "Bearer fixture-api-key", **extra_headers}, json={"input": run_input, **body})
                         if response.status == 202:
-                            _capture_real_run_tasks(adapter, run_tasks)
+                            source_tasks.extend(_capture_real_run_tasks(adapter, run_tasks))
                         await response.read()
                         async def wait_for_run():
                             while len(captured) == count:
                                 await asyncio.sleep(0.01)
                         if response.status == 202:
                             await asyncio.wait_for(wait_for_run(), 10)
-                            _capture_real_run_tasks(adapter, run_tasks)
+                            source_tasks.extend(_capture_real_run_tasks(adapter, run_tasks))
                         runs.append({"name": name, "status": response.status, "runtime": captured[-1] if len(captured) > count else None})
+                        if name == "session":
+                            # Join only the exact source tasks created for this /v1/runs
+                            # request; an empty capture is a fixture failure, never proof of
+                            # a joined worker. The final flag is read from each task itself.
+                            session_run_tasks = tuple(source_tasks)
+                            if response.status == 202:
+                                session_run_task_joined = await _join_session_run_tasks(session_run_tasks)
+                            response = await client.post("/v1/chat/completions", headers={"Authorization": "Bearer fixture-api-key", "X-Hermes-Session-Id": "parent"}, json={"messages": [{"role": "user", "content": "read result"}]})
+                            await response.read()
+                            chat_resumed_history = copy.deepcopy(captured[-1]["history"])
             finally:
                 await _join_real_run_tasks(tuple(run_tasks))
         durable_child_rows = sum(
@@ -167,7 +216,18 @@ async def probe():
             if message.get("display_kind") == "async_delegation_complete"
             and message.get("content") == "DELIVERY_RESULT"
         )
-        result = {"requests": records, "runs": runs, "delivery_error": delivery_error, "unsolicited_calls": calls_after-calls_before, "resumed_history": resumed_history, "durable_child_rows": durable_child_rows}
+        result = {
+            "requests": records, "runs": runs, "delivery_error": delivery_error,
+            "unsolicited_calls": calls_after-calls_before, "resumed_history": resumed_history,
+            "session_run_raw_history": session_run_raw_history,
+            "session_run_expected_history": session_run_expected_history,
+            "session_run_resolved_session_id": session_run_resolved_session_id,
+            "session_run_input": session_run_input, "session_run_reply": session_run_reply,
+            "session_run_task_count": len(session_run_tasks),
+            "session_run_task_joined": session_run_task_joined,
+            "chat_resumed_history": chat_resumed_history,
+            "durable_child_rows": durable_child_rows,
+        }
         return result
 
     try:

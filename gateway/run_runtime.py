@@ -174,11 +174,13 @@ async def initialize_gateway_runtime(runner):
     # owner before the existing compression write; the legacy initializer never enters this loop.
     from gateway.session_authorities import all_authorities, owner_scope
     from gateway.session_local_adoption import adopt_local_compressions
+    from gateway.session_local_recovery import recover_local_sessions
     for authority in all_authorities(runner):
         name = registry.profile_name(authority)
         try:
             with owner_scope(authority):
                 await adopt_local_compressions(authority)
+                recover_local_sessions(authority, allow_legacy=False)
         except Exception as exc:
             if name is None:
                 raise
@@ -1267,9 +1269,12 @@ async def recover_gateway_native_sessions(runner):
 async def recover_profile_native_sessions(runner, authority):
     """Bind one authority's queued native rows to the adapters connected now."""
     from gateway.session_authorities import owner_scope
+    from gateway.session_local_recovery import restore_pending_local_automation
     with owner_scope(authority):
-        pending = {row['target_session_id'] for row in authority.db._read_all(
-            "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+        pending_rows = authority.db._read_all(
+            "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")
+        pending = {row['target_session_id'] for row in pending_rows}
+        restore_pending_local_automation(authority, pending)
         bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
                     for entry in runner.session_store.list_sessions() if entry.origin is not None
                     for owner in [authority.logical_owner(entry.session_id)] if owner in pending]

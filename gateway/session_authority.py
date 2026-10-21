@@ -1171,19 +1171,23 @@ class SessionAuthority(
                     )
 
                 native = [row for row in rows if 'native_text_v1' in row['payload']]
-                if not native:
-                    # Local receipts are restored and scheduled by recover_local_sessions before
-                    # this native-only binding pass. Do not reserve an automation root here and then
-                    # return not_found: that would strand an accepted handle with no consumer.
+                local_automation = [
+                    row for row in rows if 'local_automation_v1' in row['payload']
+                ]
+                if not native and not local_automation:
                     raise RuntimeStoreError('not_found')
-                target = self.physical_target(SessionRef(self.profile_id, sid))
-                last_native = native[-1]
+                target = self.physical_target(SessionRef(self.profile_id, sid)) if native else None
+                last_native = native[-1] if native else local_automation[-1]
                 if recognized_automation(last_native):
                     recovered = self._preservation_recover_automation(last_native)
                     if recovered is None:
                         raise RuntimeStoreError('preservation_owner_unmapped')
-                source, route = await check_native_route(self.runner, native[-1]['payload'], target,
-                                                    available_source, adapter)
+                if native:
+                    source, route = await check_native_route(
+                        self.runner, last_native['payload'], target, available_source, adapter)
+                else:
+                    from gateway.session_recovery_custody import _local_automation_route
+                    source, route = _local_automation_route(self, sid, available_source)
                 for row in rows:
                     if row['status'] != 'queued':
                         continue

@@ -29,3 +29,7 @@ def test_local_watch_match_without_an_observer_is_a_note(tmp_path):
 
 def test_local_completion_survives_owner_kill_without_duplicate(tmp_path):
     _probe(tmp_path, 'restart')
+
+
+def test_local_recovery_refuses_tampered_i10_custody_before_effect(tmp_path):
+    _probe(tmp_path, 'preflight')

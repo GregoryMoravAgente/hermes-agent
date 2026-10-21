@@ -602,7 +602,9 @@ def recover_local_sessions(authority, *, schedule=False, allow_legacy=None):
         except (_ReceiptRefused, _CatchUpPending):
             continue  # the refusal/worker keeps its source handle for a later owner step
         except RuntimeStoreError as exc:
-            logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+            logging.getLogger(__name__).warning(
+                'Local session %s paused: %s', sid, _refused_check(exc),
+            )
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
         from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
@@ -612,3 +614,41 @@ def recover_local_sessions(authority, *, schedule=False, allow_legacy=None):
             if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
                 # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
                 track_mutation(authority, settle_viewer_close(authority, sid))
+
+
+def restore_pending_local_automation(authority, session_ids):
+    """Rebuild only routes named by a pending, persisted local automation admission.
+
+    Managed startup normally restores LOCAL policy receipts before native recovery.  A hard-killed
+    owner can leave the automation admission's durable row behind while the session-store route is
+    absent, though.  The row's own payload selects this narrow repair; ``restore_local_session``
+    still authenticates the receipt's profile, source, stored entry and lineage before publishing
+    the route.  A refusal leaves the admission queued for the existing fail-closed recovery path.
+    """
+    for sid in session_ids:
+        rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        if not any(
+            row.get('status') in {'queued', 'started', 'unknown'}
+            and isinstance(row.get('principal_id'), str)
+            and row['principal_id'].startswith('automation:')
+            and isinstance(row.get('payload'), dict)
+            and isinstance(row['payload'].get('local_automation_v1'), dict)
+            for row in rows
+        ):
+            continue
+        try:
+            from gateway.session_recovery_custody import validate_local_automation_recovery
+            for row in rows:
+                if (
+                    row.get('status') in {'queued', 'started', 'unknown'}
+                    and isinstance(row.get('principal_id'), str)
+                    and row['principal_id'].startswith('automation:')
+                    and isinstance(row.get('payload'), dict)
+                    and isinstance(row['payload'].get('local_automation_v1'), dict)
+                ):
+                    validate_local_automation_recovery(authority, row)
+            restore_local_session(authority, sid)
+        except (_ReceiptRefused, _CatchUpPending, RuntimeStoreError) as exc:
+            logging.getLogger(__name__).warning(
+                'Local automation route %s paused: %s', sid, _refused_check(exc),
+            )

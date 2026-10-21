@@ -1571,6 +1571,103 @@ def recover_claim_parent(authority, row, parent):
     return authority._preservation_handles.get(row.get("admission_id"))
 
 
+def _bind_local_automation_route(authority, sid, source, route):
+    """Publish a LOCAL route only when an existing live source and route match."""
+    from gateway.session_authority import LiveSession
+
+    live = authority.sessions.get(sid)
+    if live is None:
+        authority.sessions[sid] = LiveSession(source, route)
+        return
+    try:
+        same_source = live.source is not None and live.source.to_dict() == source.to_dict()
+    except (AttributeError, TypeError, ValueError):
+        same_source = False
+    if not same_source or live.route != route:
+        raise RuntimeStoreError("admission_conflict")
+
+
+def _local_automation_route(authority, sid, available_source):
+    """Resolve one persisted LOCAL automation row through its canonical session entry."""
+    route = authority.runner.session_store._generate_session_key(available_source)
+    entry = authority.runner.session_store.lookup_by_session_key(route)
+    if (
+        entry is None
+        or entry.origin is None
+        or entry.origin.to_dict() != available_source.to_dict()
+        or authority.logical_owner(entry.session_id) != sid
+    ):
+        raise RuntimeStoreError("admission_conflict")
+    _bind_local_automation_route(authority, sid, entry.origin, route)
+    return entry.origin, route
+
+
+def _queued_local_automation_identity(authority, row):
+    """Read the current queued identity and physical owner before route effects."""
+    status = row.get("status")
+    if status != "queued":
+        reason = "unknown_execution" if status in {"started", "unknown"} else "preservation_owner_unmapped"
+        raise RuntimeStoreError(reason)
+    current = get_session_admission(authority.db, admission_id=row.get("admission_id"))
+    current_identity = _identity(current, authority)
+    if (not isinstance(current, dict) or current.get("status") != "queued"
+            or not _same_full_identity(_identity(row, authority), current_identity)):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    return current_identity
+
+
+def _existing_local_automation_owner(authority, row, handle):
+    """Reuse an exact existing automation root; this path never mints a successor."""
+    if (getattr(handle, "owner_class", None) not in {
+            "I07_automation_route_wakes", "I08_goals_loops_heartbeat", "I09_a2a_hosted_kanban"}
+            or _validate_handle(authority, handle) is None):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    if authority._preservation_recover_existing_automation(row) is not handle:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+
+
+def _validate_i10_local_binding(authority, row, binding, handle, current_identity):
+    """Require the canonical binding and original accepted opaque I10 handle."""
+    if (not isinstance(binding, dict) or binding.get("handle") is not handle
+            or getattr(handle, "owner_class", None) != OWNER_CLASS
+            or binding.get("profile_home") != str(_home(authority))
+            or binding.get("process_instance") != authority.instance_id
+            or binding.get("authority_epoch") != authority.epoch):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    if (_binding_for_row(authority, row) is not binding
+            or _validate_handle(authority, handle) is None
+            or not _same_full_identity(binding.get("identity"), current_identity)):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+
+
+def validate_local_automation_recovery(authority, row):
+    """Authenticate a LOCAL automation owner before route/store publication."""
+    payload = row.get("payload") if isinstance(row, dict) else None
+    if not isinstance(payload, dict) or "local_automation_v1" not in payload:
+        return None
+    current_identity = _queued_local_automation_identity(authority, row)
+    admission_id = row.get("admission_id")
+    bindings = getattr(authority, "_i10_recovery_bindings", None)
+    handles = getattr(authority, "_preservation_handles", None)
+    binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+    handle = handles.get(admission_id) if isinstance(handles, dict) else None
+    if binding is None:
+        _existing_local_automation_owner(authority, row, handle)
+        owner = "existing"
+    else:
+        _validate_i10_local_binding(authority, row, binding, handle, current_identity)
+        owner = "i10"
+    _current_epoch(authority)
+    _physical_owner(authority)
+    authority._require_admission_open()
+    return owner
+
+
+def _is_i10_local_automation(authority, row):
+    """Recognize I10 only after the same current-owner validation used before restoration."""
+    return validate_local_automation_recovery(authority, row) == "i10"
+
+
 async def recover_native_sessions(authority, bindings):
     """Run the public native-recovery producer through the exact I10 root."""
     from collections import Counter
@@ -1598,27 +1695,33 @@ async def recover_native_sessions(authority, bindings):
                 )
 
             native = [row for row in rows if "native_text_v1" in row.get("payload", {})]
-            if not native:
+            local_automation = [
+                row for row in rows if "local_automation_v1" in row.get("payload", {})
+            ]
+            if not native and not local_automation:
                 raise RuntimeStoreError("not_found")
-            if any(row["status"] == "started" for row in rows):
+            if any(row["status"] in {"started", "unknown"} for row in rows):
                 raise RuntimeStoreError("unknown_execution")
-            target = authority.physical_target(SessionRef(authority.profile_id, sid))
-            last_native = native[-1]
-            if recognized_automation(last_native):
-                recovered = authority._preservation_recover_automation(last_native)
-                if recovered is None:
-                    raise RuntimeStoreError("preservation_owner_unmapped")
-            source, route = await check_native_route(
-                authority.runner, last_native["payload"], target, available_source, adapter,
-            )
+            target = authority.physical_target(SessionRef(authority.profile_id, sid)) if native else None
+            last_native = native[-1] if native else local_automation[-1]
+            for row in rows:
+                if row["status"] != "queued":
+                    continue
+                local_owner = validate_local_automation_recovery(authority, row)
+                if recognized_automation(row) and local_owner not in {"i10", "existing"}:
+                    recovered = authority._preservation_recover_automation(row)
+                    if recovered is None:
+                        raise RuntimeStoreError("preservation_owner_unmapped")
+            if native:
+                source, route = await check_native_route(
+                    authority.runner, last_native["payload"], target, available_source, adapter,
+                )
+            else:
+                source, route = _local_automation_route(authority, sid, available_source)
             for row in rows:
                 if row["status"] != "queued":
                     continue
                 payload = row["payload"]
-                if recognized_automation(row):
-                    recovered = authority._preservation_recover_automation(row)
-                    if recovered is None:
-                        raise RuntimeStoreError("preservation_owner_unmapped")
                 if "native_text_v1" in payload:
                     if not recognized_automation(row):
                         ensure_native_recovery_root(authority, row)
