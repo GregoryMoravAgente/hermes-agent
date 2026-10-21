@@ -20,6 +20,10 @@ from hermes_cli.backend_retirement import (
     RetirementLease,
     retirement,
 )
+from gateway.runtime_custody_profiles import ProfileScopeResolver, ProfileScopeResult
+
+
+_UNSPECIFIED_PHYSICAL_OWNER = object()
 
 
 @dataclass(frozen=True)
@@ -122,6 +126,7 @@ class CustodyHandle:
     close_generation: int
     lease: RetirementLease
     coordinator_id: str
+    physical_owner_epoch: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +139,7 @@ class ChildReservation:
     close_generation: int
     reservation: RetirementChildReservation
     coordinator_id: str
+    physical_owner_epoch: Optional[str] = None
 
 
 @dataclass
@@ -152,7 +158,10 @@ class RuntimeCustodyCoordinator:
     it keeps an unknown record live.  No caller can force release by copying an id or generation.
     """
 
-    def __init__(self, *, process_instance: str, authority_epoch: int, fence=retirement):
+    def __init__(
+        self, *, process_instance: str, authority_epoch: int, fence=retirement,
+        profile_scope: ProfileScopeResolver | None = None,
+    ):
         if not isinstance(process_instance, str) or not process_instance:
             raise ValueError("process_instance is required")
         if type(authority_epoch) is not int or authority_epoch < 1:
@@ -160,6 +169,7 @@ class RuntimeCustodyCoordinator:
         self.process_instance = process_instance
         self.authority_epoch = authority_epoch
         self._fence = fence
+        self._profile_scope = profile_scope
         self._coordinator_id = secrets.token_urlsafe(24)
         self._lock = threading.RLock()
         self._state = "open"
@@ -186,6 +196,104 @@ class RuntimeCustodyCoordinator:
         self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
         self._owner_reason: dict[str, str] = {}
         self._native_ack = False
+
+    def _profile_scope_result_locked(
+        self, profile_id: Optional[str], authority_epoch: int, process_instance: str, *,
+        require_serving: bool, allow_retiring: bool,
+    ) -> ProfileScopeResult:
+        """Resolve a profile tuple while ``_lock`` is held; no profile epoch is cached."""
+        if profile_id is None:
+            if process_instance != self.process_instance:
+                return ProfileScopeResult(False, "stale_process_instance", "")
+            if authority_epoch != self.authority_epoch:
+                return ProfileScopeResult(False, "stale_authority_epoch", "")
+            return ProfileScopeResult(True, "", "", self.authority_epoch)
+        if self._profile_scope is None:
+            if process_instance != self.process_instance:
+                return ProfileScopeResult(False, "stale_process_instance", str(profile_id))
+            if authority_epoch != self.authority_epoch:
+                return ProfileScopeResult(False, "stale_authority_epoch", str(profile_id))
+            return ProfileScopeResult(True, "", str(profile_id), authority_epoch)
+        return self._profile_scope.check(
+            profile_id, authority_epoch, process_instance,
+            require_serving=require_serving, allow_retiring=allow_retiring,
+        )
+
+    def _scope_refusal_locked(
+        self, profile_id: Optional[str], authority_epoch: int, owner_class: str, *,
+        require_serving: bool, allow_retiring: bool,
+        expected_physical_owner_epoch: object = _UNSPECIFIED_PHYSICAL_OWNER,
+    ) -> CustodyRefusal | None:
+        result = self._profile_scope_result_locked(
+            profile_id, authority_epoch, self.process_instance,
+            require_serving=require_serving, allow_retiring=allow_retiring,
+        )
+        if result.ok and (
+            self._profile_scope is None
+            or profile_id is None
+            or expected_physical_owner_epoch is _UNSPECIFIED_PHYSICAL_OWNER
+            or (
+                type(expected_physical_owner_epoch) is str
+                and result.physical_owner_epoch == expected_physical_owner_epoch
+            )
+        ):
+            return None
+        return CustodyRefusal(
+            result.reason if not result.ok else "foreign_custody", owner_class,
+        )
+
+    def _scope_unknown_locked(self, handle: CustodyHandle) -> CustodyRefusal | None:
+        """Retain one accepted lease unknown when its live profile owner is no longer proven."""
+        result = self._profile_scope_result_locked(
+            getattr(handle, "profile_id", None), getattr(handle, "authority_epoch", None),
+            getattr(handle, "process_instance", None),
+            require_serving=False, allow_retiring=True,
+        )
+        expected_owner_epoch = getattr(handle, "physical_owner_epoch", None)
+        if (
+            result.ok and self._profile_scope is not None
+            and handle.profile_id is not None
+            and (
+                type(expected_owner_epoch) is not str
+                or result.physical_owner_epoch != expected_owner_epoch
+            )
+        ):
+            result = ProfileScopeResult(False, "foreign_custody", str(handle.profile_id))
+        if result.ok:
+            return None
+        record = self._records.get(getattr(getattr(handle, "lease", None), "lease_id", ""))
+        if record is not None and record.handle is handle:
+            record.state = "unknown"
+            record.reason = (
+                result.reason if result.reason in _OWNER_UNKNOWN_REASONS else "foreign_custody"
+            )
+        return CustodyRefusal(result.reason, getattr(handle, "owner_class", None))
+
+    def profile_scope_valid(
+        self, profile_id: Optional[str], authority_epoch: int, *,
+        require_serving: bool = False, allow_retiring: bool = True,
+        physical_owner_epoch: object = _UNSPECIFIED_PHYSICAL_OWNER,
+    ) -> bool:
+        """Expose the same live tuple check to process-registry evidence consumers."""
+        with self._lock:
+            result = self._profile_scope_result_locked(
+                profile_id, authority_epoch, self.process_instance,
+                require_serving=require_serving, allow_retiring=allow_retiring,
+            )
+            return result.ok and (
+                self._profile_scope is None or profile_id is None
+                or physical_owner_epoch is _UNSPECIFIED_PHYSICAL_OWNER
+                or (type(physical_owner_epoch) is str
+                    and result.physical_owner_epoch == physical_owner_epoch)
+            )
+
+    def authority_epoch_for_profile(
+        self, profile_id: str, *, require_serving: bool = True,
+    ) -> int | None:
+        """Read a profile's current epoch only through live authority and lock evidence."""
+        if self._profile_scope is None:
+            return self.authority_epoch
+        return self._profile_scope.current_epoch(profile_id, require_serving=require_serving)
 
     @property
     def state(self) -> str:
@@ -343,8 +451,12 @@ class RuntimeCustodyCoordinator:
         """Reserve and index one root while ``_lock`` is held."""
         if owner_class not in OWNER_SPECS:
             return CustodyRefusal("unknown_owner_class", owner_class)
-        if authority_epoch != self.authority_epoch:
-            return CustodyRefusal("stale_authority_epoch", owner_class)
+        scope_result = self._profile_scope_result_locked(
+            profile_id, authority_epoch, self.process_instance,
+            require_serving=parent is None, allow_retiring=parent is not None,
+        )
+        if not scope_result.ok:
+            return CustodyRefusal(scope_result.reason, owner_class)
         if self._state in {"handoff_pending", "closed"} and parent is None:
             return CustodyRefusal("runtime_draining", owner_class)
         if self._state == "closing" and parent is None:
@@ -352,6 +464,17 @@ class RuntimeCustodyCoordinator:
         parent_lease = self._parent(parent)
         if parent is not None and parent_lease is None:
             return CustodyRefusal("stale_parent_lease", owner_class)
+        if parent is not None and (
+            parent.profile_id != profile_id
+            or parent.authority_epoch != authority_epoch
+            or parent.process_instance != self.process_instance
+        ):
+            return CustodyRefusal("stale_parent_lease", owner_class)
+        if self._profile_scope is not None and parent is not None and (
+            type(parent.physical_owner_epoch) is not str
+            or scope_result.physical_owner_epoch != parent.physical_owner_epoch
+        ):
+            return CustodyRefusal("foreign_custody", owner_class)
         lease = self._fence.acquire(
             owner_kind=owner_class, owner_id=owner_id, profile_id=profile_id,
             parent=parent_lease,
@@ -361,7 +484,7 @@ class RuntimeCustodyCoordinator:
         handle = CustodyHandle(
             owner_class, owner_id, profile_id, authority_epoch, self.process_instance,
             self._close.close_generation if self._close is not None else 0,
-            lease, self._coordinator_id,
+            lease, self._coordinator_id, scope_result.physical_owner_epoch,
         )
         self._records[lease.lease_id] = _Record(handle)
         if parent_lease is not None:
@@ -376,6 +499,16 @@ class RuntimeCustodyCoordinator:
                 return CustodyRefusal(
                     "secondary_parent_mismatch", getattr(child, "owner_class", None),
                 )
+            if self._profile_scope is not None and (
+                child.physical_owner_epoch is None
+                or parent.physical_owner_epoch != child.physical_owner_epoch
+                or self._scope_refusal_locked(
+                    child.profile_id, child.authority_epoch, child.owner_class,
+                    require_serving=False, allow_retiring=True,
+                    expected_physical_owner_epoch=child.physical_owner_epoch,
+                ) is not None
+            ):
+                return CustodyRefusal("secondary_parent_mismatch", child.owner_class)
             child_id, parent_id = edge
             existing = self._secondary_parents_by_child.get(child_id, set())
             if parent_id in existing:
@@ -407,6 +540,16 @@ class RuntimeCustodyCoordinator:
             parent_record = self._active_handle_locked(
                 parent, parent_class, child.profile_id, child.authority_epoch)
             if parent_record is None or parent.process_instance != child.process_instance:
+                return CustodyRefusal("stale_parent_lease", "I03_api_run_direct")
+            if self._profile_scope is not None and (
+                child.physical_owner_epoch is None
+                or parent.physical_owner_epoch != child.physical_owner_epoch
+                or self._scope_refusal_locked(
+                    child.profile_id, child.authority_epoch, child.owner_class,
+                    require_serving=False, allow_retiring=True,
+                    expected_physical_owner_epoch=child.physical_owner_epoch,
+                ) is not None
+            ):
                 return CustodyRefusal("stale_parent_lease", "I03_api_run_direct")
             child_id = child.lease.lease_id
             parent_id = parent.lease.lease_id
@@ -508,6 +651,19 @@ class RuntimeCustodyCoordinator:
                 secondary_parent, "I04_fifo_turn_execution", profile_id, authority_epoch,
             ) is None:
                 return CustodyRefusal("secondary_parent_mismatch", owner_class)
+            scope_refusal = self._scope_refusal_locked(
+                profile_id, authority_epoch, owner_class,
+                require_serving=False, allow_retiring=True,
+                expected_physical_owner_epoch=getattr(parent, "physical_owner_epoch", None),
+            )
+            if scope_refusal is not None:
+                return CustodyRefusal("secondary_parent_mismatch", owner_class)
+            if self._profile_scope is not None and (
+                getattr(parent, "physical_owner_epoch", None) is None
+                or getattr(secondary_parent, "physical_owner_epoch", None) is None
+                or parent.physical_owner_epoch != secondary_parent.physical_owner_epoch
+            ):
+                return CustodyRefusal("secondary_parent_mismatch", owner_class)
             request = self._reserve_root_locked(
                 owner_class, owner_id, profile_id=profile_id,
                 authority_epoch=authority_epoch, parent=parent,
@@ -534,8 +690,21 @@ class RuntimeCustodyCoordinator:
             parent_lease = self._parent(parent)
             if parent_lease is None:
                 return CustodyRefusal("stale_parent_lease", owner_class)
-            if owner_class not in OWNER_SPECS or authority_epoch != self.authority_epoch:
+            if (
+                parent.profile_id != profile_id
+                or parent.authority_epoch != authority_epoch
+                or parent.process_instance != self.process_instance
+            ):
+                return CustodyRefusal("stale_parent_lease", owner_class)
+            if owner_class not in OWNER_SPECS:
                 return CustodyRefusal("invalid_child_owner", owner_class)
+            scope_refusal = self._scope_refusal_locked(
+                profile_id, authority_epoch, owner_class,
+                require_serving=False, allow_retiring=True,
+                expected_physical_owner_epoch=getattr(parent, "physical_owner_epoch", None),
+            )
+            if scope_refusal is not None:
+                return scope_refusal
             reservation = self._fence.reserve_child(
                 parent_lease,
                 owner_kind=owner_class,
@@ -548,6 +717,7 @@ class RuntimeCustodyCoordinator:
             return ChildReservation(
                 owner_class, owner_id, profile_id, authority_epoch, self.process_instance,
                 reservation.close_generation, reservation, self._coordinator_id,
+                getattr(parent, "physical_owner_epoch", None),
             )
 
     def activate_child(self, child: ChildReservation):
@@ -555,16 +725,23 @@ class RuntimeCustodyCoordinator:
             if (
                 not isinstance(child, ChildReservation)
                 or child.coordinator_id != self._coordinator_id
-                or child.authority_epoch != self.authority_epoch
                 or child.process_instance != self.process_instance
             ):
                 return CustodyRefusal("stale_child_reservation")
+            scope_refusal = self._scope_refusal_locked(
+                child.profile_id, child.authority_epoch, child.owner_class,
+                require_serving=False, allow_retiring=True,
+                expected_physical_owner_epoch=child.physical_owner_epoch,
+            )
+            if scope_refusal is not None:
+                return CustodyRefusal("stale_child_reservation", child.owner_class)
             lease = self._fence.activate_child(child.reservation)
             if lease is None:
                 return CustodyRefusal("child_activation_refused", child.owner_class)
             handle = CustodyHandle(
                 child.owner_class, child.owner_id, child.profile_id, child.authority_epoch,
                 child.process_instance, lease.close_generation, lease, self._coordinator_id,
+                child.physical_owner_epoch,
             )
             self._records[lease.lease_id] = _Record(handle)
             pending = self._pending_children_by_parent.get(child.reservation.parent_lease_id)
@@ -630,6 +807,13 @@ class RuntimeCustodyCoordinator:
                 or authority_epoch != handle.authority_epoch
             ):
                 return CustodyRefusal("custody_identity_mismatch", getattr(handle, "owner_class", None))
+            scope_refusal = self._scope_refusal_locked(
+                profile_id, authority_epoch, handle.owner_class,
+                require_serving=False, allow_retiring=True,
+                expected_physical_owner_epoch=handle.physical_owner_epoch,
+            )
+            if scope_refusal is not None:
+                return scope_refusal
             record.state = "accepted"
             record.reason = None
             return None
@@ -643,6 +827,9 @@ class RuntimeCustodyCoordinator:
                 return CustodyRefusal("custody_unknown", handle.owner_class)
             if record.state not in {"accepted", "finalizing"}:
                 return CustodyRefusal("invalid_terminal_transition", handle.owner_class)
+            scope_refusal = self._scope_unknown_locked(handle)
+            if scope_refusal is not None:
+                return scope_refusal
             if self._secondary_parents_by_child.get(handle.lease.lease_id):
                 return CustodyRefusal("secondary_parent_required", handle.owner_class)
             if self._has_children(handle.lease.lease_id):
@@ -677,6 +864,9 @@ class RuntimeCustodyCoordinator:
     ):
         """Terminalize a request and remove its primary and exact secondary edges atomically."""
         with self._lock:
+            scope_refusal = self._scope_unknown_locked(handle)
+            if scope_refusal is not None:
+                return scope_refusal
             validation = self._secondary_terminal_ids_locked(handle, parents)
             if isinstance(validation, CustodyRefusal):
                 return validation
@@ -722,6 +912,9 @@ class RuntimeCustodyCoordinator:
                 return CustodyRefusal("stale_lease")
             if record.state != "accepted":
                 return CustodyRefusal("accepted_row_unknown", handle.owner_class)
+            scope_refusal = self._scope_unknown_locked(handle)
+            if scope_refusal is not None:
+                return scope_refusal
             if self._has_children(handle.lease.lease_id):
                 return CustodyRefusal("custody_pending", handle.owner_class)
             if self._secondary_parents_by_child.get(handle.lease.lease_id):
@@ -756,10 +949,16 @@ class RuntimeCustodyCoordinator:
             if (
                 not isinstance(child, ChildReservation)
                 or child.coordinator_id != self._coordinator_id
-                or child.authority_epoch != self.authority_epoch
                 or child.process_instance != self.process_instance
             ):
                 return CustodyRefusal("stale_child_reservation")
+            scope_refusal = self._scope_refusal_locked(
+                child.profile_id, child.authority_epoch, child.owner_class,
+                require_serving=False, allow_retiring=True,
+                expected_physical_owner_epoch=child.physical_owner_epoch,
+            )
+            if scope_refusal is not None:
+                return scope_refusal
             if not self._fence.release_child_reservation(child.reservation):
                 return CustodyRefusal("child_reservation_release_failed", child.owner_class)
             pending = self._pending_children_by_parent.get(child.reservation.parent_lease_id)
@@ -867,9 +1066,11 @@ class RuntimeCustodyCoordinator:
 
 def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
     descriptor = getattr(runner, "session_runtime_descriptor", None) or {}
+    registry = getattr(runner, "session_authorities", None)
     coordinator = RuntimeCustodyCoordinator(
         process_instance=descriptor.get("instance_id", ""),
         authority_epoch=descriptor.get("authority_epoch", 0),
+        profile_scope=ProfileScopeResolver(runner) if registry is not None else None,
     )
     runner.runtime_custody = coordinator
     return coordinator

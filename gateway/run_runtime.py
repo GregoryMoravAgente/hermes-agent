@@ -36,7 +36,6 @@ def reserved_profile_homes(runner):
 async def _build_profile_authority(runner, name, home, *, register):
     """One profile's authority against its own ``state.db``; raises when that store is unusable."""
     from gateway.run import _profile_runtime_scope
-    from gateway.session_authority import initialize_session_authority
     registry = runner.session_authorities
     instance_id = runner.session_runtime_descriptor['instance_id']
     # Each home's store resolves through the runner's scope-following handle cache, exactly
@@ -53,6 +52,36 @@ async def _build_profile_authority(runner, name, home, *, register):
             registry.remove(home)
             raise
     registry.replace(home, authority)
+    return authority
+
+
+async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True):
+    """Build and publish one profile authority after exclusive ownership is established."""
+    from hermes_state_runtime import begin_runtime_epoch, recover_session_inputs
+    from gateway.session_authority import SessionAuthority, backfill_legacy_session_owners
+
+    if db is None:
+        db = getattr(runner._session_db, '_db', runner._session_db)
+    db_key = await asyncio.to_thread(Path(db.db_path).resolve)
+    epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
+    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
+    await asyncio.to_thread(backfill_legacy_session_owners, db)
+    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
+    from gateway.session_local_adoption import adopt_local_compressions
+    await adopt_local_compressions(authority)
+    if register:
+        runner.session_authority = authority
+    from gateway.session_cron import bind_owner
+    bind_owner(authority)
+    store = runner.session_store
+    if register:
+        store._local_authority_epoch = epoch
+    epochs = getattr(store, '_local_authority_epochs', None)
+    if epochs is None:
+        epochs = store._local_authority_epochs = {}
+    epochs[db_key] = epoch
+    from gateway.session_local_recovery import recover_local_sessions
+    recover_local_sessions(authority)
     return authority
 
 
@@ -273,11 +302,12 @@ def _preservation_receipt(params):
 
 
 _INTEGRATED_PRESERVATION_OWNER_CLASSES = (
-    # I01 is sealed only after the native entrypoint has been consumed and all producer/marker/
-    # delivery-ledger registries plus durable admissions are quiescent; an empty queue alone cannot
-    # seal it.
+    # I01 and I06 are sealed only after their registered adapter sources close for this exact
+    # generation and all producer/marker/delivery-ledger registries plus durable admissions are
+    # quiescent; an empty queue or an activity bit alone cannot seal either class.
     'I01_native_inbound',
     'I02_api_session_turn', 'I04_fifo_turn_execution',
+    'I06_busy_followup_delivery',
     # Automation supplies its own observed-ingress and durable/terminal readiness checks.
     'I07_automation_route_wakes',
 )
@@ -378,6 +408,46 @@ def _seal_physical_profile_owner(runner, coordinator, receipt, descriptor):
         coordinator.mark_owner_unknown('I20_runtime_ownership_and_foreign_handoff', 'read_failed')
 
 
+def _authority_owner_ready(authority, owner_class: str, coordinator) -> bool:
+    try:
+        return bool(authority.preservation_owner_ready(owner_class))
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        coordinator.mark_owner_unknown(owner_class, 'read_failed')
+        return False
+
+
+def _seal_authority_preservation_owner(
+    runner, coordinator, receipt, descriptor, authority, owner_class: str,
+) -> None:
+    from gateway.runtime_custody import OWNER_SPECS
+
+    owner_id = f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}'
+    if owner_class in {'I01_native_inbound', 'I06_busy_followup_delivery'}:
+        from gateway.preservation_source_close import source_owner_evidence
+
+        evidence = source_owner_evidence(
+            runner, owner_class,
+            process_instance=receipt.process_instance,
+            authority_epoch=receipt.authority_epoch,
+            close_generation=receipt.close_generation,
+            owner_id=owner_id,
+        )
+        if evidence is None:
+            return
+    else:
+        evidence = {
+            'source': OWNER_SPECS[owner_class].source,
+            'process_instance': receipt.process_instance,
+            'authority_epoch': receipt.authority_epoch,
+            'close_generation': receipt.close_generation,
+            'owner_id': owner_id,
+            'observed': True,
+        }
+    refusal = coordinator.seal_owner(owner_class, evidence)
+    if refusal is not None:
+        coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+
+
 def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     """Seal source consumers whose durable terminal paths are wired here.
 
@@ -390,23 +460,12 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
     if authorities:
         for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
-            try:
-                if not all(authority.preservation_owner_ready(owner_class) for authority in authorities):
-                    continue
-            except BaseException:  # health: allow BLE001 -- opaque owner custody query failure marks that owner unknown and withholds handoff
-                coordinator.mark_owner_unknown(owner_class, 'read_failed')
+            if not all(_authority_owner_ready(authority, owner_class, coordinator) for authority in authorities):
                 continue
-            evidence = {
-                'source': OWNER_SPECS[owner_class].source,
-                'process_instance': receipt.process_instance,
-                'authority_epoch': receipt.authority_epoch,
-                'close_generation': receipt.close_generation,
-                'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}',
-                'observed': True,
-            }
-            refusal = coordinator.seal_owner(owner_class, evidence)
-            if refusal is not None:
-                coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
+            for authority in authorities:
+                _seal_authority_preservation_owner(
+                    runner, coordinator, receipt, descriptor, authority, owner_class,
+                )
 
     # Direct API runs have a separate adapter-owned source hook.  It may seal only after the
     # adapter registered its run lifecycle and every source-owned run/status/transport/finalizer
@@ -434,12 +493,16 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     # observation, not an empty running map. A missing or failed source hook is explicitly unknown.
     try:
         from tools.process_registry import process_registry
-        process_evidence = process_registry.preservation_owner_evidence(
+        from tools.process_registry_custody_evidence import (
+            preservation_owner_evidence_for_profiles,
+        )
+        process_evidence = preservation_owner_evidence_for_profiles(
+            process_registry,
             process_instance=receipt.process_instance,
             authority_epoch=receipt.authority_epoch,
             close_generation=receipt.close_generation,
             owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:I15_process_registry_terminal',
-            profile_id=process_registry._process_profile_id(),
+            launch_profile_id=process_registry._process_profile_id(),
         )
         if process_evidence is None:
             coordinator.mark_owner_unknown('I15_process_registry_terminal', 'cross_process_unproven')
@@ -478,6 +541,28 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
             coordinator.mark_owner_unknown(owner_class, 'read_failed')
 
 
+def _preservation_begin_gate(runner, params, peer_subject):
+    """Validate the authenticated close request before touching coordinator state."""
+    if not isinstance(peer_subject, str) or not peer_subject:
+        return {'status': 'refused', 'reason': 'permission_denied'}, None, None
+    if not isinstance(params, dict) or set(params) != {
+        'instance_id', 'authority_epoch', 'owner_id', 'scope', 'deadline_s'
+    }:
+        return {'status': 'refused', 'reason': 'invalid_params'}, None, None
+    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
+    if params['instance_id'] != descriptor.get('instance_id'):
+        return {'status': 'refused', 'reason': 'stale_instance'}, None, None
+    if params['authority_epoch'] != descriptor.get('authority_epoch'):
+        return {'status': 'refused', 'reason': 'stale_authority_epoch'}, None, None
+    ownership_reason = _preservation_ownership_reason(runner)
+    if ownership_reason is not None:
+        return {'status': 'refused', 'reason': ownership_reason}, None, None
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is None:
+        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}, None, None
+    return None, descriptor, coordinator
+
+
 async def begin_preservation_drain(runner, params, peer_subject):
     """Atomically close fresh roots through the existing authenticated private socket.
 
@@ -485,23 +570,9 @@ async def begin_preservation_drain(runner, params, peer_subject):
     destructive shutdown drain/interrupt/kill path: a pre-handoff refusal must be able to restore
     the same owner without losing accepted leases.
     """
-    if not isinstance(peer_subject, str) or not peer_subject:
-        return {'status': 'refused', 'reason': 'permission_denied'}
-    if not isinstance(params, dict) or set(params) != {
-        'instance_id', 'authority_epoch', 'owner_id', 'scope', 'deadline_s'
-    }:
-        return {'status': 'refused', 'reason': 'invalid_params'}
-    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
-    if params['instance_id'] != descriptor.get('instance_id'):
-        return {'status': 'refused', 'reason': 'stale_instance'}
-    if params['authority_epoch'] != descriptor.get('authority_epoch'):
-        return {'status': 'refused', 'reason': 'stale_authority_epoch'}
-    ownership_reason = _preservation_ownership_reason(runner)
-    if ownership_reason is not None:
-        return {'status': 'refused', 'reason': ownership_reason}
-    coordinator = getattr(runner, 'runtime_custody', None)
-    if coordinator is None:
-        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
+    refusal, descriptor, coordinator = _preservation_begin_gate(runner, params, peer_subject)
+    if refusal is not None:
+        return refusal
     receipt = coordinator.begin_close(
         owner_id=f'{peer_subject}:{params["owner_id"]}',
         scope=params['scope'],
@@ -512,6 +583,17 @@ async def begin_preservation_drain(runner, params, peer_subject):
     else:
         wire = {'status': 'refused', 'reason': getattr(receipt, 'code', 'close_conflict')}
     if wire.get('status') == 'closing':
+        from gateway.preservation_source_close import (
+            abort_source_close,
+            await_source_resume,
+            begin_source_close,
+        )
+        if not begin_source_close(runner, receipt.close_generation):
+            remaining = coordinator.remaining_seconds()
+            if remaining is not None and await await_source_resume(runner, receipt.close_generation, remaining):
+                abort_source_close(runner, receipt.close_generation)
+            coordinator.abort_before_handoff(receipt)
+            return {'status': 'refused', 'reason': 'source_close_conflict'}
         # Preserve the existing reversible external-drain distinction: fresh roots refuse, while
         # already accepted FIFO continuations may claim and settle under their live parent lease.
         # Ordinary ``_draining`` remains reserved for shutdown/restart and must stay false here.
@@ -557,6 +639,25 @@ async def prepare_preservation_handoff(runner, params, peer_subject):
     remaining = coordinator.remaining_seconds()
     if remaining is None:
         return {'status': 'refused', 'reason': 'stale_close_receipt'}
+    # The source close is an awaited transport boundary.  Its close response carries the exact
+    # queue epoch, registration and retained backlog snapshot; source_owner_ready is meaningful
+    # only after that response and every accepted callback have settled.
+    from gateway.preservation_source_close import await_source_close, source_owner_ready
+    if not await await_source_close(runner, receipt.close_generation, remaining):
+        _seal_integrated_preservation_owners(runner, coordinator, receipt)
+        blocked = coordinator.prepare_handoff(receipt)
+        if hasattr(blocked, 'as_wire'):
+            return blocked.as_wire()
+        return {'status': 'refused', 'reason': getattr(blocked, 'code', 'custody_pending')}
+    if not source_owner_ready(runner, receipt.close_generation):
+        _seal_integrated_preservation_owners(runner, coordinator, receipt)
+        blocked = coordinator.prepare_handoff(receipt)
+        if hasattr(blocked, 'as_wire'):
+            return blocked.as_wire()
+        return {'status': 'refused', 'reason': getattr(blocked, 'code', 'custody_pending')}
+    remaining = coordinator.remaining_seconds()
+    if remaining is None:
+        return {'status': 'refused', 'reason': 'stale_close_receipt'}
     for authority in _authorities(runner):
         try:
             await await_authority_work(authority, remaining)
@@ -585,9 +686,17 @@ async def abort_preservation_drain(runner, params, peer_subject):
         # Keep the close receipt and all unresolved leases live for the active lifecycle owner.
         # A failed ownership check is never permission to release or reopen that custody.
         return {'status': 'refused', 'reason': ownership_reason}
+    remaining = coordinator.remaining_seconds()
+    if remaining is None:
+        return {'status': 'refused', 'reason': 'stale_close_receipt'}
+    from gateway.preservation_source_close import abort_source_close, await_source_resume
+    if not await await_source_resume(runner, receipt.close_generation, remaining):
+        return {'status': 'refused', 'reason': 'source_resume_pending'}
     refused = coordinator.abort_before_handoff(receipt)
     if refused is not None:
         return refused.as_wire()
+    if not abort_source_close(runner, receipt.close_generation):
+        return {'status': 'refused', 'reason': 'source_resume_conflict'}
     descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
     runner._external_drain_active = False
     runner._preservation_drain_active = False

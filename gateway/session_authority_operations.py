@@ -35,6 +35,386 @@ class PreservationOperationsMixin:
             raise RuntimeStoreError('runtime_custody_unavailable')
         return None
 
+    def _preservation_release_terminal_gate(self, admission_id):
+        """Return the exact completion gate and sidecars before mutating source ownership."""
+        from gateway.session_classic_delivery import (
+            CLASSIC_CALLBACK_NOT_REQUIRED,
+            CLASSIC_CALLBACK_UNKNOWN,
+            classic_callback_requirement,
+            classic_post_delivery_callback_settled,
+        )
+        completion = None
+        api_required = False
+        try:
+            from gateway.platforms.api_server_run_completion import (
+                api_i02_completion_required, completion_for,
+            )
+            completion = completion_for(self, admission_id)
+            api_required = completion is not None or api_i02_completion_required(self, admission_id)
+        except (ImportError, RuntimeError):
+            api_required = False
+        if completion is not None and getattr(getattr(completion, 'receipt', None), 'state', None) == 'complete':
+            return False, True, completion, api_required, []
+        callback_requirement = classic_callback_requirement(self, admission_id)
+        if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
+            if completion is not None:
+                completion.fail('api_callback_requirement_unknown')
+            self._preservation_mark_unknown(admission_id, 'unmapped_writer')
+            return False, False if api_required else None, completion, api_required, []
+        if (callback_requirement != CLASSIC_CALLBACK_NOT_REQUIRED
+                and not classic_post_delivery_callback_settled(self, admission_id)):
+            return False, False if api_required else None, completion, api_required, []
+        adopter = getattr(self, 'marker_adopters', {}).get(admission_id)
+        marker = getattr(adopter, '_gateway_marker_released', None)
+        if marker is not None and not marker.is_set():
+            # Delivery may release the marker after this drain returns. Keep the exact lease live
+            # and let the tracked marker watcher perform the same terminal transition later.
+            self._preservation_watch_marker(admission_id, marker)
+            return False, False if api_required else None, completion, api_required, []
+        sidecars = [entry for entry in self._preservation_sidecars.values()
+                    if entry['admission_id'] == admission_id]
+        if sidecars and not all(entry['terminal'] for entry in sidecars):
+            # A cached sidecar owns an exact request child. Its service finalizer calls back here
+            # after the durable result/transport boundary, so the FIFO child cannot be released
+            # while physical work is still in flight.
+            return False, False if api_required else None, completion, api_required, sidecars
+        if completion is not None and not completion.prepare_parent_release():
+            completion.fail('api_parent_release_receipt_missing')
+            self._preservation_mark_unknown(admission_id, 'api_parent_release_receipt_missing')
+            return False, False, completion, api_required, sidecars
+        return True, None, completion, api_required, sidecars
+
+    def _preservation_recover_i02_unknown(self, admission_id, parent):
+        """Reopen the original unknown I02 parent before its normal release boundary runs."""
+        from gateway.runtime_custody import CustodyRefusal
+
+        coordinator = self._preservation_coordinator()
+        handles = getattr(self, '_preservation_handles', None)
+        coordinator_id = getattr(coordinator, '_coordinator_id', None)
+        parent_lease = getattr(parent, 'lease', None)
+        parent_lease_id = getattr(parent_lease, 'lease_id', None)
+        if (
+            coordinator is None
+            or not isinstance(handles, dict)
+            or handles.get(admission_id) is not parent
+            or getattr(parent, 'owner_class', None) != 'I02_api_session_turn'
+            or parent_lease is None
+            or not isinstance(parent_lease_id, str)
+            or not parent_lease_id
+            or getattr(parent, 'coordinator_id', None) != coordinator_id
+            or getattr(parent, 'profile_id', None) != getattr(self, 'profile_id', None)
+            or getattr(parent, 'authority_epoch', None) != getattr(self, 'epoch', None)
+            or getattr(parent, 'process_instance', None)
+            != getattr(coordinator, 'process_instance', None)
+        ):
+            return CustodyRefusal('api_parent_release_identity_mismatch', 'I02_api_session_turn')
+
+        # ``_preservation_mark_unknown`` marks the retained I04 child before the I02
+        # parent.  Reopening only the parent leaves the original child sticky-unknown,
+        # so the normal child-before-parent terminal boundary still refuses with
+        # ``custody_unknown``.  Authenticate the exact mapped child and its existing
+        # coordinator edge before changing either record; never construct a replacement
+        # handle or infer a child from the admission id.
+        children = getattr(self, '_preservation_children', {})
+        if not isinstance(children, dict):
+            return CustodyRefusal('api_child_release_identity_mismatch', 'I04_fifo_turn_execution')
+        child = children.get(admission_id)
+        if child is not None:
+            if (
+                not hasattr(child, 'lease')
+                or getattr(child, 'owner_class', None) != 'I04_fifo_turn_execution'
+                or getattr(child, 'coordinator_id', None) != coordinator_id
+                or getattr(child, 'profile_id', None) != getattr(parent, 'profile_id', None)
+                or getattr(child, 'authority_epoch', None) != getattr(parent, 'authority_epoch', None)
+                or getattr(child, 'process_instance', None)
+                != getattr(parent, 'process_instance', None)
+                or not isinstance(getattr(getattr(child, 'lease', None), 'lease_id', None), str)
+                or not getattr(child.lease, 'lease_id', None)
+                or getattr(child.lease, 'parent_lease_id', None) != parent_lease_id
+            ):
+                return CustodyRefusal('api_child_release_identity_mismatch', 'I04_fifo_turn_execution')
+            refusal = coordinator.reconcile_unknown(
+                child,
+                owner_id=child.owner_id,
+                profile_id=child.profile_id,
+                process_instance=child.process_instance,
+                authority_epoch=child.authority_epoch,
+            )
+            if refusal is not None:
+                return refusal
+        refusal = coordinator.reconcile_unknown(
+            parent,
+            owner_id=parent.owner_id,
+            profile_id=parent.profile_id,
+            process_instance=parent.process_instance,
+            authority_epoch=parent.authority_epoch,
+        )
+        if refusal is not None and child is not None:
+            # Parent reconciliation is the second authenticated state transition.  If
+            # it refuses, restore the exact child to the same fail-closed state; a
+            # partial child reopen must never make the parent appear recoverable.
+            coordinator.mark_unknown(child, 'custody_unknown')
+        return refusal
+
+    def _preservation_i02_release_receipt(self, admission_id, parent, coordinator, release_receipt):
+        if release_receipt is None:
+            registry = getattr(self, '_api_finalizer_completions', None)
+            completion = registry.get(admission_id) if isinstance(registry, dict) else None
+            release_receipt = getattr(completion, '_parent_release_receipt', None)
+        if not isinstance(release_receipt, dict):
+            return None
+        expected = {
+            'admission_id': admission_id,
+            'parent_lease_id': getattr(getattr(parent, 'lease', None), 'lease_id', None),
+            'coordinator_id': getattr(coordinator, '_coordinator_id', None),
+            'parent_owner_id': getattr(parent, 'owner_id', None),
+            'profile_id': getattr(parent, 'profile_id', None),
+            'authority_epoch': getattr(parent, 'authority_epoch', None),
+            'process_instance': getattr(parent, 'process_instance', None),
+            'close_generation': getattr(parent, 'close_generation', None),
+            'released': True,
+        }
+        if set(release_receipt) != {*expected, 'process_receipt'}:
+            return None
+        if any(release_receipt.get(key) != value for key, value in expected.items()):
+            return None
+        process_receipt = release_receipt.get('process_receipt')
+        if (
+            not isinstance(process_receipt, dict)
+            or set(process_receipt) != {
+                'kind', 'process_instance', 'authority_epoch', 'close_generation',
+                'owner_id', 'task_id', 'observed', 'cross_process_proof',
+            }
+            or process_receipt.get('kind') != 'parent_handle'
+            or process_receipt.get('owner_id') != expected['parent_owner_id']
+            or process_receipt.get('task_id') is not None
+            or process_receipt.get('process_instance') != expected['process_instance']
+            or process_receipt.get('authority_epoch') != expected['authority_epoch']
+            or process_receipt.get('close_generation') != expected['close_generation']
+            or process_receipt.get('observed') is not True
+            or process_receipt.get('cross_process_proof') is not False
+        ):
+            return None
+        return release_receipt
+
+    def _preservation_i02_parent_released(self, admission_id, parent, release_receipt=None):
+        """Confirm a terminal marker for this exact parent under the coordinator lock."""
+        coordinator = self._preservation_coordinator()
+        handles = getattr(self, '_preservation_handles', None)
+        if (
+            coordinator is None
+            or not isinstance(handles, dict)
+            or getattr(parent, 'owner_class', None) != 'I02_api_session_turn'
+            or getattr(parent, 'coordinator_id', None)
+            != getattr(coordinator, '_coordinator_id', None)
+            or getattr(parent, 'profile_id', None) != getattr(self, 'profile_id', None)
+            or getattr(parent, 'authority_epoch', None) != getattr(self, 'epoch', None)
+            or getattr(parent, 'process_instance', None)
+            != getattr(coordinator, 'process_instance', None)
+        ):
+            return False
+        lease_id = getattr(getattr(parent, 'lease', None), 'lease_id', None)
+        if not isinstance(lease_id, str) or not lease_id:
+            return False
+        mapped = handles.get(admission_id)
+        registry = getattr(self, '_api_finalizer_completions', None)
+        completion = registry.get(admission_id) if isinstance(registry, dict) else None
+        if (
+            getattr(completion, 'admission_id', None) != admission_id
+            or getattr(completion, 'parent', None) is not parent
+        ):
+            return False
+        if mapped is not parent and mapped is not None:
+            return False
+        lock = getattr(coordinator, '_lock', None)
+        records = getattr(coordinator, '_records', None)
+        completed = getattr(coordinator, '_completed', None)
+        if lock is None or not isinstance(records, dict) or not isinstance(completed, dict):
+            return False
+        release_receipt = self._preservation_i02_release_receipt(
+            admission_id, parent, coordinator, release_receipt,
+        )
+        if release_receipt is None or release_receipt.get('parent_lease_id') != lease_id:
+            return False
+        with lock:
+            parent_readback = getattr(coordinator, '_parent', None)
+            return (
+                callable(parent_readback)
+                and parent_readback(parent) is None
+                and lease_id not in records
+                and completed.get(lease_id) == 'terminal'
+            )
+
+    def _preservation_commit_i02_parent_release(self, admission_id, parent, release_receipt=None):
+        """Drop the staged authority reference only after the coordinator terminal marker is read."""
+        if not self._preservation_i02_parent_released(admission_id, parent, release_receipt):
+            return False
+        handles = getattr(self, '_preservation_handles', None)
+        if not isinstance(handles, dict):
+            return False
+        mapped = handles.get(admission_id)
+        if mapped is parent:
+            handles.pop(admission_id, None)
+            self._preservation_automation_bindings.pop(admission_id, None)
+            return True
+        return mapped is None
+
+    def _preservation_release_terminal(self, admission_id):
+        """Release child then root only after typed delivery and API-child evidence are visible."""
+        can_release, early_result, completion, api_required, sidecars = (
+            self._preservation_release_terminal_gate(admission_id)
+        )
+        if not can_release:
+            return early_result
+        for entry in sidecars:
+            request_id = getattr(getattr(entry['request'], 'lease', None), 'lease_id', None)
+            self._preservation_sidecars.pop(request_id, None)
+        self._preservation_delivery_retries.pop(admission_id, None)
+        coordinator = self._preservation_coordinator()
+        # /new cancellation is a durable route move, not a terminal producer result. Keep the
+        # exact I07 root and rebind it to the new queued row before any successor can claim it.
+        if admission_id in self._preservation_automation_rehomes:
+            self._preservation_finish_automation_rehome(admission_id)
+            return False if api_required else None
+        if coordinator is None:
+            if (admission_id in self._preservation_handles
+                    or admission_id in self._preservation_children
+                    or any(record.get('admission_id') == admission_id
+                           for record in self._preservation_operations.values())):
+                self._require_preservation_coordinator()
+            if completion is not None:
+                completion.fail('api_parent_release_unavailable')
+            return False if api_required else None
+        child = self._preservation_children.get(admission_id)
+        parent = self._preservation_handles.get(admission_id)
+        if completion is not None and parent is None:
+            completion.fail('api_parent_release_missing')
+            self._preservation_mark_unknown(admission_id, 'api_parent_release_missing')
+            return False
+        if child is not None and hasattr(child, 'lease'):
+            result = coordinator.mark_terminal(child)
+            if result is not None:
+                if parent is not None:
+                    coordinator.mark_unknown(parent, 'lease_release_failed')
+                if completion is not None:
+                    completion.fail('api_child_release_failed')
+                return False
+            self._preservation_children.pop(admission_id, None)
+        if parent is not None:
+            if completion is not None:
+                # The marker cleanup is part of the same authenticated parent boundary. Perform it
+                # before the irreversible coordinator operation so a cleanup exception cannot leave
+                # a missing parent receipt after mark_terminal has deleted the live row.
+                try:
+                    from gateway.session_classic_delivery import clear_classic_marker_adopter
+                    clear_classic_marker_adopter(self, admission_id)
+                except BaseException:  # health: allow BLE001 -- opaque marker cleanup retains custody
+                    completion.fail('api_parent_cleanup_failed')
+                    self._preservation_mark_unknown(admission_id, 'api_parent_cleanup_failed')
+                    return False
+            result = coordinator.mark_terminal(parent)
+            if result is not None:
+                if completion is not None:
+                    completion.fail('api_parent_release_failed')
+                return False
+            if completion is None:
+                self._preservation_handles.pop(admission_id, None)
+                self._preservation_automation_bindings.pop(admission_id, None)
+        elif completion is not None:
+            completion.fail('api_parent_release_missing')
+            self._preservation_mark_unknown(admission_id, 'api_parent_release_missing')
+            return False
+        if completion is None:
+            from gateway.session_classic_delivery import clear_classic_marker_adopter
+            clear_classic_marker_adopter(self, admission_id)
+        return True if api_required else None
+
+    async def _preservation_finish_settled_delivery(self, admission_id, delivery_receipt, response):
+        """Stage an I02 finalizer before its waiter, then let the bound I03 child settle."""
+        from gateway.platforms.api_server_run_completion import (
+            api_i02_completion_required, completion_for,
+        )
+        from gateway.session_ingress import finish_preservation_delivery
+        completion = completion_for(self, admission_id)
+        api_required = completion is not None or api_i02_completion_required(self, admission_id)
+        if not api_required:
+            waiter_delivered = await self._resolve_settled_waiter(admission_id, response)
+            return await finish_preservation_delivery(
+                self, admission_id, delivery_receipt, waiter_delivered,
+            )
+        failure = None
+        try:
+            staged = await finish_preservation_delivery(
+                self, admission_id, delivery_receipt, False,
+            )
+        except BaseException as exc:  # health: allow BLE001 -- delivery failure is retained and re-raised
+            staged = False
+            failure = exc
+        waiter_delivered = await self._resolve_settled_waiter(admission_id, response)
+        if completion is not None:
+            completion.note_waiter_delivery(waiter_delivered)
+            # The observer waiter is now released, so run_legacy_authority_turn can
+            # terminalize the bound I03 child.  Keep this FIFO drain at the same
+            # admission until that typed completion settles; this is a sibling
+            # barrier, not an API waiter/finalizer cycle.
+            try:
+                completion_receipt = await completion.wait()
+            except asyncio.CancelledError:
+                completion.fail("api_drain_cancelled")
+                raise
+            if getattr(completion_receipt, "state", None) != "complete":
+                staged = False
+        if failure is not None:
+            raise failure
+        return staged
+
+    def _preservation_watch_fifo_close(self, admission_id):
+        """Re-enter the existing release boundary when this admission's FIFO drain ends.
+
+        A Bot projection may finish before the authenticated I04 child has closed.  The child
+        drain task is the existing source-owned completion boundary; its done callback is only a
+        trigger.  ``_preservation_release_terminal`` still re-reads the canonical row, callback,
+        marker, sidecar, handle, and coordinator identity before releasing anything.
+        """
+        bindings = getattr(self, '_preservation_automation_bindings', None)
+        binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+        if not isinstance(binding, dict):
+            return False
+        descriptor = binding.get('descriptor')
+        if not isinstance(descriptor, dict):
+            return False
+        row = binding.get('row')
+        if row is not None and (
+                not isinstance(row, dict) or row.get('admission_id') != admission_id):
+            return False
+        handles = getattr(self, '_preservation_handles', None)
+        children = getattr(self, '_preservation_children', None)
+        handle = binding.get('handle')
+        child = children.get(admission_id) if isinstance(children, dict) else None
+        if (not isinstance(handles, dict) or handles.get(admission_id) is not handle
+                or child is None or not hasattr(child, 'lease')):
+            return False
+        session_id = row.get('target_session_id') if isinstance(row, dict) else None
+        if not isinstance(session_id, str) or not session_id:
+            session_id = descriptor.get('session_id')
+        sessions = getattr(self, 'sessions', None)
+        live = sessions.get(session_id) if isinstance(sessions, dict) else None
+        task = getattr(live, 'task', None)
+        if task is None or not callable(getattr(task, 'add_done_callback', None)):
+            return False
+        if binding.get('fifo_close_task') is not None:
+            return True
+        binding['fifo_close_task'] = task
+
+        def retry(_done):
+            try:
+                self._preservation_release_terminal(admission_id)
+            except BaseException:  # health: allow BLE001 -- failed re-entry retains custody unknown
+                self._preservation_mark_unknown(admission_id, 'join_failed')
+
+        task.add_done_callback(retry)
+        return True
+
     def _preservation_root(self, owner_class, owner_id):
         coordinator = self._preservation_coordinator()
         if coordinator is None:
@@ -47,7 +427,8 @@ class PreservationOperationsMixin:
         return handle
 
     def _preservation_operation_parent(
-        self, session_id, admission_id=None, *, generation=None, principal_id=None, queued_control=False
+        self, session_id, admission_id=None, *, generation=None, principal_id=None, queued_control=False,
+        shared_group_principal=False,
     ):
         """Return the exact active parent lease for a real operation.
 
@@ -73,7 +454,8 @@ class PreservationOperationsMixin:
                 continue
             if generation is not None and row.get('generation') != generation:
                 continue
-            if principal_id is not None and row.get('principal_id') != principal_id:
+            if (principal_id is not None and row.get('principal_id') != principal_id
+                    and not shared_group_principal):
                 continue
             if (execution_admission is not None
                     and execution_admission == current
@@ -188,6 +570,160 @@ class PreservationOperationsMixin:
         return not execution or all(execution.get(name) in allowed
                                     for name, allowed in expected.items())
 
+    def _preservation_operation_expected_parent_valid(self, record, expected_parent):
+        """Validate the exact retained opaque I04/I07 parent for a row readback."""
+        if not isinstance(record, dict) or record.get('parent_handle') is not expected_parent:
+            return False
+        coordinator = self._preservation_coordinator()
+        if coordinator is None:
+            return False
+        try:
+            from gateway.runtime_custody import CustodyHandle
+            if not isinstance(expected_parent, CustodyHandle):
+                return False
+            return self._preservation_operation_validate_parent_handle(
+                expected_parent, coordinator, self.profile_id, self.epoch, self.instance_id,
+            ) is expected_parent
+        except (AttributeError, RuntimeStoreError, TypeError, ValueError):
+            return False
+
+    def _preservation_operation_parented_native_row_live_matches(
+        self, record, row, admission_id, row_generation, expected_parent,
+    ):
+        """Validate a queued native child against its exact live I04 parent.
+
+        A classic I06 child is accepted while the parent I04 is still executing.  Its own native
+        row is therefore queued and cannot satisfy the generic current-admission check until the
+        FIFO claims it.  This narrow path authenticates the existing parent handle and the actual
+        current I04 row before allowing the exact queued child row to bind; it is never a general
+        queued-row or I06 live-check bypass.
+        """
+        if (
+            not isinstance(record, dict)
+            or record.get('owner_class') != 'I06_busy_followup_delivery'
+            or record.get('operation') not in {'running-slot', 'fifo', 'debounce'}
+            or record.get('parent_handle') is not expected_parent
+            or not isinstance(row, dict)
+            or row.get('status') != 'queued'
+            or row_generation is not None
+            or record.get('generation') not in (None, 'pre-admission')
+            or not isinstance(admission_id, str)
+            or not admission_id
+            or row.get('admission_id') != admission_id
+        ):
+            return False
+        payload = row.get('payload')
+        descriptor = payload.get('native_text_v1') if isinstance(payload, dict) else None
+        if (not isinstance(descriptor, dict)
+                or descriptor.get('producer_process_mode') != 'managed_turn'):
+            return False
+        coordinator = self._preservation_coordinator()
+        if coordinator is None or not self._preservation_operation_expected_parent_valid(
+                record, expected_parent):
+            return False
+        parent = expected_parent
+        if parent.owner_class != 'I04_fifo_turn_execution':
+            return False
+        owner_id = parent.owner_id
+        prefix = 'claim:'
+        if type(owner_id) is not str or not owner_id.startswith(prefix):
+            return False
+        parent_admission_id = owner_id[len(prefix):]
+        if not parent_admission_id or parent_admission_id == admission_id:
+            return False
+        children = getattr(self, '_preservation_children', None)
+        if not isinstance(children, dict) or children.get(parent_admission_id) is not parent:
+            return False
+        from hermes_state_runtime import get_session_admission
+        try:
+            parent_row = get_session_admission(self.db, admission_id=parent_admission_id)
+        except (OSError, RuntimeError, sqlite3.Error, KeyError, TypeError, ValueError):
+            return False
+        if (isinstance(parent_row, dict)
+                and parent_row.get('principal_id') != record.get('principal_id')):
+            live = self.sessions.get(record.get('session_id'))
+            parent_source = getattr(live, 'source', None)
+            child_source = getattr(record.get('producer_object'), 'source', None)
+            config = getattr(getattr(self, 'runner', None), 'config', None)
+            shared_group_route = (
+                getattr(parent_source, 'chat_type', None) == 'group'
+                and getattr(child_source, 'chat_type', None) == 'group'
+                and getattr(parent_source, 'platform', None) == getattr(child_source, 'platform', None)
+                and getattr(parent_source, 'profile', None) == getattr(child_source, 'profile', None)
+                and getattr(parent_source, 'chat_id', None) == getattr(child_source, 'chat_id', None)
+                and getattr(parent_source, 'thread_id', None) == getattr(child_source, 'thread_id', None)
+                and getattr(config, 'group_sessions_per_user', True) is False
+            )
+            if not shared_group_route:
+                return False
+        if (
+            not isinstance(parent_row, dict)
+            or parent_row.get('admission_id') != parent_admission_id
+            or parent_row.get('status') != 'started'
+            or parent_row.get('owner_epoch') != self.epoch
+            or parent_row.get('target_session_id') != record.get('session_id')
+            or type(parent_row.get('generation')) is not int
+            or parent_row.get('generation') < 1
+        ):
+            return False
+        parent_payload = parent_row.get('payload')
+        parent_descriptor = (
+            parent_payload.get('native_text_v1') if isinstance(parent_payload, dict) else None
+        )
+        if not isinstance(parent_descriptor, dict):
+            return False
+        parent_mode = parent_descriptor.get('producer_process_mode')
+        if parent_mode == 'classic_busy':
+            # A first public classic row is durably marked before the authority creates this I04
+            # claim.  Authenticate that marker through the original source-owned I06 record; the
+            # descriptor alone is never a mode allowlist or a substitute for its producer object.
+            try:
+                from gateway.session_classic_custody import (
+                    classic_direct_route_marker, classic_row_is_direct,
+                )
+                if not classic_row_is_direct(parent_row):
+                    return False
+                resolver = getattr(self, '_classic_execution_owner_for_admission', None)
+                if not callable(resolver):
+                    return False
+                parent_owner, parent_error = resolver(parent_row)
+                owner_key = getattr(parent_owner, '_classic_custody_key', None)
+                records = getattr(self, '_preservation_operations', None)
+                parent_record = records.get(owner_key) if isinstance(records, dict) else None
+                if (
+                    parent_error is not None
+                    or parent_owner is None
+                    or classic_direct_route_marker(self, parent_owner) != 'classic_busy'
+                    or getattr(parent_owner, '_classic_custody_authority', None) is not self
+                    or not isinstance(owner_key, str)
+                    or not isinstance(parent_record, dict)
+                    or parent_record.get('owner_class') != 'I06_busy_followup_delivery'
+                    or parent_record.get('producer_object') is not parent_owner
+                    or parent_record.get('parent_handle') is not None
+                    or parent_record.get('admission_id') != parent_admission_id
+                ):
+                    return False
+            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                return False
+        elif parent_mode != 'managed_turn':
+            return False
+        live = self.sessions.get(record.get('session_id'))
+        event_stream = getattr(live, 'event_stream', None) if live is not None else None
+        lock = getattr(event_stream, 'lock', None)
+        if live is None or event_stream is None or lock is None:
+            return False
+        with lock:
+            execution = getattr(event_stream, 'execution', None)
+            executing = getattr(self, 'executing', None)
+            return (
+                type(execution) is dict
+                and execution.get('authority_epoch') == self.epoch
+                and execution.get('admission_id') == parent_admission_id
+                and execution.get('execution_generation') == parent_row.get('generation')
+                and isinstance(executing, dict)
+                and executing.get(record.get('session_id')) == parent_row.get('generation')
+            )
+
     @staticmethod
     def _preservation_operation_pin_row(record, state, row_generation, binding):
         # This helper is called only after all identity, generation, and live checks pass.
@@ -209,7 +745,9 @@ class PreservationOperationsMixin:
             'generation': record.get('generation'),
         }
 
-    def _preservation_operation_validate_row(self, record, row, admission_id):
+    def _preservation_operation_validate_row(
+            self, record, row, admission_id, *, expected_parent=None,
+    ):
         """Validate one exact durable row and pin its committed generation once."""
         if not self._preservation_operation_row_identity_matches(record, row, admission_id):
             return None
@@ -218,12 +756,37 @@ class PreservationOperationsMixin:
         if generation_info is None:
             return None
         state, row_generation, binding = generation_info
-        if not self._preservation_operation_live_row_matches(record, admission_id, row_generation):
+        queued_parented = (
+            isinstance(record, dict)
+            and record.get('parent_handle') is not None
+            and isinstance(row, dict)
+            and row.get('status') == 'queued'
+            and row_generation is None
+        )
+        if queued_parented:
+            bot_parented = (
+                isinstance(record, dict)
+                and record.get('owner_class') == 'I06_busy_followup_delivery'
+                and record.get('operation') == 'bot-delivery'
+                and getattr(expected_parent, 'owner_class', None)
+                    == 'I07_automation_route_wakes'
+            )
+            if bot_parented:
+                if (expected_parent is None
+                        or not self._preservation_automation_row_matches(row, expected_parent)):
+                    return None
+            elif (expected_parent is None
+                  or not self._preservation_operation_parented_native_row_live_matches(
+                      record, row, admission_id, row_generation, expected_parent)):
+                return None
+        elif not self._preservation_operation_live_row_matches(record, admission_id, row_generation):
             return None
         self._preservation_operation_pin_row(record, state, row_generation, binding)
         return row
 
-    def _preservation_operation_bind_admission(self, key, admission_id):
+    def _preservation_operation_bind_admission(
+            self, key, admission_id, *, expected_parent=None,
+    ):
         """Bind a real native receipt to the operation that reserved before admission."""
         if key is None or not isinstance(admission_id, str) or not admission_id:
             return False
@@ -240,7 +803,8 @@ class PreservationOperationsMixin:
         except (OSError, RuntimeError, sqlite3.Error, KeyError, TypeError, ValueError):
             self._preservation_operation_unknown(key, 'read_failed')
             return False
-        if self._preservation_operation_validate_row(record, row, admission_id) is None:
+        if self._preservation_operation_validate_row(
+                record, row, admission_id, expected_parent=expected_parent) is None:
             self._preservation_operation_unknown(key, 'read_failed')
             return False
         record['admission_id'] = admission_id
@@ -276,10 +840,30 @@ class PreservationOperationsMixin:
             'generation_state': 'pinned',
         }
         return True
-    def _preservation_operation_row(self, key):
+    def _preservation_operation_row(self, key, *, expected_parent=None):
         """Read the exact admission identity, never a session-wide status census."""
         record = self._preservation_operations.get(key)
+        retired = False
         if record is None:
+            matches = []
+            for adopter in (getattr(self, 'marker_adopters', None) or {}).values():
+                owner = getattr(adopter, '_classic_execution_owner_event', None) or adopter
+                bridge = getattr(owner, '_classic_execution_bridge', None)
+                retired_record = getattr(bridge, 'retired_operation_record', None)
+                if (isinstance(retired_record, dict)
+                        and getattr(bridge, 'operation_key', None) == key
+                        and getattr(bridge, 'admission_id', None) == retired_record.get('admission_id')
+                        and retired_record.get('owner_class') == 'I06_busy_followup_delivery'
+                        and retired_record.get('producer_object') is owner
+                        and getattr(owner, '_classic_custody_authority', None) is self):
+                    matches.append(retired_record)
+            if len(matches) != 1:
+                return None
+            record = matches[0]
+            retired = True
+        if expected_parent is not None and not self._preservation_operation_expected_parent_valid(
+                record, expected_parent):
+            self._preservation_operation_unknown(key, 'read_failed')
             return None
         from hermes_state_runtime import find_session_admission, get_session_admission
         admission_id = record.get('admission_id')
@@ -306,10 +890,12 @@ class PreservationOperationsMixin:
                 or (record.get('admission_request_id', record.get('request_id')) is not None
                     and row.get('request_id') != record.get('admission_request_id', record.get('request_id')))
                 or self._preservation_operation_validate_row(
-                    record, row, row.get('admission_id')) is None):
+                    record, row, row.get('admission_id'),
+                    expected_parent=expected_parent) is None):
             self._preservation_operation_unknown(key, 'read_failed')
             return None
-        if not self._preservation_operation_bind_admission(key, row.get('admission_id')):
+        if not retired and not self._preservation_operation_bind_admission(
+                key, row.get('admission_id'), expected_parent=expected_parent):
             self._preservation_operation_unknown(key, 'read_failed')
             return None
         return row
@@ -664,6 +1250,9 @@ class PreservationOperationsMixin:
         coordinator = self._preservation_coordinator()
         if record is None:
             return
+        if record.get('terminal') is True:
+            self._preservation_operations.pop(key, None)
+            return
         if coordinator is None:
             self._require_preservation_coordinator()
             return
@@ -673,6 +1262,13 @@ class PreservationOperationsMixin:
             return
         result = coordinator.mark_terminal(record['handle'])
         if result is None:
+            if record.get('owner_class') == 'I06_busy_followup_delivery':
+                owner = record.get('producer_object')
+                bridge = getattr(owner, '_classic_execution_bridge', None)
+                if (getattr(bridge, 'operation_key', None) == key
+                        and getattr(bridge, 'admission_id', None) == record.get('admission_id')
+                        and getattr(owner, '_classic_custody_authority', None) is self):
+                    bridge.retired_operation_record = record
             self._preservation_operations.pop(key, None)
         elif result.code != 'stale_lease':
             coordinator.mark_unknown(record['handle'], 'lease_release_failed')

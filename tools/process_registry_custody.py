@@ -124,6 +124,7 @@ class ProcessCustody:
     profile_id: str
     process_instance: str
     authority_epoch: int
+    physical_owner_epoch: Optional[str] = None  # Retained lock incarnation for terminal evidence.
     state: str = "accepted"
     reason: str = ""
     process_bound: bool = False
@@ -157,20 +158,21 @@ class ProcessCustody:
     ) -> ProcessCustody:
         if not isinstance(profile_id, str) or not profile_id:
             raise ValueError("process custody requires an authenticated profile")
+        from gateway.runtime_custody_profiles import current_profile_epoch, profile_custody_matches
+        authority_epoch = current_profile_epoch(
+            coordinator, profile_id, require_serving=parent_handle is None,
+        )
+        if type(authority_epoch) is not int or authority_epoch < 1:
+            raise RuntimeError("process custody reservation refused: foreign_custody")
         handle = coordinator.reserve_root(
             OWNER_CLASS,
             owner_id,
             profile_id=profile_id,
-            authority_epoch=coordinator.authority_epoch,
+            authority_epoch=authority_epoch,
             parent=parent_handle,
         )
-        if (
-            not hasattr(handle, "lease")
-            or getattr(handle, "owner_class", None) != OWNER_CLASS
-            or getattr(handle, "owner_id", None) != owner_id
-            or getattr(handle, "profile_id", None) != profile_id
-            or getattr(handle, "process_instance", None) != coordinator.process_instance
-            or getattr(handle, "authority_epoch", None) != coordinator.authority_epoch
+        if not profile_custody_matches(
+            coordinator, handle, OWNER_CLASS, owner_id, profile_id, authority_epoch,
         ):
             if hasattr(handle, "lease"):
                 try:
@@ -187,6 +189,7 @@ class ProcessCustody:
             profile_id=profile_id,
             process_instance=handle.process_instance,
             authority_epoch=handle.authority_epoch,
+            physical_owner_epoch=getattr(handle, "physical_owner_epoch", None),
             parent_handle=parent_handle,
             scope_fence=scope_fence,
         )
@@ -295,6 +298,7 @@ class ProcessCustody:
             "profile_id": self.profile_id,
             "process_instance": self.process_instance,
             "authority_epoch": self.authority_epoch,
+            "physical_owner_epoch": self.physical_owner_epoch,
             "close_generation": close_generation,
             "observed": True,
             "cross_process_proof": self.cross_process_proven,
@@ -464,6 +468,7 @@ class ProcessRegistryCustodyMixin:
         try:
             from agent.context_compressor import _DB_PERSISTED_MARKER
             from agent.tool_result_custody import _payload_digest, read_managed_tool_row
+            from gateway.runtime_custody_profiles import profile_scope_valid_for_handle
 
             proof_message = proof.message
             get_role = getattr(proof.database, "get_message_role", None)
@@ -501,7 +506,7 @@ class ProcessRegistryCustodyMixin:
                 or type(record.delivery_close_generation) is not int
                 or handle.close_generation != record.delivery_close_generation
                 or custody.process_instance != coordinator.process_instance
-                or custody.authority_epoch != coordinator.authority_epoch
+                or not profile_scope_valid_for_handle(coordinator, handle)
             ):
                 return False
             if get_role(proof.session_id, proof.row_id) != "tool":

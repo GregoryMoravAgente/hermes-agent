@@ -38,6 +38,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 
 
 @pytest.fixture
@@ -659,7 +660,39 @@ def bind_authority_runtime_custody(runner, authority):
     return install_runtime_custody(runner)
 
 
-def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False):
+def _api_runtime_cleanup_readback(adapter, runner):
+    """Read the source-owned API custody indexes before physical profile ownership is closed."""
+    custody = getattr(adapter, '_run_custody', None)
+    launches = getattr(adapter, '_run_launches', None)
+    if not isinstance(custody, dict) or not isinstance(launches, dict):
+        return False
+    if any(not getattr(item, 'released', False) or getattr(item, 'unknown_reason', None)
+           for item in custody.values()):
+        return False
+    if custody or launches:
+        return False
+    ids = getattr(adapter, '_run_idempotency_ids', None)
+    if isinstance(ids, set) and ids:
+        return False
+    authorities = []
+    authority_registry = getattr(runner, 'session_authorities', None)
+    if authority_registry is not None:
+        try:
+            authorities.extend(item for item in authority_registry if item is not None)
+        except TypeError:
+            return False
+    else:
+        authority = getattr(runner, 'session_authority', None)
+        if authority is not None:
+            authorities.append(authority)
+    for authority in authorities:
+        registry = getattr(authority, '_api_finalizer_completions', None)
+        if registry not in (None, {}):
+            return False
+    return True
+
+
+def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, cleanup_readback=False):
     """Yield an API adapter after the real single-profile runtime bootstrap has completed.
 
     This is an explicit context manager for tests that intentionally construct their own adapter;
@@ -710,15 +743,22 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False):
                     runner.session_authorities = None
                 yield adapter
         finally:
+            cleanup_proven = True
+            if cleanup_readback and adapter is not None and runner is not None:
+                cleanup_proven = _api_runtime_cleanup_readback(adapter, runner)
             if adapter is not None:
                 adapter._response_store.close()
                 adapter._run_idempotency_store.close()
             if runner is not None:
                 runner.session_store.close_all_db_handles()
                 runner.close_all_session_db_handles()
-            if reserved:
-                process_ownership.close()
-            reset_hermes_home_override(home_token)
+            try:
+                if reserved and cleanup_proven:
+                    process_ownership.close()
+                if cleanup_readback and not cleanup_proven:
+                    raise RuntimeError('api_runtime_cleanup_unproven')
+            finally:
+                reset_hermes_home_override(home_token)
 
     return owned()
 
@@ -726,6 +766,37 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False):
 def runtime_owned_legacy_api(tmp_path, monkeypatch, *, api_key=None):
     """Real API bootstrap followed by the explicit supported pre-authority topology."""
     return runtime_owned_api(tmp_path, monkeypatch, api_key=api_key, legacy=True)
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_api_owner(tmp_path, monkeypatch):
+    """A real API adapter and its source-owned authority after full runtime bootstrap.
+
+    Tests may replace only the model/turn callback; descriptor, process ownership,
+    profile DB, coordinator, and admission parent remain production-created.
+    """
+    async with runtime_owned_api(tmp_path, monkeypatch) as adapter:
+        yield adapter, adapter.gateway_runner.session_authority
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_api_adapter(tmp_path, monkeypatch):
+    """A real runtime-owned API adapter for direct route/projection tests."""
+    async with runtime_owned_api(tmp_path, monkeypatch) as adapter:
+        yield adapter
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_legacy_api_adapter(tmp_path, monkeypatch):
+    """A real bootstrap followed by the supported legacy adapter topology."""
+    async with runtime_owned_legacy_api(tmp_path / 'legacy-api', monkeypatch) as adapter:
+        runner = adapter.gateway_runner
+        # The legacy direct adapter is served without an authority registry.  Remove the
+        # bootstrap's explicit ``None`` marker only in this wrapper; the shared context and
+        # its cleanup/readback contract remain unchanged.
+        if hasattr(runner, 'session_authorities'):
+            delattr(runner, 'session_authorities')
+        yield adapter
 
 
 @pytest.fixture

@@ -173,6 +173,30 @@ async def test_recover_native_sessions_binds_real_row_and_allows_current_epoch_c
         rebound = authority._preservation_automation_bindings[row['admission_id']]
         assert rebound['row']['owner_epoch'] == new_epoch
         assert rebound['row']['generation'] == claimed['generation']
+
+        # The durable producer descriptor remains old; the current exact owner
+        # must still classify and release the genuine terminal successor.
+        settle_session_input(
+            db, epoch=new_epoch, admission_id=row['admission_id'],
+            generation=claimed['generation'], outcome='completed',
+        )
+        from gateway.session_classic_delivery import (
+            CLASSIC_CALLBACK_NOT_REQUIRED, CLASSIC_CALLBACK_UNKNOWN,
+            classic_callback_requirement,
+        )
+        assert classic_callback_requirement(
+            authority, row['admission_id'],
+        ) == CLASSIC_CALLBACK_NOT_REQUIRED
+        original_descriptor = rebound['descriptor']
+        rebound['descriptor'] = {**original_descriptor, 'profile_id': 'foreign-profile'}
+        try:
+            assert classic_callback_requirement(
+                authority, row['admission_id'],
+            ) == CLASSIC_CALLBACK_UNKNOWN
+        finally:
+            rebound['descriptor'] = original_descriptor
+        authority._preservation_release_terminal(row['admission_id'])
+        assert row['admission_id'] not in authority._preservation_handles
     finally:
         process_ownership.release(home)
         db.close()

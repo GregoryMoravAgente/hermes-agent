@@ -1,21 +1,21 @@
 """HTTP run owners can acknowledge an exact unknown API admission after restart."""
 import asyncio
 import json
+import time
 from contextlib import suppress
 from contextvars import ContextVar
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import GatewayConfig, PlatformConfig
+from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from gateway.session import SessionStore
-from gateway.session_authority import initialize_session_authority
 from gateway.session_api import restore_api_session
-from hermes_state import SessionDB
 from hermes_state_runtime import claim_session_input, list_session_admissions
+from tests.gateway.conftest import bind_authority_runtime_custody, runtime_owned_api
 
 
 _OWNER = ContextVar("test_api_unknown_owner", default="owner")
@@ -24,6 +24,23 @@ _AUTH_HEADERS = {"Authorization": f"Bearer {_API_KEYS['owner']}", "X-Test-Owner"
 _OTHER_AUTH_HEADERS = {
     "Authorization": f"Bearer {_API_KEYS['other']}", "X-Test-Owner": "other"
 }
+
+
+_PHASE_FILE = "api-unknown-resolution-phases.jsonl"
+
+
+def _write_phase(tmp_path, phase, ordinal):
+    record = {"phase": phase, "ordinal": ordinal, "monotonic_ns": time.monotonic_ns()}
+    with (Path(tmp_path) / _PHASE_FILE).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def _write_adapter_phase(adapters, phase, ordinal):
+    authority = getattr(adapters[-1].gateway_runner, "session_authority", None)
+    db = getattr(authority, "db", None)
+    db_path = getattr(db, "db_path", None)
+    if db_path is not None:
+        _write_phase(Path(db_path).resolve().parent.parent, phase, ordinal)
 
 
 def _runs_client(adapter):
@@ -51,9 +68,15 @@ def _adapter(runner, db):
 
 
 async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    store = SessionStore(tmp_path / "sessions", GatewayConfig())
-    db = SessionDB(tmp_path / "state.db")
+    scope = runtime_owned_api(tmp_path, monkeypatch, api_key=_API_KEYS["owner"])
+    _write_phase(tmp_path, "scope_enter_before", 1)
+    adapter = await scope.__aenter__()
+    _write_phase(tmp_path, "scope_enter_after", 2)
+    adapter._runtime_owned_scope = scope
+    runner = adapter.gateway_runner
+    first = runner.session_authority
+    db = first.db
+    store = runner.session_store
     executed = []
 
     async def answer(event):
@@ -64,23 +87,17 @@ async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
         execution_result.get()["result"] = result
         return result["final_response"]
 
-    runner = SimpleNamespace(
-        _session_db=db,
-        session_store=store,
-        _draining=False,
-        _handle_message=answer,
-    )
-    first = await initialize_session_authority(
-        runner, profile_id="default", instance_id="api-owner-1"
-    )
-    adapter = _adapter(runner, db)
+    runner._handle_message = answer
+    runner._wire_adapter_handlers(adapter)
     runner._adapter_for_source = lambda source: adapter
 
     # Exercise the public admission handler so run ownership and the canonical
     # principal/request-id binding are the same ones the resolution route sees.
     first._schedule = lambda ref: None
     client = _runs_client(adapter)
+    _write_phase(tmp_path, "client_start_before", 10)
     await client.start_server()
+    _write_phase(tmp_path, "client_start_after", 11)
     tasks = []
     try:
         admitted = []
@@ -90,56 +107,93 @@ async def _restarted_api_runs(tmp_path, monkeypatch, *, idempotent=True):
             headers = dict(_AUTH_HEADERS)
             if idempotent:
                 headers["Idempotency-Key"] = run_id
+            _write_phase(tmp_path, "admission_post_before", len(admitted))
             response = await client.post(
                 "/v1/runs",
                 json={"input": text, "session_id": "api-session"},
                 headers=headers,
             )
+            _write_phase(tmp_path, "admission_post_after", len(admitted))
             assert response.status == 202, await response.text()
             admitted.append(await response.json())
         assert admitted[0]["run_id"] != admitted[1]["run_id"]
         tasks = list(adapter._active_run_tasks.values())
         await asyncio.sleep(0)
 
+        _write_phase(tmp_path, "claim_before", 20)
         rows = list_session_admissions(db, session_id="api-session")
         head = claim_session_input(db, epoch=first.epoch, session_id="api-session")
+        _write_phase(tmp_path, "claim_after", 21)
         assert head["admission_id"] == rows[0]["admission_id"]
 
+        from gateway.session_authority import initialize_session_authority
+        _write_phase(tmp_path, "bootstrap_before", 30)
         restarted = await initialize_session_authority(
-            runner, profile_id="default", instance_id="api-owner-2"
+            runner, profile_id=first.profile_id, instance_id="api-owner-2"
         )
+        _write_phase(tmp_path, "bootstrap_after", 31)
+        bind_authority_runtime_custody(runner, restarted)
+        _write_phase(tmp_path, "custody_bind_after", 32)
+        # Model a new owner process for this single reserved profile: publish the new
+        # authority in a fresh registry before restoring the durable session.
+        from gateway.session_authorities import SessionAuthorities
+        registry = SessionAuthorities(db.db_path.parent)
+        registry.add(db.db_path.parent, restarted)
+        runner.session_authorities = registry
+        runner.session_authority = restarted
+        _write_phase(tmp_path, "restore_before", 33)
         restore_api_session(restarted, "api-session")
+        _write_phase(tmp_path, "restore_after", 34)
         rows = list_session_admissions(db, session_id="api-session")
         assert [row["status"] for row in rows] == ["unknown", "queued"]
+        _write_phase(tmp_path, "old_client_close_before", 35)
         await client.close()
+        _write_phase(tmp_path, "old_client_close_after", 36)
 
         # A process restart constructs a new API adapter.  Keeping the original
         # adapter here would preserve _run_owners and conceal the recovery gap.
         fresh = _adapter(runner, db)
+        runner._wire_adapter_handlers(fresh)
+        fresh._runtime_owned_scope = scope
         runner._adapter_for_source = lambda source: fresh
         client = _runs_client(fresh)
+        _write_phase(tmp_path, "fresh_client_start_before", 40)
         await client.start_server()
+        _write_phase(tmp_path, "fresh_client_start_after", 41)
+        _write_phase(tmp_path, "fixture_ready", 42)
         return client, (adapter, fresh), store, restarted, rows[0], rows[1], executed, tasks
     except Exception:
+        _write_phase(tmp_path, "fixture_exception", 90)
         await client.close()
         adapter._response_store.close()
         adapter._run_idempotency_store.close()
-        store.close_all_db_handles()
+        _write_phase(tmp_path, "scope_exit_before", 91)
+        await scope.__aexit__(None, None, None)
+        _write_phase(tmp_path, "scope_exit_after", 92)
         raise
 
 
 async def _close_fixture(client, adapters, store, tasks):
+    _write_adapter_phase(adapters, "cleanup_begin", 100)
     for task in tasks:
         task.cancel()
     for task in tasks:
         with suppress(asyncio.CancelledError):
             await task
+    _write_adapter_phase(adapters, "cleanup_client_before", 101)
     await client.close()
+    _write_adapter_phase(adapters, "cleanup_client_after", 102)
     for adapter in adapters:
         adapter._response_store.close()
         adapter._run_idempotency_store.close()
-    adapters[-1].gateway_runner.session_authority.db.close()
-    store.close_all_db_handles()
+    scope = getattr(adapters[0], "_runtime_owned_scope", None)
+    if scope is None:
+        adapters[-1].gateway_runner.session_authority.db.close()
+        store.close_all_db_handles()
+    else:
+        _write_adapter_phase(adapters, "cleanup_scope_before", 103)
+        await scope.__aexit__(None, None, None)
+        _write_adapter_phase(adapters, "cleanup_scope_after", 104)
 
 
 @pytest.mark.asyncio
@@ -150,6 +204,7 @@ async def test_http_resolve_unknown_releases_follower_once_without_replaying_hea
         await _restarted_api_runs(tmp_path, monkeypatch)
     )
     try:
+        _write_phase(tmp_path, "case_request_before", 110)
         body = {
             "admission_id": unknown["admission_id"],
             "execution_generation": unknown["generation"],
@@ -201,6 +256,7 @@ async def test_http_resolve_unknown_refuses_stale_or_foreign_admission(
         await _restarted_api_runs(tmp_path, monkeypatch)
     )
     try:
+        _write_phase(tmp_path, "case_request_before", 110)
         run_path = "/v1/runs/" + unknown["request_id"] + "/resolve-unknown"
         stop = await client.post(
             "/v1/runs/" + unknown["request_id"] + "/stop",
@@ -259,6 +315,7 @@ async def test_fresh_adapter_recovers_non_idempotent_owner_but_refuses_other_cre
         await _restarted_api_runs(tmp_path, monkeypatch, idempotent=False)
     )
     try:
+        _write_phase(tmp_path, "case_request_before", 110)
         path = "/v1/runs/" + unknown["request_id"] + "/resolve-unknown"
         body = {
             "admission_id": unknown["admission_id"],
@@ -290,6 +347,7 @@ async def test_http_poll_reports_unknown_head_as_non_terminal_until_resolved(
         await _restarted_api_runs(tmp_path, monkeypatch)
     )
     try:
+        _write_phase(tmp_path, "case_request_before", 110)
         path = "/v1/runs/" + unknown["request_id"]
         polled = await client.get(path, headers=_AUTH_HEADERS)
         assert polled.status == 200, await polled.text()

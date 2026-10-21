@@ -345,72 +345,16 @@ class GatewayTurnMixin(
             _classic_receipt = attach_classic_execution_receipt(
                 self, _classic_receipt_event, session_entry, agent_result,
             )
-            # A classic direct owner cannot terminalize at transcript persistence: the platform
-            # delivery ledger is completed by BasePlatformAdapter after this handler returns. Keep
-            # the immutable receipt private and reconcile it from the canonical ledger readback in
-            # the adapter's existing post-delivery callback. Managed I04 routes do not acquire a
-            # classic root and therefore do not register this callback.
+            # Preserve the public run_turn shaping/persistence and queued-response consumer while
+            # registering the direct classic receipt through Base's exact occurrence registry.
             _classic_authority = getattr(_classic_receipt_event, "_classic_custody_authority", None)
             _classic_adapter = self._delivery_adapter_for(source)
             _classic_text = response if isinstance(response, str) and response else None
-            if (
-                _classic_receipt is not None
-                and _classic_authority is not None
-                and _classic_text is not None
-                and _classic_adapter is not None
-                and hasattr(_classic_adapter, "register_post_delivery_callback")
-            ):
-                _classic_event = _classic_receipt_event
-                _classic_session_key = session_key
-                _classic_source = source
-
-                async def _finish_classic_after_delivery() -> None:
-                    try:
-                        from dataclasses import replace
-                        from gateway import delivery_ledger
-
-                        from gateway.session_classic_custody import classic_terminal_inbound_id
-                        _message_ref = classic_terminal_inbound_id(_classic_event)
-                        _delivery_proof = None
-                        if _message_ref:
-                            _obligation_id = delivery_ledger.compute_obligation_id(
-                                _classic_session_key, str(_message_ref), _classic_text,
-                            )
-                            with self._media_delivery_scope_for_source(_classic_source):
-                                _delivery_proof = await asyncio.to_thread(
-                                    delivery_ledger.read_obligation,
-                                    _obligation_id,
-                                    session_key=_classic_session_key,
-                                    platform=str(getattr(_classic_source.platform, "value", _classic_source.platform)),
-                                    chat_id=_classic_source.chat_id,
-                                    thread_id=getattr(_classic_source, "thread_id", None),
-                                    content=_classic_text,
-                                    adapter_profile=getattr(_classic_adapter, "_owner_profile", None),
-                                    expected_state="delivered",
-                                )
-                        if _delivery_proof is None:
-                            _classic_authority._classic_finish(
-                                _classic_event, success=False, reason="delivery_proof_missing",
-                            )
-                            return
-                        _classic_authority._classic_finish(
-                            _classic_event,
-                            success=True,
-                            receipt=replace(_classic_receipt, delivery_proof=_delivery_proof),
-                        )
-                    except Exception:
-                        logger.debug("Classic post-delivery custody reconciliation failed", exc_info=True)
-                        with suppress(Exception):
-                            _classic_authority._classic_finish(
-                                _classic_event, success=False, reason="delivery_proof_readback_failed",
-                            )
-
-                try:
-                    _classic_adapter.register_post_delivery_callback(
-                        session_key, _finish_classic_after_delivery, generation=run_generation,
-                    )
-                except Exception:
-                    logger.debug("Classic post-delivery callback registration failed", exc_info=True)
+            from gateway.session_classic_delivery import register_classic_post_delivery_callback
+            register_classic_post_delivery_callback(
+                self, _classic_authority, _classic_adapter, _classic_receipt_event,
+                source, session_key, _classic_text, _classic_receipt, run_generation,
+            )
             return await self._hmwa_deliver_turn_response(
                 event, source, session_entry, session_key, run_generation,
                 agent_result, agent_messages, response, _footer_line, _intentional_silence,

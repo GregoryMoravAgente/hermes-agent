@@ -20,6 +20,12 @@ import weakref
 from abc import ABC, abstractmethod
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import safe_url_for_log
+from gateway.platforms.base_source_close import PreservationSourceAdapterMixin, preservation_source_entry
+from gateway.platforms.base_delivery_callbacks import (
+    PostDeliveryCallbackHandle, PostDeliveryCallbackMixin,
+    callback_context_for, ensure_occurrence_registry,
+    finish_post_delivery_callback,
+)
 
 from utils import normalize_proxy_url
 from agent.i18n import t
@@ -1853,7 +1859,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(PostDeliveryCallbackMixin, PreservationSourceAdapterMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -1946,9 +1952,16 @@ class BasePlatformAdapter(ABC):
         self._text_debounce: dict[str, TextDebounceState] = {}
         # handle_message() tasks; shutdown cancels them so a replaced gateway stops working.
         self._background_tasks: set[asyncio.Task] = set()
-        # Post-delivery one-shots per session_key: bare callback (legacy) or ``(generation,
-        # callback)`` so a stale run can't clear a fresher run's callback.
+        # Source-close custody is per adapter instance.  Every producer that can acknowledge or
+        # queue inbound work binds one opaque token before doing so; the source-close registry
+        # owns the token lifecycle and this set is the adapter's exact pending view.
+        self._preservation_source_close_generation: Optional[int] = None
+        self._preservation_source_pending_tokens: set = set()
+        # Generic post-delivery one-shots retain the legacy mapping for compatibility.  Classic
+        # delivery occurrences use the Base-owned opaque registry below, so same-key recursive
+        # turns cannot overwrite one another or depend on a mutable dispatch owner.
         self._post_delivery_callbacks: dict[str, Any] = {}
+        self._post_delivery_callback_registry = ensure_occurrence_registry(self)
         self._expected_cancelled_tasks: set[asyncio.Task] = set()
         self._busy_session_handler: Optional[Callable[[MessageEvent, str], Awaitable[bool]]] = None
         # Owning multiplex profile (None on primary); see _session_key_profile.
@@ -2520,28 +2533,6 @@ class BasePlatformAdapter(ABC):
         """Session-scoped key for text batching (subclasses may override)."""
         return self._event_session_key(event)
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
-        """Buffer a text event (merging into a pending one) and restart the flush timer."""
-        if self._drop_unresolved(event):
-            self._preservation_mark_unknown(event, "no_consumer")
-            return
-        key = self._text_batch_key(event)
-        existing = self._pending_text_batches.get(key)
-        if existing is None:
-            existing = self._pending_text_batches[key] = event
-        else:
-            if event.text:
-                existing.text = _append_text(existing.text, event.text)
-            if event.media_urls:
-                existing.media_urls.extend(event.media_urls)
-                existing.media_types.extend(event.media_types)
-            existing.absorb_reply_expected(event)
-        existing._last_chunk_len = len(event.text or "")  # type: ignore[attr-defined]
-        prior_task = self._pending_text_batch_tasks.get(key)
-        if prior_task and not prior_task.done():
-            prior_task.cancel()
-        self._pending_text_batch_tasks[key] = asyncio.create_task(self._flush_text_batch(key))
-
     def _text_batch_delay_for(self, pending: Optional[MessageEvent]) -> float:
         """Quiet period before ``pending`` is dispatched; near-split chunks wait longer."""
         last_len = getattr(pending, "_last_chunk_len", 0) if pending is not None else 0
@@ -2550,10 +2541,6 @@ class BasePlatformAdapter(ABC):
     def _pop_text_batch(self, key: str) -> Optional[MessageEvent]:
         """Remove and return the pending batch for ``key`` (adapters with side tables override)."""
         return self._pending_text_batches.pop(key, None)
-
-    async def _dispatch_text_batch(self, event: MessageEvent) -> None:
-        """Hand a flushed batch to the pipeline (adapters with per-chat guards override)."""
-        await self.handle_message(event)
 
     async def _flush_text_batch_now(self, key: str) -> None:
         """Dispatch the pending batch for ``key`` immediately (no quiet period)."""
@@ -3425,52 +3412,6 @@ class BasePlatformAdapter(ABC):
             self._active_sessions[session_key].set()
         await self._stop_typing_quietly(chat_id, metadata)
 
-    def register_post_delivery_callback(
-        self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
-        """Register a deferred callback to fire after the main response. Same-key registrations are
-        chained (both fire in order, per-callback exception isolation) so independent features
-        coexist; ``generation`` ties it to a gateway run — stale generations never overwrite a
-        fresher slot."""
-        if not session_key or not callable(callback):
-            return
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            existing_gen, existing_cb = _split_post_delivery_entry(existing)
-            if existing_gen is not None and generation is not None and int(generation) < int(existing_gen):
-                return
-            # Same-or-newer generation: chain so both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None or generation is None or int(existing_gen) == int(generation)):
-                callback = self._chain_callbacks(existing_cb, callback)
-        self._post_delivery_callbacks[session_key] = (
-            callback if generation is None else (int(generation), callback))
-
-    @staticmethod
-    def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
-        """Async wrapper running ``callbacks`` in order with per-callback exception isolation;
-        async so coroutines returned by async hooks are awaited, not dropped."""
-        async def _chained() -> None:
-            for _cb in callbacks:
-                try:
-                    _result = _cb()
-                    if inspect.isawaitable(_result):
-                        await _result
-                except Exception:
-                    logger.debug("Post-delivery callback failed", exc_info=True)
-        return _chained
-
-    def pop_post_delivery_callback(
-        self, session_key: str, *, generation: int | None = None) -> Callable | None:
-        """Pop a deferred callback, optionally requiring generation ownership."""
-        entry = self._post_delivery_callbacks.get(session_key) if session_key else None
-        if entry is None:
-            return None
-        entry_generation, callback = _split_post_delivery_entry(entry)
-        if generation is not None and (entry_generation is None or int(entry_generation) != int(generation)):
-            return None
-        self._post_delivery_callbacks.pop(session_key, None)
-        return callback if callable(callback) else None
-
     # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
     # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
     # can just set the emoji attributes; left ``None`` the hook is a no-op.
@@ -3916,8 +3857,10 @@ class BasePlatformAdapter(ABC):
         self._discard_text_debounce(session_key)
         return True
 
-    def _start_session_processing(self, event: MessageEvent, session_key: str, *,
-                                  interrupt_event: Optional[asyncio.Event] = None) -> bool:
+    def _start_session_processing(
+        self, event: MessageEvent, session_key: str, *,
+        interrupt_event: Optional[asyncio.Event] = None, source_tokens=(),
+    ) -> bool:
         """Spawn a background processing task under the session guard; True on success. If
         ``create_task`` is stubbed with a non-Task sentinel (tests), the guard is rolled back
         (False)."""
@@ -3928,7 +3871,9 @@ class BasePlatformAdapter(ABC):
             return False
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        tokens = tuple(source_tokens or self._preservation_source_tokens(event))
+        with self._preservation_source_context(tokens):
+            task = asyncio.create_task(self._process_message_background(event, session_key))
         if not self._track_session_task(session_key, task):
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
@@ -4014,13 +3959,13 @@ class BasePlatformAdapter(ABC):
             raise
         await self._drain_pending_after_session_command(session_key, command_guard)
 
-    def _preservation_mark_unknown(self, event: MessageEvent, reason: str) -> None:
-        handoff = getattr(event, "_preservation_handoff", None)
-        if handoff is not None:
-            handoff.mark_unknown(reason)
-    async def handle_message(self, event: MessageEvent) -> None:
+    @preservation_source_entry
+    async def handle_message(
+        self, event: MessageEvent, *, _source_handoff=(), source_token=None, source_tokens=None,
+    ) -> None:
         """Process an incoming message; returns quickly by spawning a background
         task so new messages (and interrupts) can arrive while an agent runs."""
+        source_handoff = _source_handoff
         event._gateway_accepted = False
         if not self._message_handler:
             # No handler = every inbound silently discarded on an adapter that still polls and sends;
@@ -4033,14 +3978,14 @@ class BasePlatformAdapter(ABC):
                     "can send, but every inbound message is discarded.",
                     self.name,
                 )
-            self._preservation_mark_unknown(event, "no_consumer")
+            self._preservation_source_unknown(source_handoff or event, "no_consumer")
             return
 
         if event.allow_gateway_control:
             coerce_plaintext_gateway_command(event)
         # Identity FIRST: every key below (routing check, guard lookup, batch lane) derives from it.
         if self._drop_unresolved(event):
-            self._preservation_mark_unknown(event, "preservation_owner_mismatch")
+            self._preservation_source_unknown(source_handoff or event, "preservation_owner_mismatch")
             return
         expected_session_key = str((event.metadata or {}).get("gateway_session_key") or "").strip()
         # Explicitly routed events already name their destination; recovering a
@@ -4052,19 +3997,35 @@ class BasePlatformAdapter(ABC):
         if expected_session_key and session_key != expected_session_key:
             logger.warning("Dropping internally routed event: expected session=%s derived=%s",
                            expected_session_key, session_key)
+            self._preservation_source_producer_done(source_handoff or event)
             return
         # On-entry self-heal: clear a guard whose owner task already exited.
         if session_key in self._active_sessions:
             self._heal_stale_session_lock(session_key)
         if session_key in self._active_sessions or self._shared_burst_pending(event, session_key):
             try:
-                await self._handle_message_while_active(event, session_key)
+                with self._preservation_source_context(source_handoff):
+                    await self._handle_message_while_active(event, session_key)
             except BaseException:
-                self._preservation_mark_unknown(event, "join_failed")
+                self._preservation_source_unknown(source_handoff or event, "join_failed")
                 raise
+            if event._gateway_accepted is True:
+                self._preservation_source_producer_done(source_handoff or event)
+            else:
+                # Pre-admission refusal remains unknown until a real FIFO handoff is acknowledged.
+                self._preservation_source_unknown(
+                    source_handoff or event, "busy_dispatch_not_accepted",
+                )
             return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
-        event._gateway_accepted = self._start_session_processing(event, session_key)
+        with self._preservation_source_context(source_handoff):
+            event._gateway_accepted = self._start_session_processing(
+                event, session_key, source_tokens=source_handoff,
+            )
+        if event._gateway_accepted:
+            self._preservation_source_producer_done(source_handoff or event)
+        else:
+            self._preservation_source_unknown(source_handoff or event, "session_start_refused")
 
     def _shared_runtime_owns_input(self, event: MessageEvent) -> bool:
         """True when a non-command input belongs to the shared runtime's session authority."""
@@ -4463,16 +4424,21 @@ class BasePlatformAdapter(ABC):
             local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
 
     async def _fire_post_delivery_callback(self, session_key: str, interrupt_event: asyncio.Event) -> None:
-        """Run the one-shot post-delivery callback (bounded, errors swallowed). The generation is
-        read HERE — stamped on the interrupt event DURING the handler await; an earlier snapshot
-        would let stale runs fire a fresher run's callbacks."""
-        _post_cb = self.pop_post_delivery_callback(
-            session_key, generation=getattr(interrupt_event, "_hermes_run_generation", None))
-        if callable(_post_cb):
-            with contextlib.suppress(asyncio.TimeoutError, Exception):
-                _post_result = _post_cb()
-                if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+        """Run callbacks through the existing observable Base delivery boundary."""
+        await self._consume_post_delivery_callbacks(
+            session_key, interrupt_event, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+        )
+
+    async def _fire_post_delivery_callback_occurrence(
+        self, session_key: str, interrupt_event: asyncio.Event, handle: PostDeliveryCallbackHandle,
+        *, consume_generic: bool = False,
+    ) -> None:
+        """Consume one exact occurrence through the existing Base callback consumer seam."""
+        await self._fire_post_delivery_callback(
+            session_key, callback_context_for(
+                interrupt_event, handle, consume_generic=consume_generic,
+            ),
+        )
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not
@@ -4619,14 +4585,9 @@ class BasePlatformAdapter(ABC):
         finally:
             await self._release_turn_marker(event)
             event._turn_marker_handoff = False  # a later run of this object clears its own marker
-            # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
-            # alive.
+            # Stop typing BEFORE source finalization and the post-delivery callback: a stuck
+            # callback must not keep it alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_thread_metadata)
-            await self._fire_post_delivery_callback(session_key, interrupt_event)
-            # Callback work or a late refresh may have recreated typing — one final bounded stop.
-            await self._stop_typing_refresh(
-                event.source.chat_id, None, metadata=_thread_metadata, stop_attempts=1)
-            # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             handoff = getattr(event, "_preservation_handoff", None)
             if handoff is not None and getattr(handoff, "state", None) == "prepared":
@@ -4634,20 +4595,31 @@ class BasePlatformAdapter(ABC):
             # Rebuild only from exact producer-owned row/delivery witnesses.  A response string,
             # delivery-attempt flag, or legacy stream attribute is not a custody proof.
             classic_receipt = None
-            with contextlib.suppress(Exception):
-                from gateway.session_classic_custody import build_classic_execution_receipt
-                _store = getattr(getattr(self, "gateway_runner", None), "session_store", None)
-                _entry = _store.lookup_by_session_key(session_key) if _store is not None else None
-                if _entry is not None:
-                    classic_receipt = build_classic_execution_receipt(
-                        self.gateway_runner, event, _entry, {},
-                    )
-            finish_adapter_event(
-                self, event, success=processing_ok,
-                reason="join_failed" if not processing_ok else "",
-                receipt=classic_receipt,
+            if processing_ok:
+                with contextlib.suppress(Exception):
+                    from gateway.session_classic_custody import build_classic_execution_receipt
+                    _store = getattr(getattr(self, "gateway_runner", None), "session_store", None)
+                    _entry = _store.lookup_by_session_key(session_key) if _store is not None else None
+                    if _entry is not None:
+                        classic_receipt = build_classic_execution_receipt(
+                            self.gateway_runner, event, _entry, {},
+                        )
+            # Source-close finalization must become visible before an occurrence callback can
+            # consume its exact release.  Missing receipts remain UNKNOWN and are never released.
+            source_tokens = tuple(token for token in self._preservation_source_tokens(event)
+                                  if getattr(token, "transport_receipt", None) is not None)
+            for source_token in source_tokens:
+                source_token.record_finalizer_or_unknown(
+                    status="success" if processing_ok else "failed",
+                    reason="" if processing_ok else "join_failed",
+                    unknown_reason="source_finalizer_receipt_missing",
+                )
+            await finish_post_delivery_callback(
+                self, event, session_key, interrupt_event,
+                processing_ok=processing_ok,
+                classic_receipt=classic_receipt,
+                thread_metadata=_thread_metadata,
             )
-            self._finish_session_task(session_key, interrupt_event)
 
     _REQUEUE_BACKOFF_INITIAL_SECONDS = 0.25
     # Kept at 1s: nothing wakes the back-off sleep, so a genuine message merged into the slot
@@ -4709,7 +4681,9 @@ class BasePlatformAdapter(ABC):
             if pending_event is None:  # consumed elsewhere during the back-off
                 self._cleanup_finished_session_task(session_key, guard)
                 return
-        await self._process_message_background(pending_event, session_key)
+        tokens = self._preservation_source_tokens(pending_event)
+        with self._preservation_source_context(tokens):
+            await self._process_message_background(pending_event, session_key)
 
     def _clear_session_guard(self, session_key: str) -> None:
         """Clear (not delete) the session's interrupt Event so the guard stays live for inbound."""

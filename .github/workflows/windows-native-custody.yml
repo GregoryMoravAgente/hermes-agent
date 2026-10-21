@@ -1,15 +1,17 @@
 name: Windows Native Custody
 
-# Public PR-head producer. The product test bank remains the canonical
-# scripts/run_tests.sh path; this workflow adds the existing owned-Job receipt.
+# Exact-head native producer. The owned diagnostic branch can run without waiting
+# for the emulated local Server VM; it never publishes or installs a product.
 on:
   pull_request:
+  push:
+    branches: [codex/AGC-1722/windows-close-worker-root-20261021-01a120af]
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-native-custody-${{ github.event.pull_request.number }}
+  group: windows-native-custody-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -37,6 +39,11 @@ env:
     tests/tools/test_process_registry_windows_background_custody.py
     tests/gateway/test_preservation_admission_consumers.py
     tests/tools/test_process_registry_background_failure_retention.py
+    tests/gateway/test_runtime_custody_profile_epochs.py
+    tests/gateway/test_runtime_custody_bootstrap_contract.py
+    tests/gateway/test_runtime_service_parent_edges.py
+    tests/gateway/test_session_authorities_multiplex.py
+    tests/gateway/test_codex_service_custody.py
 
 jobs:
   native-custody:
@@ -51,11 +58,11 @@ jobs:
           git config --global core.autocrlf false
           test "$(git config --global --get core.autocrlf)" = false
 
-      - name: Check out the exact PR head
+      - name: Check out the exact candidate head
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
         with:
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-          ref: ${{ github.event.pull_request.head.sha }}
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 0
           persist-credentials: false
           submodules: false
@@ -93,6 +100,7 @@ jobs:
         id: pm
         uses: ./.github/actions/setup-pm
         with:
+          toolchain: all
           packages: git,ripgrep
           extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
           test-environment: 'true'
@@ -107,11 +115,44 @@ jobs:
           "$HERMES_PYTHON" - "$REPO_NATIVE" "$PROOF_NATIVE" <<'PY'
           import hashlib
           import json
+          import os
           from pathlib import Path
+          import subprocess
           import sys
 
           repo = Path(sys.argv[1])
           proof = Path(sys.argv[2])
+          def runtime_map(root):
+              result = {}
+              for directory, dirs, names in os.walk(root):
+                  dirs[:] = [name for name in dirs if name not in {".git", "__pycache__", ".pytest_cache"}]
+                  for name in names:
+                      if not name.endswith(".pyc"):
+                          path = Path(directory) / name
+                          result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return result
+
+          def source_map():
+              names = subprocess.check_output(
+                  ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repo,
+              ).split(b"\0")
+              return {
+                  name.decode(): hashlib.sha256((repo / name.decode()).read_bytes()).hexdigest()
+                  for name in names if name and (repo / name.decode()).is_file()
+              }
+
+          def environment_map():
+              tools_root = os.environ["HERMES_RUNTIME_DIR"]
+              return {
+                  "source": source_map(),
+                  "pm_root": sys.prefix,
+                  "pm": runtime_map(Path(sys.prefix)),
+                  "base_root": sys.base_prefix,
+                  "base": runtime_map(Path(sys.base_prefix)),
+                  "tools_root": tools_root,
+                  "tools": runtime_map(Path(tools_root)),
+              }
+
           files = [
               line.strip()
               for line in (proof / "expected-files.txt").read_text(encoding="utf-8").splitlines()
@@ -123,6 +164,10 @@ jobs:
               "hermes_cli/local_runtime/processes.py",
               "tests/hermes_cli/test_local_runtime_processes.py",
           ]
+          assert sys.prefix != sys.base_prefix, "PM test environment is required"
+          (proof / "whole-environment-before.json").write_text(
+              json.dumps(environment_map(), sort_keys=True) + "\n", encoding="utf-8",
+          )
           hashes = {}
           for relative in files:
               path = repo / relative
@@ -136,6 +181,12 @@ jobs:
               encoding="utf-8",
           )
           PY
+
+      - name: Run configured static checks before native consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$HERMES_PYTHON" scripts/check --base edbbaa0509e9def84cdfeddc38114027f2e09565
 
       - name: Run the complete native file bank under the owned Windows Job
         id: native-bank
@@ -201,7 +252,7 @@ jobs:
         if: ${{ always() }}
         shell: bash
         env:
-          EXPECTED_PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          EXPECTED_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
           test -n "${HERMES_PYTHON:-}"
@@ -212,13 +263,52 @@ jobs:
           "$HERMES_PYTHON" - "$REPO_NATIVE" "$PROOF_NATIVE" "$EXPECTED_PR_HEAD" <<'PY'
           import hashlib
           import json
+          import os
           from pathlib import Path
+          import subprocess
           import sys
           import xml.etree.ElementTree as ET
 
           repo = Path(sys.argv[1])
           proof = Path(sys.argv[2])
+          def runtime_map(root):
+              result = {}
+              for directory, dirs, names in os.walk(root):
+                  dirs[:] = [name for name in dirs if name not in {".git", "__pycache__", ".pytest_cache"}]
+                  for name in names:
+                      if not name.endswith(".pyc"):
+                          path = Path(directory) / name
+                          result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return result
+
+          def source_map():
+              names = subprocess.check_output(
+                  ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repo,
+              ).split(b"\0")
+              return {
+                  name.decode(): hashlib.sha256((repo / name.decode()).read_bytes()).hexdigest()
+                  for name in names if name and (repo / name.decode()).is_file()
+              }
+
+          def environment_map():
+              tools_root = os.environ["HERMES_RUNTIME_DIR"]
+              return {
+                  "source": source_map(),
+                  "pm_root": sys.prefix,
+                  "pm": runtime_map(Path(sys.prefix)),
+                  "base_root": sys.base_prefix,
+                  "base": runtime_map(Path(sys.base_prefix)),
+                  "tools_root": tools_root,
+                  "tools": runtime_map(Path(tools_root)),
+              }
+
           expected_head = sys.argv[3]
+          environment_before = json.loads((proof / "whole-environment-before.json").read_text(encoding="utf-8"))
+          environment_after = environment_map()
+          (proof / "whole-environment-after.json").write_text(
+              json.dumps(environment_after, sort_keys=True) + "\n", encoding="utf-8",
+          )
+          whole_environment_equal = environment_before == environment_after
           expected_files = [
               line.strip()
               for line in (proof / "expected-files.txt").read_text(encoding="utf-8").splitlines()
@@ -317,6 +407,11 @@ jobs:
           autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
           receipt = {
               "schema": "windows-native-custody-pr-v2",
+              "whole_source_pm_base_tools_unchanged": whole_environment_equal,
+              "whole_source_file_count": len(environment_before["source"]),
+              "pm_file_count": len(environment_before["pm"]),
+              "base_file_count": len(environment_before["base"]),
+              "tool_file_count": len(environment_before["tools"]),
               "source": {
                   "expected_pr_head_sha": expected_head,
                   "head_before": head_before,
@@ -363,6 +458,7 @@ jobs:
               json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           valid = all((
+              whole_environment_equal,
               receipt["source"]["head_matches"],
               receipt["source"]["status_clean_before"],
               receipt["source"]["status_clean_after"],
@@ -380,7 +476,7 @@ jobs:
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-native-custody-${{ github.event.pull_request.head.sha }}-${{ github.run_attempt }}
+          name: windows-native-custody-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/windows-native-custody
           include-hidden-files: true
           if-no-files-found: error

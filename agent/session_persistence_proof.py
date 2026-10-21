@@ -46,6 +46,7 @@ class GatewayWriterProofHandoff:
     writer_proof: SessionDBWriteProof
     binding: Any
     turn_id: str
+    physical_tip_witness: Any = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,91 @@ _GATEWAY_WRITER_INTERMEDIATE_SEAL = "_classic_writer_intermediate_fence_seal"
 _GATEWAY_WRITER_INTERMEDIATE_PREFIX_HANDOFF = "_classic_writer_intermediate_prefix_handoff"
 _GATEWAY_WRITER_UNKNOWN = object()
 _UNSET = object()
+
+
+def _physical_tip_value(value: Any) -> Any:
+    """Extract only the canonical immutable physical-tip witness from a retained value."""
+    if value is None:
+        return None
+    try:
+        from gateway.session_turn_physical_tip import PhysicalTipWitness
+    except (AttributeError, ImportError):
+        return None
+    if type(value) is PhysicalTipWitness:
+        return value
+    nested = getattr(value, "physical_tip_witness", _UNSET)
+    return nested if type(nested) is PhysicalTipWitness else None
+
+
+def _is_direct_physical_tip_witness(value: Any) -> bool:
+    """Recognize the exact raw tip witness used by direct OpenAI/classic turns."""
+    if value is None:
+        return False
+    try:
+        from gateway.session_turn_physical_tip import PhysicalTipWitness
+    except (AttributeError, ImportError):
+        return False
+    return type(value) is PhysicalTipWitness
+
+
+def _is_managed_receipt_witness(value: Any) -> bool:
+    """Recognize the existing ACP receipt witness without accepting lookalike values."""
+    if value is None:
+        return False
+    try:
+        from agent.copilot_acp_durable_receipt import _ManagedDurableReceiptWitness
+    except (AttributeError, ImportError):
+        return False
+    return type(value) is _ManagedDurableReceiptWitness
+
+
+def _managed_physical_tip_valid(agent: Any, binding: Any, expected: Any = None) -> bool:
+    physical = getattr(agent, "session_id", None)
+    root = getattr(binding, "session_id", None)
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+        from gateway.session_classic_custody import ClassicWriterBinding
+        from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+    except (AttributeError, ImportError):
+        return False
+    if isinstance(binding, ClassicWriterBinding):
+        return physical == root and expected is None
+    if not isinstance(binding, TurnCustodyBinding):
+        return False
+    try:
+        # Turn custody always resolves the current source-owned tip, including an
+        # uncompressed root.  The root shortcut is reserved for Classic's legacy carrier.
+        witness = resolve_physical_tip_witness(binding, physical, _store_path(agent))
+        expected_tip = _physical_tip_value(expected) if expected is not None else None
+        return witness is not None and (expected is None or witness == expected_tip)
+    except (
+        AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        sqlite3.Error,
+    ):
+        return False
+
+
+def _gateway_writer_physical_witness_valid(
+    agent: Any, binding: Any, proof: Any, physical_witness: Any,
+) -> bool:
+    """Revalidate the immutable tip for every path, then apply the typed ACP guard only to ACP receipts.
+
+    Direct OpenAI turns retain a raw ``PhysicalTipWitness``.  They have no managed ACP receipt
+    validator, so routing that value through ``validate_managed_durable_receipt_witness`` would
+    reject an otherwise authenticated direct retry.  A managed ACP receipt still must pass its
+    existing provider/receipt validator after the same current physical-tip check.
+    """
+    if physical_witness is None or not _managed_physical_tip_valid(
+        agent, binding, _physical_tip_value(physical_witness),
+    ):
+        return False
+    if _is_direct_physical_tip_witness(physical_witness):
+        return True
+    if not _is_managed_receipt_witness(physical_witness):
+        return False
+    acp = getattr(agent, "_managed_acp_client", None)
+    validator = getattr(acp, "validate_managed_durable_receipt_witness", None)
+    return callable(validator) and validator(agent, proof, physical_witness) is True
 
 
 def _set_managed_intermediate_fence_aliases(
@@ -176,12 +262,13 @@ def _managed_intermediate_context(agent: Any, client: Any):
         or getattr(receipt, "state", None) in {"unknown", "closed", "released"}
         or request is None
         or getattr(receipt, "ephemeral_process", False) is not True
-        or getattr(agent, "session_id", None) != getattr(binding, "session_id", None)
     ):
         return None
     try:
         validate_turn_binding(binding)
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _managed_physical_tip_valid(agent, binding):
         return None
     lease_id = getattr(getattr(request, "lease", None), "lease_id", None)
     if type(lease_id) is not str or not lease_id:
@@ -247,6 +334,10 @@ def _managed_intermediate_recovery_context(
         _require_authoritative_row(binding, row, status="started")
         _require_live_execution(binding)
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not _managed_physical_tip_valid(
+        agent, binding, _physical_tip_value(fence.physical_witness),
+    ):
         return None
     return parent, service, request, receipt, binding
 
@@ -471,6 +562,9 @@ def managed_intermediate_writer_fence(agent: Any, client: Any):
         or fence.writer_proof.session_id != getattr(agent, "session_id", None)
         or fence.writer_proof.store_path != _store_path(agent)
         or not _managed_intermediate_fence_aliases_match(agent, parent, receipt, fence)
+        or not _managed_physical_tip_valid(
+            agent, binding, _physical_tip_value(fence.physical_witness),
+        )
         or not _managed_intermediate_prefix_identity_matches(agent, client, fence)
         or not _managed_intermediate_witness_shape(fence)
         or not _managed_writer_proof_readback(agent, fence.writer_proof)
@@ -900,6 +994,12 @@ def prepare_gateway_writer_proof_recovery(
         or getattr(receipt, "external_publication_proof", None) is not None
     ):
         return False
+    if not _managed_physical_tip_valid(
+        agent, binding, _physical_tip_value(
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        ),
+    ):
+        return False
     expected = tuple(zip(proof.row_ids, proof.row_roles, proof.row_snapshots))
     if (
         not expected
@@ -1019,15 +1119,28 @@ def prepare_gateway_writer_postcommit_recovery(
     if not _gateway_proof_rows_match(agent, messages, proof, proof.session_id):
         return None
     capture = getattr(client, "capture_managed_durable_receipt_witness", None)
-    validate = getattr(client, "validate_managed_durable_receipt_witness", None)
-    if not callable(capture) or not callable(validate):
-        return None
+    if _is_direct_physical_tip_witness(retained_witness):
+        if not _gateway_writer_physical_witness_valid(
+            agent, binding, proof, retained_witness,
+        ):
+            return None
+        physical_witness = retained_witness
+    else:
+        if not callable(capture):
+            return None
+        try:
+            physical_witness = capture(agent, proof)
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if (
+            not _is_managed_receipt_witness(physical_witness)
+            or getattr(physical_witness, "writer_proof", None) is not proof
+            or not _gateway_writer_physical_witness_valid(
+                agent, binding, proof, physical_witness,
+            )
+        ):
+            return None
     try:
-        physical_witness = capture(agent, proof)
-        if physical_witness is None or physical_witness.writer_proof is not proof:
-            return None
-        if validate(agent, proof, physical_witness) is not True:
-            return None
         if any(
             getattr(physical_witness, field, None) is not getattr(retained_witness, field, None)
             for field in (
@@ -1040,6 +1153,7 @@ def prepare_gateway_writer_postcommit_recovery(
             getattr(physical_witness, field, None) != getattr(retained_witness, field, None)
             for field in (
                 "provider_identity", "binding_snapshot_identity", "durable_identity", "binding_identity",
+                "physical_tip_witness",
             )
         ):
             return None
@@ -1117,13 +1231,44 @@ def remember_gateway_writer_proof(
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
         return False
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+    except (AttributeError, ImportError):
+        TurnCustodyBinding = None
+    if TurnCustodyBinding is not None and isinstance(binding, TurnCustodyBinding):
+        try:
+            from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+            current_witness = resolve_physical_tip_witness(binding, session_id, _store_path(agent))
+        except (
+            AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error,
+        ):
+            current_witness = None
+        supplied_witness = _physical_tip_value(physical_witness)
+        if current_witness is None or (
+            physical_witness is not None and supplied_witness != current_witness
+        ):
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_TURN_ID, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_BOUND_BINDING, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
+            agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
+            return False
     setattr(agent, _GATEWAY_WRITER_PROOF_TURN_ID, turn_id)
     setattr(agent, _GATEWAY_WRITER_PROOF_BOUND_BINDING, binding)
     if explicit:
         # Preserve the exact binding for the later Gateway handoff even when the
         # finalizer runs outside the original ContextVar scope.
         setattr(agent, _GATEWAY_WRITER_PROOF_BINDING, binding)
-    if physical_witness is None:
+    if TurnCustodyBinding is not None and isinstance(binding, TurnCustodyBinding):
+        # Direct writers have no ACP receipt wrapper, so retain the raw canonical witness.
+        # Managed ACP writers retain their receipt witness, whose physical-tip member was
+        # checked against this same immutable value above.
+        setattr(
+            agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS,
+            physical_witness if physical_witness is not None else current_witness,
+        )
+        setattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, True)
+    elif physical_witness is None:
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
         agent.__dict__.pop(_GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, None)
     else:
@@ -1170,6 +1315,10 @@ def _gateway_proof_reuse_context(
         or proof.session_id != session_id
         or proof.store_path != _store_path(agent)
         or not _classic_binding_is_current(binding, session_id)
+        or not _managed_physical_tip_valid(
+            agent, binding,
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        )
     ):
         return None
     return turn_id, binding, session_id
@@ -1219,12 +1368,10 @@ def reuse_gateway_writer_proof(
         return _GATEWAY_WRITER_UNKNOWN if managed_witness_required else None
     turn_id, _binding, session_id = context
     if managed_witness_required:
-        acp = getattr(agent, "_managed_acp_client", None)
-        validator = getattr(acp, "validate_managed_durable_receipt_witness", None)
         physical_witness = getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None)
-        if not callable(validator) or physical_witness is None or validator(
-            agent, proof, physical_witness,
-        ) is not True:
+        if not _gateway_writer_physical_witness_valid(
+            agent, _binding, proof, physical_witness,
+        ):
             return _GATEWAY_WRITER_UNKNOWN
     # Reuse the existing handoff validator for current-turn row identity, exact binding type, and
     # active I04 validation.  Its result is intentionally discarded: publication must still add
@@ -1318,17 +1465,35 @@ def _gateway_writer_handoff(
             # Validate the real I04 parent, authoritative admission row, and live execution before
             # the writer proof can be published. Scalar fields are never an ownership proof.
             validate_turn_binding(binding)
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
             return None
     elif not isinstance(binding, ClassicWriterBinding):
         return None
-    if getattr(binding, "session_id", None) != session_id:
+    physical_tip_witness = None
+    if isinstance(binding, TurnCustodyBinding):
+        try:
+            from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+            physical_tip_witness = resolve_physical_tip_witness(
+                binding, session_id, _store_path(agent),
+            )
+        except (
+            AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error,
+        ):
+            return None
+        retained_tip = _physical_tip_value(
+            getattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_WITNESS, None),
+        )
+        if physical_tip_witness is None or retained_tip is None or retained_tip != physical_tip_witness:
+            return None
+    if (getattr(binding, "session_id", None) != session_id
+            and not isinstance(binding, TurnCustodyBinding)):
         return None
     result_row_ids = row_ids[1:]
     if not result_row_ids:
         return None
     bound_proof = replace(proof, result_row_ids=result_row_ids)
-    return GatewayWriterProofHandoff(bound_proof, binding, turn_id)
+    return GatewayWriterProofHandoff(bound_proof, binding, turn_id, physical_tip_witness)
 
 
 def publish_gateway_writer_proof(

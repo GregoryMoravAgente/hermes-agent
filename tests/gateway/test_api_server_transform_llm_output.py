@@ -14,8 +14,6 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from agent.turn_finalizer import apply_llm_output_transform
-from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
 
 RAW = "Original model reply."
 TRANSFORMS = {
@@ -60,8 +58,8 @@ def _sse_payloads(body):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", sorted(TRANSFORMS))
-async def test_streaming_routes_deliver_transformed_final(kind):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={}))
+async def test_streaming_routes_deliver_transformed_final(kind, runtime_owned_legacy_api_adapter):
+    adapter = runtime_owned_legacy_api_adapter
     expected = TRANSFORMS[kind](RAW)
     with ExitStack() as stack:
         app = _app_with_fake_turn(adapter, TRANSFORMS[kind], stack)

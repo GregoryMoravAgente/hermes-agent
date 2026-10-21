@@ -39,21 +39,30 @@ class Adapter(BasePlatformAdapter):
 
 
 async def _busy_owner(monkeypatch, turns):
-    """Real runner + authority over SQLite; turn production is a gated stand-in (no model)."""
-    import gateway.session_finite as finite
+    """Real runner + authority over SQLite; only the model result is a gated stand-in."""
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
 
-    async def produce(authority, ref, row):
-        return await turns[row['payload']['text']]()
-    monkeypatch.setattr(finite, 'execute_finite_admission', produce)
     runner = GatewayRunner(GatewayConfig())
     adapter = Adapter()
     runner.adapters = {Platform.TELEGRAM: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='busy-owner')
     runner._wire_adapter_handlers(adapter)
+    async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
+        response = await turns[message]()
+        return {
+            'final_response': response,
+            'messages': [*history, {'role': 'user', 'content': message},
+                         {'role': 'assistant', 'content': response}],
+            'agent_persisted': False,
+            'api_calls': 1,
+            'tools': [],
+            'history_offset': len(history),
+            'session_id': session_id,
+        }
+    monkeypatch.setattr(runner, '_run_agent', model)
     source = adapter.build_source(chat_id='busy-chat', chat_type='dm', user_id='fixture-user')
     return authority, adapter, source
 

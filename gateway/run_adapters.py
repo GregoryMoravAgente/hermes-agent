@@ -1352,9 +1352,15 @@ class GatewayAdapterLifecycleMixin:
         busy_session_handler=None, authorization_check=None, platform_event_handler=None,
         busy_text_mode: Optional[str] = None, busy_text_timing: Optional[tuple[float, float]] = None,
         human_delay: Optional[tuple[int, int]] | object = _UNSET,
+        preservation_profile: Optional[str] = None,
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
+        # Register the transport before installing any callback. During a reversible preservation
+        # close a new adapter must refuse at this source boundary, rather than becoming a handler
+        # with no close-generation proof behind it.
+        from gateway.preservation_source_close import register_source_adapter
+        register_source_adapter(self, adapter, preservation_profile)
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
@@ -1404,6 +1410,7 @@ class GatewayAdapterLifecycleMixin:
             ),
             busy_text_timing=(timings.get(profile_name) if isinstance(timings, dict) else None),
             human_delay=(delays.get(profile_name, _UNSET) if isinstance(delays, dict) else _UNSET),
+            preservation_profile=profile_name,
         )
         # Voice transcripts from this bot's channels dispatch through THIS adapter.
         self._bind_voice_input_callback(adapter)
@@ -1804,8 +1811,16 @@ class GatewayAdapterLifecycleMixin:
         credentials after a hosted room flipped the process-wide guard (#112878). Decided per event:
         activation happens after the adapters were wired."""
         async def _handler(*args):
-            with self._standalone_launch_scope():
-                return await handler(*args)
+            event = next((item for item in args if hasattr(item, "source")), None)
+            from gateway.run import get_hermes_home
+            from gateway.session_ingress_context import native_callback, register_transport_home
+            profile = getattr(getattr(event, "source", None), "profile", None)
+            transport_home = (getattr(self, "_native_transport_homes", None) or {}).get(profile)
+            transport_home = transport_home or get_hermes_home()
+            register_transport_home(self, profile, transport_home)
+            with native_callback(self, event, transport_home, profile):
+                with self._standalone_launch_scope():
+                    return await handler(*args)
 
         return _handler
 

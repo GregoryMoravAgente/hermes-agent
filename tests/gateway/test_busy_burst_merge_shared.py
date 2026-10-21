@@ -6,6 +6,8 @@ over two messages (or a photo burst) ran as separate turns. Real GatewayRunner, 
 SessionAuthority and drain over SQLite; the running user turn is a stand-in holding the slot.
 """
 import asyncio
+import threading
+import time
 
 import pytest
 
@@ -88,29 +90,92 @@ async def test_busy_burst_is_admitted_once(monkeypatch, tmp_path, case, follow_u
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.session_ingress_burst import holds_busy_burst
-    from gateway.session_results import execution_result
     from hermes_state_runtime import list_session_admissions
 
-    fixture = await _real_discord_runtime(tmp_path, monkeypatch)
+    from tests.fakes import fake_llm_provider
+    from tests.fakes.fake_llm_provider import FakeLLMServer, Text, write_hermes_home
+
+    loop = asyncio.get_running_loop()
+    running, finish = asyncio.Event(), asyncio.Event()
+    provider_finish = threading.Event()
+    executed = []
+    executed_lock = threading.Lock()
+    stream_delay = 0.001
+    stream_deadline = [None]
+
+    class _EventClock:
+        def __init__(self):
+            self._real = time
+            self._stream_sleep_calls = 0
+
+        def sleep(self, seconds):
+            if seconds != stream_delay:
+                return self._real.sleep(seconds)
+            self._stream_sleep_calls += 1
+            deadline = stream_deadline[0]
+            if deadline is None:
+                return self._real.sleep(seconds)
+            remaining = deadline - self._real.monotonic()
+            if remaining <= 0:
+                raise TimeoutError('busy burst provider stream exceeded 10s deadline')
+            # FakeLLMServer sleeps before writing each content chunk. The first
+            # call precedes the first chunk; the second follows that flushed
+            # chunk, so this is the first safe point to wake the busy producer.
+            if self._stream_sleep_calls == 2:
+                loop.call_soon_threadsafe(running.set)
+            if self._stream_sleep_calls >= 2:
+                if not provider_finish.wait(remaining):
+                    raise TimeoutError('busy burst provider stream exceeded 10s deadline')
+                return
+            return self._real.sleep(min(seconds, remaining))
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    # Keep FakeLLMServer's actual HTTP/SSE renderer. Only its fixture-local
+    # pacing clock is event-controlled; the original provider deadline remains
+    # one absolute ten-second budget and the real finish event releases it.
+    monkeypatch.setattr(fake_llm_provider, 'time', _EventClock())
+
+    def responder(record):
+        body = record.get('body') if type(record) is dict else None
+        messages = body.get('messages') if type(body) is dict else None
+        message = '<unknown>'
+        for item in reversed(messages if type(messages) is list else []):
+            if type(item) is dict and item.get('role') == 'user':
+                content = item.get('content')
+                message = content if type(content) is str else '<multimodal>'
+                break
+        with executed_lock:
+            executed.append(message)
+        if message == 'A':
+            # The clock publishes running only after FakeLLMServer has flushed
+            # the first real SSE content chunk; its second pacing call then
+            # waits on the original provider-finish event.
+            stream_deadline[0] = time.monotonic() + 10
+            return Text('x' * 80, chunk_chars=1, delay_per_chunk=stream_delay)
+        return Text('ok')
+
+    llm = FakeLLMServer(responder)
+    llm.start()
+    try:
+        write_hermes_home(
+            (tmp_path / 'profile').resolve(), llm.base_url,
+            extra_config='display:\n  busy_input_mode: queue\n  busy_text_mode: queue\n',
+        )
+        fixture = await _real_discord_runtime(tmp_path, monkeypatch)
+    except BaseException:
+        provider_finish.set()
+        finish.set()
+        llm.stop()
+        raise
     runner, adapter, authority = fixture.runner, fixture.adapter, fixture.authority
     try:
         async def send(chat_id, content, reply_to=None, metadata=None):
             return SendResult(success=True, message_id='sent')
         monkeypatch.setattr(adapter, 'send', send)
+        monkeypatch.setattr('hermes_cli.tools_config._get_platform_tools', lambda *_: {'terminal'})
         adapter.gateway_runner = runner
-        running, finish = asyncio.Event(), asyncio.Event()
-        executed = []
-
-        async def turn(event, source, quick_key, run_generation):
-            executed.append(event.text)
-            if event.text == 'A':
-                running.set()
-                await finish.wait()
-            captured = execution_result.get()
-            if captured is not None:
-                captured['result'] = {'final_response': 'ok', 'messages': []}
-            return 'ok'
-        monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
 
         def event(sender, text, photo, n):
             source = adapter.build_source(chat_id='room', chat_type='group', user_id=sender)
@@ -139,6 +204,12 @@ async def test_busy_burst_is_admitted_once(monkeypatch, tmp_path, case, follow_u
         assert [(r['payload']['text'], len(r['payload']['native_text_v1'].get('media', [])))
                 for r in rows[1:]] == expected
         finish.set()
+        provider_finish.set()
         await async_wait_until(lambda: len(executed) >= 1 + len(expected), timeout=10, what='every merged turn executed')
     finally:
-        fixture.cleanup()
+        finish.set()
+        provider_finish.set()
+        try:
+            fixture.cleanup()
+        finally:
+            llm.stop()

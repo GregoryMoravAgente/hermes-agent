@@ -324,18 +324,32 @@ def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, d
                         session_id=sid, request_id=request_id, payload=payload,
                         _authorize_write=authority._admission_gate(partial(
                             _admit_target, sid, request_id, payload['api_turn_v1']['settings'],
-                            client_key=bool(kwargs.get('request_id'))), fresh=True))
+                            db=authority.db, client_key=bool(kwargs.get('request_id'))), fresh=True))
     authority._preservation_bind_or_release(row, preservation_handle)
     return authority, ref, row
 
 
-def _admit_target(session_id, request_id, settings, conn, *, client_key=True):
+def _admit_target(session_id, request_id, settings, conn, *, client_key=True, db=None):
     """Inside the admission's own off-loop transaction: one target per request id, and the
     session's settings for its later payload-less (internal) turns, committed with the admitted
     turn rather than by the drain on the owner loop (N50)."""
-    target = conn.execute("SELECT ended_at FROM sessions WHERE id = ?", (session_id,)).fetchone()
-    if target is None or target["ended_at"] is not None:
+    target = conn.execute(
+        "SELECT ended_at, end_reason FROM sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    if target is None:
         raise RuntimeStoreError('admission_conflict')
+    if target["ended_at"] is not None:
+        # Compression deliberately ends the logical root while its FIFO identity remains the
+        # admission target. Read the exact live tip in this write transaction; all other retired
+        # rows keep the normal refusal and the direct helper call remains strict when no db is bound.
+        if db is None or target["end_reason"] != "compression":
+            raise RuntimeStoreError('admission_conflict')
+        tip = db._compression_tip_on(conn, session_id)
+        tip_row = conn.execute(
+            "SELECT id, ended_at FROM sessions WHERE id = ?", (tip,)
+        ).fetchone()
+        if tip == session_id or tip_row is None or tip_row["ended_at"] is not None:
+            raise RuntimeStoreError('admission_conflict')
     _one_target(session_id, request_id, conn, client_key=client_key)
     conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                  (_SETTINGS_PREFIX + session_id, _json(settings)))

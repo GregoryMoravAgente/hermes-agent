@@ -318,6 +318,57 @@ class SessionAuthority(
             self._preservation_scheduler_handles.pop(scheduler_id, None)
         else:
             coordinator.mark_unknown(handle, 'lease_release_failed')
+    def _preservation_retain_terminal_automation(self, row, handle):
+        """Retain one live automation lease until terminal callback classification consumes it."""
+        if (not isinstance(row, dict)
+                or row.get('status') != 'terminal'
+                or row.get('outcome') == 'cancelled'
+                or getattr(handle, 'owner_class', None) not in {
+                    'I07_automation_route_wakes', 'I08_goals_loops_heartbeat',
+                    'I09_a2a_hosted_kanban',
+                }):
+            return False
+        admission_id = row.get('admission_id')
+        if not isinstance(admission_id, str) or not admission_id:
+            return False
+        descriptor = self._preservation_automation_row_descriptor(row)
+        if not isinstance(descriptor, dict):
+            return False
+        coordinator = self._preservation_coordinator()
+        lease_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+        records = getattr(coordinator, '_records', None) if coordinator is not None else None
+        lock = getattr(coordinator, '_lock', None) if coordinator is not None else None
+        if not isinstance(lease_id, str) or not isinstance(records, dict) or lock is None:
+            return False
+        with lock:
+            live = records.get(lease_id)
+            if (live is None or getattr(live, 'handle', None) is not handle
+                    or getattr(live, 'state', None) not in {'accepted', 'finalizing'}):
+                return False
+        existing = self._preservation_automation_bindings.get(admission_id)
+        if (isinstance(existing, dict) and existing.get('handle') is not None
+                and existing.get('handle') is not handle):
+            return False
+        mapped = self._preservation_handles.get(admission_id)
+        if mapped is not None and mapped is not handle:
+            return False
+        if not self._preservation_automation_row_matches(row, handle, allow_terminal=True):
+            return False
+        self._preservation_forget_pending_root(handle)
+        self._preservation_handles[admission_id] = handle
+        binding = dict(existing or {})
+        binding.update({
+            'handle': handle,
+            'row': dict(row),
+            'descriptor': dict(descriptor),
+            'source_identity': descriptor.get('source_identity') or binding.get('source_identity'),
+            'delivery_id': descriptor.get('delivery_id') or binding.get('delivery_id'),
+            'terminal_pending': True,
+        })
+        self._preservation_automation_bindings[admission_id] = binding
+        return True
+
+
     def _preservation_bind_or_release(self, row, handle):
         if handle is None:
             return
@@ -351,6 +402,13 @@ class SessionAuthority(
                 self._native_inbound_seen = True
             return
         if row is not None:
+            if self._preservation_retain_terminal_automation(row, handle):
+                return
+            if row.get('status') == 'terminal':
+                coordinator = self._preservation_coordinator()
+                if coordinator is not None:
+                    coordinator.mark_unknown(handle, 'terminal_row_unmapped')
+                return
             self._preservation_forget_pending_root(handle)
         self._preservation_release_unaccepted(handle)
     def _preservation_reconcile_failed(self, handle, *, principal_id, session_id, request_id):
@@ -620,14 +678,8 @@ class SessionAuthority(
         return marker is None or marker.is_set()
 
     async def _preservation_wait_marker(self, admission_id, marker):
-        try:
-            await marker.wait()
-        except BaseException:
-            self._preservation_marker_watchers.pop(admission_id, None)
-            self._preservation_mark_unknown(admission_id, 'join_failed')
-            raise
-        self._preservation_marker_watchers.pop(admission_id, None)
-        self._preservation_release_terminal(admission_id)
+        from gateway.session_classic_delivery import wait_for_classic_marker_release
+        await wait_for_classic_marker_release(self, admission_id, marker)
 
     def _preservation_watch_marker(self, admission_id, marker):
         if admission_id in self._preservation_marker_watchers:
@@ -640,65 +692,12 @@ class SessionAuthority(
             return
         self._preservation_marker_watchers[admission_id] = task
 
-    def _preservation_release_terminal(self, admission_id):
-        """Release child then root only after terminal delivery/finalizer completion is visible."""
-        adopter = getattr(self, 'marker_adopters', {}).get(admission_id)
-        marker = getattr(adopter, '_gateway_marker_released', None)
-        if marker is not None and not marker.is_set():
-            # Delivery may release the marker after this drain returns.  Keep the exact lease live
-            # and let the tracked marker watcher perform the same terminal transition later.
-            self._preservation_watch_marker(admission_id, marker)
-            return
-        sidecars = [entry for entry in self._preservation_sidecars.values()
-                    if entry['admission_id'] == admission_id]
-        if sidecars and not all(entry['terminal'] for entry in sidecars):
-            # A cached sidecar owns an exact request child.  Its service finalizer calls back
-            # here after the durable result/transport boundary, so the FIFO child cannot be
-            # released while physical work is still in flight.
-            return
-        for entry in sidecars:
-            request_id = getattr(getattr(entry['request'], 'lease', None), 'lease_id', None)
-            self._preservation_sidecars.pop(request_id, None)
-        self._preservation_delivery_retries.pop(admission_id, None)
-        coordinator = self._preservation_coordinator()
-        # /new cancellation is a durable route move, not a terminal producer result. Keep the
-        # exact I07 root and rebind it to the new queued row before any successor can claim it.
-        # The rehome helper validates the live coordinator and exact handle before moving anything.
-        if admission_id in self._preservation_automation_rehomes:
-            self._preservation_finish_automation_rehome(admission_id)
-            return
-        if coordinator is None:
-            if (admission_id in self._preservation_handles
-                    or admission_id in self._preservation_children
-                    or any(record.get('admission_id') == admission_id
-                           for record in self._preservation_operations.values())):
-                self._require_preservation_coordinator()
-            return
-        child = self._preservation_children.get(admission_id)
-        parent = self._preservation_handles.get(admission_id)
-        if child is not None and hasattr(child, 'lease'):
-            result = coordinator.mark_terminal(child)
-            if result is not None:
-                if parent is not None:
-                    coordinator.mark_unknown(parent, 'lease_release_failed')
-                return
-            self._preservation_children.pop(admission_id, None)
-        if parent is not None:
-            result = coordinator.mark_terminal(parent)
-            if result is not None:
-                return
-            self._preservation_handles.pop(admission_id, None)
-            self._preservation_automation_bindings.pop(admission_id, None)
-
     def preservation_owner_ready(self, owner_class):
         """Report quiescence for the API/FIFO/native source seams wired by this proposal.
 
         This is a source-owned observation used by handoff preparation after natural settlement; it
         does not seal the other 17 owner classes or infer cross-process ownership.
         """
-        # Native inbound remains unknown until a committed native admission has passed through the
-        # production entrypoint. An empty native queue is not evidence that the process-wide
-        # connector source is quiescent.
         if owner_class not in {
             'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution',
             'I06_busy_followup_delivery', 'I07_automation_route_wakes',
@@ -721,20 +720,54 @@ class SessionAuthority(
             if (owner_class in custody.get('active_owner_classes', ())
                     or owner_class in custody.get('unknown_owner_classes', ())):
                 return False
-        if owner_class == 'I01_native_inbound' and not self._native_inbound_seen:
-            return False
-        if owner_class in {'I06_busy_followup_delivery', 'I07_automation_route_wakes'}:
+        if owner_class in {'I01_native_inbound', 'I06_busy_followup_delivery'}:
+            # A registered source close is stronger than an activity bit: every callback accepted
+            # before this exact close generation is retained until native_callback exits, while a
+            # new callback is refused before the adapter can acknowledge it. No event is required
+            # to make this proof, but an empty/unregistered source graph remains unknown.
+            from gateway.preservation_source_close import source_owner_ready
+            close_generation = custody.get('close_generation')
+            if not isinstance(close_generation, int) or not source_owner_ready(
+                    self.runner, close_generation):
+                return False
+        if owner_class == 'I07_automation_route_wakes':
             # A class is sealed only after its real source ingress has been observed. Empty local
-            # maps or an empty FIFO cannot prove that an external producer never existed.
-            seen = (self._route_wake_inbound_seen
-                    if owner_class == 'I07_automation_route_wakes' else self._busy_inbound_seen)
-            if not seen:
+            # maps or an empty FIFO cannot prove that an external route-wake producer never existed;
+            # route-wake sources are separate from the adapter callback close above.
+            if not self._route_wake_inbound_seen:
                 return False
         if owner_class == 'I01_native_inbound':
             teams_pending = self._preservation_teams_job_pending()
             if teams_pending is None or teams_pending:
                 return False
-        if (self._preservation_handles or self._preservation_children
+        i02_handles = self._preservation_handles
+        if owner_class == 'I02_api_session_turn':
+            # Exempt a retained automation handle only after current durable identity reread;
+            # stale or foreign rows remain blocking.
+            i02_handles = dict(self._preservation_handles)
+            for admission_id, handle in self._preservation_handles.items():
+                binding = self._preservation_automation_bindings.get(admission_id)
+                bound_row = binding.get('row') if isinstance(binding, dict) else None
+                if (not isinstance(binding, dict)
+                        or binding.get('handle') is not handle
+                        or not isinstance(bound_row, dict)
+                        or binding.get('terminal_pending') is not True
+                        or getattr(handle, 'owner_class', None) not in {
+                            'I07_automation_route_wakes', 'I08_goals_loops_heartbeat',
+                            'I09_a2a_hosted_kanban',
+                        }):
+                    continue
+                try:
+                    current = get_session_admission(self.db, admission_id=admission_id)
+                except (sqlite3.Error, RuntimeError, TypeError, ValueError):
+                    continue
+                if (isinstance(current, dict) and current.get('admission_id') == admission_id
+                        and current.get('status') == 'terminal'
+                        and self._preservation_automation_row_matches(
+                            current, handle, allow_terminal=True,
+                        )):
+                    i02_handles.pop(admission_id, None)
+        if (i02_handles or self._preservation_children
                 or self._preservation_pending_roots or self._preservation_claiming
                 or self._preservation_scheduler_handles
                 or self._preservation_scheduler_retry_handles
@@ -1909,11 +1942,10 @@ class SessionAuthority(
                     self.pending_deliveries.pop(admission_id, None)
                 from gateway.session_ingress import waiter_replies
                 waiter_replies(self).pop(admission_id, None)
-            from gateway.session_ingress import deliver_settled, finish_preservation_delivery
+            from gateway.session_ingress import deliver_settled
             delivery_receipt = await deliver_settled(self, admission_id)
-            waiter_delivered = await self._resolve_settled_waiter(admission_id, response)
-            if not await finish_preservation_delivery(
-                self, admission_id, delivery_receipt, waiter_delivered,
+            if not await self._preservation_finish_settled_delivery(
+                admission_id, delivery_receipt, response,
             ):
                 return
 
@@ -1960,38 +1992,8 @@ def backfill_legacy_session_owners(db):
 
 
 async def initialize_session_authority(runner, *, profile_id, instance_id, db=None, register=True):
-    """Call after exclusive profile ownership, before connecting adapters/API.
-
-    ``register=False`` builds a served secondary's authority without making it the runner's
-    launch authority (``runner.session_authority``); the per-home registry owns the lookup.
-    """
-    if db is None:
-        db = getattr(runner._session_db, '_db', runner._session_db)
-    # Resolved off-loop before any state is published: the rest of the bring-up runs without
-    # yielding, so no other task observes a half-registered authority.
-    from pathlib import Path
-    db_key = await asyncio.to_thread(Path(db.db_path).resolve)
-    epoch = await asyncio.to_thread(begin_runtime_epoch, db, instance_id=instance_id)
-    # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
-    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
-    await asyncio.to_thread(backfill_legacy_session_owners, db)
-    authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
-    # A receipt's compression catch-up (#140060) writes: it commits off the loop too, before the
-    # authority is published, so the recovery below only reads.
-    from gateway.session_local_adoption import adopt_local_compressions
-    await adopt_local_compressions(authority)
-    if register:
-        runner.session_authority = authority
-    from gateway.session_cron import bind_owner
-    bind_owner(authority)
-    store = runner.session_store
-    if register:
-        store._local_authority_epoch = epoch
-    # Local resets write the owning profile's store; the epoch fence must be that store's.
-    epochs = getattr(store, '_local_authority_epochs', None)
-    if epochs is None:
-        epochs = store._local_authority_epochs = {}
-    epochs[db_key] = epoch
-    from gateway.session_local_recovery import recover_local_sessions
-    recover_local_sessions(authority)
-    return authority
+    """Compatibility export for the runtime-owned authority bootstrap."""
+    from gateway.run_runtime import initialize_session_authority as _initialize
+    return await _initialize(
+        runner, profile_id=profile_id, instance_id=instance_id, db=db, register=register,
+    )

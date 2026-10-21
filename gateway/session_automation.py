@@ -13,6 +13,7 @@ from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session_contract import SessionRef
 from gateway.session_automation_custody import (
+    _AUTOMATION_OWNER_CLASSES, _automation_descriptor_complete,
     automation_source_identity, kanban_occurrence_metadata, route_wake_identity,
 )
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_session_admissions
@@ -472,6 +473,90 @@ def check_i09_automation(authority, ref, row):
     handle = authority._preservation_handles.get(row.get('admission_id'))
     if handle is None or not authority._preservation_automation_row_matches(row, handle):
         raise RuntimeStoreError('preservation_owner_unmapped')
+
+
+def callback_record_for_automation(authority, row, admission_id, handle):
+    """Return the complete source-owned terminal candidate for an automation root.
+
+    Automation roots are intentionally retained in the handle/binding maps rather than duplicated in
+    ``_preservation_operations``.  Callback classification may consume that existing binding only
+    after the canonical terminal row, exact opaque handle, and descriptor all agree.  A cancelled
+    queued row has a separate no-execution witness and is accepted only while that exact root remains
+    bound and no I04 child was reserved.
+    """
+    if (
+        not isinstance(row, dict)
+        or row.get('admission_id') != admission_id
+        or row.get('status') != 'terminal'
+        or handle is None
+    ):
+        return None
+    preclaim_cancel = (row.get('outcome') == 'cancelled' and row.get('generation') is None)
+    if not preclaim_cancel and (type(row.get('generation')) is not int or row.get('generation') < 1):
+        return None
+    owner_class = getattr(handle, 'owner_class', None)
+    if owner_class not in _AUTOMATION_OWNER_CLASSES:
+        return None
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+    if (
+        not isinstance(binding, dict)
+        or binding.get('handle') is not handle
+        or not isinstance(binding.get('descriptor'), dict)
+    ):
+        return None
+    descriptor = authority._preservation_automation_row_descriptor(row)
+    # Recovery deliberately keeps the predecessor producer descriptor while the
+    # current owner holds a new opaque handle. Reuse the same exact-row successor
+    # contract that admitted and rebound that handle, rather than equating epochs.
+    if (
+        not _automation_descriptor_complete(descriptor)
+        or descriptor != binding.get('descriptor')
+        or not authority._preservation_automation_row_matches(
+            row, handle, allow_terminal=True, allow_preclaim_cancel=preclaim_cancel)
+    ):
+        return None
+    bound_row = binding.get('row')
+    if isinstance(bound_row, dict):
+        if any(
+            row.get(field) != bound_row.get(field)
+            for field in ('admission_id', 'target_session_id', 'principal_id', 'request_id')
+        ):
+            return None
+        if (
+            bound_row.get('owner_epoch') is not None
+            and row.get('owner_epoch') != bound_row.get('owner_epoch')
+        ):
+            return None
+        if (
+            bound_row.get('generation') is not None
+            and row.get('generation') != bound_row.get('generation')
+        ):
+            return None
+    handles = getattr(authority, '_preservation_handles', None)
+    children = getattr(authority, '_preservation_children', None)
+    if not (
+        isinstance(handles, dict)
+        and handles.get(admission_id) is handle
+    ) and not (
+        isinstance(children, dict)
+        and children.get(admission_id) is handle
+    ):
+        return None
+    return {
+        'handle': handle,
+        'owner_class': owner_class,
+        'profile_id': getattr(handle, 'profile_id', None),
+        'authority_epoch': getattr(handle, 'authority_epoch', None),
+        'session_id': row.get('target_session_id'),
+        'principal_id': row.get('principal_id'),
+        'admission_id': admission_id,
+        'request_id': row.get('request_id'),
+        'generation': row.get('generation'),
+        'preclaim_cancelled': preclaim_cancel,
+        'source_identity': descriptor.get('source_identity'),
+        'parent_handle': None,
+    }
 
 
 def restore_local_automation(authority, ref, row):

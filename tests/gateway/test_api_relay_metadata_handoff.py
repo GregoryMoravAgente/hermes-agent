@@ -7,10 +7,14 @@ from gateway.session_api_turn import admit_api_turn
 
 
 @pytest.mark.asyncio
-async def test_request_relay_metadata_reaches_the_executing_turn(api, owner):
+async def test_request_relay_metadata_reaches_the_executing_turn(runtime_owned_api_owner):
+    api, owner = runtime_owned_api_owner
     metadata = {'relay.trace': 'trace-7', 'tenant': 'acme'}
     _, ref, row = admit_api_turn(api, session_id='relay-meta', user_message='hello',
                                  conversation_history=[], relay_metadata=metadata)
+    live = owner.sessions[ref.session_id]
+    row, first = await owner._claim_next(ref, live)
+    assert row and first and row['admission_id'] == first['admission_id']
     seen = {}
 
     async def handle(event):

@@ -708,6 +708,40 @@ def _enqueue_terminal_sentinel(run: _RunLaunch) -> None:
         # Keep the lifecycle fence source-owned even when a test or transport wrapper declines
         # the sentinel before the launch method can record its own close receipt.
         run.custody.mark_stream_closed(False)
+    if (run.execution_task is not None
+            and run.execution_task.done()):
+        _retire_live_run(run.owner, run.run_id)
+
+
+def _settle_structured_run_after_task(self, launch: _RunLaunch, task: Any) -> None:
+    """Consume an I02 completion only after the structured task and transport are terminal."""
+    task = task or getattr(launch, "execution_task", None)
+    custody = getattr(launch, "custody", None)
+    if (task is None or not task.done() or getattr(launch, "queue", None) is None
+            or custody is None or getattr(custody, "producer_phase", None) != "api_i02"
+            or launch.terminal_event_outcome is not True
+            or launch.stream_close_outcome is not True
+            or custody.worker_done is not True
+            or custody.control_finalizers is not True):
+        return
+    from gateway.platforms.api_server_run_custody import (
+        complete_legacy_source, retire_legacy_source_with_completion,
+    )
+    try:
+        refusal = complete_legacy_source(custody, active_run_id=None)
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "structured_completion_unknown"))
+            return
+        completion = getattr(custody, "finalizer_completion", None)
+        if getattr(getattr(completion, "receipt", None), "state", None) != "complete":
+            custody.mark_completion_unknown("structured_finalizer_completion_unknown")
+            return
+        if not retire_legacy_source_with_completion(custody):
+            custody.mark_completion_unknown("structured_completion_retire_pending")
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            TypeError, ValueError, sqlite3.Error):
+        logger.exception("[api_server] structured finalizer failed for run %s", launch.run_id)
+        custody.mark_unknown("structured_completion_error")
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -734,6 +768,8 @@ def _retire_live_run(self, run_id: str) -> None:
         self._active_run_agents, self._run_approval_sessions,
         self._stopping_run_ids, self._shutdown_interrupted_run_ids)
     if task is None or task.done():
+        if launch is not None:
+            _settle_structured_run_after_task(self, launch, task)
         active_tables = (*active_tables, self._active_run_tasks)
     _forget_run(self, run_id, *active_tables)
 

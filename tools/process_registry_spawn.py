@@ -118,9 +118,17 @@ class ProcessRegistrySpawnMixin:
                 raise RuntimeError("I03 process scope is closed or mismatched")
             session.profile_id = self._process_profile_id()
             session.process_instance = self._runtime_custody.process_instance
-            session.authority_epoch = self._runtime_custody.authority_epoch
+            epoch_for_profile = getattr(
+                self._runtime_custody, "authority_epoch_for_profile", None,
+            )
+            session.authority_epoch = (
+                epoch_for_profile(session.profile_id, require_serving=False)
+                if callable(epoch_for_profile) else self._runtime_custody.authority_epoch
+            ) or 0
             session.custody_state = "unknown"
-            session.custody_error = "late_adoption"
+            session.custody_error = (
+                "late_adoption" if session.authority_epoch else "foreign_custody"
+            )
             self._custody_observed = True
             self._custody_unbound_sessions.add(session.id)
         return session

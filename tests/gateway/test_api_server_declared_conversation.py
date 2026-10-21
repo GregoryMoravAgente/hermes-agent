@@ -19,6 +19,7 @@ import types
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
@@ -255,24 +256,26 @@ class TestBindFollowsPrecedence:
 API_KEY = "test-api-key"
 
 
-@pytest.fixture
-def live(tmp_path):
-    """A real adapter behind real routes, with a scratch state.db attached."""
-    adapter = APIServerAdapter(
-        PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "port": 0, "key": API_KEY})
-    )
-    db = SessionDB(tmp_path / "state.db")
-    adapter._session_db = db
+@pytest_asyncio.fixture
+async def live(tmp_path, monkeypatch):
+    """Give the real legacy HTTP routes their production profile and process ownership."""
+    from tests.gateway.conftest import runtime_owned_legacy_api
 
-    mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
-    app = web.Application(middlewares=mws)
-    app["api_server_adapter"] = adapter
-    app.router.add_post("/v1/responses", adapter._handle_responses)
-    app.router.add_post("/v1/runs", adapter._handle_runs)
-    try:
-        yield adapter, db, app
-    finally:
-        db.close()
+    async with runtime_owned_legacy_api(tmp_path, monkeypatch, api_key=API_KEY) as adapter:
+        # A legacy adapter has no authority registry. A present null registry instead denotes
+        # an unserved managed profile, which correctly refuses a fallback to the local DB.
+        monkeypatch.delattr(adapter.gateway_runner, "session_authorities")
+        db = adapter._ensure_session_db()
+        assert db is not None
+        mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
+        app = web.Application(middlewares=mws)
+        app["api_server_adapter"] = adapter
+        app.router.add_post("/v1/responses", adapter._handle_responses)
+        app.router.add_post("/v1/runs", adapter._handle_runs)
+        try:
+            yield adapter, db, app
+        finally:
+            adapter._close_cached_session_dbs()
 
 
 def _spy_run_agent(adapter, seen):
@@ -373,6 +376,11 @@ class TestRunsHandlerPrecedence:
                 headers=_headers(KEY),
             )
             assert resp.status in (200, 202)
+            run_id = (await resp.json())["run_id"]
+            task = adapter._active_run_tasks.get(run_id)
+            if task is not None:
+                await asyncio.wait_for(asyncio.shield(task), 10.0)
+            assert await _await_run(adapter, run_id), "run never settled"
 
         assert seen and seen[0]["session_id"] == "sess-live"
 
@@ -391,6 +399,11 @@ class TestRunsHandlerPrecedence:
                 headers=_headers(KEY),
             )
             assert resp.status in (200, 202)
+            run_id = (await resp.json())["run_id"]
+            task = adapter._active_run_tasks.get(run_id)
+            if task is not None:
+                await asyncio.wait_for(asyncio.shield(task), 10.0)
+            assert await _await_run(adapter, run_id), "run never settled"
 
         assert seen and seen[0]["session_id"] == "explicit-session"
         # KEY still resolves to its own conversation, never the explicit one.

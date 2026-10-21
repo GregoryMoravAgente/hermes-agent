@@ -16,16 +16,20 @@ from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wai
 
 @pytest.mark.asyncio
 async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkeypatch):
-    from gateway.config import GatewayConfig, Platform
+    from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
     from gateway.runtime_custody import RuntimeCustodyCoordinator
     from hermes_cli.backend_retirement import RetirementFence
-    from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
-    runner = GatewayRunner(GatewayConfig())
+    monkeypatch.setenv('TELEGRAM_HOME_CHANNEL', 'busy-chat')
+    config = GatewayConfig()
+    config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True, home_channel=HomeChannel(Platform.TELEGRAM, 'busy-chat', 'fixture-home'),
+    )
+    runner = GatewayRunner(config)
     adapter = Adapter()
     adapter.gateway_runner = runner  # as GatewayRunner._create_adapter binds every adapter
     runner.adapters = {Platform.TELEGRAM: adapter}
@@ -40,13 +44,21 @@ async def test_busy_followup_keeps_its_marker_until_the_reply_is_ledgered(monkey
     key = runner.session_store._generate_session_key(source)
     gate = asyncio.Event()
 
-    async def turn(event, source, quick_key, run_generation):
-        await runner._mark_durable_active_turn(event, quick_key)
-        if event.text == 'one':
+    async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
+        if message == 'one':
             await gate.wait()
-        execution_result.get()['result'] = {'final_response': 'reply to ' + event.text, 'messages': []}
-        return 'reply to ' + event.text
-    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+        response = 'reply to ' + message
+        return {
+            'final_response': response,
+            'messages': [*history, {'role': 'user', 'content': message},
+                         {'role': 'assistant', 'content': response}],
+            'agent_persisted': False,
+            'api_calls': 1,
+            'tools': [],
+            'history_offset': len(history),
+            'session_id': session_id,
+        }
+    monkeypatch.setattr(runner, '_run_agent', model)
 
     marker_at_ledger = {}
     record = adapter._record_delivery_obligation
