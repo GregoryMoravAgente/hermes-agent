@@ -442,7 +442,7 @@ async def test_i15_close_seals_real_terminal_children_from_mixed_profile_epochs(
         sessions.append(launch_session)
         _finish_native_profile_child(registry, launch_session)
         receipt = coordinator.begin_close(owner_id="profile-epoch-mixed-close", deadline_s=5)
-        assert getattr(receipt, "status", None) == "closing"
+        assert receipt.state == "closing"
         assert receipt.authority_epoch == launch.epoch
         evidence = preservation_owner_evidence_for_profiles(
             registry,

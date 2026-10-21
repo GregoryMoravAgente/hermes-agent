@@ -1015,10 +1015,12 @@ class ServiceProcessReceipt:
         return True
 
     def close_after_delivery(self) -> bool:
+        from gateway.runtime_service_native_close import can_retry_managed_native_close
+        managed_native_retry = can_retry_managed_native_close(self)
         external_unknown = self.unknown_reason in (
             {"catalog_discovery_failed", "cache_readback_unknown"}
             | _EXTERNAL_CLOSE_RETRY_REASONS
-        )
+        ) and not managed_native_retry
         if external_unknown:
             proof = self.external_publication_proof
             if (
@@ -1075,7 +1077,7 @@ class ServiceProcessReceipt:
                 # A native close can fail after the exact empty proof while the retained
                 # handle and generation remain valid. Re-open only this same handle after
                 # the close retry succeeds; identity/reader uncertainty stays sticky.
-                if self.unknown_reason not in _EXTERNAL_CLOSE_RETRY_REASONS:
+                if self.unknown_reason not in _EXTERNAL_CLOSE_RETRY_REASONS and not managed_native_retry:
                     return False
                 reconciled = self.service.coordinator.reconcile_unknown(
                     self.handle, owner_id=self.handle.owner_id, profile_id=self.handle.profile_id,
@@ -1092,7 +1094,7 @@ class ServiceProcessReceipt:
             if self.unknown_reason not in (
                 {"catalog_discovery_failed", "cache_readback_unknown"}
                 | _EXTERNAL_CLOSE_RETRY_REASONS
-            ):
+            ) and not managed_native_retry:
                 return False
             reconciled = self.service.coordinator.reconcile_unknown(
                 self.handle, owner_id=self.handle.owner_id, profile_id=self.handle.profile_id,

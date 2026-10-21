@@ -44,6 +44,7 @@ env:
     tests/gateway/test_runtime_service_parent_edges.py
     tests/gateway/test_session_authorities_multiplex.py
     tests/gateway/test_codex_service_custody.py
+    tests/agent/transports/test_codex_physical_custody.py
 
 jobs:
   native-custody:

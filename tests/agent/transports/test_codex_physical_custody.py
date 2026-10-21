@@ -560,6 +560,136 @@ async def test_windows_real_job_binary_readers_natural_eof_same_transaction_clos
 
 @pytest.mark.platforms("windows")
 @pytest.mark.asyncio
+@pytest.mark.parametrize("membership_fault", [None, "query", "foreign"])
+async def test_windows_exited_codex_root_drains_only_retained_job(
+    tmp_path, monkeypatch, membership_fault,
+):
+    """An exited root cannot release its live Job child or bypass exact membership."""
+    from agent.transports.codex_app_server import CodexAppServerTransportError
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
+    from tests.waiting import wait_until
+
+    fixture = await real_runtime_binding(tmp_path, monkeypatch)
+    session = None
+    transaction = None
+    original_membership = None
+    try:
+        launcher = _windows_codex_launcher(tmp_path, exit_after_turn=True)
+        script = tmp_path / "app-server"
+        script.write_text(
+            "import subprocess\n"
+            "subprocess.Popen([__import__('sys').executable, '-c', "
+            "'import threading; threading.Event().wait(30)'], "
+            "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+            + script.read_text(encoding="utf-8"), encoding="utf-8",
+        )
+        writer = _RealProofAgent(fixture.authority.db, "pending-session")
+        session = CodexAppServerSession(
+            cwd=str(tmp_path), codex_bin=str(launcher),
+            codex_home=str(tmp_path / "codex-home"), require_custody=True,
+        )
+        _request, receipt = await _complete_real_admission(
+            session, fixture, writer, "same-job-child",
+        )
+        transaction = receipt.transaction
+        process, job, handle = transaction.process, transaction.job, transaction.job._handle
+        wait_until(lambda: process.poll() is not None, timeout=5, what="Codex root exit")
+        assert process.poll() == 0
+        assert job.contains_process_handle(transaction.process_ref) is True
+        assert job.active_processes() >= 1
+        assert transaction.observe_empty() is None
+        assert transaction.scope_observation == "nonempty"
+        original_membership = job.contains_process_handle
+        if membership_fault is not None:
+            def invalid_membership(_process_ref):
+                if membership_fault == "query":
+                    raise OSError("native membership query unavailable")
+                return False
+
+            monkeypatch.setattr(job, "contains_process_handle", invalid_membership)
+            with pytest.raises(CodexAppServerTransportError, match="native Job did not settle"):
+                session.close()
+            assert receipt.state == "unknown"
+            assert session._custody.service.physical is receipt
+            assert transaction.process is process and transaction.job is job
+            assert job._handle is handle
+            assert transaction.termination_attempts == 0
+            assert transaction.process_handle_closed is False
+            assert transaction.job_handle_closed is False
+        else:
+            session.close()
+            assert transaction.process is process and transaction.job is job
+            assert transaction.termination_attempts == 1
+            assert transaction.native_empty_observed is True
+            assert transaction.process_handle_closed is True
+            assert transaction.job_handle_closed is True
+            assert receipt.state == "closed"
+    finally:
+        if transaction is not None and not transaction.job_handle_closed:
+            if original_membership is not None:
+                monkeypatch.setattr(transaction.job, "contains_process_handle", original_membership)
+            transaction.terminate_owned_tree()
+            transaction.process.wait(timeout=5)
+            wait_until(lambda: transaction.observe_empty() is True, timeout=5, what="owned Job cleanup")
+            assert transaction.close_after_observed_empty() is True
+        if session is not None and session._client is not None and session._client._proc.poll() is None:
+            session._client._proc.kill()
+            session._client._proc.wait(timeout=5)
+        fixture.cleanup()
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.asyncio
+async def test_windows_empty_observation_cannot_close_replacement_job(tmp_path, monkeypatch):
+    """An empty receipt stays bound to the native Job originally observed."""
+    from agent.transports.codex_app_server_session import CodexAppServerSession
+    from hermes_cli.local_runtime.processes import _WindowsJob
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
+    from tests.waiting import wait_until
+
+    fixture = await real_runtime_binding(tmp_path, monkeypatch)
+    transaction = original_job = foreign_job = None
+    try:
+        writer = _RealProofAgent(fixture.authority.db, "pending-session")
+        session = CodexAppServerSession(
+            cwd=str(tmp_path), codex_bin=str(_windows_codex_launcher(tmp_path, exit_after_turn=True)),
+            codex_home=str(tmp_path / "codex-home"), require_custody=True,
+        )
+        _request, receipt = await _complete_real_admission(session, fixture, writer, "exact-empty-job")
+        transaction = receipt.transaction
+        transaction.process.wait(timeout=5)
+        wait_until(lambda: transaction.observe_empty() is True, timeout=5, what="original empty Job")
+        original_job = transaction.job
+        original_handle = original_job._handle
+        foreign_job = _WindowsJob()
+        foreign_handle = foreign_job._handle
+        assert foreign_job.empty() is True
+        transaction.job = foreign_job
+        assert transaction.drain_after_process_exit(1) is False
+        assert transaction.close_after_observed_empty() is False
+        assert receipt.state == "unknown"
+        assert receipt.unknown_reason == "foreign_custody"
+        assert original_job._handle is original_handle
+        assert foreign_job._handle is foreign_handle
+        assert transaction.process_handle_closed is False
+        assert transaction.job_handle_closed is False
+    finally:
+        if transaction is not None:
+            transaction.job = original_job or transaction.job
+            if transaction.process.poll() is None:
+                transaction.terminate_owned_tree()
+                transaction.process.wait(timeout=5)
+            wait_until(lambda: transaction.observe_empty() is True, timeout=5, what="original Job cleanup")
+            assert transaction.close_after_observed_empty() is True
+        if foreign_job is not None:
+            assert foreign_job.empty() is True
+            foreign_job.close()
+        fixture.cleanup()
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.asyncio
 async def test_windows_codex_constructor_failure_retains_transaction_before_publish(tmp_path, monkeypatch):
     """A native launch that fails before client publication keeps the exact child and transaction."""
     from agent.transports.codex_app_server_session import CodexAppServerSession
