@@ -87,6 +87,64 @@ def _pgroup_alive(pgid: Optional[int]) -> bool:
         return False
 
 
+class _ObservedAsyncContext:
+    """Delegate one async context while recording its awaited exit outcome."""
+
+    __slots__ = ("body_error", "close_error", "closed", "context", "entered", "value")
+
+    def __init__(self, context):
+        self.context = context
+        self.entered = False
+        self.closed = False
+        self.close_error = None
+        self.body_error = None
+        self.value = None
+
+    async def __aenter__(self):
+        self.value = await self.context.__aenter__()
+        self.entered = True
+        return self.value
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        if exc is not None:
+            self.body_error = exc
+        try:
+            suppressed = await self.context.__aexit__(exc_type, exc, traceback)
+        except BaseException as close_error:
+            self.close_error = close_error
+            raise
+        self.closed = True
+        return suppressed
+
+    @property
+    def exit_verified(self):
+        """True after a normal exit or exact propagation of the body exception."""
+        return self.closed or (
+            self.close_error is not None
+            and self.body_error is not None
+            and _exception_tree_is_exact(self.close_error, self.body_error)
+        )
+
+    @property
+    def independent_close_error(self):
+        if self.close_error is None:
+            return None
+        if self.body_error is not None and _exception_tree_is_exact(self.close_error, self.body_error):
+            return None
+        return self.close_error
+
+
+def _exception_tree_is_exact(error, expected) -> bool:
+    """Accept only an SDK exit group that contains the same body exception and nothing else."""
+    if error is expected:
+        return True
+    return (
+        isinstance(error, BaseExceptionGroup)
+        and bool(error.exceptions)
+        and all(_exception_tree_is_exact(child, expected) for child in error.exceptions)
+    )
+
+
 class LiveEndpointUnavailable(ConnectionError):
     """A declared runtime file did not provide a usable live endpoint."""
 
@@ -279,15 +337,61 @@ class MCPServerTransportMixin:
             logger.info("MCP server '%s': reconnect requested — tearing down %s session", self.name, label)
         return reason
 
+    async def _serve_owned_transport(
+        self, transport_cm, label: str, connect_timeout: float, open_scope,
+    ) -> str:
+        """Serve one transport through the source-owned SDK scope.
+
+        The receipt constructs ``ClientSession`` and observes both SDK exits.  This
+        path therefore has no caller-provided context or exit witness to trust.
+        """
+        source_owner = getattr(self, "_i16_source_owner", None)
+        bind_task = getattr(source_owner, "bind_task", None)
+        if callable(bind_task):
+            bind_task(asyncio.current_task())
+        scope = open_scope(
+            self,
+            transport_cm,
+            session_kwargs=self._session_kwargs(),
+            task=asyncio.current_task(),
+        )
+        async with scope as session:
+            try:
+                return await self._serve_session(session, connect_timeout, label)
+            except BaseExceptionGroup as _eg:
+                return self._reconnect_or_reraise_group(_eg)
+
     async def _serve_transport(self, transport_cm, label: str, connect_timeout: float) -> str:
         """Open *transport_cm*, wrap its streams in a ClientSession and serve it. Streams are indexed,
         not unpacked (mcp 1.x yields a 3-tuple, 2.x a pair); a TaskGroup drop maps to ``"reconnect"``."""
+        source_owner = getattr(self, "_i16_source_owner", None)
+        open_scope = getattr(source_owner, "_source_open_transport_scope", None)
+        if callable(open_scope):
+            return await self._serve_owned_transport(
+                transport_cm, label, connect_timeout, open_scope,
+            )
+        observed_transport = _ObservedAsyncContext(transport_cm)
+        observed_session = None
         try:
-            async with transport_cm as _streams:
-                async with _core.ClientSession(_streams[0], _streams[1], **self._session_kwargs()) as session:
+            async with observed_transport as _streams:
+                observed_session = _ObservedAsyncContext(
+                    _core.ClientSession(_streams[0], _streams[1], **self._session_kwargs())
+                )
+                async with observed_session as session:
                     return await self._serve_session(session, connect_timeout, label)
         except BaseExceptionGroup as _eg:
             return self._reconnect_or_reraise_group(_eg)
+
+    def _remote_http_rejection_witness(self, exc: BaseException):
+        """Issue the remote fallback witness only from the recorder's exact initial response."""
+        source_owner = getattr(self, "_i16_source_owner", None)
+        make_witness = getattr(source_owner, "http_rejection_witness", None)
+        if not callable(make_witness):
+            return None
+        try:
+            return make_witness(exc)
+        except RuntimeError:
+            return None
 
     # ------------------------------------------------------------------ stdio
 
@@ -400,7 +504,26 @@ class MCPServerTransportMixin:
         _config._write_stderr_log_header(self.name)
         stderr = _config._StderrTee(_config._get_mcp_stderr_log())
         try:
-            async with _core.stdio_client(server_params, errlog=stderr.sink) as (read_stream, write_stream):
+            source_owner = getattr(self, "_i16_source_owner", None)
+            source_witness = None
+            if source_owner is not None:
+                from gateway.runtime_sidecar_sources import require_physical
+                from tools.mcp_tool_custody import captured_stdio_client
+                require_physical(source_owner, streams=("stdout",))
+                transport_cm = captured_stdio_client(
+                    _core.stdio_client, server_params, errlog=stderr.sink,
+                    owner=source_owner,
+                )
+            else:
+                from tools.mcp_tool_custody import serialized_stdio_client
+                transport_cm = serialized_stdio_client(
+                    _core.stdio_client, server_params, errlog=stderr.sink,
+                )
+            async with transport_cm as transport:
+                if source_owner is not None:
+                    (read_stream, write_stream), _process, source_witness = transport
+                else:
+                    read_stream, write_stream = transport
                 # New PIDs for force-kill cleanup, minus non-MCP children (slash_worker, LSP) racing
                 # into the window: they share the TUI's pgid — leaking them would killpg() the TUI.
                 new_pids = _filter_mcp_children(_lifecycle._snapshot_child_pids() - pids_before)
@@ -422,6 +545,17 @@ class MCPServerTransportMixin:
             stderr.close(timeout=0)
             if new_pids:
                 self._release_spawned_children(new_pids)
+            source_owner = getattr(self, "_i16_source_owner", None)
+            if source_owner is not None:
+                from gateway.runtime_sidecar_sources import mark_unknown
+                if source_witness is not None:
+                    from tools.mcp_tool_custody import finish_stdio_owner
+                    finish_stdio_owner(
+                        source_owner, source_witness,
+                        reason="posix_containment_unproven",
+                    )
+                else:
+                    mark_unknown(source_owner, "mcp_process_cleanup_unknown")
 
     # ------------------------------------------------------------------- HTTP
 
@@ -521,6 +655,19 @@ class MCPServerTransportMixin:
     def _sse_transport(self, url: str, headers: dict, connect_timeout: float,
                        ssl_verify, client_cert, oauth_auth, strict_cfg_headers: bool):
         """``sse_client`` context manager for ``transport: sse`` entries."""
+        source_owner = getattr(self, "_i16_source_owner", None)
+        source_transport = getattr(source_owner, "_source_sse_transport", None)
+        if callable(source_transport):
+            return source_transport(
+                self,
+                url=url,
+                headers=headers,
+                connect_timeout=connect_timeout,
+                ssl_verify=ssl_verify,
+                client_cert=client_cert,
+                oauth_auth=oauth_auth,
+                strict_cfg_headers=strict_cfg_headers,
+            )
         if strict_cfg_headers:  # fail closed: SSE cannot enforce the redirect boundary
             raise ValueError(f"MCP server '{self.name}': strict_redirect_headers is "
                              "not supported on the SSE transport.")
@@ -550,9 +697,24 @@ class MCPServerTransportMixin:
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
-                                   strict_cfg_headers: bool, configured_header_names: set):
+                                   strict_cfg_headers: bool, configured_header_names: set,
+                                   rejection_hook=None):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
+        source_owner = getattr(self, "_i16_source_owner", None)
+        source_transport = getattr(source_owner, "_source_streamable_http_transport", None)
+        if callable(source_transport):
+            return source_transport(
+                self,
+                url=url,
+                headers=headers,
+                connect_timeout=connect_timeout,
+                ssl_verify=ssl_verify,
+                client_cert=client_cert,
+                oauth_auth=oauth_auth,
+                strict_cfg_headers=strict_cfg_headers,
+                configured_header_names=configured_header_names,
+            )
         if not _core._MCP_NEW_HTTP:
             if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
@@ -570,7 +732,9 @@ class MCPServerTransportMixin:
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
         client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
-                               "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
+                               "event_hooks": {"response": [_make_http_rejection_recorder(
+                                   self._http_rejection, on_response=rejection_hook,
+                               )]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
                                **_present(mounts=_mcp_proxy_mounts(httpx, url, ssl_verify, client_cert, self.name),
                                           auth=oauth_auth)}
@@ -584,6 +748,10 @@ class MCPServerTransportMixin:
 
     async def _run_http(self, config: dict):
         """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
+        source_owner = getattr(self, "_i16_source_owner", None)
+        bind_task = getattr(source_owner, "bind_task", None)
+        if callable(bind_task):
+            bind_task(asyncio.current_task())
         _core._ensure_mcp_sdk()
         if not _core._MCP_HTTP_AVAILABLE:
             raise ImportError(f"MCP server '{self.name}' requires HTTP transport but "
@@ -595,16 +763,25 @@ class MCPServerTransportMixin:
         # Hash the endpoint this attempt connects to: a second read of the runtime file could
         # publish another endpoint's identity alongside this session.
         self._resolved_identity = _registration._identity_digest(inputs)
+        bind_identity = getattr(getattr(self, "_i16_source_owner", None), "bind_identity", None)
+        if callable(bind_identity):
+            bind_identity(self._resolved_identity)
         url, headers = inputs
         logger.debug("MCP server '%s': connecting to %s", self.name, url)
-        self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
+        self._http_rejection = {}  # compatibility diagnostics for direct/non-owned routes
+        source_owner = getattr(self, "_i16_source_owner", None)
+        begin_http_attempt = getattr(source_owner, "_source_begin_http_attempt", None)
+        if callable(begin_http_attempt):
+            begin_http_attempt(self, asyncio.current_task())
         # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
         # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
         if not any(key.lower() == "mcp-protocol-version" for key in headers):
             headers["mcp-protocol-version"] = _core.LATEST_HANDSHAKE_VERSION
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
-        common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
-                  self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
+        client_cert = _resolve_client_cert(self.name, config)
+        oauth_auth = self._build_oauth_auth(url, config)
+        common = (url, headers, connect_timeout, config.get("ssl_verify", True), client_cert,
+                  oauth_auth, bool(config.get("strict_redirect_headers")))
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
         if self._sse_fallback:
@@ -612,7 +789,9 @@ class MCPServerTransportMixin:
             # HTTP attempt on reconnects instead of flapping into the retry budget.
             logger.info("MCP server '%s': using latched SSE fallback transport", self.name)
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
-        transport = self._streamable_http_transport(*common, configured_header_names)
+        transport = self._streamable_http_transport(
+            *common, configured_header_names,
+        )
         label = "HTTP" if _core._MCP_NEW_HTTP else "legacy HTTP"
         try:
             return await self._serve_transport(transport, label, float(connect_timeout))
@@ -629,7 +808,14 @@ class MCPServerTransportMixin:
             # transport must not silently switch transports), never on a timeout (not a
             # transport mismatch — ``_is_streamable_http_rejection`` matches neither), and never
             # with ``strict_redirect_headers`` (SSE cannot enforce that boundary).
-            if (self._ever_connected or common[-1] or not _is_streamable_http_rejection(exc)):
+            rejection_witness = self._remote_http_rejection_witness(exc)
+            remote_owner = callable(
+                getattr(getattr(self, "_i16_source_owner", None), "prepare_replacement", None),
+            )
+            rejection_qualified = (
+                rejection_witness is not None if remote_owner else _is_streamable_http_rejection(exc)
+            )
+            if (self._ever_connected or common[-1] or not rejection_qualified):
                 if http_detail != str(_unwrap_exception_group(exc)):  # opaque SDK error + a recorded rejection
                     raise ConnectionError(f"MCP server '{self.name}': Streamable HTTP connect failed "
                                           f"({http_detail})") from exc
@@ -639,6 +825,16 @@ class MCPServerTransportMixin:
                 "over SSE. If this connects, set `transport: sse` for this server in config.yaml "
                 "to skip the failed attempt on future startups.",
                 self.name, http_detail)
+            prepare_replacement = getattr(
+                getattr(self, "_i16_source_owner", None), "prepare_replacement", None,
+            )
+            if callable(prepare_replacement):
+                # The first transport's context has exited before this branch.  A
+                # profile-owned receipt may re-use the same coordinator root only
+                # after that exact close is observed; a failed close stays UNKNOWN.
+                prepare_replacement("streamable_http_rejected", rejection=rejection_witness)
+                if callable(begin_http_attempt):
+                    begin_http_attempt(self, asyncio.current_task())
             try:
                 self._sse_fallback = True
                 return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))

@@ -572,6 +572,14 @@ class MCPServerRunMixin:
                 task.cancel()
             await asyncio.gather(*self._pending_refresh_tasks, return_exceptions=True)
             self._pending_refresh_tasks.clear()
+        source_owner = getattr(self, "_i16_source_owner", None)
+        if getattr(source_owner, "receipt", None) is not None:
+            from gateway.runtime_sidecar_factory import finish_remote_owner
+            if not finish_remote_owner(source_owner, task=self._task):
+                logger.warning(
+                    "MCP server '%s' remote source close/readback was not proven; retaining custody",
+                    self.name,
+                )
         self._deregister_tools()
         self.session = None
 

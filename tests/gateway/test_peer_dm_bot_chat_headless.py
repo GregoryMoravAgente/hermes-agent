@@ -25,6 +25,7 @@ async def headless(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config',
@@ -36,6 +37,7 @@ async def headless(tmp_path, monkeypatch):
                              _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None)
     # The gateway owns its home's session authority; no Desktop/CLI ever made a "Bot Chat".
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='fixture')
+    bind_authority_runtime_custody(runner, authority)
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter.gateway_runner = runner
     adapter._session_db = authority.db

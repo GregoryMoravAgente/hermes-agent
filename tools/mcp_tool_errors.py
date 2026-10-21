@@ -93,9 +93,11 @@ def _is_streamable_http_rejection(exc: BaseException) -> bool:
 _HTTP_REJECTION_BODY_CHARS = 300
 
 
-def _make_http_rejection_recorder(sink: dict):
+def _make_http_rejection_recorder(sink: dict | None = None, *, on_response=None):
     """httpx response hook for the owned Streamable HTTP client: remembers the last 4xx/5xx the server
-    sent (status, method, URL, head of the body). mcp >= 2.0 folds a non-2xx whose body it cannot
+    sent (status, method, URL, head of the body). ``on_response`` is an optional
+    source-owned callback that receives the exact response object and bounded body
+    after the event has been read. mcp >= 2.0 folds a non-2xx whose body it cannot
     parse as a JSON-RPC error into the opaque ``-32603 Server returned an error response`` — the
     status and the server's own words (e.g. ``400 {"code":-32020,"message":"Unsupported
     MCP-Protocol-Version"}``) never reach the exception, so this is the only place they can be
@@ -111,8 +113,12 @@ def _make_http_rejection_recorder(sink: dict):
                 body = " ".join(raw[:_HTTP_REJECTION_BODY_CHARS * 4].decode("utf-8", "replace").split())
             except Exception:  # the failure itself is still reported, just without the body
                 body = ""
-        sink.update(status=response.status_code, method=response.request.method,
-                    url=str(response.request.url), body=body[:_HTTP_REJECTION_BODY_CHARS])
+        event_body = body[:_HTTP_REJECTION_BODY_CHARS]
+        if sink is not None:
+            sink.update(status=response.status_code, method=response.request.method,
+                        url=str(response.request.url), body=event_body)
+        if callable(on_response):
+            on_response(response, event_body)
 
     return _record
 

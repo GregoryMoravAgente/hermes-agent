@@ -113,6 +113,9 @@ class ExternalProcessParent:
     _catalog_client: Any = field(default=None, repr=False)
     _owner_agent: Any = field(default=None, repr=False)
     _request: Any = field(default=None, repr=False)
+    # Remote I16 routes retain the exact SDK transport/session receipt on this
+    # object.  The SessionAuthority finalizer index remains the only registry.
+    _remote_receipt: Any = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -1024,6 +1027,11 @@ def mark_unknown(parent: ExternalProcessParent, reason: str) -> None:
     if parent.state == "unknown":
         return
     parent.state = "unknown"
+    remote = getattr(parent, "_remote_receipt", None)
+    if remote is not None:
+        marker = getattr(remote, "mark_unknown", None)
+        if callable(marker):
+            marker(reason)
     if parent._physical is not None:
         parent._physical.mark_unknown(reason)
     parent.coordinator.mark_unknown(parent.root_handle, reason)
@@ -1049,6 +1057,25 @@ def close_after_finalizers(parent: ExternalProcessParent) -> bool:
     if _service_close_is_blocked(parent):
         return False
     if parent.state == "terminal":
+        return True
+    remote = getattr(parent, "_remote_receipt", None)
+    if remote is not None:
+        if getattr(remote, "state", None) != "closed":
+            parent.state = "unknown"
+            return False
+        if getattr(remote, "readback", lambda: None)() is None:
+            parent.state = "unknown"
+            return False
+        result = parent.coordinator.mark_terminal(parent.root_handle)
+        if result is not None:
+            parent.state = "unknown"
+            return False
+        parent.state = "terminal"
+        forget = getattr(parent.profile_authority, "forget_external_process_finalizer", None)
+        if callable(forget) and not forget(parent.operation_id, parent):
+            parent.state = "unknown"
+            return False
+        parent._remote_receipt = None
         return True
     physical = parent._physical
     if physical is None:

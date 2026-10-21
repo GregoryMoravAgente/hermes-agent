@@ -1,6 +1,9 @@
 """Authority-bound hosted service; no legacy session server is constructed."""
 import asyncio
+from dataclasses import dataclass
 from contextlib import nullcontext
+import hashlib
+import json
 from pathlib import Path
 import time
 from typing import Any
@@ -407,6 +410,9 @@ async def ensure_hosted_service(runner):
 
 async def _ensure_hosted_service(runner, authority):
     with owner_scope(authority):
+        registry = getattr(authority, '_i17_producer_registry', None)
+        if isinstance(registry, dict) and registry.get('intake_closed') is True:
+            raise RuntimeStoreError('hosted_source_closed')
         service = getattr(authority, 'hosted_room_service', None)
         if service is None:
             loop = asyncio.get_running_loop()
@@ -451,50 +457,359 @@ async def stop_hosted_service(runner, timeout=5):
     return stopped
 
 
-def _i09_service_pairs(runner):
-    authorities = tuple(serving_authorities(runner))
-    pairs = tuple((authority, getattr(authority, 'hosted_room_service', None))
-                  for authority in authorities)
-    if pairs and all(service is None for _authority, service in pairs):
-        return ()
-    if any(service is None for _authority, service in pairs):
+@dataclass(frozen=True)
+class _I09SourceCatalog:
+    """Authenticated snapshot of every served I09 producer profile.
+
+    A configured absence is a source-owned result only when every served authority is
+    enumerated, each authority has the exact runtime identity and operation store, and the
+    runner has no hosted transport or materialized service.  The catalog is retained in the
+    evidence so an empty service map can never stand in for a closed-world observation.
+    """
+
+    pairs: tuple[tuple[object, object | None], ...]
+    rows: tuple[dict[str, Any], ...]
+    no_producer: bool
+    digest: str
+
+
+def _i09_authority_context(runner, authority):
+    profile_id = str(getattr(authority, 'profile_id', '')).strip()
+    authority_epoch = getattr(authority, 'epoch', None)
+    instance_id = str(getattr(authority, 'instance_id', '')).strip()
+    if not profile_id or type(authority_epoch) is not int or authority_epoch < 1:
         return None
-    return pairs
+    if not instance_id or getattr(authority, 'runner', None) is not runner:
+        return None
+    operations = getattr(authority, '_preservation_operations', None)
+    if not isinstance(operations, dict):
+        return None
+    return profile_id, authority_epoch, instance_id, operations
+
+
+def _i09_registry_binding_valid(
+    runner, coordinator, authority, context, registry, binding, source,
+) -> bool:
+    profile_id, authority_epoch, _instance_id, _operations = context
+    process_instance = getattr(coordinator, 'process_instance', None)
+    if registry is None or registry.get('source') != source:
+        return False
+    if registry.get('process_instance') != process_instance:
+        return False
+    if registry.get('profile_id') != profile_id:
+        return False
+    if registry.get('authority_epoch') != authority_epoch:
+        return False
+    if registry.get('authority') is not authority or registry.get('runner') is not runner:
+        return False
+    if binding is None or getattr(binding, 'authority', None) is not authority:
+        return False
+    if getattr(binding, 'runner', None) is not runner:
+        return False
+    if getattr(binding, 'coordinator', None) is not coordinator:
+        return False
+    if getattr(binding, 'registry', None) is not registry:
+        return False
+    if not callable(getattr(coordinator, '_source_binding_is_canonical', None)):
+        return False
+    return coordinator._source_binding_is_canonical(
+        'I17_hosted_tui_services', profile_id, binding,
+    )
+
+
+def _i09_i17_handle_observation(
+    coordinator, profile_id, authority_epoch, process_instance, handle,
+):
+    scope = getattr(coordinator, 'profile_scope_observation', None)
+    if not callable(scope) or handle is None:
+        return None
+    scope_result = scope(
+        profile_id, authority_epoch, require_serving=False, allow_retiring=True,
+    )
+    if not scope_result.ok:
+        return None
+    if type(scope_result.physical_owner_epoch) is not str:
+        return None
+    if not scope_result.physical_owner_epoch:
+        return None
+    if handle.profile_id != profile_id or handle.authority_epoch != authority_epoch:
+        return None
+    if handle.process_instance != process_instance:
+        return None
+    if handle.physical_owner_epoch != scope_result.physical_owner_epoch:
+        return None
+    active = coordinator.is_active_handle(
+        handle, owner_class='I17_hosted_tui_services',
+        profile_id=profile_id, authority_epoch=authority_epoch,
+    )
+    terminal = coordinator.is_terminal_handle(
+        handle, owner_class='I17_hosted_tui_services',
+        profile_id=profile_id, authority_epoch=authority_epoch,
+    )
+    if not active and not terminal:
+        return None
+    return scope_result
+
+
+def _i09_i17_context(runner, coordinator, authority, context):
+    from tui_gateway.hosted_tui_custody import _PRODUCER_REGISTRY_SOURCE, _producer_registry
+
+    profile_id, authority_epoch, _instance_id, _operations = context
+    process_instance = getattr(coordinator, 'process_instance', None)
+    registry = _producer_registry(authority)
+    binding = getattr(authority, '_i17_rebind_source', None)
+    handle = getattr(authority, '_i17_service_handle', None)
+    if not _i09_registry_binding_valid(
+        runner, coordinator, authority, context, registry, binding,
+        _PRODUCER_REGISTRY_SOURCE,
+    ):
+        return None
+    scope_result = _i09_i17_handle_observation(
+        coordinator, profile_id, authority_epoch, process_instance, handle,
+    )
+    if scope_result is None:
+        return None
+    return registry, binding, handle, scope_result
+
+
+def _i09_service_context(runner, authority, registry):
+    service = getattr(authority, 'hosted_room_service', None)
+    factory = registry.get('room_factory')
+    if not isinstance(factory, dict):
+        return None
+    if factory.get('source') != 'gateway.session_hosted_service:CanonicalHostedRoomService':
+        return None
+    if factory.get('authority') is not authority or factory.get('runner') is not runner:
+        return None
+    if service is None:
+        return service, factory
+    if not isinstance(service, CanonicalHostedRoomService):
+        return None
+    if getattr(service, 'authority', None) is not authority:
+        return None
+    for name in (
+        'begin_preservation_close', 'abort_preservation_close',
+        'await_preservation_close', 'preservation_owner_evidence',
+    ):
+        if not callable(getattr(service, name, None)):
+            return None
+    return service, factory
+
+
+def _i09_catalog_row(runner, coordinator, authority, control, process_instance):
+    context = _i09_authority_context(runner, authority)
+    if context is None:
+        return None
+    profile_id, authority_epoch, instance_id, operations = context
+    i17 = _i09_i17_context(runner, coordinator, authority, context)
+    if i17 is None:
+        return None
+    registry, binding, handle, scope_result = i17
+    service_context = _i09_service_context(runner, authority, registry)
+    if service_context is None:
+        return None
+    service, factory = service_context
+    row = {
+        'authority': authority,
+        'profile_id': profile_id,
+        'authority_epoch': authority_epoch,
+        'authority_instance_id': instance_id,
+        'coordinator_process_instance': process_instance,
+        'physical_owner_epoch': scope_result.physical_owner_epoch,
+        'i17_registry_source': registry['source'],
+        'i17_registry': registry,
+        'i17_binding': binding,
+        'i17_root': handle,
+        'room_factory': factory,
+        'control_present': control is not None,
+        'service_present': service is not None,
+        'operation_store': operations,
+        'active_i09_operations': sum(
+            isinstance(record, dict)
+            and record.get('owner_class') == 'I09_a2a_hosted_kanban'
+            for record in operations.values()
+        ),
+    }
+    return service, row
+
+
+def _i09_catalog_no_producer(rows, pairs, control):
+    all_absent = all(service is None for _authority, service in pairs)
+    if all_absent and control is not None:
+        return None
+    if not all_absent and (control is None or any(service is None for _authority, service in pairs)):
+        return None
+    no_producer = all_absent and control is None and all(
+        row['active_i09_operations'] == 0
+        and type(row['i17_registry']['intake_closed']) is bool
+        and row['i17_registry']['host']['state'] == 'absent'
+        and row['i17_registry']['room']['state'] == 'absent'
+        for row in rows
+    )
+    if all_absent and not no_producer:
+        return None
+    return no_producer
+
+
+def _i09_intake_is_closed(rows) -> bool:
+    return bool(rows) and all(
+        row['i17_registry'].get('intake_closed') is True for row in rows
+    )
+
+
+def _i09_set_intake_closed(rows, closed: bool) -> None:
+    for row in rows:
+        row['i17_registry']['intake_closed'] = closed
+
+
+def _i09_catalog_digest(rows):
+    encoded = json.dumps(
+        [
+            {
+                'profile_id': row['profile_id'],
+                'authority_epoch': row['authority_epoch'],
+                'authority_instance_id': row['authority_instance_id'],
+                'coordinator_process_instance': row['coordinator_process_instance'],
+                'physical_owner_epoch': row['physical_owner_epoch'],
+                'i17_registry_source': row['i17_registry_source'],
+                'control_present': row['control_present'],
+                'service_present': row['service_present'],
+                'active_i09_operations': row['active_i09_operations'],
+                'intake_closed': row['i17_registry']['intake_closed'],
+                'host_state': row['i17_registry']['host']['state'],
+                'room_state': row['i17_registry']['room']['state'],
+            }
+            for row in rows
+        ],
+        sort_keys=True, separators=(',', ':'), ensure_ascii=True,
+    )
+    return hashlib.sha256(encoded.encode('utf-8')).hexdigest()
+
+
+def _i09_source_catalog(runner) -> _I09SourceCatalog | None:
+    authorities = tuple(serving_authorities(runner))
+    if not authorities:
+        return None
+    coordinator = getattr(runner, 'runtime_custody', None)
+    process_instance = getattr(coordinator, 'process_instance', None)
+    if not isinstance(process_instance, str) or not process_instance:
+        return None
+    control = getattr(runner, 'session_control_server', None)
+    pairs, rows = [], []
+    for authority in authorities:
+        result = _i09_catalog_row(
+            runner, coordinator, authority, control, process_instance,
+        )
+        if result is None:
+            return None
+        service, row = result
+        pairs.append((authority, service))
+        rows.append(row)
+    no_producer = _i09_catalog_no_producer(rows, pairs, control)
+    if no_producer is None:
+        return None
+    return _I09SourceCatalog(
+        tuple(pairs), tuple(rows), no_producer, _i09_catalog_digest(rows),
+    )
+
+
+def _i09_service_pairs(runner):
+    catalog = _i09_source_catalog(runner)
+    return None if catalog is None else catalog.pairs
+
+
+def _i09_source_installed(runner) -> bool:
+    """Recognize the boot-installed I17 source seam by identity.
+
+    Some API/native compatibility consumers use a real ``SessionAuthority`` without booting a
+    hosted gateway. They have no I09 producer to close. A booted runner is recognized only by the
+    actual coordinator-owned binding on every served authority, never by an empty service map or a
+    readiness flag.
+    """
+    coordinator = getattr(runner, 'runtime_custody', None)
+    authorities = tuple(serving_authorities(runner))
+    if not authorities or coordinator is None:
+        return False
+    if all(
+        getattr(authority, '_i17_runtime_custody', None) is coordinator
+        for authority in authorities
+    ):
+        return True
+    # A control listener or materialized hosted service means the runner is on the real hosted
+    # path.  A partially bound authority must fail closed into the authenticated catalog instead
+    # of being treated as a standalone compatibility fixture with no producer.
+    return getattr(runner, 'session_control_server', None) is not None or any(
+        getattr(authority, 'hosted_room_service', None) is not None
+        for authority in authorities
+    )
 
 
 def begin_i09_source_close(runner, close_generation: int) -> bool:
     """Close every configured hosted producer at the coordinator's exact generation."""
-    pairs = _i09_service_pairs(runner)
-    if pairs is None:
+    # Standalone authority fixtures and legacy adapter consumers do not install the boot-owned I17
+    # source seam, so they have no I09 hosted source to close. A real booted runner must pass the
+    # authenticated catalog below.
+    if not _i09_source_installed(runner):
+        return True
+    catalog = _i09_source_catalog(runner)
+    if catalog is None:
         return False
+    if catalog.no_producer:
+        _i09_set_intake_closed(catalog.rows, True)
+        return True
     begun = []
-    for _authority, service in pairs:
+    for _authority, service in catalog.pairs:
         begin = getattr(service, 'begin_preservation_close', None)
         if not callable(begin) or not begin(close_generation):
+            rollback_ok = True
             for previous in begun:
-                previous.abort_preservation_close(close_generation)
+                rollback_ok = previous.abort_preservation_close(close_generation) and rollback_ok
+            if rollback_ok:
+                _i09_set_intake_closed(catalog.rows, False)
             return False
+        row = _i09_catalog_row_for_authority(catalog, _authority)
+        if row is None:
+            return False
+        row['i17_registry']['intake_closed'] = True
         begun.append(service)
     return True
 
 
 def abort_i09_source_close(runner, close_generation: int) -> bool:
-    pairs = _i09_service_pairs(runner)
-    if pairs is None:
+    if not _i09_source_installed(runner):
+        return True
+    catalog = _i09_source_catalog(runner)
+    if catalog is None:
         return False
-    result = True
-    for _authority, service in pairs:
+    if catalog.no_producer:
+        if not _i09_intake_is_closed(catalog.rows):
+            return False
+        _i09_set_intake_closed(catalog.rows, False)
+        return True
+    for _authority, service in catalog.pairs:
         abort = getattr(service, 'abort_preservation_close', None)
-        result = bool(callable(abort) and abort(close_generation)) and result
-    return result
+        if not callable(abort) or not abort(close_generation):
+            # A partial abort must retain the same generation fence.  Reclose every service,
+            # including one whose abort just failed, before exposing a retryable refusal.
+            for _reclose_authority, candidate in catalog.pairs:
+                begin = getattr(candidate, 'begin_preservation_close', None)
+                if not callable(begin) or not begin(close_generation):
+                    return False
+            return False
+    _i09_set_intake_closed(catalog.rows, False)
+    return True
 
 
 async def await_i09_source_close(runner, close_generation: int, timeout: float) -> bool:
-    pairs = _i09_service_pairs(runner)
-    if pairs is None:
+    if not _i09_source_installed(runner):
+        return True
+    catalog = _i09_source_catalog(runner)
+    if catalog is None:
         return False
+    if catalog.no_producer:
+        return _i09_intake_is_closed(catalog.rows)
     deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout))
-    for _authority, service in pairs:
+    for _authority, service in catalog.pairs:
         wait = getattr(service, 'await_preservation_close', None)
         if not callable(wait):
             return False
@@ -504,14 +819,18 @@ async def await_i09_source_close(runner, close_generation: int, timeout: float) 
     return True
 
 
+def _i09_catalog_row_for_authority(catalog: _I09SourceCatalog, authority):
+    return next((row for row in catalog.rows if row.get('authority') is authority), None)
+
+
 def preservation_i09_owner_ready(authority, custody: dict[str, Any]) -> bool:
-    service = getattr(authority, 'hosted_room_service', None)
     generation = custody.get('close_generation') if isinstance(custody, dict) else None
-    if service is None or type(generation) is not int:
+    if type(generation) is not int:
         return False
-    evidence = service.preservation_owner_evidence(
-        process_instance=authority.instance_id, authority_epoch=authority.epoch,
-        close_generation=generation, owner_id=f'{authority.instance_id}:I09_a2a_hosted_kanban')
+    evidence = preservation_i09_owner_evidence(
+        authority, process_instance=str(getattr(authority, 'instance_id', '')),
+        authority_epoch=getattr(authority, 'epoch', None), close_generation=generation,
+        owner_id=f'{getattr(authority, "instance_id", "")}:I09_a2a_hosted_kanban')
     return evidence is not None
 
 
@@ -519,9 +838,48 @@ def preservation_i09_owner_evidence(
     authority, *, process_instance: str, authority_epoch: int,
     close_generation: int, owner_id: str,
 ) -> dict[str, Any] | None:
+    runner = getattr(authority, 'runner', None)
+    if runner is None:
+        return None
+    catalog = _i09_source_catalog(runner)
+    if catalog is None or not isinstance(process_instance, str) or not process_instance:
+        return None
+    coordinator = getattr(runner, 'runtime_custody', None)
+    coordinator_process_instance = getattr(coordinator, 'process_instance', None)
+    row = _i09_catalog_row_for_authority(catalog, authority)
+    if row is None or (row['authority_instance_id'] != process_instance
+                       or row['authority_epoch'] != authority_epoch
+                       or row['coordinator_process_instance'] != coordinator_process_instance):
+        return None
+    if type(close_generation) is not int or close_generation < 1 or not owner_id:
+        return None
+    current_close = getattr(getattr(coordinator, '_close', None), 'close_generation', None)
+    if getattr(coordinator, 'state', None) == 'closing' and current_close != close_generation:
+        return None
     service = getattr(authority, 'hosted_room_service', None)
+    if catalog.no_producer and service is None:
+        if not _i09_intake_is_closed(catalog.rows):
+            return None
+        from gateway.runtime_custody import OWNER_SPECS
+        return {
+            'source': OWNER_SPECS['I09_a2a_hosted_kanban'].source,
+            'process_instance': process_instance,
+            'authority_epoch': authority_epoch,
+            'close_generation': close_generation,
+            'owner_id': owner_id,
+            'observed': True,
+            'configured_absent': True,
+            'source_catalog': catalog.rows,
+            'source_catalog_digest': catalog.digest,
+            'served_authority_count': len(catalog.rows),
+        }
     if service is None:
         return None
-    return service.preservation_owner_evidence(
+    evidence = service.preservation_owner_evidence(
         process_instance=process_instance, authority_epoch=authority_epoch,
         close_generation=close_generation, owner_id=owner_id)
+    if not isinstance(evidence, dict):
+        return None
+    return {**evidence, 'source_catalog': catalog.rows,
+            'source_catalog_digest': catalog.digest,
+            'served_authority_count': len(catalog.rows)}

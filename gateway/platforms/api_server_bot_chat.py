@@ -96,6 +96,24 @@ def bot_chat_tip(authority, session_id):
     return db.get_session(tip)
 
 
+def _reject_nonlocal_peer_turn(authority, tip, custody, home, key):
+    if str(tip.get('chat_id') or '').startswith('local-'):
+        return None
+    from hermes_state_local_migration import validate_legacy_row
+    try:
+        validate_legacy_row(authority.db, tip)
+    except RuntimeStoreError as exc:
+        reason, error = _refusal(authority, tip, exc)
+    else:
+        reason, error = _refusal(authority, tip, RuntimeStoreError('not_found'))
+    if custody is not None:
+        custody.mark_admission_closed()
+        custody.mark_unknown(reason)
+    return home, {
+        'status': 'failed', 'delivery_id': key, 'reason': reason, 'error': error,
+    }
+
+
 async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     """``(profile home, receipt)`` when *session_id* is the Bot Chat and the turn was admitted to its
     FIFO; None when the target is any other session (the caller runs it as an API turn)."""
@@ -113,6 +131,9 @@ async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     actor = Principal(tip['user_id'], authority.profile_id,
                       frozenset({'session:submit', 'session:read'}), 'api-peer-dm')
     key = uuid.uuid4().hex
+    nonlocal_refusal = _reject_nonlocal_peer_turn(authority, tip, custody, home, key)
+    if nonlocal_refusal is not None:
+        return nonlocal_refusal
     params = dict(id=key, profile=served_profile_name(home), message=message)
     if author is not None:
         params['author'] = dict(author)
@@ -151,17 +172,15 @@ async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
             return
         if custody.parent_bound and custody.initial_admission_id == record.get('admission_id'):
             return
-        from hermes_state_runtime import get_session_admission
         record.update({
             "_api_producer_phase": "bot_i02",
             "_api_producer_source": "bot_chat",
         })
-        row = get_session_admission(authority.db, admission_id=record.get('admission_id'))
-        authority._preservation_bind_or_release(row, parent_handle)
-        refusal = custody.bind_peer_record(record, authority)
+        refusal = custody.bind_peer_record(record, authority, expected_parent=parent_handle)
         if refusal is not None:
             custody.mark_unknown(getattr(refusal, 'code', 'peer_parent_unmapped'))
             return
+        authority._preservation_forget_pending_root(parent_handle)
         refusal = custody.mark_worker_submitted()
         if refusal is not None:
             custody.mark_unknown(getattr(refusal, 'code', 'peer_worker_submission_unknown'))
@@ -187,8 +206,8 @@ async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
             custody.mark_admission_closed()
             custody.mark_unknown('peer_admission_interrupted')
         raise
-    if parent_handle is not None and not any(
-            handle is parent_handle for handle in authority._preservation_handles.values()):
+    if (parent_handle is not None and custody is not None and not custody.parent_bound
+            and not any(handle is parent_handle for handle in authority._preservation_handles.values())):
         authority._preservation_release_unaccepted(parent_handle)
     _bind_admitted(record)
     # The exact authority that admitted this FIFO row is an internal custody input.  Do not

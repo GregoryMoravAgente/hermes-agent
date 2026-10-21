@@ -8,6 +8,7 @@ terminal state is used.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import threading
@@ -17,9 +18,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.runtime_custody import RuntimeCustodyCoordinator
-from gateway.session_authorities import SessionAuthorities
+import hermes_state
+import gateway.runtime_custody as runtime_custody_module
+from gateway.config import GatewayConfig
+from gateway.run import GatewayRunner
+from gateway.run_runtime import (
+    _retire_profile_authority,
+    drain_gateway_runtime,
+    initialize_gateway_runtime,
+)
+from gateway.runtime_ownership import ProfileReleaseOutcome, process_ownership
+from gateway.session_authorities import all_authorities
 from hermes_cli import backend_retirement
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tests.waiting import wait_until
 from tui_gateway import hosted_tui_custody
 from tui_gateway.host_supervisor import HostSupervisor
@@ -29,39 +40,351 @@ from tui_gateway.hosted_room_driver import HostedRoomRuntime
 pytestmark = pytest.mark.platforms("posix", "windows")
 
 
+# These are test-resource references, never custody state. A resource enters the retained list
+# only when source-owned retirement or physical-release proof is UNKNOWN or pending.
+_ACTIVE_I17_TEST_RESOURCES: list[dict] = []
+_RETAINED_I17_TEST_RESOURCES: list[dict] = []
+
+
+def _owned_runtime_loop():
+    loop = asyncio.new_event_loop()
+    ready = threading.Event()
+
+    def run_loop():
+        asyncio.set_event_loop(loop)
+        ready.set()
+        loop.run_forever()
+
+    thread = threading.Thread(
+        target=run_loop,
+        name="i17-hosted-custody-test-loop",
+        daemon=True,
+    )
+    thread.start()
+    if not ready.wait(5):
+        raise RuntimeError("I17 test runtime loop did not start")
+
+    def call(coroutine, *, timeout=60):
+        future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        try:
+            return future.result(timeout)
+        except BaseException:
+            if not future.done():
+                future.cancel()
+            raise
+
+    return loop, thread, call
+
+
+async def _pending_runtime_tasks():
+    current = asyncio.current_task()
+    return tuple(
+        task for task in asyncio.all_tasks()
+        if task is not current and not task.done()
+    )
+
+
+def _report_i17_cleanup(node, resource, reasons):
+    if node is None or not hasattr(node, "add_report_section"):
+        return
+    status = {}
+    coordinator = resource.get("coordinator")
+    if coordinator is not None:
+        try:
+            status = coordinator.status()
+        except BaseException:
+            status = {"status_read": "failed"}
+    node.add_report_section(
+        "teardown",
+        "i17-hosted-custody",
+        repr({
+            "clean_retirement_proven": False,
+            "retained_boundary": True,
+            "home": str(resource.get("home")),
+            "reasons": tuple(reasons),
+            "coordinator": status,
+        }),
+    )
+
+
+def _retain_i17_resource(resource, node, reasons):
+    resource["retained"] = True
+    resource["retention_reasons"] = tuple(reasons)
+    if resource not in _RETAINED_I17_TEST_RESOURCES:
+        _RETAINED_I17_TEST_RESOURCES.append(resource)
+    token = resource.get("home_token")
+    if token is not None:
+        reset_hermes_home_override(token)
+        resource["home_token"] = None
+    _report_i17_cleanup(node, resource, reasons)
+
+
+def _stop_owned_runtime_loop(resource):
+    call = resource.get("call")
+    loop = resource.get("loop")
+    thread = resource.get("thread")
+    if loop is None or thread is None:
+        return True
+    if call is not None and call(_pending_runtime_tasks()):
+        return False
+    loop.call_soon_threadsafe(loop.stop)
+    thread.join(60)
+    if thread.is_alive():
+        return False
+    loop.close()
+    resource["loop"] = None
+    resource["thread"] = None
+    return True
+
+
+def _settle_i17_supervisors(resource):
+    reasons = []
+    # Complete the real child shutdown where the test did not already consume its receipt. A
+    # returned receipt is passed through production host_shutdown; no synthetic receipt is made
+    # for a child that never produced one.
+    for supervisor in reversed(resource.get("supervisors", ())):
+        if getattr(supervisor, "_i17_terminal_receipt", None) is not None:
+            continue
+        had_effect = getattr(supervisor, "_i17_test_had_host_effect", None)
+        if had_effect is None:
+            had_effect = hosted_tui_custody._host_effect_started(supervisor)
+        if not had_effect:
+            try:
+                if hosted_tui_custody.host_start_failed(supervisor) is True:
+                    continue
+            except BaseException as exc:
+                reasons.append(f"host_pre_effect:{type(exc).__name__}")
+                continue
+        receipts = getattr(supervisor, "_i17_test_shutdown_receipts", ())
+        receipt = receipts[0] if receipts else None
+        try:
+            if receipt is None:
+                receipt = supervisor.shutdown()
+        except BaseException as exc:
+            reasons.append(f"host_shutdown:{type(exc).__name__}")
+            continue
+        if isinstance(receipt, dict):
+            try:
+                if hosted_tui_custody.host_shutdown(supervisor, receipt) is not True:
+                    reasons.append("host_receipt_unproven")
+            except BaseException as exc:
+                reasons.append(f"host_receipt:{type(exc).__name__}")
+    return reasons
+
+
+def _retire_i17_authorities(resource):
+    runner = resource.get("runner")
+    call = resource.get("call")
+    authorities = tuple(
+        authority for authority in resource.get("authorities", ())
+        if authority is not None
+    )
+    reasons = []
+    if runner is None or not resource.get("initialized") or call is None:
+        return authorities, reasons
+    try:
+        call(drain_gateway_runtime(runner))
+    except BaseException as exc:
+        reasons.append(f"drain:{type(exc).__name__}")
+    authorities = tuple(
+        authority for authority in all_authorities(runner) if authority is not None
+    )
+    resource["authorities"] = authorities
+    # Retirement is the source-owned join: the real authority stays canonical while workers,
+    # rooms, finalizers, and I17 source custody settle.
+    for authority in authorities:
+        try:
+            if call(_retire_profile_authority(authority)) is not True:
+                reasons.append("authority_retirement_unproven")
+        except BaseException as exc:
+            reasons.append(f"authority_retirement:{type(exc).__name__}")
+    return authorities, reasons
+
+
+def _close_i17_stores(resource, authorities):
+    runner = resource.get("runner")
+    reasons = []
+    try:
+        for authority in authorities:
+            db = getattr(authority, "db", None)
+            close = getattr(db, "close", None)
+            if callable(close):
+                close()
+        store = getattr(runner, "session_store", None)
+        close_all = getattr(store, "close_all_db_handles", None)
+        if callable(close_all):
+            close_all()
+        close_sessions = getattr(runner, "close_all_session_db_handles", None)
+        if callable(close_sessions):
+            close_sessions()
+    except BaseException as exc:
+        reasons.append(f"store_close:{type(exc).__name__}")
+    return reasons
+
+
+def _release_i17_home(resource):
+    if not resource.get("reserved"):
+        return []
+    try:
+        outcome = process_ownership.release_outcome(resource["home"])
+    except BaseException as exc:
+        return [f"physical_release:{type(exc).__name__}"]
+    if outcome is not ProfileReleaseOutcome.RELEASED:
+        return [f"physical_release:{getattr(outcome, 'value', outcome)}"]
+    return []
+
+
+def _cleanup_i17_resource(resource, node):
+    if resource.get("cleaned") or resource.get("retained"):
+        return
+
+    reasons = _settle_i17_supervisors(resource)
+    authorities, retirement_reasons = _retire_i17_authorities(resource)
+    reasons.extend(retirement_reasons)
+    if reasons:
+        _retain_i17_resource(resource, node, reasons)
+        return
+
+    # Do not close stores or release the native profile lock while the owned loop could still
+    # contain source work. A failed quiescence check retains the exact runtime for retry.
+    try:
+        quiescent = _stop_owned_runtime_loop(resource)
+    except BaseException as exc:
+        quiescent = False
+        reasons.append(f"runtime_loop:{type(exc).__name__}")
+    if not quiescent:
+        reasons.append("runtime_loop_not_quiescent")
+    if reasons:
+        _retain_i17_resource(resource, node, reasons)
+        return
+
+    reasons.extend(_close_i17_stores(resource, authorities))
+    if reasons:
+        _retain_i17_resource(resource, node, reasons)
+        return
+
+    reasons.extend(_release_i17_home(resource))
+    if reasons:
+        _retain_i17_resource(resource, node, reasons)
+        return
+
+    token = resource.get("home_token")
+    if token is not None:
+        reset_hermes_home_override(token)
+        resource["home_token"] = None
+    runner = resource.get("runner")
+    if runner is not None:
+        runner.__dict__.pop("_i17_test_call", None)
+    resource["cleaned"] = True
+
+
+@pytest.fixture(autouse=True)
+def _i17_runtime_cleanup(request, monkeypatch):
+    # Depend on monkeypatch so cleanup runs while the real hosted-TUI globals are still bound.
+    start = len(_ACTIVE_I17_TEST_RESOURCES)
+
+    def finalize():
+        resources = list(_ACTIVE_I17_TEST_RESOURCES[start:])
+        for resource in reversed(resources):
+            _cleanup_i17_resource(resource, request.node)
+        del _ACTIVE_I17_TEST_RESOURCES[start:]
+
+    request.addfinalizer(finalize)
+
+
 def _runtime(monkeypatch, tmp_path: Path, *, bind_authority_now: bool = True):
     home = (tmp_path / "hermes-home").resolve()
     home.mkdir()
-    process_instance = "i17-test-process"
-    authority = SimpleNamespace(
-        profile_id=str(home),
-        epoch=1,
-        instance_id=process_instance,
-        retiring=False,
-        retired=False,
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("gateway.run._hermes_home", home)
+    monkeypatch.setattr(
+        hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH
     )
-    authorities = SessionAuthorities(home)
-    authorities.add(home, authority)
-    runner = SimpleNamespace(
-        session_authorities=authorities,
-        session_runtime_descriptor={
-            "instance_id": process_instance,
-            "authority_epoch": 1,
-        },
-    )
-    fence = backend_retirement.RetirementFence()
-    coordinator = RuntimeCustodyCoordinator(
-        process_instance=process_instance,
-        authority_epoch=1,
-        fence=fence,
-    )
-    runner.runtime_custody = coordinator
     monkeypatch.setattr(hosted_tui_custody, "_RUNTIME_RUNNER", None)
     monkeypatch.setattr(hosted_tui_custody, "_RUNTIME_COORDINATOR", None)
-    hosted_tui_custody.bind_runtime(runner, coordinator, reserve=bind_authority_now)
-    if bind_authority_now:
-        hosted_tui_custody.bind_authority(authority, runner=runner, coordinator=coordinator)
-    return runner, authority, coordinator, fence, home
+
+    # install_runtime_custody's production class has a definition-time default
+    # (fence=hermes_cli.backend_retirement.retirement).  Patching that module global
+    # alone cannot inject a fresh fence after runtime_custody imported it.  Keep the
+    # canonical coordinator implementation and type identity, but use a local subclass
+    # whose constructor passes this test's real RetirementFence explicitly.  The subclass
+    # is used only while initialize_gateway_runtime calls the constructor; every object
+    # consumed by production custody code remains an actual RuntimeCustodyCoordinator.
+    fence = backend_retirement.RetirementFence()
+    canonical_coordinator = runtime_custody_module.RuntimeCustodyCoordinator
+
+    class _FreshFenceRuntimeCustodyCoordinator(canonical_coordinator):
+        def __init__(self, *, process_instance, authority_epoch, profile_scope=None):
+            super().__init__(
+                process_instance=process_instance,
+                authority_epoch=authority_epoch,
+                fence=fence,
+                profile_scope=profile_scope,
+            )
+
+    monkeypatch.setattr(
+        runtime_custody_module,
+        "RuntimeCustodyCoordinator",
+        _FreshFenceRuntimeCustodyCoordinator,
+    )
+
+    home_token = set_hermes_home_override(home)
+    resource = {
+        "home": home,
+        "home_token": home_token,
+        "reserved": False,
+        "initialized": False,
+        "runner": None,
+        "authority": None,
+        "authorities": (),
+        "coordinator": None,
+        "call": None,
+        "loop": None,
+        "thread": None,
+        "supervisors": [],
+            "fence": fence,
+            "process_registry": None,
+            "process_registry_binding": None,
+    }
+    _ACTIVE_I17_TEST_RESOURCES.append(resource)
+    try:
+        process_ownership.reserve([home])
+        resource["reserved"] = True
+        loop, thread, call = _owned_runtime_loop()
+        resource.update(loop=loop, thread=thread, call=call)
+        runner = GatewayRunner(GatewayConfig(sessions_dir=home / "sessions"))
+        resource["runner"] = runner
+        call(initialize_gateway_runtime(runner))
+        from tools.process_registry import process_registry
+
+        resource["process_registry"] = process_registry
+        resource["process_registry_binding"] = getattr(process_registry, "_runtime_custody", None)
+        authority = runner.session_authority
+        authorities = tuple(
+            authority_item
+            for authority_item in getattr(runner, "session_authorities", ())
+            if authority_item is not None
+        )
+        coordinator = runner.runtime_custody
+        if authority is None or not authorities or coordinator is None:
+            raise RuntimeError("I17 canonical runtime bootstrap was incomplete")
+        resource.update(
+            authority=authority,
+            authorities=authorities,
+            coordinator=coordinator,
+            initialized=True,
+        )
+        # This test-only call helper schedules production coroutines on the already-owned loop; it
+        # never participates in source identity or custody proof.
+        runner._i17_test_call = call
+        if bind_authority_now:
+            hosted_tui_custody.bind_authority(
+                authority, runner=runner, coordinator=coordinator
+            )
+        return runner, authority, coordinator, fence, home
+    except BaseException:
+        _cleanup_i17_resource(resource, None)
+        raise
 
 
 def _supervisor(
@@ -89,6 +412,25 @@ def _supervisor(
         expected_hermes_home=str(home),
         heartbeat_secs=60,
     )
+    original_shutdown = supervisor.shutdown
+    supervisor._i17_test_shutdown_receipts = []
+    supervisor._i17_test_had_host_effect = None
+
+    def capture_shutdown(*args, **kwargs):
+        if supervisor._i17_test_had_host_effect is None:
+            supervisor._i17_test_had_host_effect = hosted_tui_custody._host_effect_started(
+                supervisor
+            )
+        receipt = original_shutdown(*args, **kwargs)
+        if not supervisor._i17_test_shutdown_receipts and isinstance(receipt, dict):
+            supervisor._i17_test_shutdown_receipts.append(receipt)
+        return receipt
+
+    supervisor.shutdown = capture_shutdown
+    for resource in reversed(_ACTIVE_I17_TEST_RESOURCES):
+        if resource.get("home") == home and not resource.get("retained"):
+            resource["supervisors"].append(supervisor)
+            break
     return supervisor, home
 
 
@@ -390,8 +732,6 @@ def test_reversible_abort_rebinds_exact_terminal_root_before_new_rpc(monkeypatch
 
 
 def test_cold_profile_root_is_bound_before_close_owner_snapshot(monkeypatch, tmp_path):
-    import asyncio
-
     runner, authority, coordinator, _fence, _home = _runtime(
         monkeypatch, tmp_path, bind_authority_now=False,
     )
@@ -404,7 +744,7 @@ def test_cold_profile_root_is_bound_before_close_owner_snapshot(monkeypatch, tmp
         runtime=SimpleNamespace(status=lambda: {"running": False, "current_tasks": 0}),
     )
     from gateway.session_hosted_service import ensure_hosted_service
-    asyncio.run(ensure_hosted_service(runner))
+    runner._i17_test_call(ensure_hosted_service(runner))
     root = authority._i17_service_handle
     assert root is not None
     receipt = coordinator.begin_close(owner_id="i17-cold-profile")
@@ -447,3 +787,29 @@ def test_child_bridge_positive_and_foreign_identity_refusal(monkeypatch, tmp_pat
     assert token is not None and reason is None
     assert bridge.settle(token, known=False) is False
     assert unknown == [True]
+
+
+@pytest.mark.parametrize("close_before_release", (False, True))
+def test_real_unstarted_host_releases_registered_source_before_or_during_close(
+    monkeypatch, tmp_path, close_before_release,
+):
+    """A genuine no-Popen producer settles its exact reservation even after ingress closes."""
+    _runner, authority, coordinator, fence, home = _runtime(monkeypatch, tmp_path)
+    supervisor, _ = _supervisor(monkeypatch, tmp_path, fence)
+    assert hosted_tui_custody.bind_supervisor(supervisor, home, "i17-real-pre-effect")
+    registry = authority._i17_producer_registry
+    handle = supervisor._i17_host_handle
+    assert registry["host"]["state"] == "registered"
+    assert registry["host"]["supervisor"] is supervisor
+    assert not hosted_tui_custody._host_effect_started(supervisor)
+    if close_before_release:
+        receipt = coordinator.begin_close(owner_id="i17-real-pre-effect-close")
+        assert getattr(receipt, "state", None) == "closing"
+        assert hosted_tui_custody.close_profile(authority) is False
+        assert registry["intake_closed"] is True
+    assert hosted_tui_custody.host_start_failed(supervisor) is True
+    assert registry["host"]["state"] == "absent"
+    assert not coordinator.is_active_handle(handle, owner_class="I17_hosted_tui_services")
+    assert coordinator.status()["active_child_parents"] == []
+    assert hosted_tui_custody.close_profile(authority) is True
+    assert coordinator.status()["active_owner_classes"] == []

@@ -18,6 +18,7 @@ import threading
 from typing import Any
 
 from gateway.runtime_custody import CustodyHandle, CustodyRefusal, RuntimeCustodyCoordinator
+from gateway.runtime_sidecar_transport import required_reader_streams
 
 
 class ServiceCustodyError(RuntimeError):
@@ -26,8 +27,6 @@ class ServiceCustodyError(RuntimeError):
     def __init__(self, code: str):
         self.code = code
         super().__init__(code)
-
-
 _MANAGED_PROCESS_RETRY_REASONS = frozenset({
     "reader_join_failed", "reader_setup_failed", "acp_session_failed",
     "native_cleanup_interrupted", "reader_cleanup_interrupted",
@@ -889,9 +888,9 @@ class ServiceProcessReceipt:
         if (
             self.process is None or self.process.poll() is None
             or self.reader_error is not None
-            or self.eof_streams != {"stdout", "stderr"}
-            or self.joined_streams != {"stdout", "stderr"}
-            or set(self.readers) != {"stdout", "stderr"}
+            or self.eof_streams != required_reader_streams(self)
+            or self.joined_streams != required_reader_streams(self)
+            or set(self.readers) != required_reader_streams(self)
         ):
             return False
         if self.transaction is not None:
@@ -952,9 +951,9 @@ class ServiceProcessReceipt:
             return True
         if (
             self.reader_error is not None
-            or self.eof_streams != {"stdout", "stderr"}
-            or self.joined_streams != {"stdout", "stderr"}
-            or set(self.readers) != {"stdout", "stderr"}
+            or self.eof_streams != required_reader_streams(self)
+            or self.joined_streams != required_reader_streams(self)
+            or set(self.readers) != required_reader_streams(self)
             or self.process is None
         ):
             return self._delivery_finalize_unknown("physical_receipt_incomplete")
@@ -1043,9 +1042,9 @@ class ServiceProcessReceipt:
             self.durable_proofs
             or self.delivery_requests
             or self.reader_error is not None
-            or self.eof_streams != {"stdout", "stderr"}
-            or self.joined_streams != {"stdout", "stderr"}
-            or set(self.readers) != {"stdout", "stderr"}
+            or self.eof_streams != required_reader_streams(self)
+            or self.joined_streams != required_reader_streams(self)
+            or set(self.readers) != required_reader_streams(self)
             or not self.completed_requests
             or self.process is None
         ):
@@ -1189,7 +1188,7 @@ class ServiceLease:
 
     @staticmethod
     def _readers_stopped(receipt: ServiceProcessReceipt) -> bool:
-        if receipt.readers and set(receipt.readers) != {"stdout", "stderr"}:
+        if receipt.readers and set(receipt.readers) != required_reader_streams(receipt):
             return False
         for reader in receipt.readers.values():
             checker = getattr(reader, "is_alive", None)
@@ -1334,9 +1333,9 @@ class ServiceLease:
         if receipt is None or receipt.reader_error is not None:
             return False
         if (
-            set(receipt.readers) != {"stdout", "stderr"}
-            or receipt.reader_start_states != {"stdout": "started", "stderr": "started"}
-            or receipt.joined_streams != {"stdout", "stderr"}
+            set(receipt.readers) != required_reader_streams(receipt)
+            or receipt.reader_start_states != dict.fromkeys(required_reader_streams(receipt), "started")
+            or receipt.joined_streams != required_reader_streams(receipt)
         ):
             return False
         if not receipt.close_native_after_process():
@@ -1373,8 +1372,8 @@ class ServiceLease:
             return False
         if (
             receipt.reader_error is not None
-            or set(receipt.readers) != {"stdout", "stderr"}
-            or receipt.joined_streams != {"stdout", "stderr"}
+            or set(receipt.readers) != required_reader_streams(receipt)
+            or receipt.joined_streams != required_reader_streams(receipt)
         ):
             return False
         if not receipt.close_native_after_process():

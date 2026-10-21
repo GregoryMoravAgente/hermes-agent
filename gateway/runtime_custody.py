@@ -131,6 +131,40 @@ class CustodyHandle:
 
 
 @dataclass(frozen=True)
+class TerminalRootRebindProof:
+    """Source-owned proof for restoring one terminalized profile root during abort."""
+
+    source: str
+    predecessor: CustodyHandle
+    predecessor_owner_id: str
+    process_instance: str
+    profile_id: str
+    authority_epoch: int
+    close_generation: int
+    physical_owner_epoch: Optional[str]
+    producer_graph_digest: str
+    producer_registry: object
+    source_binding: object
+
+
+@dataclass(frozen=True)
+class TerminalRootRebindObservation:
+    """Fresh observation returned by the canonical I17 source binding at the lock boundary."""
+
+    source: str
+    predecessor: CustodyHandle
+    predecessor_owner_id: str
+    process_instance: str
+    profile_id: str
+    authority_epoch: int
+    close_generation: int
+    physical_owner_epoch: Optional[str]
+    producer_graph_digest: str
+    producer_registry: object
+    source_binding: object
+
+
+@dataclass(frozen=True)
 class ChildReservation:
     owner_class: str
     owner_id: str
@@ -175,6 +209,10 @@ class RuntimeCustodyCoordinator:
         self._lock = threading.RLock()
         self._state = "open"
         self._close: Optional[RetirementClose] = None
+        # The authority owns the source binding.  Keep only a weak coordinator witness so retired
+        # profiles do not leave a strong global profile/binding cache behind.
+        self._source_rebind_bindings = weakref.WeakValueDictionary()
+        self._source_rebind_transition = object()
         self._receipt_id: Optional[str] = None
         self._records: dict[str, _Record] = {}
         self._completed: dict[str, str] = {}
@@ -302,6 +340,88 @@ class RuntimeCustodyCoordinator:
                     and result.physical_owner_epoch == physical_owner_epoch)
             )
 
+    def profile_scope_observation(
+        self, profile_id: str, authority_epoch: int, *,
+        require_serving: bool, allow_retiring: bool,
+    ) -> ProfileScopeResult:
+        """Return the live profile and physical-incarnation observation for a source validator."""
+        with self._lock:
+            return self._profile_scope_result_locked(
+                profile_id, authority_epoch, self.process_instance,
+                require_serving=require_serving, allow_retiring=allow_retiring,
+            )
+
+    def _source_binding_registration_identity_valid(
+        self, owner_class: str, profile_id: str, binding, all_authorities,
+    ) -> bool:
+        authority = getattr(binding, "authority", None)
+        runner = getattr(binding, "runner", None)
+        registry = getattr(binding, "registry", None)
+        if authority is None or runner is None or not isinstance(registry, dict):
+            return False
+        if getattr(binding, "coordinator", None) is not self:
+            return False
+        if getattr(authority, "_i17_rebind_source", None) is not binding:
+            return False
+        if not any(item is authority for item in all_authorities(runner)):
+            return False
+        if registry.get("source") != "tui_gateway.hosted_tui_custody:i17-producer-registry-v1":
+            return False
+        if getattr(authority, "profile_id", None) != profile_id:
+            return False
+        if getattr(authority, "runner", None) is not runner:
+            return False
+        if getattr(runner, "runtime_custody", None) is not self:
+            return False
+        if getattr(authority, "_i17_runtime_custody", None) is not self:
+            return False
+        return getattr(authority, "_i17_producer_registry", None) is registry
+
+    def _source_binding_registration_scope_valid(
+        self, profile_id: str, binding,
+    ) -> bool:
+        authority = binding.authority
+        registry = binding.registry
+        scope = self._profile_scope_result_locked(
+            profile_id, getattr(authority, "epoch", None), self.process_instance,
+            require_serving=False, allow_retiring=True,
+        )
+        return (
+            scope.ok
+            and type(scope.physical_owner_epoch) is str
+            and bool(scope.physical_owner_epoch)
+            and registry.get("authority_epoch") == getattr(authority, "epoch", None)
+        )
+
+    def _register_source_rebind_binding(self, owner_class: str, profile_id: str, binding):
+        """Retain the boot-installed source capability used by closing-time rebind."""
+        if not isinstance(owner_class, str) or not isinstance(profile_id, str) or not profile_id:
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        try:
+            from tui_gateway.hosted_tui_custody import _I17RebindSource
+            from gateway.session_authorities import all_authorities
+        except (ImportError, AttributeError):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        if type(binding) is not _I17RebindSource:
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        with self._lock:
+            if not self._source_binding_registration_identity_valid(
+                owner_class, profile_id, binding, all_authorities,
+            ):
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            if not self._source_binding_registration_scope_valid(profile_id, binding):
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            current = self._source_rebind_bindings.get((owner_class, profile_id))
+            if current is not None and current is not binding:
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            self._source_rebind_bindings[(owner_class, profile_id)] = binding
+            return None
+
+    def _source_binding_is_canonical(self, owner_class: str, profile_id: str, binding) -> bool:
+        """Check one boot-installed source capability by object identity under the coordinator lock."""
+        with self._lock:
+            return self._source_rebind_bindings.get((owner_class, profile_id)) is binding
+
     def authority_epoch_for_profile(
         self, profile_id: str, *, require_serving: bool = True,
     ) -> int | None:
@@ -336,6 +456,11 @@ class RuntimeCustodyCoordinator:
             )
             if close is None:
                 return CustodyRefusal("close_conflict")
+            if not self._fence._register_abort_rebind_capability(
+                close, self._coordinator_id, self._source_rebind_transition,
+            ):
+                self._fence.release_close(close)
+                return CustodyRefusal("source_transition_unavailable")
             self._close = close
             self._receipt_id = secrets.token_urlsafe(24)
             self._state = "closing"
@@ -1218,6 +1343,142 @@ class RuntimeCustodyCoordinator:
                 self._rebound_terminal_roots[lease_id] = retired
             return rebound
 
+    def _abort_rebind_request_refusal(
+        self, owner_id: str, owner_class: str, receipt: DrainReceipt,
+        source_proof: TerminalRootRebindProof,
+    ):
+        if self._state != "closing" or not self._check_close_identity(receipt):
+            return CustodyRefusal("stale_close_receipt", owner_class)
+        if owner_class != "I17_hosted_tui_services":
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        if not isinstance(owner_id, str) or not owner_id:
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        if not isinstance(source_proof, TerminalRootRebindProof):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        return None
+
+    def _observe_abort_rebind_source_locked(
+        self, retired: CustodyHandle, profile_id: str,
+        source_proof: TerminalRootRebindProof,
+    ):
+        binding = source_proof.source_binding
+        canonical_binding = self._source_rebind_bindings.get(
+            ("I17_hosted_tui_services", profile_id)
+        )
+        if canonical_binding is None or binding is not canonical_binding:
+            return None
+        observe = getattr(canonical_binding, "observe_rebind", None)
+        try:
+            canonical = observe(retired, self._close) if callable(observe) else None
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            canonical = None
+        if not isinstance(canonical, TerminalRootRebindObservation):
+            return None
+        return canonical_binding, canonical
+
+    def _abort_rebind_observation_matches(
+        self, retired: CustodyHandle, profile_id: str, authority_epoch: int,
+        source_proof: TerminalRootRebindProof, binding, canonical,
+    ) -> bool:
+        if canonical.predecessor is not retired:
+            return False
+        if canonical.source != "tui_gateway.hosted_tui_custody:i17-producer-registry-v1":
+            return False
+        if canonical.source_binding is not binding:
+            return False
+        if canonical.producer_registry is not source_proof.producer_registry:
+            return False
+        if source_proof.predecessor is not canonical.predecessor:
+            return False
+        if type(retired.physical_owner_epoch) is not str or not retired.physical_owner_epoch:
+            return False
+        if not isinstance(canonical.producer_graph_digest, str) or not canonical.producer_graph_digest:
+            return False
+        if canonical.physical_owner_epoch != retired.physical_owner_epoch:
+            return False
+        expected = (
+            (canonical.source, source_proof.source),
+            (canonical.predecessor_owner_id, retired.owner_id),
+            (canonical.process_instance, self.process_instance),
+            (canonical.profile_id, profile_id),
+            (canonical.authority_epoch, authority_epoch),
+            (canonical.close_generation, self._close.close_generation),
+            (source_proof.predecessor_owner_id, canonical.predecessor_owner_id),
+            (source_proof.process_instance, canonical.process_instance),
+            (source_proof.profile_id, canonical.profile_id),
+            (source_proof.authority_epoch, canonical.authority_epoch),
+            (source_proof.close_generation, canonical.close_generation),
+            (source_proof.physical_owner_epoch, canonical.physical_owner_epoch),
+            (source_proof.producer_graph_digest, canonical.producer_graph_digest),
+        )
+        return all(actual == expected_value for actual, expected_value in expected)
+
+    def _abort_rebind_predecessor_refusal_locked(
+        self, retired: CustodyHandle, profile_id: str, authority_epoch: int,
+        owner_class: str,
+    ):
+        physical_owner_epoch = getattr(retired, "physical_owner_epoch", None)
+        if type(physical_owner_epoch) is not str or not physical_owner_epoch:
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        lease_id = getattr(getattr(retired, "lease", None), "lease_id", None)
+        if lease_id in self._rebound_terminal_roots:
+            return CustodyRefusal("stale_terminal_root", owner_class)
+        if not self.is_terminal_handle(
+            retired, owner_class=owner_class, profile_id=profile_id,
+            authority_epoch=authority_epoch,
+        ):
+            return CustodyRefusal("stale_terminal_root", owner_class)
+        return self._scope_refusal_locked(
+            profile_id, authority_epoch, owner_class,
+            require_serving=False, allow_retiring=True,
+            expected_physical_owner_epoch=physical_owner_epoch,
+        )
+
+    def rebind_terminal_root_during_abort(
+        self, retired: CustodyHandle, owner_id: str, *, profile_id: str,
+        authority_epoch: int, owner_class: str, receipt: DrainReceipt,
+        source_proof: TerminalRootRebindProof,
+    ):
+        """Restore one source-owned root through the exact close and source transition."""
+        with self._lock:
+            refusal = self._abort_rebind_request_refusal(
+                owner_id, owner_class, receipt, source_proof,
+            )
+            if refusal is not None:
+                return refusal
+            observed = self._observe_abort_rebind_source_locked(
+                retired, profile_id, source_proof,
+            )
+            if observed is None:
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            binding, canonical = observed
+            if not self._abort_rebind_observation_matches(
+                retired, profile_id, authority_epoch, source_proof, binding, canonical,
+            ):
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            refusal = self._abort_rebind_predecessor_refusal_locked(
+                retired, profile_id, authority_epoch, owner_class,
+            )
+            if refusal is not None:
+                return refusal
+            lease_id = retired.lease.lease_id
+            lease = self._fence.rebind_root_during_close(
+                self._close, retired.lease,
+                owner_kind=owner_class, owner_id=owner_id, profile_id=profile_id,
+                coordinator_id=self._coordinator_id,
+                source_transition=self._source_rebind_transition,
+            )
+            if lease is None:
+                return CustodyRefusal("runtime_draining", owner_class)
+            handle = CustodyHandle(
+                owner_class, owner_id, profile_id, authority_epoch, self.process_instance,
+                receipt.close_generation, lease, self._coordinator_id,
+                retired.physical_owner_epoch,
+            )
+            self._records[lease.lease_id] = _Record(handle)
+            self._rebound_terminal_roots[lease_id] = retired
+            return handle
+
     def release_child_reservation(self, child: ChildReservation):
         """Release a child reservation only when the FIFO claim definitely did not commit."""
         with self._lock:
@@ -1306,6 +1567,7 @@ class RuntimeCustodyCoordinator:
             self._receipt_id = None
             self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
             self._owner_reason.clear()
+            self._source_rebind_transition = object()
             return None
 
     def status(self) -> dict[str, Any]:

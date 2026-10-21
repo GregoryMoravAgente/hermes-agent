@@ -333,6 +333,9 @@ def yield_to_background_handler(
     i03_owner_task_id = None
     i03_parent_handle = None
     i03_scope_fence = None
+    sidecar_owner = None
+    from gateway.runtime_service_custody import current_turn_binding
+    managed_turn_binding = current_turn_binding()
     from gateway.session_context import get_i03_custody_binding
     i03_binding = get_i03_custody_binding()
     if i03_binding is not None:
@@ -362,7 +365,7 @@ def yield_to_background_handler(
         )
 
     def _prepare_custody() -> None:
-        nonlocal custody, launch_transaction, prepare_failure
+        nonlocal custody, launch_transaction, prepare_failure, sidecar_owner
         if custody is not None:
             return
         from tools.process_registry import process_registry
@@ -371,14 +374,23 @@ def yield_to_background_handler(
         # Popen would create a live child with no authenticated owner. Non-Windows keeps the
         # existing host path and remains explicitly unknown until a proven scope exists.
         try:
+            from tools.environments.local_custody import prepare_managed_local_sidecar
+            sidecar_owner = prepare_managed_local_sidecar(
+                source_identity=f"terminal:{effective_task_id}",
+                binding=managed_turn_binding,
+            )
+            process_parent = sidecar_owner.handle if sidecar_owner is not None else i03_parent_handle
+            process_profile = (
+                sidecar_owner.parent.profile_id if sidecar_owner is not None else None
+            )
             if foreground_binding is None:
                 custody = process_registry.reserve_foreground_custody(
-                    parent_handle=i03_parent_handle, scope_fence=i03_scope_fence,
+                    profile_id=process_profile, parent_handle=process_parent, scope_fence=i03_scope_fence,
                     owner_task_id=i03_owner_task_id or effective_task_id,
                 )
             else:
                 custody = process_registry.reserve_foreground_custody(
-                    binding=foreground_binding, parent_handle=i03_parent_handle,
+                    binding=foreground_binding, profile_id=process_profile, parent_handle=process_parent,
                     scope_fence=i03_scope_fence,
                     owner_task_id=i03_owner_task_id or effective_task_id,
                 )
@@ -403,23 +415,40 @@ def yield_to_background_handler(
                 _handler._retain_reader_until_eof = True
         except BaseException:
             prepare_failure = True
+            if sidecar_owner is not None:
+                from tools.environments.local_custody import finish_local_process
+                finish_local_process(sidecar_owner, reason="local_reservation_failed")
             raise
 
     def _release_custody() -> None:
-        nonlocal custody, launch_transaction
+        nonlocal custody, launch_transaction, sidecar_owner
+        def _finish_sidecar() -> None:
+            nonlocal sidecar_owner
+            if sidecar_owner is None:
+                return
+            if sidecar_owner.process is None and not sidecar_owner.effect_observed:
+                from gateway.runtime_sidecar_sources import release_before_effect
+                if release_before_effect(sidecar_owner):
+                    sidecar_owner = None
+                    return
+            from tools.environments.local_custody import finish_local_process
+            finish_local_process(sidecar_owner)
         if custody is None:
+            _finish_sidecar()
             return
         from tools.process_registry import process_registry
         if launch_transaction is not None:
             if launch_transaction.has_process_effect:
                 custody.mark_unknown("partial_launch")
                 process_registry.retain_foreground_custody(launch_transaction)
+                _finish_sidecar()
                 return
             if not launch_transaction.release_before_effect():
                 # ``release_before_effect`` may fail after a native object was created or
                 # closed ambiguously. Keep the exact transaction reachable; never create a
                 # second Job/Popen on the strength of an exception string.
                 process_registry.retain_foreground_custody(launch_transaction)
+                _finish_sidecar()
                 return
             if custody.foreground_reserved:
                 if custody.scope_fence is None or not custody.scope_fence.release_foreground(
@@ -427,22 +456,26 @@ def yield_to_background_handler(
                 ):
                     custody.mark_unknown("process_scope_unavailable")
                     process_registry.retain_foreground_custody(launch_transaction)
+                    _finish_sidecar()
                     return
                 custody.foreground_reserved = False
             process_registry.consume_foreground_custody(custody)
             _handler._retain_reader_until_eof = False
         else:
             if not custody.release_unaccepted():
+                _finish_sidecar()
                 return
             if custody.foreground_reserved:
                 if custody.scope_fence is None or not custody.scope_fence.release_foreground(
                     custody.owner_id
                 ):
                     custody.mark_unknown("process_scope_unavailable")
+                    _finish_sidecar()
                     return
                 custody.foreground_reserved = False
         custody = None
         launch_transaction = None
+        _finish_sidecar()
 
     def _handoff_managed_reader(proc, output, reader_thread, reader_stop, evidence):
         """Register the already-running native reader without reopening its pipe."""
@@ -491,6 +524,9 @@ def yield_to_background_handler(
         _handler._foreground_reader_transferred = True
         _handler._foreground_pending = False
         _handler._retain_reader_until_eof = False
+        if sidecar_owner is not None:
+            from tools.environments.local_custody import finish_local_process
+            finish_local_process(sidecar_owner, reason="local_reader_transferred")
         logger.info(
             "foreground command yielded to background as %s (pid %s) with its live reader",
             session.id, session.pid,
@@ -501,6 +537,12 @@ def yield_to_background_handler(
             "yielded_session_id": session.id,
             "pid": session.pid,
         }
+
+    def _bind_source_process(proc) -> None:
+        if sidecar_owner is None or sidecar_owner.process is not None:
+            return
+        from tools.environments.local_custody import bind_local_process
+        bind_local_process(sidecar_owner, proc)
 
     def _retry_disposition() -> str:
         if prepare_failure:
@@ -561,9 +603,15 @@ def yield_to_background_handler(
                     process_registry.retain_foreground_custody(
                         transaction, binding=foreground_binding,
                     )
+                if sidecar_owner is not None:
+                    from tools.environments.local_custody import finish_local_process
+                    finish_local_process(sidecar_owner, reason="local_delivery_record_missing")
                 return False
             # The parent turn's durable callback is the only authority that may admit and
             # settle this staged process. Keep the original transaction and evidence alive.
+            if sidecar_owner is not None:
+                from tools.environments.local_custody import finish_local_process
+                finish_local_process(sidecar_owner, reason="local_readback_unavailable")
             return True
         if transaction is not None and not _managed_reader_complete(evidence):
             if custody is not None:
@@ -589,11 +637,17 @@ def yield_to_background_handler(
             custody = None
             launch_transaction = None
             _handler._retain_reader_until_eof = False
+            if sidecar_owner is not None:
+                from tools.environments.local_custody import finish_local_process
+                finish_local_process(sidecar_owner, reason="local_readback_unavailable")
         else:
             if custody is not None:
                 custody.mark_unknown("foreground_evidence_unavailable")
             if transaction is not None:
                 process_registry.retain_foreground_custody(transaction)
+            if sidecar_owner is not None:
+                from tools.environments.local_custody import finish_local_process
+                finish_local_process(sidecar_owner, reason="local_readback_unavailable")
         foreground_pending = False
         _handler._foreground_pending = False
         foreground_evidence = None
@@ -637,6 +691,9 @@ def yield_to_background_handler(
         custody = None
         launch_transaction = None
         _handler._retain_reader_until_eof = False
+        if sidecar_owner is not None:
+            from tools.environments.local_custody import finish_local_process
+            finish_local_process(sidecar_owner, reason="local_reader_transferred")
         foreground_pending = False
         foreground_evidence = None
         _handler._foreground_pending = False
@@ -656,6 +713,7 @@ def yield_to_background_handler(
     _handler._launch_transaction = None
     _handler._retain_reader_until_eof = False
     _handler._handoff_managed_reader = _handoff_managed_reader
+    _handler._bind_source_process = _bind_source_process
     _handler._foreground_binding = foreground_binding
     return _handler
 

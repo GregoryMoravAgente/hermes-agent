@@ -110,6 +110,10 @@ class RetirementFence:
         self._fence_id = secrets.token_urlsafe(16)
         self._process_instance = _PROCESS_INSTANCE
         self._now = time.monotonic
+        # A reversible close may admit exactly one source-authenticated replacement root.  The
+        # coordinator registers this opaque transition capability for the exact close object; a
+        # copied coordinator id, receipt, or caller-minted token cannot cross that boundary.
+        self._abort_rebind_capabilities: dict[int, tuple[str, object]] = {}
 
     def _expire(self):
         """Expire only the legacy 30-second token; reversible close never auto-reopens."""
@@ -188,6 +192,94 @@ class RetirementFence:
                 profile_id=profile_id,
                 parent_lease_id=parent.lease_id if parent is not None else None,
                 close_generation=close.close_generation if close is not None else self._generation,
+                process_instance=self._process_instance,
+                _fence_id=self._fence_id,
+            )
+            self._active[lease_id] = lease
+            return lease
+
+    def _register_abort_rebind_capability(self, close_receipt, coordinator_id, capability):
+        """Bind one coordinator-owned transition object to one exact close receipt."""
+        if not isinstance(close_receipt, RetirementClose) or not close_receipt.reversible:
+            return False
+        if not isinstance(coordinator_id, str) or not coordinator_id or capability is None:
+            return False
+        with self._lock:
+            self._expire()
+            if self._close is not close_receipt or self._preparing or self._committed:
+                return False
+            key = id(close_receipt)
+            existing = self._abort_rebind_capabilities.get(key)
+            if existing is not None:
+                return (
+                    existing[0] == coordinator_id
+                    and existing[1] is capability
+                )
+            self._abort_rebind_capabilities[key] = (coordinator_id, capability)
+            return True
+
+    def _rebind_root_close_valid(
+        self, close_receipt, retired_lease, *, owner_kind, owner_id, profile_id,
+        coordinator_id, source_transition, close, capability,
+    ) -> bool:
+        if self._preparing or self._committed:
+            return False
+        if close is not close_receipt or not close.reversible:
+            return False
+        if close_receipt.process_instance != self._process_instance:
+            return False
+        if close_receipt._fence_id != self._fence_id:
+            return False
+        if (
+            type(owner_kind), bool(owner_kind), type(owner_id), bool(owner_id)
+        ) != (str, True, str, True):
+            return False
+        if retired_lease.process_instance != self._process_instance:
+            return False
+        if retired_lease._fence_id != self._fence_id:
+            return False
+        if self._active.get(retired_lease.lease_id) is retired_lease:
+            return False
+        if retired_lease.parent_lease_id is not None:
+            return False
+        if retired_lease.owner_kind != owner_kind or retired_lease.owner_id != owner_id:
+            return False
+        if retired_lease.profile_id != profile_id:
+            return False
+        if retired_lease.close_generation >= close.close_generation:
+            return False
+        if capability is None or capability[0] != coordinator_id:
+            return False
+        return capability[1] is source_transition
+
+    def rebind_root_during_close(
+        self, close_receipt, retired_lease, *, owner_kind, owner_id, profile_id,
+        coordinator_id, source_transition,
+    ):
+        """Reserve a replacement root only through the exact coordinator close transition."""
+        if not isinstance(close_receipt, RetirementClose):
+            return None
+        if not isinstance(retired_lease, RetirementLease):
+            return None
+        with self._lock:
+            self._expire()
+            close = self._close
+            capability = self._abort_rebind_capabilities.get(id(close_receipt))
+            if close is None or not self._rebind_root_close_valid(
+                close_receipt, retired_lease,
+                owner_kind=owner_kind, owner_id=owner_id, profile_id=profile_id,
+                coordinator_id=coordinator_id, source_transition=source_transition,
+                close=close, capability=capability,
+            ):
+                return None
+            lease_id = secrets.token_urlsafe(18)
+            lease = RetirementLease(
+                lease_id=lease_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                profile_id=profile_id,
+                parent_lease_id=None,
+                close_generation=close.close_generation,
                 process_instance=self._process_instance,
                 _fence_id=self._fence_id,
             )
@@ -438,6 +530,7 @@ class RetirementFence:
                 return False
             self._close = None
             self._token = None
+            self._abort_rebind_capabilities.pop(id(receipt), None)
             return True
 
     def commit_close(self, receipt):
@@ -459,6 +552,7 @@ class RetirementFence:
                 return False
             self._committed = True
             self._token = receipt.token
+            self._abort_rebind_capabilities.pop(id(receipt), None)
             return True
 
     def prepare(self):

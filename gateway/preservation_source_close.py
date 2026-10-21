@@ -1215,18 +1215,48 @@ class PreservationSourceClose:
         return ok
 
     def abort(self, close_generation: int) -> bool:
-        """Resume the exact generation while preserving every accepted/unknown token."""
+        """Resume one exact generation, retaining the close on any failed resume.
+
+        A source may resume one transport and fail another.  Reopening the coordinator in that
+        partial state would let a new admission race an old source, so successful resumes are
+        re-fenced at the same generation and the exact leases/UNKNOWN witnesses remain live until
+        a later retry proves every source resumed.
+        """
         if self._state != "closing" or self._close_generation != close_generation:
             return False
-        ok = True
-        for registration in self._all_registrations():
+        registrations = self._all_registrations()
+        failed = []
+        for registration in registrations:
             if registration.close_generation != close_generation:
+                failed.append(registration)
+                self._unknown_sources[("resume", registration.generation)] = "source_generation_missing"
                 continue
-            resumed = bool(_safe_contract_call(registration.contract.resume, close_generation, default=False))
-            ok = ok and resumed
+            resumed = bool(_safe_contract_call(
+                registration.contract.resume, close_generation, default=False))
             if not resumed:
+                failed.append(registration)
                 self._unknown_sources[("resume", registration.generation)] = "source_resume_failed"
+        if failed:
+            # Keep every registration fenced.  A resume that returned true above may have opened
+            # its producer, so close it again before returning a retryable refusal.
+            for registration in registrations:
+                if registration.close_generation != close_generation:
+                    registration.close_generation = close_generation
+                closed = bool(_safe_contract_call(
+                    registration.contract.close, close_generation, default=False))
+                if not closed:
+                    self._unknown_sources[("reclose", registration.generation)] = "source_reclose_failed"
+            for token in tuple(self._leases):
+                token.close_generation = close_generation
+                token.identity = (token.registration.adapter, token.registration.profile,
+                                  token.registration.transport_owner, token.registration.generation,
+                                  close_generation)
+            self._signal()
+            return False
+        for registration in registrations:
             registration.close_generation = None
+            self._unknown_sources.pop(("resume", registration.generation), None)
+            self._unknown_sources.pop(("reclose", registration.generation), None)
         self._state = "open"
         self._close_generation = None
         for token in tuple(self._leases):
@@ -1234,7 +1264,7 @@ class PreservationSourceClose:
             token.identity = (token.registration.adapter, token.registration.profile,
                               token.registration.transport_owner, token.registration.generation, None)
         self._signal()
-        return ok
+        return True
 
     def _pending_for(
         self, registration: _SourceRegistration, generation: int,

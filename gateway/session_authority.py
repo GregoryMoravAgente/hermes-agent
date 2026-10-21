@@ -192,9 +192,24 @@ class SessionAuthority(
         # on the serving authority, not a second ledger; retirement consumes these object-bound
         # finalizers before releasing the profile.
         self._external_process_finalizers = {}
+        # One profile-scoped factory capability; accepted source parents remain
+        # in the finalizer index above, never in a second ownership ledger.
+        self._mcp_source_factory = None
         # Source-backed evidence that this authority has actually consumed the native inbound
         # entrypoint.  An empty native registry is not evidence that the connector source is wired.
         self._native_inbound_seen = False
+    def register_mcp_source_factory(self, factory):
+        """Bind one profile factory before MCP discovery ingress."""
+        current = self._mcp_source_factory
+        if current is not None and current is not factory:
+            raise RuntimeStoreError('mcp_factory_registry_collision')
+        if getattr(factory, 'authority', None) is not self:
+            raise RuntimeStoreError('mcp_factory_registry_mismatch')
+        self._mcp_source_factory = factory
+        return factory
+    def mcp_source_factory(self):
+        """Return the exact profile factory, if bootstrap installed one."""
+        return self._mcp_source_factory
     def register_external_process_finalizer(self, operation_id, parent):
         """Register the exact external parent that profile retirement must consume."""
         if self.retiring or self.retired:

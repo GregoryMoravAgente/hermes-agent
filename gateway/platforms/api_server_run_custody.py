@@ -19,6 +19,8 @@ from gateway.runtime_custody import CustodyHandle, CustodyRefusal
 from gateway.platforms.api_server_run_peer import (
     peer_binding_identity as _peer_binding_identity,
     peer_binding_source as _peer_binding_source,
+    peer_binding_replay as _peer_binding_replay,
+    peer_source_kind as _peer_source_kind,
 )
 
 
@@ -951,11 +953,15 @@ class ApiRunCustody:
         handles = getattr(authority, "_preservation_handles", {})
         parent = handles.get(admission_id) if isinstance(handles, dict) else None
         if isinstance(parent, CustodyHandle):
-            return parent, "I02_api_session_turn"
+            owner_class = getattr(parent, "owner_class", None)
+            if owner_class in {"I02_api_session_turn", "I04_fifo_turn_execution"}:
+                return parent, owner_class
         children = getattr(authority, "_preservation_children", {})
         parent = children.get(admission_id) if isinstance(children, dict) else None
         if isinstance(parent, CustodyHandle):
-            return parent, "I04_fifo_turn_execution"
+            owner_class = getattr(parent, "owner_class", None)
+            if owner_class in {"I02_api_session_turn", "I04_fifo_turn_execution"}:
+                return parent, owner_class
         return None, None
 
     def bind_admission(self, admission: Any):
@@ -1072,15 +1078,24 @@ class ApiRunCustody:
         self.execution_generation = generation
         return None
 
-    def bind_peer_record(self, record: Any, authority: Any):
+    def bind_peer_record(self, record: Any, authority: Any, *, expected_parent: Any = None):
+        if self.parent_bound and self.admission_id is not None:
+            return _peer_binding_replay(self, record, authority)
         identity, refusal = _peer_binding_identity(self, record, authority)
         if refusal is not None:
             return refusal
         admission_id, binding_id, generation = identity
-        source_data, refusal = _peer_binding_source(self, record, authority, binding_id, generation)
+        source_data, refusal = _peer_binding_source(
+            self, record, authority, binding_id, generation, expected_parent=expected_parent)
         if refusal is not None:
             return refusal
         row, source, parent, parent_kind = source_data
+        if generation is None:
+            generation = row.get("generation")
+            if generation is None and row.get("status") == "queued":
+                pass
+            elif type(generation) is not int or generation < 0:
+                return CustodyRefusal("peer_generation_missing", "I03_api_run_direct")
         self.admission_id = binding_id
         if self.initial_admission_id is None:
             self.initial_admission_id = admission_id
@@ -1133,12 +1148,12 @@ class ApiRunCustody:
             or row.get("principal_id") != self.producer_principal
             or record.get("profile_id") != self.profile_id
             or record.get("authority_epoch") != self.authority_epoch
-            or record.get("principal_id") != self.producer_principal
+            or (record.get("principal_id") is not None
+                and record.get("principal_id") != self.producer_principal)
         ):
             return CustodyRefusal("peer_generation_mismatch", "I03_api_run_direct")
-        session = getattr(authority.db, "get_session", lambda _id: None)(self.admission_session_id)
-        source = session.get("source") if isinstance(session, dict) else None
-        if source not in {"bot_room", "api_server"}:
+        source = _peer_source_kind(authority, record)
+        if source is None:
             return CustodyRefusal("peer_source_mismatch", "I03_api_run_direct")
         current_parent, refusal = self.bound_parent_handle()
         if refusal is not None or current_parent is None:

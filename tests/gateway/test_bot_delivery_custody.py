@@ -83,6 +83,119 @@ def _install_custody(authority):
     return authority.runner.runtime_custody
 
 
+async def _start_held_bot_admission(bot, monkeypatch, key):
+    """Claim one real Bot row and hold it before the model/handler boundary."""
+    from gateway import session_finite
+    from gateway.session_bot import deliver
+    from hermes_state_runtime import get_session_admission
+
+    authority = bot.authority
+    coordinator = _install_custody(authority)
+    scheduled = []
+    original_schedule = authority._schedule_admitted
+    original_execute = session_finite.execute_finite_admission
+    started, finish = asyncio.Event(), asyncio.Event()
+    executed = []
+
+    async def held_execute(authority, ref, row):
+        started.set()
+        await finish.wait()
+        executed.append(row['admission_id'])
+        return await original_execute(authority, ref, row)
+
+    monkeypatch.setattr(authority, '_schedule_admitted',
+                        lambda ref, _receipt=None: scheduled.append(ref))
+    monkeypatch.setattr(session_finite, 'execute_finite_admission', held_execute)
+    receipt = await deliver(
+        bot.connection,
+        {'id': key, 'profile': 'default', 'message': 'held Bot custody input'},
+    )
+    assert scheduled, 'the real Bot admission did not reach its FIFO scheduler'
+    original_schedule(scheduled[0])
+    await asyncio.wait_for(started.wait(), timeout=5)
+    row = get_session_admission(authority.db, admission_id=receipt['admission_id'])
+    assert row['status'] == 'started' and type(row['generation']) is int and row['generation'] >= 1
+    child_key = authority._preservation_automation_children[receipt['admission_id']]
+    return {
+        'authority': authority,
+        'coordinator': coordinator,
+        'receipt': receipt,
+        'row': row,
+        'root': authority._preservation_handles[receipt['admission_id']],
+        'child_key': child_key,
+        'record': authority._preservation_operations[child_key],
+        'finish': finish,
+        'executed': executed,
+    }
+
+
+@pytest.mark.asyncio
+async def test_started_bot_admission_binds_without_a_classic_bridge(bot, monkeypatch):
+    from gateway.session_automation import restore_local_automation
+    from gateway.session_contract import SessionRef
+    from gateway.session_ingress import _bind_classic_execution_event
+    from tests.gateway.test_session_bot_retry import _settle_quietly
+
+    held = await _start_held_bot_admission(bot, monkeypatch, 'e' * 32)
+    authority, row = held['authority'], held['row']
+    event = restore_local_automation(
+        authority, SessionRef(authority.profile_id, bot.chat), row,
+    )
+    try:
+        _bind_classic_execution_event(authority, row, event)
+        assert getattr(event, '_classic_execution_bridge', None) is None
+        assert held['executed'] == []
+        binding = authority._preservation_operations[held['child_key']]
+        assert binding.get('producer_object') is None
+        assert binding['parent_handle'] is held['root']
+        assert authority._preservation_handles[row['admission_id']] is held['root']
+    finally:
+        held['finish'].set()
+    await _settle_quietly(bot)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('tamper', ['copied_child', 'foreign_source', 'missing_child_index'])
+async def test_started_bot_tamper_keeps_exact_handles_unknown_before_handler(
+    bot, monkeypatch, tamper,
+):
+    from copy import copy
+
+    from gateway.session_automation import restore_local_automation
+    from gateway.session_contract import SessionRef
+    from gateway.session_ingress import _bind_classic_execution_event
+    from gateway.session_managed_worker import ManagedExecutionUnknown
+    from tests.gateway.test_session_bot_retry import _settle_quietly
+
+    held = await _start_held_bot_admission(bot, monkeypatch, ('d' if tamper == 'copied_child' else 'a') * 32)
+    authority, row = held['authority'], held['row']
+    child_key, original_record = held['child_key'], held['record']
+    original_child = original_record['handle']
+    if tamper == 'copied_child':
+        original_record['handle'] = copy(original_record['handle'])
+    elif tamper == 'foreign_source':
+        original_record['source_identity'] = 'foreign-source-identity'
+    else:
+        authority._preservation_automation_children.pop(row['admission_id'])
+    event = restore_local_automation(
+        authority, SessionRef(authority.profile_id, bot.chat), row,
+    )
+    try:
+        with pytest.raises(ManagedExecutionUnknown, match='bot_owner_unknown'):
+            _bind_classic_execution_event(authority, row, event)
+        assert getattr(event, '_classic_execution_bridge', None) is None
+        assert held['executed'] == []
+        assert authority._preservation_operations[child_key]['unknown'] is True
+        root_record = held['coordinator']._records[held['root'].lease.lease_id]
+        child_record = held['coordinator']._records[original_child.lease.lease_id]
+        assert root_record.handle is held['root'] and root_record.state == 'unknown'
+        assert child_record.handle is original_child
+        assert child_record.state == 'unknown'
+    finally:
+        held['finish'].set()
+    await _settle_quietly(bot)
+
+
 @pytest.mark.asyncio
 async def test_bot_settlement_cancellation_retains_the_exact_claim_unknown(bot, monkeypatch):
     from gateway.session_bot import deliver

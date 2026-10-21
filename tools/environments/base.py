@@ -865,6 +865,12 @@ class BaseEnvironment(ABC):
                     wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
                     launch_transaction=getattr(yield_handler, "_launch_transaction", None),
                 )
+                bind_source_process = getattr(yield_handler, "_bind_source_process", None)
+                if callable(bind_source_process):
+                    # The source parent was reserved before _run_bash_with_custody. Bind the
+                    # exact returned Popen/transaction before it is published to the live
+                    # foreground set or any reader can transfer it.
+                    bind_source_process(spawned)
             except BaseException:
                 if callable(release_custody):
                     release_custody()

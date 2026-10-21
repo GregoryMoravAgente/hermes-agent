@@ -4,9 +4,22 @@ The mailbox remains a delivery projection.  These helpers only keep the real I07
 child attached to the canonical admission until the result projection is durable.
 """
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 
 from gateway.platforms.event import MessageEvent
 from hermes_state_runtime import RuntimeStoreError, get_session_admission
+
+
+@dataclass(frozen=True)
+class BotExecutionBinding:
+    """The authenticated I07 root/I06 child pair consumed by Bot ingress."""
+
+    admission_id: str
+    root_handle: object
+    child_key: str
+    child_handle: object
+    source_identity: str
 
 
 def _validate_bot_admission_row(authority, record, row, *, admission_id, request_id,
@@ -240,6 +253,242 @@ async def _retain_committed_bot_pin(authority, home, key, ref, record, event=Non
             'Bot delivery %s committed row could not be projected after admission error', key)
 
 
+def _stamp_bot_callback_identity(authority, child_key, row):
+    """Retain the exact Bot child identity consumed by the callback classifier.
+
+    Bot delivery uses the generic I06 operation record, but it has no classic producer event or
+    bridge.  The callback boundary still requires the I06 identity projection, so carry only the
+    source-owned operation fields that were read back from the canonical row and opaque handle.
+    This does not create a classic bridge or receipt.
+    """
+    records = getattr(authority, '_preservation_operations', None)
+    record = records.get(child_key) if isinstance(records, dict) else None
+    handle = record.get('handle') if isinstance(record, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get('owner_class') != 'I06_busy_followup_delivery'
+        or record.get('operation') != 'bot-delivery'
+        or not isinstance(row, dict)
+        or row.get('admission_id') != record.get('admission_id')
+        or row.get('target_session_id') != record.get('session_id')
+        or row.get('principal_id') != record.get('principal_id')
+        or row.get('request_id') != record.get('request_id')
+        or row.get('owner_epoch') != getattr(authority, 'epoch', None)
+        or getattr(handle, 'owner_class', None) != record.get('owner_class')
+        or getattr(handle, 'profile_id', None) != getattr(authority, 'profile_id', None)
+        or getattr(handle, 'authority_epoch', None) != getattr(authority, 'epoch', None)
+        or getattr(handle, 'process_instance', None) != getattr(authority, 'instance_id', None)
+        or not isinstance(record.get('source_identity'), str)
+        or not record.get('source_identity')
+    ):
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    record['classic_identity'] = {
+        'owner_class': record['owner_class'],
+        'profile_id': handle.profile_id,
+        'process_instance': handle.process_instance,
+        'authority_epoch': handle.authority_epoch,
+        'session_id': record['session_id'],
+        'principal_id': record['principal_id'],
+        'request_id': record['request_id'],
+        'source_identity': record['source_identity'],
+    }
+
+
+def _bot_row_signature(row):
+    """Recognize the source-owned Bot envelope before looking at operation indexes."""
+    if not isinstance(row, dict) or not isinstance(row.get('request_id'), str):
+        return None
+    if not row['request_id'].startswith('bot:'):
+        return None
+    payload = row.get('payload')
+    local = payload.get('local_automation_v1') if isinstance(payload, dict) else None
+    return local if isinstance(local, dict) else {}, (
+        local.get('custody') if isinstance(local, dict) else None
+    )
+
+
+def _bot_descriptor_matches(authority, row, local, descriptor):
+    if (not isinstance(local, dict) or not isinstance(descriptor, dict)
+            or descriptor.get('owner_class') != 'I07_automation_route_wakes'
+            or local.get('identity') != row.get('request_id')
+            or local.get('owner') != row.get('target_session_id')
+            or descriptor.get('request_id') != row.get('request_id')
+            or descriptor.get('session_id') != row.get('target_session_id')
+            or descriptor.get('principal_id') != row.get('principal_id')
+            or descriptor.get('profile_id') != getattr(authority, 'profile_id', None)
+            or descriptor.get('profile_home') != str(Path(authority.db.db_path).parent.resolve())
+            or not isinstance(descriptor.get('source_identity'), str)
+            or not descriptor.get('source_identity')):
+        return False
+    delivery_id = descriptor.get('delivery_id')
+    return delivery_id is None or delivery_id == row.get('request_id')[4:]
+
+
+def _bot_execution_unknown(authority, admission_id, keys, reason='bot_owner_unknown'):
+    coordinator = authority._preservation_coordinator()
+    canonical_handles = []
+    records = getattr(coordinator, '_records', {}) if coordinator is not None else {}
+    operations = getattr(authority, '_preservation_operations', None)
+    for key in dict.fromkeys(keys):
+        record = operations.get(key) if isinstance(operations, dict) else None
+        handle = record.get('handle') if isinstance(record, dict) else None
+        lease_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+        canonical = records.get(lease_id) if isinstance(records, dict) else None
+        if canonical is not None and canonical.handle is not handle:
+            canonical_handles.append(canonical.handle)
+    for handle in canonical_handles:
+        coordinator.mark_unknown(handle, reason)
+    for key in dict.fromkeys(keys):
+        authority._preservation_operation_unknown(key, reason)
+    handles = getattr(authority, '_preservation_handles', None)
+    root = handles.get(admission_id) if isinstance(handles, dict) else None
+    if root is not None and coordinator is not None:
+        coordinator.mark_unknown(root, reason)
+    mark_unknown = getattr(authority, '_preservation_mark_unknown', None)
+    if callable(mark_unknown):
+        mark_unknown(admission_id, reason)
+    from gateway.session_managed_worker import ManagedExecutionUnknown
+    raise ManagedExecutionUnknown('bot_owner_unknown')
+
+
+def _bot_handle_graph_valid(authority, root, child):
+    coordinator = authority._preservation_coordinator()
+    if coordinator is None or root is None or child is None:
+        return False
+    expected = (getattr(authority, 'profile_id', None), getattr(authority, 'epoch', None),
+                getattr(authority, 'instance_id', None), getattr(coordinator, '_coordinator_id', None))
+    for handle in (root, child):
+        if (getattr(handle, 'profile_id', None), getattr(handle, 'authority_epoch', None),
+                getattr(handle, 'process_instance', None), getattr(handle, 'coordinator_id', None)) != expected:
+            return False
+    if getattr(root, 'physical_owner_epoch', None) != getattr(child, 'physical_owner_epoch', None):
+        return False
+    try:
+        if not coordinator.profile_scope_valid(
+                root.profile_id, root.authority_epoch, require_serving=False,
+                allow_retiring=True, physical_owner_epoch=root.physical_owner_epoch):
+            return False
+        if not coordinator.profile_scope_valid(
+                child.profile_id, child.authority_epoch, require_serving=False,
+                allow_retiring=True, physical_owner_epoch=child.physical_owner_epoch):
+            return False
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    root_id = getattr(getattr(root, 'lease', None), 'lease_id', None)
+    child_id = getattr(getattr(child, 'lease', None), 'lease_id', None)
+    if (not isinstance(root_id, str) or not isinstance(child_id, str)
+            or getattr(getattr(child, 'lease', None), 'parent_lease_id', None) != root_id):
+        return False
+    with coordinator._lock:
+        records = getattr(coordinator, '_records', {})
+        root_record, child_record = records.get(root_id), records.get(child_id)
+        return (
+            root_record is not None and root_record.handle is root
+            and root_record.state in {'accepted', 'finalizing'}
+            and child_record is not None and child_record.handle is child
+            and child_record.state in {'accepted', 'finalizing'}
+        )
+
+
+def _bot_root_map_witness_valid(authority, row, descriptor, root):
+    """Authenticate the retained I07 root through its canonical delivery-key index.
+
+    The generic automation writer may rebuild a pending-root snapshot without the optional
+    delivery id. In that case the durable Bot request id carries the same source-owned key. The
+    opaque root object and a unique canonical map entry are still required; this never reconstructs
+    or selects a root from a string alone.
+    """
+    roots = getattr(authority, '_preservation_automation_roots', None)
+    if not isinstance(roots, dict):
+        return False
+    delivery_id = descriptor.get('delivery_id') if isinstance(descriptor, dict) else None
+    if delivery_id is not None:
+        return roots.get(delivery_id) is root
+    request_id = row.get('request_id') if isinstance(row, dict) else None
+    if not isinstance(request_id, str) or not request_id.startswith('bot:'):
+        return False
+    root_entries = [(key, value) for key, value in roots.items() if value is root]
+    return len(root_entries) == 1 and root_entries[0][0] == request_id[4:]
+
+
+def _bot_execution_record_valid(authority, row, descriptor, root, child_key, record):
+    if (not isinstance(record, dict)
+            or record.get('owner_class') != 'I06_busy_followup_delivery'
+            or record.get('operation') != 'bot-delivery'
+            or record.get('unknown') is True
+            or record.get('admission_id') != row.get('admission_id')
+            or record.get('parent_handle') is not root
+            or record.get('principal_id') != row.get('principal_id')
+            or record.get('session_id') != row.get('target_session_id')
+            or record.get('request_id') != row.get('request_id')
+            or record.get('admission_request_id', row.get('request_id')) != row.get('request_id')
+            or record.get('source_identity') != descriptor.get('source_identity')
+            or record.get('handle') is None
+            or not _bot_handle_graph_valid(authority, root, record.get('handle'))):
+        return False
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    binding = bindings.get(row.get('admission_id')) if isinstance(bindings, dict) else None
+    if not isinstance(binding, dict) or binding.get('handle') is not root:
+        return False
+    if not _bot_root_map_witness_valid(authority, row, descriptor, root):
+        return False
+    if not authority._preservation_automation_row_matches(row, root):
+        return False
+    try:
+        reread = authority._preservation_operation_row(child_key, expected_parent=root)
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+        return False
+    return (
+        isinstance(reread, dict)
+        and reread.get('admission_id') == row.get('admission_id')
+        and reread.get('status') == row.get('status') == 'started'
+        and reread.get('generation') == row.get('generation')
+        and type(row.get('generation')) is int and row['generation'] >= 1
+        and record.get('generation') == row.get('generation')
+        and record.get('generation_state') == 'pinned'
+        and record.get('producer_object') is None
+    )
+
+
+def bot_execution_binding_for_admission(authority, row):
+    """Authenticate a started Bot admission and bypass the classic producer resolver.
+
+    Bot delivery deliberately owns an I07 root and an I06 child without a classic producer event.
+    Every field below comes from the canonical row, retained opaque handles, and the coordinator's
+    live records; a missing or conflicting witness retains the exact handles as UNKNOWN.
+    """
+    signature = _bot_row_signature(row)
+    if signature is None:
+        return None
+    local, descriptor = signature
+    admission_id = row.get('admission_id') if isinstance(row, dict) else None
+    operations = getattr(authority, '_preservation_operations', None)
+    candidates = [
+        (key, record) for key, record in (operations.items() if isinstance(operations, dict) else ())
+        if (isinstance(record, dict)
+            and record.get('owner_class') == 'I06_busy_followup_delivery'
+            and record.get('operation') == 'bot-delivery'
+            and record.get('admission_id') == admission_id)
+    ]
+    candidate_keys = [key for key, _record in candidates]
+    if (not isinstance(admission_id, str) or not admission_id
+            or not _bot_descriptor_matches(authority, row, local, descriptor)):
+        _bot_execution_unknown(authority, admission_id, candidate_keys)
+    handles = getattr(authority, '_preservation_handles', None)
+    children = getattr(authority, '_preservation_automation_children', None)
+    root = handles.get(admission_id) if isinstance(handles, dict) else None
+    child_key = children.get(admission_id) if isinstance(children, dict) else None
+    record = operations.get(child_key) if isinstance(operations, dict) and isinstance(child_key, str) else None
+    if (len(candidates) != 1 or child_key != candidates[0][0]
+            or root is None or record is not candidates[0][1]
+            or not _bot_execution_record_valid(authority, row, descriptor, root, child_key, record)):
+        _bot_execution_unknown(authority, admission_id, candidate_keys or ([child_key] if child_key else []))
+    return BotExecutionBinding(
+        admission_id=admission_id, root_handle=root, child_key=child_key,
+        child_handle=record['handle'], source_identity=descriptor['source_identity'],
+    )
+
+
 async def _admit_bot_row(authority, home, key, ref, live, event, record, child_key, automation_root, legacy):
     """Commit the canonical row and retain exact custody on every refusal or unknown result."""
     from gateway.session_bot import _OWNER_STATE_REFUSALS, _admission_at
@@ -257,8 +506,10 @@ async def _admit_bot_row(authority, home, key, ref, live, event, record, child_k
         )
         if (child_key is not None and getattr(receipt, 'status', None) != 'terminal'
                 and authority._preservation_handles.get(receipt.admission_id) is automation_root):
-            authority._preservation_operation_bind_admission(child_key, receipt.admission_id)
+            authority._preservation_operation_bind_admission(
+                child_key, receipt.admission_id, expected_parent=automation_root)
             authority._preservation_bind_automation_child(receipt.admission_id, child_key)
+            _stamp_bot_callback_identity(authority, child_key, row)
         elif child_key is not None:
             authority._preservation_operation_release_unaccepted(child_key)
     except RuntimeStoreError as exc:
@@ -312,6 +563,28 @@ async def commit_bot_admission(authority, home, key, ref, live, event, record, c
     return await _admit_bot_row(authority, home, key, ref, live, event, record, child_key, automation_root, legacy)
 
 
+def _managed_bot_projection_binding(authority, admission_id, record):
+    """Return whether this projection still has its exact source-owned I07 binding."""
+    descriptor = record.get('automation_custody') if isinstance(record, dict) else None
+    if not isinstance(descriptor, dict) or descriptor.get('owner_class') != 'I07_automation_route_wakes':
+        return False
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    handles = getattr(authority, '_preservation_handles', None)
+    binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+    handle = binding.get('handle') if isinstance(binding, dict) else None
+    if (not isinstance(handles, dict)
+            or handles.get(admission_id) is not handle
+            or getattr(handle, 'owner_class', None) != 'I07_automation_route_wakes'
+            or not isinstance(binding, dict)
+            or not isinstance(binding.get('descriptor'), dict)
+            or any(binding['descriptor'].get(field) != descriptor.get(field) for field in (
+                'owner_class', 'owner_id', 'profile_id', 'profile_home', 'authority_epoch',
+                'process_instance', 'close_generation', 'coordinator_id', 'session_id',
+                'principal_id', 'request_id', 'source_identity'))):
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    return True
+
+
 async def finish_bot_projection(authority, home, record, written):
     """Close the exact delivery child only after terminal mailbox projection readback."""
     from gateway.session_bot_mailbox import read_receipt
@@ -328,6 +601,7 @@ async def finish_bot_projection(authority, home, record, written):
     handle = handles.get(admission_id)
     if handle is None or record.get('status') not in _TERMINAL:
         return
+    managed = _managed_bot_projection_binding(authority, admission_id, record)
     try:
         if written is not True:
             raise RuntimeStoreError('storage_unavailable')
@@ -355,6 +629,20 @@ async def finish_bot_projection(authority, home, record, written):
                 return
             raise RuntimeStoreError('preservation_owner_unmapped')
         _reconcile_unknown_bot_handles(authority, admission_id, row)
+        if managed:
+            # The mailbox is a projection, but this exact terminal readback is also the Bot
+            # child's source-owned finalizer boundary.  Retire only I06 here; the typed
+            # DeliveryReceipt/callback path still owns the I07 root release and re-reads the
+            # same binding through the normal terminal gate.
+            authority._preservation_finish_automation(
+                admission_id, finalizer_id='bot-projection:' + record['delivery_id'],
+                keep_root=True,
+            )
+            # The first terminal gate may have observed this exact I06 child as still active
+            # and left the I07 root finalizing.  Re-enter that same gate after the child receipt
+            # is committed; it performs the complete callback/sidecar/marker checks again.
+            authority._preservation_release_terminal(admission_id)
+            return
     except BaseException:
         authority._preservation_finish_automation(
             admission_id, finalizer_id='bot-projection:' + record['delivery_id'], unknown=True,

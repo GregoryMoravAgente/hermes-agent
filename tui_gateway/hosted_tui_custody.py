@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import sys
 import os
+import hashlib
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +19,103 @@ _PRODUCER_REGISTRY_SOURCE = "tui_gateway.hosted_tui_custody:i17-producer-registr
 _RUNTIME_RUNNER = None
 _RUNTIME_COORDINATOR = None
 _CHILD_BRIDGE = None
+
+
+class _I17RebindSource:
+    """Boot-installed I17 source capability used by the coordinator's abort boundary."""
+
+    __slots__ = ("__weakref__", "authority", "coordinator", "registry", "runner")
+
+    def __init__(self, authority, runner, coordinator, registry):
+        self.authority = authority
+        self.runner = runner
+        self.coordinator = coordinator
+        self.registry = registry
+
+    def update_registry(self, registry):
+        self.registry = registry
+
+    def _authority_rebind_context(self, retired):
+        from gateway.session_authorities import all_authorities
+
+        authority = self.authority
+        coordinator = self.coordinator
+        if getattr(self.runner, "runtime_custody", None) is not coordinator:
+            return None
+        if not any(item is authority for item in all_authorities(self.runner)):
+            return None
+        if getattr(authority, "_i17_runtime_custody", None) is not coordinator:
+            return None
+        if getattr(authority, "_i17_service_handle", None) is not retired:
+            return None
+        registry = _producer_registry(authority)
+        if registry is None or registry is not self.registry:
+            return None
+        factory = registry.get("room_factory")
+        if registry.get("authority") is not authority:
+            return None
+        if registry.get("runner") is not self.runner:
+            return None
+        if not isinstance(factory, dict):
+            return None
+        if factory.get("source") != "gateway.session_hosted_service:CanonicalHostedRoomService":
+            return None
+        if factory.get("authority") is not authority or factory.get("runner") is not self.runner:
+            return None
+        if getattr(authority, "_i17_service_closed", False) is not True:
+            return None
+        valid, receipts = _profile_host_evidence(authority)
+        if not valid:
+            return None
+        profile_id = str(getattr(authority, "profile_id", ""))
+        authority_epoch = getattr(authority, "epoch", None)
+        if not profile_id or type(authority_epoch) is not int or authority_epoch < 1:
+            return None
+        return coordinator, registry, receipts, profile_id, authority_epoch
+
+    def _rebind_scope_observation(self, coordinator, profile_id, authority_epoch, retired):
+        scope = coordinator.profile_scope_observation(
+            profile_id, authority_epoch, require_serving=False, allow_retiring=True,
+        )
+        retired_physical_epoch = getattr(retired, "physical_owner_epoch", None)
+        if not scope.ok or type(scope.physical_owner_epoch) is not str:
+            return None
+        if not scope.physical_owner_epoch:
+            return None
+        if type(retired_physical_epoch) is not str or not retired_physical_epoch:
+            return None
+        if scope.physical_owner_epoch != retired_physical_epoch:
+            return None
+        return scope
+
+    def observe_rebind(self, retired, close):
+        from hermes_cli.backend_retirement import RetirementClose
+        from gateway.runtime_custody import TerminalRootRebindObservation
+
+        if not isinstance(close, RetirementClose):
+            return None
+        context = self._authority_rebind_context(retired)
+        if context is None:
+            return None
+        coordinator, registry, receipts, profile_id, authority_epoch = context
+        scope = self._rebind_scope_observation(
+            coordinator, profile_id, authority_epoch, retired,
+        )
+        if scope is None:
+            return None
+        return TerminalRootRebindObservation(
+            source=_PRODUCER_REGISTRY_SOURCE,
+            predecessor=retired,
+            predecessor_owner_id=retired.owner_id,
+            process_instance=coordinator.process_instance,
+            profile_id=profile_id,
+            authority_epoch=authority_epoch,
+            close_generation=close.close_generation,
+            physical_owner_epoch=scope.physical_owner_epoch,
+            producer_graph_digest=_producer_graph_digest(registry, receipts),
+            producer_registry=registry,
+            source_binding=self,
+        )
 
 
 def _server():
@@ -85,7 +184,56 @@ def bind_runtime(runner, coordinator, *, reserve=True):
             bind_authority(authority, runner=runner, coordinator=coordinator)
 
 
-def bind_authority(authority, *, runner=None, coordinator=None):
+def _rebind_existing_authority(
+    authority, runner, coordinator, existing, profile_id, epoch, owner_id,
+    close_receipt, source_proof,
+):
+    registry = _producer_registry(authority)
+    if registry is None:
+        raise RuntimeError("I17 producer registry is unavailable")
+    binding = _ensure_rebind_source(authority, runner, coordinator, registry)
+    if not getattr(authority, "_i17_service_closed", False):
+        if not coordinator.is_active_handle(
+            existing, owner_class=_OWNER_CLASS, profile_id=profile_id,
+            authority_epoch=epoch,
+        ):
+            raise RuntimeError("I17 authority root is stale")
+        return existing
+    # A reversible prepare terminalizes the old root.  Abort must prove that exact predecessor
+    # before allocating a new root; clearing the closed flag or reusing the removed lease would
+    # let a copied/stale root cross the profile boundary.
+    if close_receipt is not None or source_proof is not None:
+        if close_receipt is None or source_proof is None:
+            raise RuntimeError("I17 abort proof is incomplete")
+        from gateway.runtime_custody import TerminalRootRebindProof
+        if not isinstance(source_proof, TerminalRootRebindProof):
+            raise RuntimeError("I17 abort proof type is invalid")
+        if source_proof.producer_registry is not _producer_registry(authority):
+            raise RuntimeError("I17 abort producer registry is not canonical")
+        rebound = coordinator.rebind_terminal_root_during_abort(
+            existing, owner_id, profile_id=profile_id, authority_epoch=epoch,
+            owner_class=_OWNER_CLASS, receipt=close_receipt, source_proof=source_proof,
+        )
+    else:
+        rebound = coordinator.rebind_terminal_root(
+            existing, owner_id, profile_id=profile_id, authority_epoch=epoch,
+            owner_class=_OWNER_CLASS,
+        )
+    if getattr(rebound, "lease", None) is None:
+        raise RuntimeError(
+            f"I17 profile root rebind refused: {getattr(rebound, 'code', 'unknown')}"
+        )
+    authority._i17_retired_service_handle = existing
+    authority._i17_service_handle = rebound
+    authority._i17_service_closed = False
+    authority._i17_service_owner_id = owner_id
+    authority._i17_runtime_custody = coordinator
+    _reset_producer_registry(authority, coordinator, runner=runner)
+    binding.update_registry(_producer_registry(authority))
+    return rebound
+
+
+def bind_authority(authority, *, runner=None, coordinator=None, close_receipt=None, source_proof=None):
     """Reserve one profile root before hosted service or RPC effects are published."""
     existing = getattr(authority, "_i17_service_handle", None)
     if runner is None or coordinator is None:
@@ -100,31 +248,10 @@ def bind_authority(authority, *, runner=None, coordinator=None):
         raise RuntimeError("I17 authority identity is unavailable")
     owner_id = f"{coordinator.process_instance}:I17:{profile_id}"
     if existing is not None:
-        if not getattr(authority, "_i17_service_closed", False):
-            if not coordinator.is_active_handle(
-                existing, owner_class=_OWNER_CLASS, profile_id=profile_id,
-                authority_epoch=epoch,
-            ):
-                raise RuntimeError("I17 authority root is stale")
-            return existing
-        # A reversible prepare terminalizes the old root.  Abort must prove that exact predecessor
-        # before allocating a new root; clearing the closed flag or reusing the removed lease would
-        # let a copied/stale root cross the profile boundary.
-        rebound = coordinator.rebind_terminal_root(
-            existing, owner_id, profile_id=profile_id, authority_epoch=epoch,
-            owner_class=_OWNER_CLASS,
+        return _rebind_existing_authority(
+            authority, runner, coordinator, existing, profile_id, epoch, owner_id,
+            close_receipt, source_proof,
         )
-        if getattr(rebound, "lease", None) is None:
-            raise RuntimeError(
-                f"I17 profile root rebind refused: {getattr(rebound, 'code', 'unknown')}"
-            )
-        authority._i17_retired_service_handle = existing
-        authority._i17_service_handle = rebound
-        authority._i17_service_closed = False
-        authority._i17_service_owner_id = owner_id
-        authority._i17_runtime_custody = coordinator
-        _reset_producer_registry(authority, coordinator)
-        return rebound
     handle = coordinator.reserve_root(
         _OWNER_CLASS, owner_id, profile_id=profile_id, authority_epoch=epoch)
     if getattr(handle, "lease", None) is None:
@@ -134,11 +261,17 @@ def bind_authority(authority, *, runner=None, coordinator=None):
     authority._i17_runtime_custody = coordinator
     authority._i17_producer_registry = _new_producer_registry(
         coordinator, profile_id=profile_id, authority_epoch=epoch,
+        authority=authority, runner=runner,
+    )
+    _ensure_rebind_source(
+        authority, runner, coordinator, authority._i17_producer_registry,
     )
     return handle
 
 
-def _new_producer_registry(coordinator, *, profile_id: str, authority_epoch: int) -> dict:
+def _new_producer_registry(
+    coordinator, *, profile_id: str, authority_epoch: int, authority=None, runner=None,
+) -> dict:
     """Create the source-owned closed-world producer declaration for one profile."""
     return {
         "source": _PRODUCER_REGISTRY_SOURCE,
@@ -146,12 +279,19 @@ def _new_producer_registry(coordinator, *, profile_id: str, authority_epoch: int
         "authority_epoch": authority_epoch,
         "profile_id": profile_id,
         "intake_closed": False,
+        "authority": authority,
+        "runner": runner,
+        "room_factory": {
+            "source": "gateway.session_hosted_service:CanonicalHostedRoomService",
+            "authority": authority,
+            "runner": runner,
+        },
         "host": {"state": "absent"},
         "room": {"state": "absent"},
     }
 
 
-def _reset_producer_registry(authority, coordinator) -> None:
+def _reset_producer_registry(authority, coordinator, *, runner=None) -> None:
     """Reopen the exact source graph after abort; no prior terminal receipt is reused."""
     profile_id = str(getattr(authority, "profile_id", ""))
     epoch = getattr(authority, "epoch", None)
@@ -159,6 +299,7 @@ def _reset_producer_registry(authority, coordinator) -> None:
         raise RuntimeError("I17 authority identity is unavailable")
     authority._i17_producer_registry = _new_producer_registry(
         coordinator, profile_id=profile_id, authority_epoch=epoch,
+        authority=authority, runner=runner,
     )
 
 
@@ -179,6 +320,28 @@ def _producer_registry(authority) -> dict | None:
     if not isinstance(registry, dict) or registry.get("source") != _PRODUCER_REGISTRY_SOURCE:
         return None
     return registry
+
+
+def _ensure_rebind_source(authority, runner, coordinator, registry):
+    binding = getattr(authority, "_i17_rebind_source", None)
+    if binding is None:
+        binding = _I17RebindSource(authority, runner, coordinator, registry)
+        authority._i17_rebind_source = binding
+    elif (
+        binding.authority is not authority
+        or binding.runner is not runner
+        or binding.coordinator is not coordinator
+        or binding.registry is not registry
+    ):
+        raise RuntimeError("I17 source binding is not canonical")
+    refusal = coordinator._register_source_rebind_binding(
+        _OWNER_CLASS, str(getattr(authority, "profile_id", "")), binding,
+    )
+    if refusal is not None:
+        raise RuntimeError(
+            f"I17 source binding refused: {getattr(refusal, 'code', 'unknown')}"
+        )
+    return binding
 
 
 def _child(parent, owner_id: str, coordinator):
@@ -241,11 +404,43 @@ def host_start_failed(supervisor):
     handle = getattr(supervisor, "_i17_host_handle", None)
     coordinator = getattr(supervisor, "_i17_runtime_custody", None)
     if handle is None or coordinator is None:
-        return
+        return False
     if _host_effect_started(supervisor):
         coordinator.mark_unknown(handle, "child_start_unknown")
-    else:
-        coordinator.release_unaccepted(handle)
+        return False
+    if not coordinator.is_active_handle(
+        handle, owner_class=_OWNER_CLASS, profile_id=handle.profile_id,
+        authority_epoch=handle.authority_epoch,
+    ):
+        return False
+    authority = getattr(supervisor, "_i17_profile_authority", None)
+    root = getattr(supervisor, "_i17_service_root", None)
+    registry = _producer_registry(authority)
+    producer = registry.get("host") if registry is not None else None
+    if (
+        authority is None
+        or root is None
+        or getattr(authority, "_i17_runtime_custody", None) is not coordinator
+        or getattr(authority, "_i17_service_handle", None) is not root
+        or getattr(supervisor, "_i17_host_handle", None) is not handle
+        or registry is None
+        or registry.get("authority") is not authority
+        or getattr(authority, "runner", None) is None
+        or registry.get("runner") is not getattr(authority, "runner", None)
+        or not _registry_identity_valid(authority, registry)
+        or not isinstance(producer, dict)
+        or producer.get("state") != "registered"
+        or producer.get("supervisor") is not supervisor
+        or producer.get("profile_id") != handle.profile_id
+        or producer.get("authority_epoch") != handle.authority_epoch
+        or producer.get("process_instance") != handle.process_instance
+        or producer.get("owner_id") != handle.owner_id
+    ):
+        return False
+    if coordinator.release_unaccepted(handle) is not None:
+        return False
+    producer["state"] = "absent"
+    return True
 
 
 def host_shutdown_failed(supervisor):
@@ -771,7 +966,75 @@ def seal_owner(runner, coordinator, receipt):
     return True
 
 
-def restore_after_abort(runner) -> bool:
+def _producer_graph_digest(registry, receipts):
+    def receipt_facts(value):
+        if not isinstance(value, dict):
+            return None
+        keys = (
+            "host_generation", "host_boot_id", "host_pid", "clean",
+            "process_exited", "natural_exit", "stdout_eof", "stderr_eof",
+            "completion_eof", "shutdown_ack", "exit_settled", "stopped",
+            "running", "workers_joined",
+        )
+        return {key: value.get(key) for key in keys if key in value}
+
+    graph = {
+        "source": registry["source"],
+        "process_instance": registry["process_instance"],
+        "profile_id": registry["profile_id"],
+        "authority_epoch": registry["authority_epoch"],
+        "intake_closed": registry["intake_closed"],
+        "host": {
+            "state": registry["host"].get("state"),
+            "profile_id": registry["host"].get("profile_id"),
+            "receipt": receipt_facts(receipts[0]),
+        },
+        "room": {
+            "state": registry["room"].get("state"),
+            "profile_id": registry["room"].get("profile_id"),
+            "receipt": receipt_facts(receipts[1]),
+        },
+    }
+    encoded = json.dumps(graph, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _build_abort_rebind_proof(authority, receipt):
+    """Build an immutable proof from the profile's real closed producer graph."""
+    from gateway.runtime_custody import TerminalRootRebindProof
+
+    root = getattr(authority, "_i17_service_handle", None)
+    coordinator = getattr(authority, "_i17_runtime_custody", None)
+    registry = _producer_registry(authority)
+    if root is None or coordinator is None or registry is None:
+        return None
+    valid, receipts = _profile_host_evidence(authority)
+    if not valid or not getattr(authority, "_i17_service_closed", False):
+        return None
+    if getattr(receipt, "close_generation", None) is None:
+        return None
+
+    binding = getattr(authority, "_i17_rebind_source", None)
+    if binding is None or binding.registry is not registry:
+        return None
+    if type(root.physical_owner_epoch) is not str or not root.physical_owner_epoch:
+        return None
+    return TerminalRootRebindProof(
+        source=_PRODUCER_REGISTRY_SOURCE,
+        predecessor=root,
+        predecessor_owner_id=root.owner_id,
+        process_instance=coordinator.process_instance,
+        profile_id=str(getattr(authority, "profile_id", "")),
+        authority_epoch=authority.epoch,
+        close_generation=receipt.close_generation,
+        physical_owner_epoch=root.physical_owner_epoch,
+        producer_graph_digest=_producer_graph_digest(registry, receipts),
+        producer_registry=registry,
+        source_binding=binding,
+    )
+
+
+def restore_after_abort(runner, receipt=None) -> bool:
     """Restore every profile root after an authenticated reversible-abort.
 
     ``close_profile`` may have retired the old root while preparing the handoff.  Only that exact
@@ -785,7 +1048,19 @@ def restore_after_abort(runner) -> bool:
         registry = _producer_registry(authority)
         if getattr(authority, "_i17_service_closed", False):
             try:
-                bind_authority(authority, runner=runner, coordinator=runner.runtime_custody)
+                if receipt is None:
+                    # Preserve the established post-abort API for callers that already released
+                    # the coordinator receipt; the lifecycle owner has proved OPEN separately.
+                    bind_authority(authority, runner=runner, coordinator=runner.runtime_custody)
+                else:
+                    proof = _build_abort_rebind_proof(authority, receipt)
+                    if proof is None:
+                        ok = False
+                        continue
+                    bind_authority(
+                        authority, runner=runner, coordinator=runner.runtime_custody,
+                        close_receipt=receipt, source_proof=proof,
+                    )
             except (RuntimeError, TypeError, ValueError):
                 ok = False
         elif registry is not None and registry.get("intake_closed"):

@@ -661,7 +661,7 @@ def bind_authority_runtime_custody(runner, authority):
 
 
 def _api_runtime_cleanup_readback(adapter, runner):
-    """Read the source-owned API custody indexes before physical profile ownership is closed."""
+    """Read source-owned API custody indexes after profile roots have closed."""
     custody = getattr(adapter, '_run_custody', None)
     launches = getattr(adapter, '_run_launches', None)
     if not isinstance(custody, dict) or not isinstance(launches, dict):
@@ -736,6 +736,7 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
                 runner.adapters = {Platform.API_SERVER: adapter}
                 await initialize_gateway_runtime(runner)
                 runner._wire_adapter_handlers(adapter)
+                authorities = tuple(getattr(runner, 'session_authorities', ()) or ())
                 if legacy:
                     # The pre-authority route is supported only after the real bootstrap has
                     # installed process ownership, descriptor, database, and coordinator.
@@ -744,8 +745,17 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
                 yield adapter
         finally:
             cleanup_proven = True
+            if runner is not None:
+                from tui_gateway.hosted_tui_custody import close_profile
+                authorities = tuple(locals().get('authorities', ()) or ())
+                for authority in authorities:
+                    if not close_profile(authority):
+                        cleanup_proven = False
             if cleanup_readback and adapter is not None and runner is not None:
-                cleanup_proven = _api_runtime_cleanup_readback(adapter, runner)
+                cleanup_proven = (
+                    _api_runtime_cleanup_readback(adapter, runner)
+                    and cleanup_proven
+                )
             if adapter is not None:
                 adapter._response_store.close()
                 adapter._run_idempotency_store.close()
@@ -761,6 +771,126 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
                 reset_hermes_home_override(home_token)
 
     return owned()
+
+
+@pytest.fixture
+def started_mux(tmp_path, monkeypatch, unused_tcp_port):
+    """Run a real multi-profile gateway through startup and READY publication.
+
+    The direct ``mux`` fixture intentionally stops after runtime initialization so it can test
+    source constructors in isolation.  Public preservation controls need the production startup
+    boundary instead: process/profile ownership, the session API listener, the API adapter, the
+    gateway's ``start()`` path, and the READY transition all have to run before the control call.
+    """
+    import asyncio
+    import json
+    import threading
+
+    from gateway.control_socket import GatewayControlServer
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    from gateway.run_runtime import (
+        drain_gateway_runtime,
+        initialize_gateway_runtime,
+        publish_gateway_runtime_ready,
+        start_gateway_runtime_api,
+    )
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import _IMPORT_DEFAULT_DB_PATH
+    import hermes_state
+    from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+    from tui_gateway.hosted_tui_custody import close_profile
+
+    root = (tmp_path / ".hermes").resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", _IMPORT_DEFAULT_DB_PATH)
+    homes = [("default", root)]
+    for name in ("alpha", "beta"):
+        home = root / "profiles" / name
+        home.mkdir(parents=True, mode=0o700)
+        (home / "config.yaml").write_text("{}")
+        homes.append((name, home))
+    for _name, home in homes:
+        config = {
+            "model": {"default": "fixture-model"},
+            "platform_toolsets": {"cli": []},
+            "hosted_rooms": {"profiles": {n: str(h) for n, h in homes if h != home}},
+        }
+        (home / "config.yaml").write_text(json.dumps(config))
+
+    api_key = "started-mux-api-key-0123456789"
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(
+                enabled=True,
+                extra={"key": api_key, "port": unused_tcp_port},
+            ),
+        },
+        sessions_dir=root / "sessions",
+    )
+    config.multiplex_profiles = True
+    config._runtime_profile_homes = tuple(homes)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="started-mux-loop")
+    thread.start()
+    runner = None
+    control_server = None
+    home_token = set_hermes_home_override(root)
+    reserved = False
+    started = False
+
+    def call(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(30)
+
+    def call_sync(function, *args):
+        async def invoke():
+            return function(*args)
+        return call(invoke())
+
+    try:
+        with FakeLLMServer(default_text="started-mux-fixture-ok") as provider:
+            write_hermes_home(root, provider.base_url)
+            process_ownership.reserve([home for _name, home in homes])
+            reserved = True
+            runner = GatewayRunner(config)
+            call(initialize_gateway_runtime(runner))
+            control_server = runner.session_control_server = GatewayControlServer(
+                root, verb_handlers={"identify": lambda: runner.session_runtime_descriptor}
+            )
+            call(control_server.start())
+            # This is the same listener startup used by gateway.run.start_gateway; it is required
+            # before GatewayRunner.start(), because publish_gateway_runtime_ready checks its live task.
+            call(start_gateway_runtime_api(runner))
+            assert call(runner.start()) is True
+            started = True
+            call_sync(publish_gateway_runtime_ready, runner)
+            assert runner._running is True
+            assert runner.session_runtime_descriptor["state"] == "ready"
+            yield runner, dict(homes), loop, call
+    finally:
+        if runner is not None:
+            if started:
+                call(runner.stop())
+            else:
+                if getattr(runner, "session_runtime_descriptor", None) is not None:
+                    call(drain_gateway_runtime(runner))
+            if control_server is not None:
+                call(control_server.stop())
+            for authority in tuple(getattr(runner, "session_authorities", []) or ()):
+                assert close_profile(authority), "I17 profile root did not close during fixture cleanup"
+                authority.db.close()
+            runner.session_store.close_all_db_handles()
+            runner.close_all_session_db_handles()
+        if reserved:
+            process_ownership.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(30)
+        assert not thread.is_alive(), "started gateway loop did not stop"
+        loop.close()
+        reset_hermes_home_override(home_token)
 
 
 def runtime_owned_legacy_api(tmp_path, monkeypatch, *, api_key=None):

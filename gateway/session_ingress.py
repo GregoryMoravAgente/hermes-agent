@@ -472,6 +472,12 @@ def _mark_classic_owner_unknown(authority, row, event) -> None:
 
 def _bind_classic_execution_event(authority, row, event) -> None:
     """Bind a restored direct-classic event or retain its exact operation as unknown."""
+    from gateway.session_bot_custody import bot_execution_binding_for_admission
+    if bot_execution_binding_for_admission(authority, row) is not None:
+        # Bot delivery owns an I07 root and an I06 child, but intentionally has no classic
+        # producer event or bridge. Its typed binding was authenticated above, so the classic
+        # resolver must not reinterpret the child as an ownerless classic occurrence.
+        return
     resolver = getattr(authority, '_classic_execution_owner_for_admission', None)
     if not callable(resolver):
         return
