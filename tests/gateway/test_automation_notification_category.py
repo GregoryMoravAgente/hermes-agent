@@ -17,11 +17,13 @@ async def _authority(tmp_path, monkeypatch):
     monkeypatch.setattr('gateway.session_bot._watch_reply', lambda *args: None)
     runner = GatewayRunner(GatewayConfig(sessions_dir=tmp_path / 'sessions'))
     from hermes_state import SessionDB
+    from tests.gateway.conftest import bind_authority_runtime_custody
     db = SessionDB(tmp_path / 'state.db')
     runner.session_store._db = db
     runner._session_db = db
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='category-fixture',
                                                   db=db)
+    bind_authority_runtime_custody(runner, authority)
     return runner, authority
 
 

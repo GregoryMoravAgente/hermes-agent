@@ -135,6 +135,7 @@ async def test_reload_never_changes_a_running_or_queued_turns_servers(tmp_path, 
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionRef, Submission
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_policy import policy_for_source
     import hermes_state_runtime as rt
     home = _home(monkeypatch)
@@ -147,6 +148,7 @@ async def test_reload_never_changes_a_running_or_queued_turns_servers(tmp_path, 
         await release.wait()
         return 'ok'
     authority = await initialize_session_authority(_runner(store, handle), profile_id=str(home), instance_id='only')
+    bind_authority_runtime_custody(authority.runner, authority)
     _reloadable(authority, monkeypatch)
     owner = _connect(authority)
     try:
@@ -218,6 +220,7 @@ async def test_a_rotated_mcp_secret_commits_a_generation_with_the_new_value(tmp_
     compares the private values' fingerprints too: ``reload.mcp`` and a resume (also after an owner restart)
     commit it, and the next turn's worker gets the new token, which never reaches state.db."""
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_state_local import local_receipt
     home = _home(monkeypatch)
     (home / 'config.yaml').write_text(ADDED)
@@ -242,6 +245,7 @@ async def test_a_rotated_mcp_secret_commits_a_generation_with_the_new_value(tmp_
         await owner.close()
         # An owner restart has no cached values: the stored reference still names the old token.
         cold = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id='restarted')
+        bind_authority_runtime_custody(cold.runner, cold)
         viewer = _connect(cold)
         await _call(viewer, 'session.resume', session_id=other)
         assert _generation(store, other) == generations[other] + 1
@@ -397,6 +401,7 @@ async def test_a_removed_pick_keeps_later_refreshes_following_config_after_a_res
     another picked server still reaches the chat (the removed name no longer fails the pick's validation)."""
     from gateway.session_authority import initialize_session_authority
     from gateway.session_policy import policy_for_source
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from tests.gateway.test_session_resume_config_refresh import _runner
     both = CONFIG.replace('{old: {command: old-mcp}}', '{old: {command: old-mcp}, keep: {command: keep-mcp}}')
     home = _home(monkeypatch)
@@ -417,6 +422,7 @@ async def test_a_removed_pick_keeps_later_refreshes_following_config_after_a_res
         (home / 'config.yaml').write_text(both.replace('old: {command: old-mcp}, ', '').replace(
             '{command: keep-mcp}', '{command: keep-mcp, enabled: false}'))
         cold = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id='restarted')
+        bind_authority_runtime_custody(cold.runner, cold)
         viewer = _connect(cold)
         await _call(viewer, 'session.resume', session_id=sid)
         assert _generation(store, sid) == generation + 2

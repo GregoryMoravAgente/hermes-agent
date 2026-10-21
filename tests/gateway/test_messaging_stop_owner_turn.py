@@ -41,11 +41,13 @@ async def test_stop_during_agent_construction_latches_so_the_turn_runs_no_tools(
     from gateway.run_turn_runner import TurnRunner
     from gateway.session_authority import initialize_session_authority
     from gateway.session_results import execution_result
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.turn_context import TurnContext
     from hermes_state_runtime import list_session_admissions
 
     runner, adapter, sent = _owner(monkeypatch)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     key = runner.session_store._generate_session_key(source)
@@ -99,6 +101,7 @@ async def test_idle_stop_and_new_cancel_the_queued_followup(monkeypatch, command
     from gateway.session_contract import SessionRef
     from gateway.session_ingress import admit_message
     from gateway.session_ingress_context import native_callback
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
 
@@ -107,6 +110,7 @@ async def test_idle_stop_and_new_cancel_the_queued_followup(monkeypatch, command
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
     monkeypatch.setattr(runner, '_read_user_config', lambda: {'approvals': {'destructive_slash_confirm': False}})
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     follow_up = MessageEvent(text='B', source=source, message_id='B')
