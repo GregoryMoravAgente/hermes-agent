@@ -10,6 +10,7 @@ request and physical receipt they expect.
 from __future__ import annotations
 
 import shlex
+import json
 import subprocess
 import sys
 import threading
@@ -533,6 +534,43 @@ async def test_windows_real_job_binary_readers_natural_eof_same_transaction_clos
         assert transaction.process is receipt.process
         original_job_close = transaction.job.close
         failed = {"value": False}
+        original_physical_close = receipt.close_after_delivery
+
+        def observe_physical_close():
+            result = original_physical_close()
+            if result is not True:
+                from gateway.runtime_service_native_close import can_retry_managed_native_close
+                from gateway.runtime_service_custody import TurnCustodyBinding
+                coordinator = receipt.service.coordinator
+                with coordinator._lock:
+                    record = coordinator._records.get(receipt.handle.lease.lease_id)
+                    state = getattr(record, "state", None)
+                    reason = getattr(record, "reason", None)
+                print("native-close-retry-diagnostic: " + json.dumps({
+                    "physical_state": receipt.state, "physical_reason": receipt.unknown_reason,
+                    "coordinator_state": state, "coordinator_reason": reason,
+                    "same_managed_native_retry": can_retry_managed_native_close(receipt),
+                    "typed_binding": isinstance(receipt.service.binding, TurnCustodyBinding),
+                    "external_parent": receipt.service.external_parent is not None,
+                    "same_transaction_custody": transaction.custody is receipt,
+                    "same_process": transaction.process is receipt.process,
+                    "same_pid_start": transaction.matches(
+                        receipt.process, receipt.pid, receipt.process_started_at,
+                    ),
+                    "transaction_state": transaction.state,
+                    "process_handle_closed": transaction.process_handle_closed,
+                    "job_handle_closed": transaction.job_handle_closed,
+                    "scope_captured": transaction.scope_captured,
+                    "native_empty": transaction.native_empty_observed,
+                    "reader_error": receipt.reader_error,
+                    "eof": sorted(receipt.eof_streams), "joined": sorted(receipt.joined_streams),
+                    "durable_requests": len(receipt.durable_proofs),
+                    "delivery_requests": len(receipt.delivery_requests),
+                    "completed_requests": len(receipt.completed_requests),
+                }, sort_keys=True))
+            return result
+
+        monkeypatch.setattr(receipt, "close_after_delivery", observe_physical_close)
 
         def fail_native_close_once():
             if not failed["value"]:

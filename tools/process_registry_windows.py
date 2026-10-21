@@ -409,6 +409,7 @@ class WindowsLaunchTransaction:
             or self.custody.native_scope is not self
             or not self.matches(process, self.pid, self.host_start_time)
             or not self._retained_scope_matches()
+            or (self.assigned and not self.scope_captured)
         ):
             return False
         if self.native_empty_observed:
@@ -596,7 +597,7 @@ class WindowsLaunchTransaction:
         """Return true only for the exact retained process handle and Job."""
         if self.assignment_observation == "nonmember":
             return self._observe_unassigned_empty()
-        if self.job is None or self.process is None or not self.assigned:
+        if self.job is None or self.process is None or not self.assigned or not self.scope_captured:
             self.scope_observation = "unavailable"
             return None
         process_ref = self.process_ref
