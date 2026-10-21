@@ -14,8 +14,9 @@ import pytest
 from tests.waiting import async_wait_until
 
 
-def _install_custody(authority):
+def _install_custody(authority, *source_adapters):
     from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.preservation_source_close import register_source_adapter
     from hermes_cli.backend_retirement import RetirementFence
 
     authority.runner.runtime_custody = RuntimeCustodyCoordinator(
@@ -23,6 +24,13 @@ def _install_custody(authority):
         authority_epoch=authority.epoch,
         fence=RetirementFence(),
     )
+    # These consumer fixtures use the canonical owner fixture, which intentionally does not
+    # run the full GatewayRunner adapter bootstrap. Register the real adapter instance through
+    # the production source-close seam so begin_preservation_drain observes the same source
+    # ownership that a wired runner would install. The adapter itself remains the real test
+    # transport; no registry state is fabricated here.
+    for adapter in source_adapters:
+        register_source_adapter(authority.runner, adapter, getattr(adapter, '_owner_profile', None))
     return authority.runner.runtime_custody
 
 
@@ -118,7 +126,7 @@ async def test_real_api_waiter_settles_under_close_and_aborts_with_active_custod
     from gateway.session_results import execution_result
     from hermes_state_runtime import RuntimeStoreError, get_session_admission
 
-    coordinator = _install_custody(owner)
+    coordinator = _install_custody(owner, api)
     owner.runner.session_runtime_descriptor = {
         'instance_id': owner.instance_id,
         'authority_epoch': owner.epoch,
@@ -255,6 +263,8 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
     adapter = LedgerAdapter()
     adapter.gateway_runner = owner.runner
     adapter._owner_profile = 'default'
+    from gateway.preservation_source_close import register_source_adapter
+    register_source_adapter(owner.runner, adapter, adapter._owner_profile)
     owner.runner.adapters = {Platform.SLACK: adapter}
     owner.runner._delivery_adapter_for = lambda _source: adapter
     owner.runner._adapter_for_source = lambda _source: adapter
@@ -452,7 +462,7 @@ async def test_hosted_room_binding_refuses_fresh_close_before_sql_write(api, own
     from gateway.session_api import hosted_member_session
     from hermes_state_runtime import RuntimeStoreError
 
-    coordinator = _install_custody(owner)
+    coordinator = _install_custody(owner, api)
     owner.runner.session_runtime_descriptor = {
         'instance_id': owner.instance_id,
         'authority_epoch': owner.epoch,

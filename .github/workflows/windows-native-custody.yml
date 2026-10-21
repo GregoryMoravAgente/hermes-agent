@@ -45,6 +45,7 @@ env:
     tests/gateway/test_session_authorities_multiplex.py
     tests/gateway/test_codex_service_custody.py
     tests/agent/transports/test_codex_physical_custody.py
+    tests/gateway/test_runtime_service_native_close_identity.py
 
 jobs:
   native-custody:

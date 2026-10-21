@@ -831,6 +831,21 @@ async def retry_preservation_delivery(authority, admission_id, reason, *, effect
     return None
 
 
+async def _retry_pre_effect_delivery(authority, admission_id, delivery_receipt, transport_delivered):
+    """Reconcile one typed pre-effect failure before callback classification sees UNKNOWN."""
+    if (
+        not authority._preservation_has_sidecar(admission_id)
+        or getattr(delivery_receipt, 'reason', None) != 'delivery_failed'
+        or getattr(delivery_receipt, 'effect_state', None) != 'none'
+    ):
+        return delivery_receipt
+    retry_receipt = await retry_preservation_delivery(
+        authority, admission_id, delivery_receipt.reason,
+        effect_state=delivery_receipt.effect_state,
+    )
+    return retry_receipt if transport_delivered(retry_receipt) else delivery_receipt
+
+
 async def _finish_preservation_delivery_impl(authority, admission_id, delivery_receipt, waiter_delivered):
     """Apply the delivery/finalizer fences and hold FIFO successors until terminal custody."""
     from gateway.session_classic_delivery import (
@@ -860,13 +875,19 @@ async def _finish_preservation_delivery_impl(authority, admission_id, delivery_r
             and receipt.effect_state == 'delivered'
         )
 
+    has_sidecar = authority._preservation_has_sidecar(admission_id)
+    # A source-owned pre-effect failure marks the exact physical/request/I04 chain UNKNOWN
+    # before this finalizer runs. Retry the same retained admission before callback classification.
+    delivery_receipt = await _retry_pre_effect_delivery(
+        authority, admission_id, delivery_receipt, transport_delivered,
+    )
+
     callback_requirement = None
     if not automation_binding:
         callback_requirement = classic_callback_requirement(authority, admission_id)
         if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
             return False
 
-    has_sidecar = authority._preservation_has_sidecar(admission_id)
     physical_delivery = transport_delivered(delivery_receipt)
     if not has_sidecar:
         if automation_binding:
