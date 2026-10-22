@@ -815,18 +815,44 @@ def browser_preflight() -> None:
     timed_out = False
     stdout: bytes = b""
     stderr: bytes = b""
-    remaining = max(deadline - time.monotonic(), 0.0)
-    if remaining <= 0.0:
-        timed_out = True
-        terminate_owned_process(process, timeout=0.0)
-    else:
-        try:
-            stdout, stderr = process.communicate(timeout=remaining)
-        except subprocess.TimeoutExpired as exc:
+    communicate_checkpoints: list[dict[str, Any]] = []
+    completed = False
+    for checkpoint_seconds in (10.0, 20.0, 30.0):
+        elapsed = max(time.monotonic() - started, 0.0)
+        remaining = max(deadline - time.monotonic(), 0.0)
+        if remaining <= 0.0:
             timed_out = True
-            stdout = exc.stdout or b""
-            stderr = exc.stderr or b""
-            terminate_owned_process(process, timeout=max(deadline - time.monotonic(), 0.0))
+            break
+        checkpoint_remaining = max(checkpoint_seconds - elapsed, 0.0)
+        timeout = min(remaining, checkpoint_remaining)
+        try:
+            observed_stdout, observed_stderr = process.communicate(timeout=timeout)
+            stdout = observed_stdout
+            stderr = observed_stderr
+            completed = True
+            break
+        except subprocess.TimeoutExpired as exc:
+            if exc.stdout is not None:
+                stdout = exc.stdout
+            if exc.stderr is not None:
+                stderr = exc.stderr
+            checkpoint_elapsed = max(time.monotonic() - started, 0.0)
+            checkpoint_remaining = max(deadline - time.monotonic(), 0.0)
+            communicate_checkpoints.append(
+                {
+                    "checkpoint_seconds": checkpoint_seconds,
+                    "elapsed_seconds": round(checkpoint_elapsed, 6),
+                    "remaining_deadline_seconds": round(checkpoint_remaining, 6),
+                    "returncode": process.poll(),
+                    "stdout_bytes": len(stdout),
+                    "stderr_bytes": len(stderr),
+                    "stdout_sha256": sha_bytes(stdout),
+                    "stderr_sha256": sha_bytes(stderr),
+                }
+            )
+    if not completed:
+        timed_out = True
+        terminate_owned_process(process, timeout=max(deadline - time.monotonic(), 0.0))
     _write_browser_preflight_output("browser-preflight.stdout", stdout)
     _write_browser_preflight_output("browser-preflight.stderr", stderr)
     remaining = max(deadline - time.monotonic(), 0.0)
@@ -844,6 +870,7 @@ def browser_preflight() -> None:
     success = not timed_out and process.returncode == 0 and closure_ok and native_page_status != "unresolved"
     receipt = {
         "pid": process.pid,
+        "argv": command,
         "returncode": process.returncode,
         "stdout_sha256": sha_bytes(stdout),
         "stderr_sha256": sha_bytes(stderr),
@@ -861,6 +888,8 @@ def browser_preflight() -> None:
         "sigchld_default_after_wait": after_sigchld,
         "original_deadline_seconds": 30.0,
         "remaining_deadline_seconds": remaining,
+        "communicate_checkpoint_targets_seconds": [10.0, 20.0, 30.0],
+        "communicate_checkpoints": communicate_checkpoints,
         "success": success,
         **reap,
     }
