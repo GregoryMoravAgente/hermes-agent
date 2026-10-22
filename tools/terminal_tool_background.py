@@ -426,6 +426,18 @@ def yield_to_background_handler(
             nonlocal sidecar_owner
             if sidecar_owner is None:
                 return
+            # Managed API turns hand the exact sidecar receipt to the durable-result
+            # finalizer.  On POSIX there is no I15 native transaction to retain, so the
+            # base environment reaches this teardown hook before the I04 writer proof;
+            # marking the sidecar UNKNOWN here poisons that authenticated finalizer.
+            if (
+                foreground_binding is not None
+                and getattr(sidecar_owner, "process", None) is not None
+                and getattr(getattr(sidecar_owner, "physical", None), "state", None)
+                not in {"unknown", "closed", "released"}
+                and getattr(sidecar_owner, "reader", None) is not None
+            ):
+                return
             if sidecar_owner.process is None and not sidecar_owner.effect_observed:
                 from gateway.runtime_sidecar_sources import release_before_effect
                 if release_before_effect(sidecar_owner):
@@ -560,6 +572,26 @@ def yield_to_background_handler(
             evidence if foreground_pending and evidence.get("reader_lease") is True
             else dict(evidence)
         )
+        if foreground_binding is not None and sidecar_owner is not None:
+            reader_state = evidence.get("reader_state")
+            reader = evidence.get("reader_thread")
+            reader_complete = (
+                isinstance(reader_state, dict)
+                and reader_state.get("done") is True
+                and callable(getattr(reader, "is_alive", None))
+                and not reader.is_alive()
+                and evidence.get("status") == "true_eof"
+                and evidence.get("drain_joined") is True
+                and evidence.get("stdout_closed") is True
+            )
+            if reader_complete:
+                from tools.environments.local_custody import record_local_readback
+                if not record_local_readback(sidecar_owner, reader):
+                    from tools.environments.local_custody import finish_local_process
+                    finish_local_process(sidecar_owner, reason="local_readback_unavailable")
+            else:
+                from tools.environments.local_custody import finish_local_process
+                finish_local_process(sidecar_owner, reason="local_readback_unavailable")
         _handler._foreground_pending = foreground_pending
         if foreground_pending:
             foreground_evidence["process"] = proc
