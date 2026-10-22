@@ -17,6 +17,7 @@ from gateway.session_classic_callback_waiters import (
     _classic_callback_waiter_entry,
     _classic_callback_waiter_slot,
 )
+from gateway.session_classic_graph_witness import graph_direct_native_row
 
 
 logger = logging.getLogger(__name__)
@@ -950,7 +951,7 @@ def _callback_class_for_row(authority, row, operations):
             return 'I06_busy_followup_delivery'
         if mode == 'managed_turn':
             return _recovered_native_callback_owner(authority, row.get('admission_id'))
-        if mode == 'direct' and _graph_direct_native_row(row):
+        if mode == 'direct' and graph_direct_native_row(row):
             return 'I01_native_inbound'
     owners = {
         record.get('owner_class') for record in (operations.values() if isinstance(operations, dict) else ())
@@ -1007,35 +1008,6 @@ def _authenticated_local_operator_input(authority, row):
         return False
 
 
-def _graph_direct_native_row(row):
-    """Recognize the Graph adapter's authenticated direct native envelope."""
-    payload = row.get('payload') if isinstance(row, dict) else None
-    descriptor = payload.get('native_text_v1') if isinstance(payload, dict) else None
-    source = descriptor.get('source') if isinstance(descriptor, dict) else None
-    automation = descriptor.get('automation') if isinstance(descriptor, dict) else None
-    event = descriptor.get('event') if isinstance(descriptor, dict) else None
-    principal_id = row.get('principal_id') if isinstance(row, dict) else None
-    route = descriptor.get('route') if isinstance(descriptor, dict) else None
-    return (
-        isinstance(descriptor, dict)
-        and descriptor.get('producer_process_mode') == 'direct'
-        and isinstance(source, dict)
-        and source.get('platform') == 'msgraph_webhook'
-        and isinstance(source.get('chat_id'), str)
-        and source['chat_id'].startswith('msgraph:')
-        and source.get('user_id') == 'msgraph'
-        and isinstance(route, str)
-        and route
-        and isinstance(principal_id, str)
-        and principal_id == f'msgraph:{route}'
-        and isinstance(automation, dict)
-        and automation.get('owner') == row.get('target_session_id')
-        and automation.get('identity') == row.get('request_id')
-        and isinstance(event, dict)
-        and event.get('message_id') == row.get('request_id')
-    )
-
-
 def _callback_typed_native_witness(row, handle, record):
     owner_class = getattr(handle, 'owner_class', None)
     payload = row.get('payload')
@@ -1048,7 +1020,7 @@ def _callback_typed_native_witness(row, handle, record):
             isinstance(descriptor, dict)
             and (
                 descriptor.get('producer_process_mode') == 'managed_turn'
-                or (owner_class == 'I01_native_inbound' and _graph_direct_native_row(row))
+                or (owner_class == 'I01_native_inbound' and graph_direct_native_row(row))
             )
         )
     if owner_class != 'I04_fifo_turn_execution':
@@ -1061,7 +1033,7 @@ def _callback_typed_native_witness(row, handle, record):
         and isinstance(descriptor, dict)
         and (
             descriptor.get('producer_process_mode') == 'managed_turn'
-            or _graph_direct_native_row(row)
+            or graph_direct_native_row(row)
         )
     )
 
