@@ -175,17 +175,40 @@ jobs:
           printf 'exit_status=%s\n' "$status" >> "$GITHUB_OUTPUT"
           exit 0
 
-      - name: Stop after direct-file diagnostic before capacity and SUT
+      - name: Run single-process Chromium diagnostic only
+        id: browser-single-process
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          single_proof="$HERMES_CUA_PROOF_DIR/single-process"
+          mkdir -p "$single_proof"
+          chmod 700 "$single_proof"
+          cp -- "$HERMES_CUA_PROOF_DIR/resolved-tools.json" "$single_proof/resolved-tools.json"
+          cmp -- "$HERMES_CUA_PROOF_DIR/resolved-tools.json" "$single_proof/resolved-tools.json"
+          set +e
+          HERMES_CUA_PROOF_DIR="$single_proof" "$HERMES_PYTHON" scripts/ci/linux_cua_single_process_probe.py
+          status=$?
+          set -e
+          printf 'exit_status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Stop after single-process diagnostic before capacity and SUT
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          status='${{ steps.browser-direct-file.outputs.exit_status }}'
-          if [[ ! "$status" =~ ^[0-9]+$ ]]; then
+          direct_status='${{ steps.browser-direct-file.outputs.exit_status }}'
+          single_status='${{ steps.browser-single-process.outputs.exit_status }}'
+          if [[ ! "$direct_status" =~ ^[0-9]+$ ]]; then
             echo "direct-file diagnostic did not produce an exit status"
             exit 1
           fi
-          echo "direct-file diagnostic completed with exit status $status; stopping before qualification/SUT"
+          if [[ ! "$single_status" =~ ^[0-9]+$ ]]; then
+            echo "single-process diagnostic did not produce an exit status"
+            exit 1
+          fi
+          echo "direct-file diagnostic completed with exit status $direct_status; single-process diagnostic completed with exit status $single_status; stopping before qualification/SUT"
           exit 1
 
       - name: Capacity gate after browser initialization
