@@ -22,8 +22,36 @@ MAX_RETAINED_RESULTS = 64
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
-    "termination_source", "notify_on_complete",
+    "termination_source", "notify_on_complete", "output_log", "total_output_chars",
 )
+
+_REDACTED_HOME = "<HERMES_HOME>"
+
+
+def _redacted_output_log(value) -> str:
+    """Persist only a profile-relative log path, never a host path or arbitrary input."""
+    from pathlib import Path
+
+    if not value:
+        return ""
+    try:
+        home = get_hermes_home().resolve()
+        relative = Path(str(value)).resolve(strict=False).relative_to(home)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return ""
+    return f"{_REDACTED_HOME}/{relative.as_posix()}"
+
+
+def _restore_output_log(value) -> str:
+    """Expand only the serializer's own profile-relative token for a cold reader."""
+    from pathlib import Path
+
+    if not isinstance(value, str) or not value.startswith(f"{_REDACTED_HOME}/"):
+        return ""
+    relative = Path(value[len(_REDACTED_HOME) + 1:])
+    if relative.is_absolute() or ".." in relative.parts:
+        return ""
+    return str(get_hermes_home() / relative)
 
 
 def _result_paths():
@@ -46,13 +74,16 @@ def _result_paths():
     return [path for _, path in retained[:MAX_RETAINED_RESULTS]]
 
 
-def save_completed_result(session) -> None:
+def save_completed_result(session) -> bool:
     from agent.redact import redact_sensitive_text, redact_terminal_output
     from tools.process_registry import MAX_OUTPUT_CHARS
 
     with session._lock:
         record = {key: getattr(session, key) for key in _RESULT_FIELDS}
         record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:]
+    record["output_log"] = _redacted_output_log(record["output_log"])
+    if type(record["total_output_chars"]) is not int or record["total_output_chars"] < 0:
+        record["total_output_chars"] = len(record["output"])
     # Live-output opt-out must not persist raw credentials in durable receipts.
     record["output"] = redact_terminal_output(record["output"], record["command"], force=True)
     record["command"] = redact_sensitive_text(record["command"], code_file=True, force=True)
@@ -63,9 +94,11 @@ def save_completed_result(session) -> None:
         make_user_dir(directory, mode=0o700, parents=True, exist_ok=True)
         atomic_json_write(directory / f"{session.id}.json", record, mode=0o600)
         _result_paths()
+        return True
     except OSError:
         # Preserve live delivery on disk failure, but never silently claim durability.
         logger.warning("Could not retain completed process result %s", session.id, exc_info=True)
+        return False
 
 
 def _owns_result(owner: str, parent: str | None) -> bool:
@@ -108,10 +141,16 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
-            session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
-                exited=True, output_buffer=record["output"],
+            output = record["output"]
+            if not isinstance(output, str):
+                raise TypeError("retained process output is not text")
+            fields = {key: record[key] for key in _RESULT_FIELDS if key in record}
+            fields["output_log"] = _restore_output_log(record.get("output_log"))
+            total_chars = record.get("total_output_chars", len(output))
+            fields["total_output_chars"] = (
+                total_chars if type(total_chars) is int and total_chars >= 0 else len(output)
             )
+            session = ProcessSession(**fields, exited=True, output_buffer=output)
             session._completion_event.set()
             results[session.id] = session
         except (OSError, ValueError, KeyError, TypeError, sqlite3.Error):

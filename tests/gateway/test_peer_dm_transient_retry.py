@@ -19,9 +19,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
-from hermes_state import SessionDB
 
 SESSION_ID = "peer_dm_retry"
 DM = "disk status?"
@@ -51,14 +49,12 @@ def _app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
-def _adapter(tmp_path) -> tuple[APIServerAdapter, str]:
+def _adapter(adapter: APIServerAdapter) -> tuple[APIServerAdapter, str]:
     """A real adapter over a real store, holding the DM row a failed attempt's turn-start persist
     would have left as the transcript's unanswered tail."""
-    db = SessionDB(tmp_path / "state.db")
+    db = adapter._ensure_session_db()
     sid = db.create_session(SESSION_ID, "api_server")
     db.append_message(sid, "user", content=DM)
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
     return adapter, sid
 
 
@@ -83,8 +79,10 @@ def _fake_agent(seen: list, outcome: dict) -> MagicMock:
 
 
 @pytest.mark.asyncio
-async def test_peer_dm_retries_a_transient_turn_once_and_still_reports_a_permanent_one(tmp_path):
-    adapter, sid = _adapter(tmp_path)
+async def test_peer_dm_retries_a_transient_turn_once_and_still_reports_a_permanent_one(
+    tmp_path, runtime_owned_legacy_api_adapter,
+):
+    adapter, sid = _adapter(runtime_owned_legacy_api_adapter)
     app = _app(adapter)
 
     # ① Transient failure -> re-run once, resuming the persisted DM row, and the recovered reply is

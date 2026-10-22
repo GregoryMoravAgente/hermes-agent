@@ -5,15 +5,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('flag,status', [('failed', 'failed'), ('interrupted', 'cancelled')])
 @pytest.mark.parametrize('stream', [False, True])
-async def test_responses_terminal_result_is_not_success(flag, status, stream):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+async def test_responses_terminal_result_is_not_success(
+    flag, status, stream, runtime_owned_api_adapter
+):
+    adapter = runtime_owned_api_adapter
     adapter._run_agent = AsyncMock(return_value=({'final_response': 'diagnostic', flag: True,
                                                  'completed': False, 'messages': []}, {}))
     app = web.Application()
@@ -38,8 +37,10 @@ def test_chat_interruption_is_not_stop():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('flag,status', [('failed', 'failed'), ('interrupted', 'cancelled')])
-async def test_session_chat_terminal_result_is_not_success(flag, status):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+async def test_session_chat_terminal_result_is_not_success(
+    flag, status, runtime_owned_api_adapter
+):
+    adapter = runtime_owned_api_adapter
     adapter._prepare_session_chat = AsyncMock(return_value=({'gateway_session_key': None,
         'session_id': 'owned', 'run_kwargs': {}, 'runtime_request': {}, 'user_message': 'hello',
         'lock_active': False, 'body': {}}, None))

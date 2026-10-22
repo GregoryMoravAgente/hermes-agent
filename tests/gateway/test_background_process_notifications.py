@@ -49,6 +49,10 @@ class _FakeRegistry:
     def is_completion_consumed(self, session_id):
         return self._consumed
 
+    def acknowledge_completion_delivery(self, delivery_token):
+        """Legacy sessions have no owned delivery token to acknowledge."""
+        assert not delivery_token
+
 
 def _build_runner(monkeypatch, tmp_path, mode: str) -> GatewayRunner:
     """Create a GatewayRunner with a fake config for the given mode."""

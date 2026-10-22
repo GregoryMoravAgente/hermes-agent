@@ -82,12 +82,16 @@ class CanonicalBotDeliverResult(Result):
     status: str
     delivery_id: str
     profile_home: str
+    profile_id: str | None = None
+    authority_epoch: int | None = None
     session_id: str
     admission_id: str | None = None
     refused: Literal[True] | None = None
     message: str
     reply: str | None = None
     retry_admission_id: str | None = None
+    execution_generation: int | None = None
+    retry_execution_generation: int | None = None
     error: str | None = None
     reason: str | None = None
 

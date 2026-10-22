@@ -3975,37 +3975,9 @@ class GatewayRunner(
     })
 
     def _set_session_env(self, context: SessionContext) -> list:
-        """Set session context variables (contextvars, not os.environ, so concurrent messages can't
-        overwrite each other). Returns reset tokens for ``_clear_session_env`` in a ``finally``."""
-        from gateway.session_context import set_session_vars
-        # Async-delivery capability tells async tools whether this channel can wake a later turn. Default
-        # True keeps CLI/unknown paths working; stateless adapters (api_server) declare False.
-        _adapter = (getattr(self, "adapters", None) or {}).get(context.source.platform)
-        _async_delivery = getattr(_adapter, "supports_async_delivery", True)
-        # #98619: an admitted API turn carries its session-id provenance in the admission settings,
-        # and its rebound browser-controller identity; every other platform leaves both undeclared.
-        from gateway.session_api_turn import api_session_vars
-        _api_vars = api_session_vars()
-        _history_delivery = _api_vars.pop("session_history_delivery", None)
-        return set_session_vars(
-            platform=context.source.platform.value,
-            chat_id=context.source.chat_id,
-            chat_type=str(context.source.chat_type) if context.source.chat_type else "",
-            chat_name=context.source.chat_name or "",
-            thread_id=str(context.source.thread_id) if context.source.thread_id else "",
-            user_id=str(context.source.user_id) if context.source.user_id else "",
-            user_id_alt=str(context.source.user_id_alt) if context.source.user_id_alt else "",
-            user_name=str(context.source.user_name) if context.source.user_name else "",
-            scope_id=str(getattr(context.source, "scope_id", "") or ""),
-            parent_chat_id=str(getattr(context.source, "parent_chat_id", "") or ""),
-            session_key=context.session_key,
-            # A cached agent binds HERMES_SESSION_ID only on the turn that built it; every later turn
-            # (and a command it yields to the background) must still see its own session.
-            session_id=context.session_id or "",
-            message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
-            async_delivery=_async_delivery,
-            cron_session="", session_history_delivery=_history_delivery, **_api_vars)
+        """Bind this turn's task-local routing and runtime context."""
+        from gateway.session_context import bind_gateway_session_context
+        return bind_gateway_session_context(self, context)
 
     def _clear_session_env(self, tokens: list) -> None:
         """Restore session context variables to their pre-handler values."""
@@ -5216,19 +5188,17 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
             stream.flush()
+    # A physical close is unknown until it returns a typed success.  The backstop must never
+    # stamp a clean exit merely because its release callback raised or returned an unfamiliar value.
+    ownership_clean = False
     def _release_locks() -> None:
-        # BEFORE the log drain (bounded, but could take its full timeout on a wedged disk); idempotent.
-        from gateway.status import remove_pid_file, release_gateway_runtime_lock
-        remove_pid_file()
-        release_gateway_runtime_lock()
+        nonlocal ownership_clean
+        from gateway.shutdown_watchdog import _release_shutdown_watchdog_ownership
+        ownership_clean = _release_shutdown_watchdog_ownership()
 
     def _mark_exited() -> None:
-        # Single funnel every graceful exit passes through, so the next boot's unclean-death detector
-        # fires only for genuine SIGKILL/OOM/VM deaths. Ownership-guarded against an old --replace life.
-        from hermes_cli.observability.shared_metrics_process import stamp_exit
-        stamp_exit("clean")  # the exit-metrics marker too: os._exit skips its atexit stamp (never raises)
-        from gateway.lifecycle_ledger import mark_exited
-        mark_exited(exit_code, reason="graceful_shutdown")
+        from gateway.shutdown_watchdog import mark_graceful_exit
+        mark_graceful_exit(exit_code, ownership_clean=ownership_clean)
 
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():

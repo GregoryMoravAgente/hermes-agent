@@ -158,7 +158,11 @@ class GatewaySessionAgentMixin:
         from gateway.session_policy import policy_for_source
         from gateway.session_worker_construct import session_prefill
         policy = policy_for_source(runner, src)
-        return ctx.AIAgent(
+        from gateway.runtime_service_operations import producer_policy_for_turn
+        producer_policy = producer_policy_for_turn(
+            runner, ctx, turn_route["runtime"].get("provider"), turn_route["runtime"].get("base_url"),
+        )
+        agent = ctx.AIAgent(
             model=turn_route["model"], **turn_route["runtime"], **_checkpoint_agent_kwargs(ctx.user_config),
             max_iterations=max_iterations, quiet_mode=not bool(policy and policy.verbose), verbose_logging=False,
             enabled_toolsets=ctx.enabled_toolsets, disabled_toolsets=ctx.disabled_toolsets,
@@ -186,7 +190,9 @@ class GatewaySessionAgentMixin:
             # A local session's frozen budget (`--run-budget` / its profile's agent.run_budget_seconds);
             # None leaves the agent reading the owner's config, as before.
             run_budget_seconds=policy.run_budget_seconds if policy else None,
+            external_process_policy=producer_policy,
         )
+        return agent
 
     def _resolve_turn_agent(self, turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr):
         """Reuse this session's cached AIAgent (frozen system prompt + tool schemas → prompt cache
@@ -203,10 +209,31 @@ class GatewaySessionAgentMixin:
         )
         cache_lock = getattr(runner, "_agent_cache_lock", None)
         cache = getattr(runner, "_agent_cache", None)
+        from gateway.runtime_service_operations import producer_policy_for_turn
         peek_sid, dead = self._cached_sid_is_dead(cache_lock, cache)
         msg_count = self._current_message_count()
         found = self._lookup_cached_agent(sig, cache_lock, cache, max_iterations, peek_sid, dead, msg_count)
         agent = found.agent
+        cached_policy = getattr(agent, "_external_process_policy", None) if found.reused else None
+        if getattr(cached_policy, "mode", None) != "managed_turn":
+            cached_policy = None
+        producer_policy = producer_policy_for_turn(
+            runner,
+            ctx,
+            turn_route["runtime"].get("provider"),
+            turn_route["runtime"].get("base_url"),
+            cached_policy=cached_policy,
+        )
+        old_policy = getattr(agent, "_external_process_policy", None) if agent is not None else None
+        old_parent = getattr(old_policy, "parent", None)
+        new_parent = getattr(producer_policy, "parent", None)
+        if found.reused and ((old_policy is None) != (producer_policy is None) or (
+            old_policy is not None and old_parent is not new_parent
+        )):
+            found.evicted, found.reused, agent = agent, False, None
+            if cache_lock and cache is not None:
+                with cache_lock:
+                    cache.pop(ctx.session_key, None)
         # Lock released — refresh the reused agent's fallback chain from disk OUTSIDE the cache lock
         # (disk I/O under the lock stalls the idle-sweep watcher and Discord heartbeats). A chain
         # configured after caching must reach the next turn; per-session serialization keeps it safe.

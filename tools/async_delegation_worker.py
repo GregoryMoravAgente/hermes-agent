@@ -46,14 +46,33 @@ class WorkerDelegationLedger:
         from tools.async_delegation import _ROUTING_KEYS
         if any(record.get(key) for key in _ROUTING_KEYS):
             raise WorkerPersistenceError('unsupported_producer')
+        from gateway.status import get_process_start_time
+        owner_started_at = get_process_start_time(self.store.scope['pid'])
+        if type(owner_started_at) is not int or owner_started_at < 0:
+            raise WorkerPersistenceError('worker_birth_unavailable')
+        execution = dict(record['execution'])
+        execution.update(
+            owner_execution_id=self.store.scope['execution_id'], owner_pid=self.store.scope['pid'],
+            owner_started_at=owner_started_at, owner_scope={
+                key: self.store.scope[key] for key in ('profile_id', 'session_id', 'generation', 'epoch')})
+        record['execution'] = execution
         return self.store._apply('delegation.dispatch', {
             key: record.get(key, '') for key in ('delegation_id', 'parent_session_id', 'session_key',
-                'origin_ui_session_id', 'origin_session_id', 'dispatched_at')} | {'task': {
+                'origin_ui_session_id', 'origin_session_id', 'dispatched_at')} |
+            {'execution': record['execution']} | {'task': {
             key: record[key] for key in ('goal', 'goals', 'context', 'toolsets', 'role', 'model', 'is_batch', 'task_indexes')
             if key in record}})['value']
 
     def complete(self, event, result):
         return self.store._apply('delegation.complete', {'event': event, 'result': result})['value']
+
+    def execution(self, delegation_id, execution):
+        return self.store._apply('delegation.execution', {
+            'delegation_id': delegation_id, 'execution': execution})['value']
+
+    def retry_pending_settlement(self):
+        """Replay the exact RuntimeSessionStore journal entry, never allocate a new sequence."""
+        return self.store.retry_pending()
 
     def child(self, delegation_id, entry):
         return self.store._apply('delegation.child', {'delegation_id': delegation_id, 'entry': entry})['value']

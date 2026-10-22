@@ -37,8 +37,9 @@ def verify_worker_identity(process, hello):
         if handle.ppid() != os.getpid() or handle.status() == psutil.STATUS_ZOMBIE:
             raise RuntimeStoreError('permission_denied')
         worker = psutil.Process(pid)
-        birth = worker.create_time()
-        if birth != hello['birth'] or not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE:
+        from gateway.session_worker import _canonical_worker_birth
+        canonical_birth = _canonical_worker_birth(pid, hello['birth'])
+        if not worker.is_running() or worker.status() == psutil.STATUS_ZOMBIE:
             raise RuntimeStoreError('permission_denied')
         # psutil's parent() already refuses a recycled ppid (parent born after child).
         chain = [p.pid for p in worker.parents()[:MAX_LAUNCHER_HOPS]]
@@ -46,7 +47,9 @@ def verify_worker_identity(process, hello):
         raise RuntimeStoreError('worker_not_live') from exc
     if pid != process.pid and process.pid not in chain:
         raise RuntimeStoreError('permission_denied')
-    return pid, birth
+    # The reservation is the durable identity boundary: always return the canonical
+    # integer, even when a legacy hand-written probe supplied a raw float.
+    return pid, canonical_birth
 
 
 def reserve_admission_worker(authority, *, admission_id, process, principal_id, hello):

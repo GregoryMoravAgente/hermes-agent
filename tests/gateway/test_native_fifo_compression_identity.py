@@ -7,6 +7,7 @@ import pytest
 @pytest.mark.asyncio
 async def test_native_fifo_identity_is_stable_across_compression(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority, SessionAuthority
@@ -19,8 +20,15 @@ async def test_native_fifo_identity_is_stable_across_compression(tmp_path, monke
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     runner = GatewayRunner(GatewayConfig())
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        return SendResult(success=True, message_id='fixture-reply')
+
+    monkeypatch.setattr(adapter, 'send', send)
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     events = [MessageEvent(text=name, source=source, message_id=name) for name in ('first', 'second')]

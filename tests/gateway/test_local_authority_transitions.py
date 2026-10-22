@@ -14,12 +14,14 @@ async def local_session(tmp_path, monkeypatch, source='cli'):
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
+    from tests.gateway.conftest import bind_authority_runtime_custody
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': [], 'acp': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
         _cached_agent_for=lambda route: None, _adapter_for_source=lambda source: None,
         _evict_cached_agent=lambda route: None)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='fixture')
+    bind_authority_runtime_custody(runner, authority)
     connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
     ref = create_local_session(authority, connection.actor, {'request_id': 'create', 'source': source,
         'cwd': str(tmp_path), 'model': 'old', 'toolsets': []})

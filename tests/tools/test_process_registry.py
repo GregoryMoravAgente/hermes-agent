@@ -19,6 +19,10 @@ from tools.process_registry import (
     FINISHED_TTL_SECONDS,
     MAX_PROCESSES,
 )
+from tests.tools.process_registry_env_poller_fixtures import (
+    make_incremental_poller_env,
+    make_quoted_path_env,
+)
 
 
 @pytest.fixture()
@@ -940,21 +944,7 @@ class TestSpawnEnvSanitization:
     def test_env_poller_quotes_temp_paths_with_spaces(self, registry):
         session = _make_session(sid="proc_space")
         session.exited = False
-
-        class FakeEnv:
-            def __init__(self):
-                self.commands = []
-                self._responses = iter([
-                    {"output": "6 0\nhello\n"},
-                    {"output": "1\n"},
-                    {"output": "0\n"},
-                ])
-
-            def execute(self, command, **kwargs):
-                self.commands.append((command, kwargs))
-                return next(self._responses)
-
-        env = FakeEnv()
+        env = make_quoted_path_env()
 
         with patch("tools.process_registry.time.sleep", return_value=None), \
             patch.object(registry, "_move_to_finished"):
@@ -968,8 +958,10 @@ class TestSpawnEnvSanitization:
 
         assert "'/path with spaces/hermes_bg.log'" in env.commands[0][0]
         assert "cat '/path with spaces/hermes_bg.log'" not in env.commands[0][0]
+        assert len(env.commands) == 4
         assert "'/path with spaces/hermes_bg.pid'" in env.commands[1][0]
-        assert "'/path with spaces/hermes_bg.exit'" in env.commands[2][0]
+        assert env.commands[2][0] == 'kill -0 "1" 2>/dev/null; echo $?'
+        assert "'/path with spaces/hermes_bg.exit'" in env.commands[3][0]
 
 
 class TestEnvPollerIncrementalRead:
@@ -982,18 +974,8 @@ class TestEnvPollerIncrementalRead:
 
     @staticmethod
     def _run_poller(registry, session, responses):
-        """Drive one poll cycle and hand back the commands the env saw."""
-
-        class FakeEnv:
-            def __init__(self):
-                self.commands = []
-                self._responses = iter(responses)
-
-            def execute(self, command, **kwargs):
-                self.commands.append(command)
-                return next(self._responses)
-
-        env = FakeEnv()
+        """Drive command-aware delta, PID, liveness, and exit reads."""
+        env = make_incremental_poller_env(responses)
         with patch("tools.process_registry.time.sleep", return_value=None), \
             patch.object(registry, "_move_to_finished"):
             registry._env_poller_loop(
@@ -1039,9 +1021,7 @@ class TestEnvPollerIncrementalRead:
             registry,
             session,
             [
-                {"output": "8 0\nand new"},
-                {"output": "1\n"},
-                {"output": "0\n"},
+                {"delta": "8 0\nand new", "pid": "4242\n", "alive": "1\n", "exit": "0\n"},
             ],
         )
         assert session.output_buffer == "already here and new"
@@ -1053,17 +1033,15 @@ class TestEnvPollerIncrementalRead:
             registry,
             session,
             [
-                {"output": "11 0\nfirst chunk"},
-                {"output": "0\n"},          # still running, poll again
-                {"output": "17 11\n and more"},
-                {"output": "1\n"},          # gone now
-                {"output": "0\n"},
+                {"delta": "11 0\nfirst chunk", "pid": "4242\n", "alive": "0\n", "exit": ""},
+                {"delta": "17 11\n and more", "pid": "4242\n", "alive": "1\n", "exit": "0\n"},
             ],
         )
         assert "O=0" in commands[0]
         # The second read starts at byte 11, so the first chunk is not sent
         # a second time.
-        assert "O=11" in commands[2]
+        assert "O=11" in commands[3]
+        assert len(commands) == 7
         assert session.output_buffer == "first chunk and more"
 
     def test_truncated_log_drops_the_stale_buffer(self, registry):
@@ -1076,11 +1054,8 @@ class TestEnvPollerIncrementalRead:
             registry,
             session,
             [
-                {"output": "11 0\nfirst chunk"},
-                {"output": "0\n"},          # still running, poll again
-                {"output": "5 0\nfresh"},
-                {"output": "1\n"},
-                {"output": "0\n"},
+                {"delta": "11 0\nfirst chunk", "pid": "4242\n", "alive": "0\n", "exit": ""},
+                {"delta": "5 0\nfresh", "pid": "4242\n", "alive": "1\n", "exit": "0\n"},
             ],
         )
         assert session.output_buffer == "fresh"
@@ -1094,9 +1069,7 @@ class TestEnvPollerIncrementalRead:
             registry,
             session,
             [
-                {"output": ""},
-                {"output": "1\n"},
-                {"output": "0\n"},
+                {"delta": "", "pid": "4242\n", "alive": "1\n", "exit": "0\n"},
             ],
         )
         assert session.output_buffer == "keep me"
@@ -1109,9 +1082,7 @@ class TestEnvPollerIncrementalRead:
             registry,
             session,
             [
-                {"output": "20 0\n" + "x" * 20},
-                {"output": "1\n"},
-                {"output": "0\n"},
+                {"delta": "20 0\n" + "x" * 20, "pid": "4242\n", "alive": "1\n", "exit": "0\n"},
             ],
         )
         assert session.output_buffer == "x" * 10

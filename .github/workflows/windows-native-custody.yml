@@ -1,0 +1,485 @@
+name: Windows Native Custody
+
+# Exact-head native producer. The owned diagnostic branch can run without waiting
+# for the emulated local Server VM; it never publishes or installs a product.
+on:
+  pull_request:
+  push:
+    branches: [codex/AGC-1722/windows-close-worker-root-20261021-01a120af]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-custody-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CI: '1'
+  GITHUB_ACTIONS: 'true'
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  NO_COLOR: '1'
+  TZ: UTC
+  OPENAI_API_KEY: ''
+  OPENROUTER_API_KEY: ''
+  NOUS_API_KEY: ''
+  ANTHROPIC_API_KEY: ''
+  FAL_KEY: ''
+  HERMES_TEST_FILE_RETRIES: '0'
+  NATIVE_CUSTODY_FILES: |
+    tests/tools/test_process_registry_windows_custody.py
+    tests/tools/test_process_registry_native_scope_retry.py
+    tests/tools/test_terminal_tool.py
+    tests/tools/test_process_registry_custody.py
+    tests/gateway/test_runtime_custody_snapshot_contract.py
+    tests/tools/test_drain_fd_windows.py
+    tests/tools/test_foreground_reader_handoff.py
+    tests/tools/test_process_registry_lazy_restore.py
+    tests/tools/test_process_registry_windows_background_custody.py
+    tests/gateway/test_preservation_admission_consumers.py
+    tests/tools/test_process_registry_background_failure_retention.py
+    tests/gateway/test_runtime_custody_profile_epochs.py
+    tests/gateway/test_runtime_custody_bootstrap_contract.py
+    tests/gateway/test_runtime_service_parent_edges.py
+    tests/gateway/test_session_authorities_multiplex.py
+    tests/gateway/test_codex_service_custody.py
+    tests/agent/transports/test_codex_physical_custody.py
+    tests/gateway/test_runtime_service_native_close_identity.py
+
+jobs:
+  native-custody:
+    name: Windows Native Custody
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Set the checkout byte policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config --global core.autocrlf false
+          test "$(git config --global --get core.autocrlf)" = false
+
+      - name: Check out the exact candidate head
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Bind the proof directory and native command paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_dir="$RUNNER_TEMP/windows-native-custody"
+          mkdir -p "$proof_dir/rows"
+          proof_native="$(cygpath -m "$proof_dir")"
+          repo_native="$(cygpath -m "$GITHUB_WORKSPACE")"
+          bash_path="$(command -v bash)"
+          test -n "$bash_path"
+          bash_native="$(cygpath -m "$bash_path")"
+          if [ ! -f "$bash_native" ] && [ -f "${bash_native}.exe" ]; then
+            bash_native="${bash_native}.exe"
+          fi
+          test -f "$bash_native"
+          printf '%s\n' "$NATIVE_CUSTODY_FILES" > "$proof_dir/expected-files.txt"
+          {
+            printf 'PROOF_DIR=%s\n' "$proof_dir"
+            printf 'PROOF_NATIVE=%s\n' "$proof_native"
+            printf 'REPO_NATIVE=%s\n' "$repo_native"
+            printf 'BASH_NATIVE=%s\n' "$bash_native"
+            printf 'HERMES_HOME=%s/hermes-home\n' "$proof_native"
+          } >> "$GITHUB_ENV"
+          printf '%s\n' "$(git rev-parse HEAD)" > "$proof_dir/head-before.txt"
+          git status --porcelain=v1 --untracked-files=all > "$proof_dir/status-before.txt"
+          git ls-files -s | sha256sum | cut -d' ' -f1 > "$proof_dir/index-before.sha256"
+          git config --global --get core.autocrlf > "$proof_dir/autocrlf.txt"
+
+      - name: Set up the locked PM test environment
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          packages: git,ripgrep
+          extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          test-environment: 'true'
+          save-python-cache: 'false'
+
+      - name: Capture source and interpreter bytes before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${HERMES_PYTHON:-}"
+          "$HERMES_PYTHON" "$REPO_NATIVE/scripts/ci/windows_native_custody.py" --help > /dev/null
+          "$HERMES_PYTHON" - "$REPO_NATIVE" "$PROOF_NATIVE" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+
+          repo = Path(sys.argv[1])
+          proof = Path(sys.argv[2])
+          def runtime_map(root):
+              result = {}
+              for directory, dirs, names in os.walk(root):
+                  dirs[:] = [name for name in dirs if name not in {".git", "__pycache__", ".pytest_cache"}]
+                  for name in names:
+                      if not name.endswith(".pyc"):
+                          path = Path(directory) / name
+                          result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return result
+
+          def source_map():
+              names = subprocess.check_output(
+                  ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repo,
+              ).split(b"\0")
+              return {
+                  name.decode(): hashlib.sha256((repo / name.decode()).read_bytes()).hexdigest()
+                  for name in names if name and (repo / name.decode()).is_file()
+              }
+
+          def environment_map():
+              tools_root = os.environ["HERMES_RUNTIME_DIR"]
+              return {
+                  "source": source_map(),
+                  "pm_root": sys.prefix,
+                  "pm": runtime_map(Path(sys.prefix)),
+                  "base_root": sys.base_prefix,
+                  "base": runtime_map(Path(sys.base_prefix)),
+                  "tools_root": tools_root,
+                  "tools": runtime_map(Path(tools_root)),
+              }
+
+          files = [
+              line.strip()
+              for line in (proof / "expected-files.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          files += [
+              "scripts/ci/windows_native_custody.py",
+              ".github/workflows/windows-native-custody.yml",
+              "hermes_cli/local_runtime/processes.py",
+              "tests/hermes_cli/test_local_runtime_processes.py",
+          ]
+          assert sys.prefix != sys.base_prefix, "PM test environment is required"
+          (proof / "whole-environment-before.json").write_text(
+              json.dumps(environment_map(), sort_keys=True) + "\n", encoding="utf-8",
+          )
+          hashes = {}
+          for relative in files:
+              path = repo / relative
+              hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
+          (proof / "source-before.json").write_text(
+              json.dumps({"files": files, "sha256": hashes}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (proof / "interpreter-before.json").write_text(
+              json.dumps({"executable": sys.executable, "version": sys.version}, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Run configured static checks before native consumers
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$HERMES_PYTHON" scripts/check --base edbbaa0509e9def84cdfeddc38114027f2e09565
+
+      - name: Run the complete native file bank under the owned Windows Job
+        id: native-bank
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          overall=0
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            safe="${file//\//__}"
+            stdout_name="$safe.stdout"
+            event_name="$safe.event.json"
+            junit_name="$safe.junit.xml"
+            stdout_native="$PROOF_NATIVE/rows/$stdout_name"
+            event_native="$PROOF_NATIVE/rows/$event_name"
+            junit_native="$PROOF_NATIVE/rows/$junit_name"
+            set +e
+            "$HERMES_PYTHON" "$REPO_NATIVE/scripts/ci/windows_native_custody.py" \
+              --receipt "$event_native" \
+              --stdout "$stdout_native" \
+              --junit "$junit_native" \
+              --outer-timeout 600 \
+              -- "$BASH_NATIVE" scripts/run_tests.sh -j 1 --file-timeout 300 --file-retries=0 \
+              "$file" -- -v --tb=long -s "--junitxml=$junit_native"
+            code=$?
+            set -e
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$file" "$code" "$stdout_name" "$event_name" "$junit_name" \
+              >> "$PROOF_DIR/results.tsv"
+            if [ "$code" -ne 0 ]; then
+              overall=1
+            fi
+          done < "$PROOF_DIR/expected-files.txt"
+          exit "$overall"
+
+      - name: Exercise the product Windows Job seam
+        id: product-seam
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          stdout_name="product-seam.stdout"
+          event_name="product-seam.event.json"
+          junit_name="product-seam.junit.xml"
+          set +e
+          "$HERMES_PYTHON" "$REPO_NATIVE/scripts/ci/windows_native_custody.py" \
+            --receipt "$PROOF_NATIVE/$event_name" \
+            --stdout "$PROOF_NATIVE/$stdout_name" \
+            --junit "$PROOF_NATIVE/$junit_name" \
+            --outer-timeout 600 \
+            -- "$BASH_NATIVE" scripts/run_tests.sh -j 1 --file-timeout 300 --file-retries=0 \
+            tests/hermes_cli/test_local_runtime_processes.py -- \
+            -v --tb=long -s "--junitxml=$PROOF_NATIVE/$junit_name"
+          code=$?
+          set -e
+          printf '%s\t%s\t%s\t%s\t%s\n' \
+            "tests/hermes_cli/test_local_runtime_processes.py" "$code" "$stdout_name" "$event_name" "$junit_name" \
+            > "$PROOF_DIR/product-seam.tsv"
+          exit "$code"
+
+      - name: Validate source, complete bank, native settlement, and receipts
+        if: ${{ always() }}
+        shell: bash
+        env:
+          EXPECTED_PR_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "${HERMES_PYTHON:-}"
+          git rev-parse HEAD > "$PROOF_DIR/head-after.txt"
+          git status --porcelain=v1 --untracked-files=all > "$PROOF_DIR/status-after.txt"
+          git ls-files -s | sha256sum | cut -d' ' -f1 > "$PROOF_DIR/index-after.sha256"
+          git diff --raw --abbrev=40 > "$PROOF_DIR/diff-after.raw"
+          "$HERMES_PYTHON" - "$REPO_NATIVE" "$PROOF_NATIVE" "$EXPECTED_PR_HEAD" <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import xml.etree.ElementTree as ET
+
+          repo = Path(sys.argv[1])
+          proof = Path(sys.argv[2])
+          def runtime_map(root):
+              result = {}
+              for directory, dirs, names in os.walk(root):
+                  dirs[:] = [name for name in dirs if name not in {".git", "__pycache__", ".pytest_cache"}]
+                  for name in names:
+                      if not name.endswith(".pyc"):
+                          path = Path(directory) / name
+                          result[path.relative_to(root).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
+              return result
+
+          def source_map():
+              names = subprocess.check_output(
+                  ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=repo,
+              ).split(b"\0")
+              return {
+                  name.decode(): hashlib.sha256((repo / name.decode()).read_bytes()).hexdigest()
+                  for name in names if name and (repo / name.decode()).is_file()
+              }
+
+          def environment_map():
+              tools_root = os.environ["HERMES_RUNTIME_DIR"]
+              return {
+                  "source": source_map(),
+                  "pm_root": sys.prefix,
+                  "pm": runtime_map(Path(sys.prefix)),
+                  "base_root": sys.base_prefix,
+                  "base": runtime_map(Path(sys.base_prefix)),
+                  "tools_root": tools_root,
+                  "tools": runtime_map(Path(tools_root)),
+              }
+
+          expected_head = sys.argv[3]
+          environment_before = json.loads((proof / "whole-environment-before.json").read_text(encoding="utf-8"))
+          environment_after = environment_map()
+          (proof / "whole-environment-after.json").write_text(
+              json.dumps(environment_after, sort_keys=True) + "\n", encoding="utf-8",
+          )
+          whole_environment_equal = environment_before == environment_after
+          expected_files = [
+              line.strip()
+              for line in (proof / "expected-files.txt").read_text(encoding="utf-8").splitlines()
+              if line.strip()
+          ]
+          source_before = json.loads((proof / "source-before.json").read_text(encoding="utf-8"))
+          source_after = {
+              relative: hashlib.sha256((repo / relative).read_bytes()).hexdigest()
+              for relative in source_before["files"]
+          }
+          (proof / "source-after.json").write_text(
+              json.dumps({"files": source_before["files"], "sha256": source_after}, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+
+          def parse_junit(path):
+              counts = {"passed": 0, "skipped": 0, "failure": 0, "error": 0}
+              cases = 0
+              if not path.is_file():
+                  return cases, counts, False
+              try:
+                  root = ET.parse(path).getroot()
+              except (OSError, ET.ParseError):
+                  return cases, counts, False
+              for case in root.iter("testcase"):
+                  cases += 1
+                  status = next((name for name in ("failure", "error", "skipped") if case.find(name) is not None), "passed")
+                  counts[status] = counts.get(status, 0) + 1
+              return cases, counts, True
+
+          def validate_row(row, row_dir):
+              file_name, code_text, stdout_name, event_name, junit_name = row
+              event_path = row_dir / event_name
+              stdout_path = row_dir / stdout_name
+              junit_path = row_dir / junit_name
+              event = json.loads(event_path.read_text(encoding="utf-8")) if event_path.is_file() else {}
+              cases, counts, junit_parseable = parse_junit(junit_path)
+              stdout_hash = hashlib.sha256(stdout_path.read_bytes()).hexdigest() if stdout_path.is_file() else None
+              junit_hash = hashlib.sha256(junit_path.read_bytes()).hexdigest() if junit_path.is_file() else None
+              valid = all((
+                  code_text == "0",
+                  event.get("success") is True,
+                  event.get("forced_cleanup") is False,
+                  event.get("cleanup_errors") == [],
+                  event.get("exact_process_handle_member_after_resume") is True,
+                  event.get("exact_process_handle_member_after_exit") is True,
+                  event.get("native_runner_tree_empty_after_exit") is True,
+                  event.get("job_handle_closed") is True,
+                  event.get("process_handle_closed") is True,
+                  event.get("stdout_present") is True,
+                  event.get("stdout_sha256") == stdout_hash,
+                  event.get("junit_present") is True,
+                  event.get("junit_sha256") == junit_hash,
+                  junit_parseable,
+                  cases > 0,
+                  counts.get("failure", 0) == 0,
+                  counts.get("error", 0) == 0,
+                  counts.get("passed", 0) > 0,
+              ))
+              return {
+                  "file": file_name,
+                  "exit_code": int(code_text) if code_text.isdigit() else None,
+                  "event": event_name,
+                  "stdout": stdout_name,
+                  "junit": junit_name,
+                  "event_success": event.get("success") is True,
+                  "cleanup_errors": event.get("cleanup_errors", []),
+                  "stdout_sha256": stdout_hash,
+                  "junit_sha256": junit_hash,
+                  "junit_cases": cases,
+                  "junit_status_counts": counts,
+                  "junit_skips_retained": counts.get("skipped", 0),
+                  "valid": valid,
+              }
+
+          def read_rows(path):
+              if not path.is_file():
+                  return []
+              return [
+                  line.split("\t")
+                  for line in path.read_text(encoding="utf-8").splitlines()
+                  if line.strip()
+              ]
+
+          rows = [validate_row(row, proof / "rows") for row in read_rows(proof / "results.tsv")]
+          seam_rows = read_rows(proof / "product-seam.tsv")
+          seam = validate_row(seam_rows[0], proof) if len(seam_rows) == 1 else {"valid": False, "reason": "missing-product-seam-row"}
+          source_before_hashes = source_before["sha256"]
+          source_equal = source_before_hashes == source_after
+          head_before = (proof / "head-before.txt").read_text(encoding="utf-8").strip()
+          head_after = (proof / "head-after.txt").read_text(encoding="utf-8").strip()
+          status_before = (proof / "status-before.txt").read_text(encoding="utf-8")
+          status_after = (proof / "status-after.txt").read_text(encoding="utf-8")
+          index_before = (proof / "index-before.sha256").read_text(encoding="utf-8").strip()
+          index_after = (proof / "index-after.sha256").read_text(encoding="utf-8").strip()
+          autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
+          receipt = {
+              "schema": "windows-native-custody-pr-v2",
+              "whole_source_pm_base_tools_unchanged": whole_environment_equal,
+              "whole_source_file_count": len(environment_before["source"]),
+              "pm_file_count": len(environment_before["pm"]),
+              "base_file_count": len(environment_before["base"]),
+              "tool_file_count": len(environment_before["tools"]),
+              "source": {
+                  "expected_pr_head_sha": expected_head,
+                  "head_before": head_before,
+                  "head_after": head_after,
+                  "head_matches": head_before == expected_head == head_after,
+                  "status_clean_before": status_before == "",
+                  "status_clean_after": status_after == "",
+                  "index_before_sha256": index_before,
+                  "index_after_sha256": index_after,
+                  "index_hashes_equal": index_before == index_after,
+                  "core_autocrlf": autocrlf,
+                  "selected_source_bytes_equal": source_equal,
+                  "selected_source_files": source_before["files"],
+              },
+              "test_bank": {
+                  "expected_files": expected_files,
+                  "attempted_files": [row["file"] for row in rows],
+                  "complete_file_bank": [row["file"] for row in rows] == expected_files,
+                  "results": rows,
+                  "all_rows_valid": bool(rows) and len(rows) == len(expected_files) and all(row["valid"] for row in rows),
+                  "junit_requires_cases_and_executed_pass": True,
+                  "skip_statuses_retained": True,
+              },
+              "product_seam": seam,
+              "runner_controls": {
+                  "runner": "windows-2022",
+                  "job_timeout_minutes": 60,
+                  "file_timeout_seconds": 300,
+                  "file_retries": 0,
+                  "parallelism": 1,
+                  "canonical_runner": "scripts/run_tests.sh",
+                  "outer_timeout_seconds": 600,
+              },
+              "native_boundary": {
+                  "product_windows_job_seam": "hermes_cli.local_runtime.processes.spawn_server",
+                  "same_owned_handle_termination": True,
+                  "exact_handle_membership_after_resume_and_exit": True,
+                  "job_empty_required_before_close": True,
+                  "no_pid_reopen_or_census_identity": True,
+                  "no_taskkill_or_foreign_job": True,
+              },
+          }
+          (proof / "receipt.json").write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          valid = all((
+              whole_environment_equal,
+              receipt["source"]["head_matches"],
+              receipt["source"]["status_clean_before"],
+              receipt["source"]["status_clean_after"],
+              receipt["source"]["index_hashes_equal"],
+              receipt["source"]["core_autocrlf"] == "false",
+              receipt["source"]["selected_source_bytes_equal"],
+              receipt["test_bank"]["complete_file_bank"],
+              receipt["test_bank"]["all_rows_valid"],
+              seam.get("valid") is True,
+          ))
+          raise SystemExit(0 if valid else 1)
+          PY
+
+      - name: Upload public native custody receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-native-custody-${{ github.event.pull_request.head.sha || github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-native-custody
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 14

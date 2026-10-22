@@ -229,31 +229,43 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     from hermes_state_schema import apply_declared_schema, schema_read_probe_statements
 
     budget = budget or _Budget(BROWSE_RECONCILE_BUDGET_S)
-    budget.check()
-    with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
-                                 isolation_level=None)) as conn:
+    conn = None
+    try:
+        conn = connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
+                                isolation_level=None)
+        budget.check()
         _reapply_durability_barriers(conn)
+        budget.check()
         budget.arm(conn)
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
-        try:
-            cursor = conn.cursor()
-            apply_declared_schema(cursor)
-            # Postcondition, still inside the transaction: every declared table/column resolves.
-            for statement in schema_read_probe_statements():
-                try:
-                    cursor.execute(statement).fetchone()
-                except sqlite3.OperationalError as exc:
-                    if _schema_not_built(exc):
-                        raise DeclarativeDriftError(str(exc)) from exc
-                    raise
-            budget.check()
-            conn.execute('COMMIT')
-        except BaseException as exc:
+        budget.check()
+        cursor = conn.cursor()
+        apply_declared_schema(cursor)
+        # Postcondition, still inside the transaction: every declared table/column resolves.
+        for statement in schema_read_probe_statements():
+            try:
+                cursor.execute(statement).fetchone()
+            except sqlite3.OperationalError as exc:
+                if _schema_not_built(exc):
+                    raise DeclarativeDriftError(str(exc)) from exc
+                raise
+        budget.check()
+        conn.execute('COMMIT')
+    except BaseException as exc:
+        if conn is not None:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute('ROLLBACK')
-            if budget.expired and isinstance(exc, sqlite3.OperationalError):
-                raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
-            raise
+        if (
+            budget.expired
+            and isinstance(exc, sqlite3.OperationalError)
+            and str(exc).strip().lower() == 'interrupted'
+        ):
+            raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 BROWSE_RECONCILE_PURPOSE = 'browse_schema_reconcile'
@@ -442,11 +454,11 @@ def reconcile_drift_for_browse(path: Path) -> bool:
     except OwnershipConflict as exc:
         if live_runtime_owner(home) is not None:
             raise owned(reason) from exc
-    if holder := _lockless_gateway_holder(path):
-        raise owned(reason, holder)
-    with _path_scan_lock(path):  # one scan per store per process; concurrent polls wait for it
+    with _path_scan_lock(path):  # serialize one expensive holder scan and integrity scan per store
         if schema_drift_reason(path) is None:
             return False
+        if holder := _lockless_gateway_holder(path):  # legacy gateway started after the lock probe
+            raise owned(reason, holder)
         signature = _verify_clean_before_lock(path, too_slow)
         try:
             with _reserve_for_ddl(home, path, owned) as current:

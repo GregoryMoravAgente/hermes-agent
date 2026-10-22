@@ -4,6 +4,8 @@ Split out of ``tools/browser_tool.py``. Facade-owned state is read through ``_bt
 """
 
 import contextlib
+import json
+import logging
 import os
 import shutil
 import signal
@@ -22,6 +24,8 @@ from tools import browser_tool_session as _session
 from tools import browser_tool_install as _install
 from tools import browser_tool_real_profile as _real_profile
 
+
+logger = logging.getLogger(__name__)
 
 def _session_expiry_timestamp(session_info: dict[str, Any]) -> Optional[float]:
     """Provider-authoritative session expiry as epoch seconds; None when absent or
@@ -68,6 +72,28 @@ def _stop_all_lightpanda() -> None:
     stop_all_lightpanda()
 
 
+def _camofox_task_ids() -> Optional[tuple[str, ...]]:
+    """Return current-profile/endpoint keys, or None when the registry cannot be read."""
+    try:
+        from tools.browser_camofox import _session_task_ids
+        return _session_task_ids()
+    except Exception:
+        logger.exception("Camofox session key lookup failed; retaining cleanup ownership")
+        return None
+
+
+def _camofox_session_present(task_id: str) -> Optional[bool]:
+    """Check one Camofox key; None means ownership is unknown and cleanup must stop."""
+    try:
+        from tools.browser_camofox import _has_session
+        return _has_session(task_id)
+    except Exception:
+        logger.exception(
+            "Camofox session presence lookup failed for %s; retaining cleanup ownership", task_id
+        )
+        return None
+
+
 def _emergency_cleanup_all_sessions():
     """atexit: close this process's sessions, then sweep orphans left by crashed
     hermes processes — every clean exit reaps accumulated orphans, not only
@@ -85,19 +111,27 @@ def _emergency_cleanup_all_sessions():
     # Real-profile Chrome is launched directly (not by agent-browser), so the
     # session cleanup never reaps it.
     _best_effort("Real-profile chrome cleanup on exit", _real_profile._terminate_real_profile_chrome)
-    if _bt._active_sessions:
-        _bt.logger.info("Emergency cleanup: closing %s active session(s)...", len(_bt._active_sessions))
+    camofox_task_ids = _camofox_task_ids()
+    if camofox_task_ids is None:
+        logger.warning("Camofox session keys unavailable during emergency cleanup; retaining ownership")
+        return
+    if _bt._active_sessions or camofox_task_ids:
+        _bt.logger.info("Emergency cleanup: closing %s active session(s)...",
+                        len(_bt._active_sessions) + len(camofox_task_ids))
+        cleanup_succeeded = False
         try:
-            cleanup_all_browsers()
+            cleanup_succeeded = cleanup_all_browsers()
         except Exception as e:
             _bt.logger.error("Emergency cleanup error: %s", e)
-        finally:
+        if cleanup_succeeded:
             with _bt._cleanup_lock:
                 _bt._active_sessions.clear()
                 _bt._session_last_activity.clear()
                 _bt._session_owner_homes.clear()
                 _bt._cleanup_failures.clear()
                 _bt._recording_sessions.clear()
+        else:
+            _bt.logger.warning("Retaining unresolved browser sessions during emergency cleanup")
     # Lightpanda servers we spawned that fell out of ``_active_sessions``.
     _best_effort("Lightpanda cleanup on exit", _stop_all_lightpanda)
     # Safe even if we never used the browser — owner_pid liveness protects daemons
@@ -169,7 +203,9 @@ def _cleanup_inactive_browser_sessions():
         _bt.logger.info("Cleaning up inactive session for task: %s (inactive for %ss)", task_id, elapsed)
         try:
             with _session_owner_scope(task_id):
-                cleanup_browser(task_id)
+                cleanup_succeeded = cleanup_browser(task_id)
+            if not cleanup_succeeded:
+                raise RuntimeError("browser session close is unresolved; retaining its owner binding")
             _forget_session_tracking(task_id)
         except Exception as e:
             with _bt._cleanup_lock:
@@ -180,13 +216,16 @@ def _cleanup_inactive_browser_sessions():
                 continue
             _bt.logger.error("Browser cleanup failed %d times for inactive session %s; "
                          "force-reaping: %s", failures, task_id, e)
+            reap_succeeded = False
             try:
                 with _session_owner_scope(task_id):
-                    _force_reap_browser_session(task_id)
+                    reap_succeeded = _force_reap_browser_session(task_id)
             except Exception as reap_exc:
                 _bt.logger.error("Force-reap of browser session %s failed: %s", task_id, reap_exc)
-            finally:
+            if reap_succeeded:
                 _forget_session_tracking(task_id, activity=False)
+            else:
+                _bt.logger.warning("Retaining unresolved browser session %s for a later same-handle retry", task_id)
 
 
 def _human_holds_shared_browser(task_id: str) -> bool:
@@ -615,9 +654,10 @@ def _drop_last_active_binding(task_id: str) -> None:
         _bt._last_active_session_key.pop(bare_task_id, None)
 
 
-def cleanup_browser(task_id: Optional[str] = None) -> None:
+def cleanup_browser(task_id: Optional[str] = None) -> bool:
     """Clean up browser session(s) for a task: a bare task id reaps BOTH the primary
-    session and any hybrid local sidecar; a ``::local`` key reaps only that one."""
+    session and any hybrid local sidecar; a ``::local`` key reaps only that one.
+    Returns ``False`` when any remote close remains unresolved."""
     if task_id is None:
         task_id = "default"
 
@@ -626,9 +666,14 @@ def cleanup_browser(task_id: Optional[str] = None) -> None:
     with _bt._cleanup_lock:
         if not _bt._is_local_sidecar_key(task_id) and sidecar_key in _bt._active_sessions:
             session_keys.append(sidecar_key)
+    cleanup_succeeded = True
     for session_key in session_keys:
-        _cleanup_single_browser_session(session_key)
-    _drop_last_active_binding(task_id)
+        cleanup_result = _cleanup_single_browser_session(session_key)
+        if cleanup_result is not False:
+            _drop_last_active_binding(session_key)
+        else:
+            cleanup_succeeded = False
+    return cleanup_succeeded
 
 
 def _kill_verified_daemon(socket_dir: str, session_name: str) -> bool:
@@ -652,24 +697,31 @@ def _kill_verified_daemon(socket_dir: str, session_name: str) -> bool:
         return False
 
 
-def _release_session_resources(task_id: str, session_info: dict[str, Any]) -> None:
-    """Untrack ``task_id``, close its cloud provider session, kill its daemon — the
-    unconditional tail of a teardown, and the whole of the janitor's force-reap path.
+def _release_session_resources(task_id: str, session_info: dict[str, Any]) -> bool:
+    """Close remote resources, then untrack ``task_id`` and kill its daemon.
 
     The unconditional tail of ``_cleanup_single_browser_session``; also the whole of the janitor's
     force-reap path (#100738), which skips the polite agent-browser/Camofox ``close`` that kept failing but
-    must still release the cloud session and the local Chromium.
+    must still release the cloud session and the local Chromium. A failed provider close returns ``False``
+    before the exact local binding is retired.
     """
-    bb_session_id = session_info.get("bb_session_id", "unknown")
-    _forget_session_tracking(task_id, session=True)
-
+    bb_session_id = session_info.get("bb_session_id")
     if bb_session_id:  # cloud only — local sidecars have bb_session_id=None
         provider = _cloud._get_cloud_provider()
-        if provider is not None:
-            try:
-                provider.close_session(bb_session_id)
-            except Exception as e:
-                _bt.logger.warning("Could not close cloud browser session: %s", e)
+        if provider is None:
+            _bt.logger.warning("Could not close cloud browser session %s: provider unavailable", bb_session_id)
+            return False
+        try:
+            if not provider.close_session(bb_session_id):
+                _bt.logger.warning("Cloud browser provider retained session %s", bb_session_id)
+                return False
+        except Exception as e:
+            _bt.logger.warning("Could not close cloud browser session %s; retaining binding: %s", bb_session_id, e)
+            return False
+
+    # The provider/remote endpoint has acknowledged the close. Only now retire the
+    # exact local record and its owner scope so a false/exceptional close can retry.
+    _forget_session_tracking(task_id, session=True)
 
     session_name = session_info.get("session_name", "")
     if session_name:
@@ -677,35 +729,78 @@ def _release_session_resources(task_id: str, session_info: dict[str, Any]) -> No
         if os.path.exists(socket_dir):
             _kill_verified_daemon(socket_dir, session_name)
             shutil.rmtree(socket_dir, ignore_errors=True)
+    return True
 
 
-def _force_reap_browser_session(task_id: str) -> None:
-    """Janitor last resort: skip the failing ``close`` round-trips, release resources directly.
+def _force_reap_browser_session(task_id: str) -> bool:
+    """Janitor last resort: release resources directly while retaining unresolved bindings.
 
     Janitor last resort after repeated cleanup failures (#100738).
     """
-    _cdp._stop_cdp_supervisor(task_id)
+    camofox_mode = _bt._is_camofox_mode()
+    if camofox_mode:
+        camofox_present = True
+    else:
+        camofox_present = _camofox_session_present(task_id)
+        if camofox_present is None:
+            return False
+    if camofox_present:
+        if not _cleanup_single_browser_session(task_id):
+            return False
+    else:
+        _cdp._stop_cdp_supervisor(task_id)
+        with _bt._cleanup_lock:
+            session_info = _bt._active_sessions.get(task_id)
+            lightpanda = bool(session_info and (session_info.get("features") or {}).get("lightpanda"))
+        if session_info:
+            if lightpanda:
+                try:
+                    from tools.browser_lightpanda import stop_lightpanda
+                    if stop_lightpanda(session_info.get("session_name", "")) is False:
+                        _bt.logger.warning("retaining unresolved Lightpanda session %s during force reap", task_id)
+                        return False
+                except Exception:
+                    logger.exception("Lightpanda force reap failed for %s; exact custody retained", task_id)
+                    return False
+            if not _release_session_resources(task_id, session_info):
+                return False
     with _bt._cleanup_lock:
-        session_info = _bt._active_sessions.get(task_id)
         _bt._session_last_activity.pop(task_id, None)
         _bt._recording_sessions.discard(task_id)
-    if session_info:
-        _release_session_resources(task_id, session_info)
     _drop_last_active_binding(task_id)
+    return True
 
 
-def _cleanup_single_browser_session(task_id: str) -> None:
+def _cleanup_single_browser_session(task_id: str) -> bool:
     """Reap a single browser session by its exact session key."""
+    # Resolve Camofox ownership before stopping any backend: an unreadable registry is
+    # unresolved custody, never evidence that this task has no Camofox session.
+    camofox_mode = _bt._is_camofox_mode()
+    if camofox_mode:
+        camofox_present = True
+    else:
+        camofox_present = _camofox_session_present(task_id)
+        if camofox_present is None:
+            return False
+
     _cdp._stop_cdp_supervisor(task_id)  # close our WebSocket BEFORE the backend tears down the endpoint
 
     # Camofox: managed persistence keeps the profile (cookies) across tasks; skip the full
     # close then — the inactivity reaper still frees idle resources.
-    if _bt._is_camofox_mode():
-        def _camofox_cleanup():
+    if camofox_present:
+        def _camofox_cleanup() -> bool:
             from tools.browser_camofox import camofox_close, camofox_soft_cleanup
-            if not camofox_soft_cleanup(task_id):
-                camofox_close(task_id)
-        _best_effort(f"Camofox cleanup for task {task_id}", _camofox_cleanup)
+            if camofox_soft_cleanup(task_id):
+                return True
+            result = json.loads(camofox_close(task_id))
+            return result.get("success") is True and result.get("closed") is True
+        try:
+            if not _camofox_cleanup():
+                _bt.logger.warning("Retaining unresolved Camofox session %s for same-handle retry", task_id)
+                return False
+        except Exception:
+            logger.exception("Camofox cleanup failed for %s; retaining session identity", task_id)
+            return False
 
     _bt.logger.debug("cleanup_browser called for task_id: %s", task_id)
     _bt.logger.debug("Active sessions: %s", list(_bt._active_sessions.keys()))
@@ -716,7 +811,7 @@ def _cleanup_single_browser_session(task_id: str) -> None:
 
     if not session_info:
         _bt.logger.debug("No active session found for task_id: %s", task_id)
-        return
+        return True
 
     _bt.logger.debug("Found session for task %s: bb_session_id=%s", task_id, session_info.get("bb_session_id", "unknown"))
     _bt._maybe_stop_recording(task_id)  # saves the file before close
@@ -724,11 +819,15 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     # Lightpanda sessions have no daemon to ``close``; an expired cloud CDP URL cannot
     # accept one and would make _get_session_info() renew the session mid-cleanup.
     if (session_info.get("features") or {}).get("lightpanda"):
+        lightpanda_cleanup_ok = False
         try:
             from tools.browser_lightpanda import stop_lightpanda
-            stop_lightpanda(session_info.get("session_name", ""))
+            lightpanda_cleanup_ok = stop_lightpanda(session_info.get("session_name", "")) is not False
         except Exception as e:
             _bt.logger.warning("lightpanda stop failed for task %s: %s", task_id, e)
+        if not lightpanda_cleanup_ok:
+            _bt.logger.warning("retaining browser resources for unresolved Lightpanda session %s", task_id)
+            return False
     elif _session_has_expired(session_info):
         _bt.logger.debug("Skipping agent-browser close for expired session %s", task_id)
     else:
@@ -738,16 +837,78 @@ def _cleanup_single_browser_session(task_id: str) -> None:
         except Exception as e:
             _bt.logger.warning("agent-browser close failed for task %s: %s", task_id, e)
 
-    _release_session_resources(task_id, session_info)
+    if not _release_session_resources(task_id, session_info):
+        return False
     _bt.logger.debug("Removed task %s from active sessions", task_id)
+    return True
 
 
-def cleanup_all_browsers() -> None:
-    """Clean up all active browser sessions (shutdown) and reset cached lookups."""
+def cleanup_browsers_for_shutdown(phase: str, shutdown_logger=logger) -> bool:
+    """Run aggregate browser teardown from gateway shutdown with the caller's logger."""
+    cleanup_succeeded = cleanup_all_browsers()
+    if cleanup_succeeded is False:
+        shutdown_logger.warning("Shutdown (%s): retaining unresolved browser sessions", phase)
+    return cleanup_succeeded
+
+
+def disconnect_cdp_browser(cleanup, failed) -> str:
+    """Disconnect the CLI CDP override after two exact cleanup acknowledgments."""
+    if not os.environ.get("BROWSER_CDP_URL", "").strip():
+        return "already_default"
+    previous_cdp_url = os.environ.get("BROWSER_CDP_URL")
+    cleanup_result = cleanup()
+    if cleanup_result is False or cleanup_result is failed:
+        return "not_connected"
+    os.environ.pop("BROWSER_CDP_URL", None)
+    with contextlib.suppress(Exception):
+        _cdp._stop_cdp_supervisor("default")
+    cleanup_result = cleanup()
+    if cleanup_result is False or cleanup_result is failed:
+        if previous_cdp_url is not None:
+            os.environ["BROWSER_CDP_URL"] = previous_cdp_url
+        return "not_connected"
+    return "disconnected"
+
+
+def notify_cdp_connect(cli) -> None:
+    """Tell an interactive CLI that browser tools are connected to its CDP backend."""
+    if hasattr(cli, "_pending_input"):
+        cli._pending_input.put(
+            "[System note: The user invoked /browser connect and connected your browser tools to "
+            "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
+            "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
+            "control that CDP browser. The command itself is a signal that using browser tools for "
+            "their current browser-related request is expected; do not wait for separate permission "
+            "just because CDP is connected. This is typically a Hermes-managed isolated debug "
+            "profile, not the user's main everyday browser. It is still user-visible and may contain "
+            "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
+            "closing tabs, or navigating away unless the user's task calls for it.]")
+
+
+def notify_cdp_disconnect(cli) -> None:
+    """Tell an interactive CLI that browser tools returned to their default backend."""
+    if hasattr(cli, "_pending_input"):
+        cli._pending_input.put(
+            "[System note: The user has disconnected the browser tools from their live Chromium-family browser. "
+            "Browser tools are back to default mode (headless local browser or cloud provider).]")
+
+
+def cleanup_all_browsers() -> bool:
+    """Clean up all active browser sessions and reset cached lookups.
+    Returns ``False`` when a session remains unresolved."""
     with _bt._cleanup_lock:
         task_ids = list(_bt._active_sessions.keys())
+    camofox_task_ids = _camofox_task_ids()
+    if camofox_task_ids is None:
+        logger.warning("Camofox session keys unavailable; retaining browser ownership")
+        return False
+    for task_id in camofox_task_ids:
+        if task_id not in task_ids:
+            task_ids.append(task_id)
+    cleanup_succeeded = True
     for task_id in task_ids:
-        cleanup_browser(task_id)
+        if not cleanup_browser(task_id):
+            cleanup_succeeded = False
 
     try:  # tear down CDP supervisors so background threads exit
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
@@ -771,3 +932,4 @@ def cleanup_all_browsers() -> None:
     ):
         setattr(_bt, flag, False)
         setattr(_bt, cache, None)
+    return cleanup_succeeded

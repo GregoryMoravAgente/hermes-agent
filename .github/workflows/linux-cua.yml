@@ -1,0 +1,210 @@
+name: Linux CUA hosted custody
+
+on:
+  push:
+    branches:
+      - codex/AGC-1721/controlled-candidate-r2-root-01a120af-20261020
+  workflow_dispatch:
+    inputs:
+      commit:
+        description: Exact candidate commit to checkout.
+        required: true
+        type: string
+      base:
+        description: Exact scripts/check baseline commit.
+        required: true
+        type: string
+  workflow_call:
+    inputs:
+      commit:
+        description: Exact candidate commit to checkout.
+        required: true
+        type: string
+      base:
+        description: Exact scripts/check baseline commit.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-cua-hosted-${{ inputs.commit || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CI: '1'
+  GITHUB_ACTIONS: 'true'
+  LANG: C.UTF-8
+  LC_ALL: C.UTF-8
+  TZ: UTC
+  NO_COLOR: '1'
+  OPENAI_API_KEY: ''
+  OPENROUTER_API_KEY: ''
+  NOUS_API_KEY: ''
+  ANTHROPIC_API_KEY: ''
+  FAL_KEY: ''
+  HERMES_E2E_BROWSER: '1'
+  CUA_DRIVER_RS_TELEMETRY_ENABLED: '0'
+  HERMES_TEST_WORKERS: '1'
+  HERMES_TEST_FILE_RETRIES: '0'
+  HERMES_CUA_EXPECTED_HEAD: ${{ inputs.commit || github.sha }}
+  # Keep the full CUA family in the static gate across workflow-only corrections.
+  HERMES_CUA_BASE: ${{ inputs.base || '11cbcc9a79c24837b699671eb1f5205944f71a0a' }}
+
+jobs:
+  hosted-cua:
+    name: Hosted Linux CUA (managed + CUA custody)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out the exact candidate head
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7.0.1
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Create task-owned directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          export TMPDIR="$RUNNER_TEMP/linux-cua/tmp"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/linux-cua/xdg"
+          export HERMES_HOME="$RUNNER_TEMP/linux-cua/hermes"
+          export HERMES_RUNTIME_DIR="$RUNNER_TEMP/linux-cua/hermes/tools"
+          export HERMES_CUA_PROOF_DIR="$RUNNER_TEMP/linux-cua/proof"
+          {
+            printf 'TMPDIR=%s\n' "$TMPDIR"
+            printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+            printf 'HERMES_HOME=%s\n' "$HERMES_HOME"
+            printf 'HERMES_RUNTIME_DIR=%s\n' "$HERMES_RUNTIME_DIR"
+            printf 'HERMES_CUA_PROOF_DIR=%s\n' "$HERMES_CUA_PROOF_DIR"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$TMPDIR" "$XDG_RUNTIME_DIR" "$HERMES_HOME" "$HERMES_RUNTIME_DIR" "$HERMES_CUA_PROOF_DIR"
+          chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR" "$HERMES_HOME" "$HERMES_CUA_PROOF_DIR"
+
+      - name: Validate exact candidate and baseline commits
+        shell: bash
+        env:
+          CUA_COMMIT: ${{ inputs.commit || github.sha }}
+          CUA_BASE: ${{ env.HERMES_CUA_BASE }}
+        run: |
+          set -euo pipefail
+          sha_pattern='^[0-9a-f]{40}$'
+          zero_sha='0000000000000000000000000000000000000000'
+          [[ "$CUA_COMMIT" =~ $sha_pattern && "$CUA_COMMIT" != "$zero_sha" ]]
+          [[ "$CUA_BASE" =~ $sha_pattern && "$CUA_BASE" != "$zero_sha" ]]
+          git cat-file -e "${CUA_COMMIT}^{commit}"
+          git cat-file -e "${CUA_BASE}^{commit}"
+          test "$(git rev-parse HEAD)" = "$CUA_COMMIT"
+
+      - name: Assert the exact source head and tracked CUA modules
+        run: >-
+          /usr/bin/python3 -S scripts/ci/linux_cua_custody.py source-contract
+          --expected-head "$HERMES_CUA_EXPECTED_HEAD"
+
+      - name: Capacity gate before provisioning
+        run: /usr/bin/python3 -S scripts/ci/linux_cua_custody.py capacity --stage before-pm
+
+      - name: Install Bot Desktop and Chromium system libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            tigervnc-standalone-server xfce4-panel xfwm4 xfdesktop4 xfce4-settings \
+            xfce4-terminal dbus-x11 x11-xserver-utils x11-utils x11-xkb-utils xauth \
+            fonts-dejavu-core \
+            libasound2t64 libatk-bridge2.0-0 libatk1.0-0 libcairo2 libcups2 \
+            libdbus-1-3 libdrm2 libgbm1 libglib2.0-0 libgtk-3-0 libnspr4 libnss3 \
+            libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
+            libxfixes3 libxrandr2 libxshmfence1
+
+      - name: Set up the locked PM environment and native tools
+        id: pm
+        uses: ./.github/actions/setup-pm
+        with:
+          toolchain: all
+          packages: cua-driver,chromium
+          extras: '["all", "computer-use"]'
+          test-environment: 'true'
+          cache-node: 'false'
+          save-python-cache: 'false'
+          save-tools-cache: 'false'
+
+      - name: Capacity gate after PM provisioning
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-pm --source-floor
+
+      - name: Resolve and seal PM CUA and Chromium binaries
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py resolve-tools
+
+      - name: Snapshot source and owned inputs before static checks
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-static
+
+      - name: Run the configured static gate before native consumers
+        run: >-
+          "$HERMES_PYTHON" scripts/check --base "$HERMES_CUA_BASE"
+
+      - name: Snapshot source and owned inputs before SUT
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-sut
+
+      - name: Initialize and seal the PM Chromium process
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py browser-preflight
+
+      - name: Capacity gate after browser initialization
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-browser --source-floor
+
+      - name: Run both complete CUA modules
+        id: cua-tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity-monitor --interval 1 &
+          monitor_pid=$!
+          set +e
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py run-tests
+          test_status=$?
+          set -e
+          : > "$HERMES_CUA_PROOF_DIR/capacity-monitor.stop"
+          set +e
+          wait "$monitor_pid"
+          monitor_status=$?
+          set -e
+          if [ "$test_status" -ne 0 ]; then
+            exit "$test_status"
+          fi
+          if [ "$monitor_status" -ne 0 ]; then
+            exit "$monitor_status"
+          fi
+
+      - name: Snapshot source and owned inputs after SUT
+        if: always()
+        continue-on-error: true
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label after-sut
+
+      - name: Verify CUA receipt and owned descendant closure
+        if: always()
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py verify
+          --test-outcome "${{ steps.cua-tests.outcome }}"
+
+      - name: Upload private CUA proof receipt
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-cua-hosted-${{ inputs.commit || github.sha }}
+          path: ${{ runner.temp }}/linux-cua/proof
+          if-no-files-found: error
+          retention-days: 14

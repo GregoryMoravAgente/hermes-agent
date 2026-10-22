@@ -1124,6 +1124,35 @@ class LocalEnvironment(BaseEnvironment):
             _pipe_stdin(proc, stdin_data)
         return proc
 
+    def _run_bash_with_custody(
+        self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+        stdin_data: str | None = None, launch_transaction=None,
+    ) -> subprocess.Popen:
+        """Use the existing Windows Job primitive for a pre-effect foreground handoff."""
+        if launch_transaction is None or not _IS_WINDOWS:
+            return self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
+        bash = _find_bash()
+        if login:
+            cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        self._recover_cwd()
+        proc = launch_transaction.launch(
+            args,
+            text=True,
+            env=_make_run_env(self.env),
+            cwd=self.cwd,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+            creationflags=windows_hide_flags(),
+        )
+        if stdin_data is not None:
+            _pipe_stdin(proc, stdin_data)
+        return proc
+
     def _kill_process(self, proc):
         """Kill the entire process group (all children)."""
         try:

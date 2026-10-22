@@ -10,6 +10,7 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
 from tools import async_delegation as ad
+from tests.gateway.test_completion_admission import prepared_execution
 
 
 class _QueuedTransport(BasePlatformAdapter):
@@ -69,6 +70,7 @@ async def test_queued_completion_after_admission_preserves_result_or_user_bounda
                 "type": "async_delegation", "delegation_id": "queued-owner",
                 "session_key": entry.session_key, "parent_session_id": "worker",
                 "dispatched_at": 1.0, "status": "completed", "summary": "completed result",
+                "execution": prepared_execution("queued-owner"),
             }
             ad._persist_dispatch(event)
             ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})

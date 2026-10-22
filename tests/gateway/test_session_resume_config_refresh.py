@@ -67,10 +67,12 @@ async def test_resume_after_restart_rereads_config_derived_fields_and_keeps_pick
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     home = _home(monkeypatch)
     store = SessionStore(home / 'sessions', GatewayConfig())
     assert store._db.db_path.parent.resolve() == home.resolve()
     first = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id='first')
+    bind_authority_runtime_custody(first.runner, first)
     owner = AuthorityConnection(first, object(), {'user_id': 'human'})
     plain = (await _call(owner, 'session.create', request_id='plain', source='cli', cwd=str(tmp_path)))['session_id']
     flags = (await _call(owner, 'session.create', request_id='flags', source='cli', cwd=str(tmp_path),
@@ -88,6 +90,7 @@ async def test_resume_after_restart_rereads_config_derived_fields_and_keeps_pick
     # `hermes tools disable web`, `hermes config set ...`, then a gateway restart and `hermes -c`.
     (home / 'config.yaml').write_text(AFTER)
     cold = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id='restarted')
+    bind_authority_runtime_custody(cold.runner, cold)
     viewer = AuthorityConnection(cold, object(), {'user_id': 'human'})
     try:
         before = store._db.get_session(plain)['runtime_generation']
@@ -127,6 +130,7 @@ async def test_resume_never_changes_a_running_turns_policy(tmp_path, monkeypatch
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import Submission
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_controls import AuthorityConnection
     import hermes_state_runtime as rt
     home = _home(monkeypatch)
@@ -141,6 +145,7 @@ async def test_resume_never_changes_a_running_turns_policy(tmp_path, monkeypatch
         await release.wait()
         return 'ok'
     authority = await initialize_session_authority(_runner(store, handle), profile_id=str(home), instance_id='only')
+    bind_authority_runtime_custody(authority.runner, authority)
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     viewer = AuthorityConnection(authority, object(), {'user_id': 'human'})
     late = AuthorityConnection(authority, object(), {'user_id': 'human'})
@@ -194,9 +199,12 @@ async def _owner_authority(home, instance='only'):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     store = SessionStore(home / 'sessions', GatewayConfig())
     assert store._db.db_path.parent.resolve() == home.resolve()
-    return store, await initialize_session_authority(_runner(store), profile_id=str(home), instance_id=instance)
+    authority = await initialize_session_authority(_runner(store), profile_id=str(home), instance_id=instance)
+    bind_authority_runtime_custody(authority.runner, authority)
+    return store, authority
 
 
 def _connect(authority, transport=None):

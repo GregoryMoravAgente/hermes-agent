@@ -381,12 +381,37 @@ class GatewayPluginInjectionMixin:
             allow_gateway_control=False, message_id=identity,
             metadata={"gateway_session_key": session_key, "gateway_session_id": session_id},
         )
+        from gateway.session_automation_custody import automation_source_identity
+        handle = None
         try:
-            await authority.admit_automation(adapter, event, identity)
+            require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+            coordinator = require_coordinator() if callable(require_coordinator) else None
+            root = getattr(authority, '_preservation_automation_root', None)
+            if coordinator is not None and not callable(root):
+                raise RuntimeStoreError('runtime_custody_unavailable')
+            kwargs = {}
+            if coordinator is not None:
+                handle = root(
+                    request_id=identity, principal_id='automation:' + session_key,
+                    session_id=session_id, source_identity=automation_source_identity(event, session_key),
+                    owner_class='I07_automation_route_wakes',
+                )
+                kwargs['_preservation_handle'] = handle
+            await authority.admit_automation(adapter, event, identity, **kwargs)
         except RuntimeStoreError as exc:
+            if handle is not None:
+                authority._preservation_reconcile_failed(
+                    handle, principal_id='automation:' + session_key,
+                    session_id=session_id, request_id=identity)
             logger.warning("Plugin message injection refused by the session authority: plugin=%s session=%s (%s)",
                            plugin_id, session_key, exc.reason)
             return False
+        except BaseException:
+            if handle is not None:
+                authority._preservation_reconcile_failed(
+                    handle, principal_id='automation:' + session_key,
+                    session_id=session_id, request_id=identity)
+            raise
         logger.info("Plugin message injection admitted: plugin=%s session=%s session_id=%s",
                     plugin_id, session_key, session_id)
         return True

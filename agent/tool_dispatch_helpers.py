@@ -26,6 +26,29 @@ from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
+
+def build_tool_dispatch_kwargs(
+    agent, *, tool_call_id: str, middleware_trace: list[dict[str, Any]],
+    skip_tool_execution_middleware: bool,
+) -> dict[str, Any]:
+    """Build the authenticated dispatch context for one model tool invocation."""
+    kwargs = dict(
+        tool_call_id=tool_call_id,
+        session_id=agent.session_id or "",
+        turn_id=getattr(agent, "_current_turn_id", "") or "",
+        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        run_generation=getattr(agent, "_current_run_generation", None),
+        enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
+        skip_pre_tool_call_hook=True,
+        skip_tool_request_middleware=True,
+        enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+        disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+        tool_request_middleware_trace=list(middleware_trace),
+    )
+    if skip_tool_execution_middleware:
+        kwargs["skip_tool_execution_middleware"] = True
+    return kwargs
+
 # Interactive / user-facing tools never run concurrently: any of these in a batch is a barrier.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_beat", "set_theme"})
 

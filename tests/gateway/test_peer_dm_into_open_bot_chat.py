@@ -14,6 +14,7 @@ import asyncio
 import json
 import queue
 import threading
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -24,7 +25,6 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import APIServerAdapter
 from hermes_cli.subcommands import peer as peer_mod
-from hermes_state import SessionDB
 from tools import bot_live_delivery as mailbox
 
 AUTHOR = {"id": "bot:cto", "name": "cto", "is_bot": True}
@@ -95,14 +95,15 @@ def _join_owner(owner) -> None:
     ids=["other-session", "bot-chat-open-in-a-viewer", "bot-chat-not-open"],
 )
 async def test_a_peer_turn_into_an_open_bot_chat_is_answered_by_its_live_owner(
-    tmp_path, monkeypatch, target, open_in_desktop, owner_replies, status, content, turn_ran_here
+    tmp_path, monkeypatch, runtime_owned_legacy_api_adapter, target, open_in_desktop, owner_replies, status,
+    content, turn_ran_here,
 ):
     """Without a profile authority nothing else may execute the Bot Chat's turn: a Desktop viewer
     lease is not an owner, so the turn runs here and no mailbox delivery is admitted."""
-    home = tmp_path.resolve()
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    adapter = runtime_owned_legacy_api_adapter
+    db = adapter._ensure_session_db()
+    home = Path(db.db_path).parent.resolve()
     monkeypatch.setattr("tools.bot_mode_dm._LIVE_WAIT_SECONDS", 1.0)
-    db = SessionDB(home / "state.db")
     db.create_session("bot-chat", "desktop")
     db.set_session_title("bot-chat", "Bot Chat")
     db.create_session("scratch", "api_server")
@@ -114,8 +115,6 @@ async def test_a_peer_turn_into_an_open_bot_chat_is_answered_by_its_live_owner(
             metadata={"live_session_id": "live-1", "bot_live_delivery_consumer": True})
         assert lease is not None and refusal is None
     owner = _owner_answers(monkeypatch, home, "pong") if owner_replies and target == "bot-chat" else None
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
     try:
         with patch.object(adapter, "_run_agent", AsyncMock(return_value=({"final_response": "ran here"}, {}))) as run:
             async with TestClient(TestServer(_app(adapter))) as cli:
@@ -140,7 +139,6 @@ async def test_a_peer_turn_into_an_open_bot_chat_is_answered_by_its_live_owner(
     finally:
         if lease is not None:
             lease.release()
-        db.close()
 
 
 def _sse_events(raw: str) -> list[tuple[str, dict]]:
@@ -180,13 +178,13 @@ async def _poll_terminal(cli, run_id, *, until=("completed", "failed", "cancelle
     ids=["other-session-runs-here", "bot-chat-runs-here-without-an-authority"],
 )
 async def test_a_peer_run_into_an_open_bot_chat_is_driven_by_its_owners_receipt(
-    tmp_path, monkeypatch, target, receipt, stop, expected, turn_ran_here
+    tmp_path, monkeypatch, runtime_owned_legacy_api_adapter, target, receipt, stop, expected, turn_ran_here
 ):
     """`peer run` into the Bot Chat with no authority to hand it to runs here like any other
     session; the run keeps its run_id and `peer status` keeps working."""
-    home = tmp_path.resolve()
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    db = SessionDB(home / "state.db")
+    adapter = runtime_owned_legacy_api_adapter
+    db = adapter._ensure_session_db()
+    home = Path(db.db_path).parent.resolve()
     db.create_session("bot-chat", "desktop")
     db.set_session_title("bot-chat", "Bot Chat")
     db.create_session("scratch", "api_server")
@@ -202,8 +200,6 @@ async def test_a_peer_run_into_an_open_bot_chat_is_driven_by_its_owners_receipt(
         if receipt
         else None
     )
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
-    adapter._session_db = db
     ran_here = []
 
     def _create_agent(**kwargs):
@@ -244,7 +240,6 @@ async def test_a_peer_run_into_an_open_bot_chat_is_driven_by_its_owners_receipt(
         assert run_id not in adapter._active_run_tasks, "the run retired like an executor-backed one"
     finally:
         lease.release()
-        db.close()
 
 
 @pytest.mark.parametrize("as_json", [False, True], ids=["text", "json"])

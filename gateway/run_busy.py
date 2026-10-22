@@ -118,6 +118,9 @@ class GatewayBusySessionMixin:
         pending_slot = getattr(adapter, "_pending_messages", None) if adapter is not None else None
         if pending_slot is None:
             return
+        from gateway.run_busy_custody import begin_classic_event
+        if not begin_classic_event(self, queued_event, session_key, "fifo", state="queued"):
+            return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
         else:
@@ -271,13 +274,19 @@ class GatewayBusySessionMixin:
             pending_event = pending_slot.get(session_key)
             if self._is_goal_continuation_event(pending_event):
                 pending_slot.pop(session_key, None)
+                from gateway.platforms.base_busy_custody import finish_adapter_event
+                finish_adapter_event(adapter, pending_event, success=False, reason="join_failed")
                 removed += 1
 
         overflow = self._overflow_queue(session_key)
         if overflow:
+            removed_events = [e for e in overflow if self._is_goal_continuation_event(e)]
             kept = [e for e in overflow if not self._is_goal_continuation_event(e)]
             removed += len(overflow) - len(kept)
             self._peek_session_state(session_key).conversation.queued_events = kept
+            from gateway.run_busy_custody import finish_classic_event
+            for pending_event in removed_events:
+                finish_classic_event(self, pending_event, success=False, reason="join_failed")
         return removed
 
     def _goal_still_active_for_session(self, session_id: str) -> bool:
@@ -490,10 +499,18 @@ class GatewayBusySessionMixin:
             and MessageType.PHOTO in merge_types
             and merge_types <= {MessageType.TEXT, MessageType.PHOTO}
         ):
+            from gateway.run_busy_custody import (
+                attach_classic_event, begin_classic_event, mark_classic_event,
+            )
+            if not begin_classic_event(self, event, session_key, "fifo", state="queued"):
+                return
             merge_pending_message_event(
                 adapter._pending_messages, session_key, event,
                 merge_text=event.message_type == MessageType.TEXT,
             )
+            if existing is not None:
+                attach_classic_event(self, existing, event)
+            mark_classic_event(self, event, "handoff")
             event._gateway_accepted = True
             return
 
@@ -502,6 +519,8 @@ class GatewayBusySessionMixin:
                 "Dropping busy-mode follow-up for session %s — pending queue at cap (%d).",
                 session_key, self._BUSY_QUEUE_MAX_PENDING,
             )
+            from gateway.run_busy_custody import finish_classic_event
+            finish_classic_event(self, event, success=False, reason="join_failed")
             return
 
         self._enqueue_fifo(session_key, event, adapter)

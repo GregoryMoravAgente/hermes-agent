@@ -27,6 +27,7 @@ async def _owner(tmp_path, monkeypatch):
     from gateway.session import SessionStore
     from gateway.run_shutdown_session_end import GatewaySessionEndMixin
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
@@ -48,6 +49,7 @@ async def _owner(tmp_path, monkeypatch):
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     runner._reset_session_off_loop = MethodType(GatewaySessionEndMixin._reset_session_off_loop, runner)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     return store._db, authority
 
 
@@ -198,6 +200,7 @@ async def _local(tmp_path, monkeypatch):
     from gateway.session_authority import SessionAuthority, initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_state import AsyncSessionDB, SessionDB
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -207,6 +210,7 @@ async def _local(tmp_path, monkeypatch):
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='lc7', db=db)
+    bind_authority_runtime_custody(runner, authority)
     actor = Principal('test-owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}),
                       'fixture')
     ref = create_local_session(authority, actor, dict(request_id='lc7', source='cli', model='fixture', toolsets=[]))
@@ -311,6 +315,7 @@ async def test_messaging_completion_still_starts_its_turn(tmp_path, monkeypatch)
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from tests.gateway.test_completion_admission import pending
 
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
@@ -319,6 +324,7 @@ async def test_messaging_completion_still_starts_its_turn(tmp_path, monkeypatch)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='lc7-messaging')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     human = MessageEvent(text='human', source=source, message_id='human')

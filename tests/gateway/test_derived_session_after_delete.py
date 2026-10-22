@@ -45,6 +45,7 @@ async def a2a(tmp_path, monkeypatch):
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config',
                         lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
@@ -53,6 +54,7 @@ async def a2a(tmp_path, monkeypatch):
     runner = run.GatewayRunner.__new__(run.GatewayRunner)
     runner.adapters, runner.session_store, runner._session_db, runner._draining = {}, store, store._db, False
     authority = await initialize_session_authority(runner, profile_id='target', instance_id='test')
+    bind_authority_runtime_custody(runner, authority)
     authority._schedule = lambda ref: None
 
     async def forward(input_id, text):

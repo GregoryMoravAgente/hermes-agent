@@ -54,7 +54,7 @@ def _make_codex_agent(**kwargs):
     """Construct an AIAgent in codex_app_server mode without contacting any
     real provider. We pass api_mode explicitly so the constructor takes the
     fast path for direct credentials."""
-    return run_agent.AIAgent(
+    agent = run_agent.AIAgent(
         api_key="stub",
         base_url="https://stub.invalid",
         provider="openai",
@@ -64,6 +64,12 @@ def _make_codex_agent(**kwargs):
         skip_memory=True,
         **kwargs,
     )
+    # These tests replace the app-server with an in-process stub.  Declare that
+    # boundary explicitly so a missing live SessionDB cannot become an implicit
+    # unmanaged-spawn route.
+    from gateway.runtime_service_operations import policy_without_spawn
+    agent._external_process_policy = policy_without_spawn()
+    return agent
 
 
 
@@ -394,6 +400,9 @@ class TestRunConversationCodexPath:
         monkeypatch.setenv("TERMINAL_CWD", str(tmp_path))
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
 
         agent = _make_codex_agent()
         assert agent.session_cwd is None
@@ -421,6 +430,9 @@ class TestRunConversationCodexPath:
 
         monkeypatch.setattr(CodexAppServerSession, "__init__", fake_init)
         monkeypatch.setattr(CodexAppServerSession, "run_turn", fake_run_turn)
+        monkeypatch.setattr(
+            CodexAppServerSession, "ensure_started", lambda self: "thread-stub-1"
+        )
 
         with patch(
             "hermes_cli.config.load_config",

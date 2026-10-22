@@ -243,11 +243,12 @@ def test_a_reader_exit_during_a_failed_scope_stop_is_not_reported_as_killed(monk
 
 
 class _SandboxEnv:
-    """Non-local backend double: answers the poller's log-delta, liveness and exit-code reads,
+    """Non-local backend double: answers the poller's log-delta, PID, liveness and exit-code reads,
     running ``hooks[step]`` first so a test can land a kill at an exact point."""
 
     def __init__(self, *, delta="", alive=False, hooks=None):
         self.delta, self.alive, self.hooks = delta, alive, hooks or {}
+        self.pid = 4242
 
     def execute(self, command, **_kwargs):
         if command.startswith("kill -0"):
@@ -255,7 +256,10 @@ class _SandboxEnv:
         elif command.startswith("kill "):
             return {"output": ""}
         elif command.startswith("cat "):
-            step, out = "exit", "0\n"
+            if ".pid" in command:
+                step, out = "pid", f"{self.pid}\n"
+            else:
+                step, out = "exit", "0\n"
         else:
             step, out = "delta", f"{len(self.delta.encode())} 0\n{self.delta}"
         hook = self.hooks.pop(step, None)

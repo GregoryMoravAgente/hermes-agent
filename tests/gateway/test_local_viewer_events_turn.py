@@ -240,10 +240,17 @@ def test_prompts_carry_the_gateway_wait_window_only_for_local_viewers(monkeypatc
     authority = SimpleNamespace(
         check_approval_generation=lambda *a: None,
         register_approval=lambda sid, gen, route, data, timeout_s=None: controls.register(sid, route, gen, data, timeout_s=timeout_s),
-        register_clarify=lambda sid, gen, entry, timeout_s=None: controls.register_clarify(sid, gen, entry, timeout_s=timeout_s))
+        register_clarify=lambda sid, gen, entry, timeout_s=None: controls.register_clarify(sid, gen, entry, timeout_s=timeout_s),
+        # This projection test intentionally has no live SessionAuthority/coordinator.  Keep the
+        # real TurnRunner callback usable for its timeout-window assertion without pretending this
+        # synthetic viewer owns a custody lease; custody is covered by the real-admission tests.
+        _preservation_prompt_operation_start=lambda **_kwargs: None,
+        _preservation_operation_unknown=lambda *_args: None,
+        _preservation_operation_terminal=lambda *_args: None,
+    )
     turn = _turn(platform, [])
     turn._approval_owner = (authority, 's', 1)
-    turn._render_approval_sync = lambda data: None
+    turn._render_approval_sync = lambda data: ('', None)
     turn._ctx.session_key = 'k'
     turn._approval_notify_sync({'request_id': 'a1', 'command': 'rm -rf build', 'description': 'delete'})
     entry = SimpleNamespace(clarify_id='c1', question='Which?', choices=['x'], multi_select=False)

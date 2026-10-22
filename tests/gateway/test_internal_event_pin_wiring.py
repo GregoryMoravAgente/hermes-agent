@@ -458,12 +458,13 @@ async def test_synthetic_goal_turn_keeps_pins_and_effective_prompt(monkeypatch, 
 async def test_goal_continuation_keeps_channel_pin_through_session_authority(tmp_path, monkeypatch, origin_message_id):
     """The default runtime admits adapter turns through the native session envelope; a goal
     continuation must arrive at the handler still asking to reuse the pins (#126109). The
-    continuation is enqueued mid-turn like the post-turn hook does and drains from the adapter
-    FIFO; a source carrying ``message_id`` (Discord) must keep its adapter ref through the
-    producer's copy or native admission refuses it as ``not_found``."""
+    continuation is admitted mid-turn through the production route-wake producer and drains
+    through the authority FIFO; a source carrying ``message_id`` (Discord) must keep its adapter
+    ref through the producer's copy or native admission refuses it as ``not_found``."""
     import gateway.run as gr
     from gateway.platforms.base import SendResult
     from gateway.session_authority import initialize_session_authority
+    from gateway.session_automation import admit_route_wake
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
     from tests.waiting import async_wait_until
 
@@ -475,17 +476,36 @@ async def test_goal_continuation_keeps_channel_pin_through_session_authority(tmp
         "text_batch_delay_seconds": 0, "session_path": str(tmp_path / "wa")}))
     adapter.gateway_runner, runner.adapters = runner, {Platform.WHATSAPP: adapter}
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="pins")
+    # Bind the same canonical coordinator used by the production authority fixture.  The
+    # continuation below is admitted through the real route-wake producer, so its I07 custody
+    # row is committed at the producer boundary rather than reconstructed as a direct FIFO event.
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     calls: list[dict] = []
     _capture(runner, calls)
     monkeypatch.setattr(adapter, "send", AsyncMock(return_value=SendResult(success=True, message_id="s")))
     source = adapter.build_source(chat_id=chat, user_id=chat, chat_type="dm", message_id=origin_message_id)
-    run_agent = runner._run_agent
+    _fake_run_agent = runner._run_agent
+
+    async def run_agent_with_real_transcript(**kw):
+        # The adapter/authority lifecycle remains real; this test-only model boundary does not
+        # persist anything, so let the canonical gateway transcript writer create the custody
+        # proof used by the delivery finalizer.
+        result = await _fake_run_agent(**kw)
+        result["agent_persisted"] = False
+        return result
+
+    run_agent = run_agent_with_real_transcript
 
     async def run_and_continue(**kw):
-        if not calls:  # the goal judge said continue: enqueue while this turn still runs
-            runner._enqueue_fifo(runner._session_key_for_source(source), runner._synthetic_prompt_event(
-                source, "[Continuing toward your standing goal]\nGoal: x"), adapter)
+        if not calls:  # the goal judge said continue: admit while this turn still runs
+            admitted = await admit_route_wake(
+                runner, adapter, source,
+                "[Continuing toward your standing goal]\nGoal: x",
+                "goal-continuation",
+            )
+            assert admitted is True
         return await run_agent(**kw)
 
     runner._run_agent = run_and_continue
@@ -493,11 +513,17 @@ async def test_goal_continuation_keeps_channel_pin_through_session_authority(tmp
         (2, MessageEvent(text="hi", source=source, message_id="h1", channel_prompt="Channel hint.")),
         (3, MessageEvent(text="hi again", source=source, message_id="h2", channel_prompt="Channel hint.")),
     )
+    def _authority_drain_done() -> bool:
+        live = next(iter(authority.sessions.values()), None)
+        task = getattr(live, "task", None)
+        return task is None or task.done()
+
     try:
         for want, event in turns:
             await adapter.handle_message(event)
             await async_wait_until(
-                lambda: len(calls) >= want and not adapter._background_tasks and not adapter._session_tasks,
+                lambda: (len(calls) >= want and not adapter._background_tasks
+                         and not adapter._session_tasks and _authority_drain_done()),
                 timeout=60, what=f"turn {want}")
     finally:
         authority.db.close()

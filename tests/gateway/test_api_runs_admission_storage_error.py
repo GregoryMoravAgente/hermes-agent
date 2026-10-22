@@ -2,22 +2,19 @@
 keeps no reservation: an exact Idempotency-Key retry then runs the work, never replays a ghost."""
 import asyncio
 import sqlite3
-from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import GatewayConfig
-from gateway.session import SessionStore
-from gateway.session_authority import initialize_session_authority
 from hermes_state import SessionDB
-from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS, _adapter, _runs_client
+from tests.gateway.conftest import runtime_owned_api
+from tests.gateway.test_api_unknown_resolution import _AUTH_HEADERS, _runs_client
 
 
 @pytest.mark.asyncio
 async def test_locked_admission_write_is_503_and_exact_retry_runs(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    store = SessionStore(tmp_path / "sessions", GatewayConfig())
-    db = SessionDB(tmp_path / "state.db")
+    scope = runtime_owned_api(tmp_path, monkeypatch)
+    adapter = await scope.__aenter__()
+    runner = adapter.gateway_runner
     executed = []
 
     async def answer(event):
@@ -26,9 +23,8 @@ async def test_locked_admission_write_is_503_and_exact_retry_runs(tmp_path, monk
         execution_result.get()["result"] = {"final_response": "ACK", "messages": []}
         return "ACK"
 
-    runner = SimpleNamespace(_session_db=db, session_store=store, _draining=False, _handle_message=answer)
-    authority = await initialize_session_authority(runner, profile_id="default", instance_id="lock-owner")
-    adapter = _adapter(runner, db)
+    runner._handle_message = answer
+    runner._wire_adapter_handlers(adapter)
     runner._adapter_for_source = lambda source: adapter
     monkeypatch.setattr(SessionDB, "_WRITE_PATIENCE_S", 0.3)
     client = _runs_client(adapter)
@@ -36,7 +32,7 @@ async def test_locked_admission_write_is_503_and_exact_retry_runs(tmp_path, monk
     headers = {**_AUTH_HEADERS, "Idempotency-Key": "locked-run"}
     body = {"input": "LOCKED", "session_id": "api-session"}
     # Another process holds the state.db writer past this owner's write patience.
-    holder = sqlite3.connect(tmp_path / "state.db", isolation_level=None)
+    holder = sqlite3.connect(tmp_path / "api-profile" / "state.db", isolation_level=None)
     holder.execute("BEGIN IMMEDIATE")
     try:
         refused = await client.post("/v1/runs", json=body, headers=headers)
@@ -57,5 +53,4 @@ async def test_locked_admission_write_is_503_and_exact_retry_runs(tmp_path, monk
         await client.close()
         adapter._response_store.close()
         adapter._run_idempotency_store.close()
-        authority.db.close()
-        store.close_all_db_handles()
+        await scope.__aexit__(None, None, None)

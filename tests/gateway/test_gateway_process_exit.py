@@ -75,9 +75,9 @@ def test_exit_backstop_releases_pid_file_and_runtime_lock(monkeypatch):
     Both releases are idempotent, so this is safe on every exit path."""
     from gateway import status as gateway_status
 
-    remove_pid = Mock()
-    release_lock = Mock()
-    monkeypatch.setattr(gateway_status, "remove_pid_file", remove_pid)
+    remove_pid = Mock(return_value=True)
+    release_lock = Mock(return_value=None)
+    monkeypatch.setattr(gateway_status, "remove_pid_file_checked", remove_pid)
     monkeypatch.setattr(gateway_status, "release_gateway_runtime_lock", release_lock)
     monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
     monkeypatch.setattr(gateway_run.sys, "stdout", SimpleNamespace(flush=Mock()))

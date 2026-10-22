@@ -28,6 +28,7 @@ def owner(tmp_path, monkeypatch, server_spec):
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_local import create_local_session
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -48,6 +49,7 @@ def owner(tmp_path, monkeypatch, server_spec):
 
     async def build():
         authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+        bind_authority_runtime_custody(runner, authority)
         built.append(authority)
         connection = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})
         ref = create_local_session(authority, connection.actor, {

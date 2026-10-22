@@ -24,6 +24,9 @@ class _Burst:
     timer: asyncio.Task | None = None
     commit: asyncio.Task | None = None
     absorbed: list = field(default_factory=list)
+    preservation_authority: object | None = None
+    preservation_key: str | None = None
+    preservation_observer_started: bool = False
 
 
 def _kind(adapter, event):
@@ -62,7 +65,11 @@ async def dispatch_busy_burst(adapter, event, session_key):
             await asyncio.wait({previous})
         return await dispatch_shared_busy(adapter, event, session_key)
     now = time.monotonic()
-    burst = bursts[session_key] = _Burst(event, asyncio.get_running_loop().create_future(), now, now)
+    from gateway.session_ingress import begin_busy_preservation
+    preservation_authority, preservation_key = begin_busy_preservation(adapter, event, session_key)
+    burst = bursts[session_key] = _Burst(
+        event, asyncio.get_running_loop().create_future(), now, now,
+        preservation_authority=preservation_authority, preservation_key=preservation_key)
     _arm(adapter, session_key, burst)
     return await _accepted(burst, event)
 
@@ -109,7 +116,10 @@ async def _commit(adapter, session_key, burst, previous):
     from gateway.session_ingress import dispatch_shared_busy
     if previous is not None:
         await asyncio.wait({previous})
-    await dispatch_shared_busy(adapter, burst.head, session_key)
+    burst.preservation_observer_started = True
+    await dispatch_shared_busy(
+        adapter, burst.head, session_key,
+        preservation=(burst.preservation_authority, burst.preservation_key))
 
 
 def _settle(burst, task):
@@ -117,8 +127,14 @@ def _settle(burst, task):
     if burst.done.done():
         return
     if task.cancelled():
+        if not burst.preservation_observer_started:
+            from gateway.session_ingress import finish_busy_preservation
+            finish_busy_preservation(burst.preservation_authority, burst.preservation_key, False)
         burst.done.cancel()
     elif task.exception() is not None:
+        if not burst.preservation_observer_started:
+            from gateway.session_ingress import finish_busy_preservation
+            finish_busy_preservation(burst.preservation_authority, burst.preservation_key, False)
         burst.done.set_exception(task.exception())
     else:
         burst.done.set_result(None)
@@ -129,4 +145,7 @@ def discard_busy_burst(adapter, session_key):
     burst = adapter.__dict__.get('_shared_bursts', {}).pop(session_key, None)
     if burst is not None:
         burst.timer.cancel()
+        if burst.commit is None:
+            from gateway.session_ingress import finish_busy_preservation
+            finish_busy_preservation(burst.preservation_authority, burst.preservation_key, False)
         burst.done.done() or burst.done.set_result(None)

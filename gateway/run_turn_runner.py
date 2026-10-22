@@ -13,6 +13,7 @@ import json
 import logging
 import queue
 import re
+import sqlite3
 import threading
 import time
 from contextlib import suppress
@@ -168,6 +169,159 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     return t("gateway.errors.no_credentials"), auth_permanent, False
 
 
+def _require_external_process_turn_parent(provider: Any) -> None:
+    """Require the explicit managed admission before a gateway turn may reach an external producer.
+
+    Gateway turns are admitted work, even when an older adapter lost the binding ContextVar. The
+    absence must remain a typed refusal; it must never be reinterpreted as live profile discovery
+    or standalone maintenance. Direct/standalone callers use the explicit runtime-service route
+    outside this turn runner.
+    """
+    if not isinstance(provider, str) or not provider:
+        return
+    from hermes_cli.runtime_provider_backends import _is_external_process_provider
+    if not _is_external_process_provider(provider):
+        return
+    from gateway.runtime_service_custody import ServiceCustodyError, current_turn_binding
+    if current_turn_binding() is None:
+        raise ServiceCustodyError("preservation_owner_unmapped")
+
+
+def _direct_i04_writer_route(agent: Any, turn_route: Any, binding: Any) -> bool:
+    """Recognize a direct, SessionDB-backed I04 route before the agent can persist.
+
+    Managed ACP and I07 have their own typed writer paths.  They must not be converted into
+    a direct I04 proof merely because a managed binding happens to be present in the context.
+    The route and constructed agent are checked together; a provider that has already moved
+    onto an external owner is left to its existing ACP custody path.
+    """
+    runtime = turn_route.get("runtime") if isinstance(turn_route, dict) else None
+    if not isinstance(runtime, dict):
+        return False
+    from gateway.runtime_service_operations import _external_provider
+    from gateway.runtime_service_custody import TurnCustodyBinding
+    if not isinstance(binding, TurnCustodyBinding):
+        return False
+    if _external_provider(runtime.get("provider"), runtime.get("base_url")):
+        return False
+    if _external_provider(getattr(agent, "provider", None), getattr(agent, "base_url", None)):
+        return False
+    if getattr(agent, "_external_process_policy", None) is not None:
+        return False
+    if getattr(agent, "_managed_acp_client", None) is not None:
+        return False
+    return True
+
+
+def _validate_direct_i04_writer_context(agent: Any, binding: Any) -> None:
+    """Fail closed on the real I04 binding, agent session/store, and current physical tip."""
+    from hermes_state_runtime import RuntimeStoreError
+    from gateway.runtime_service_custody import TurnCustodyBinding, validate_turn_binding
+
+    if not isinstance(binding, TurnCustodyBinding):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    validate_turn_binding(binding)
+    # The binding names the logical root; the agent may write its current compressed tip.
+    # The canonical witness below authenticates that relationship and the exact store.
+    if getattr(agent, "_session_db", None) is None:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    from agent.session_persistence_proof import _store_path
+    store_path = _store_path(agent)
+    if not isinstance(store_path, str) or not store_path:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    try:
+        from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+        witness = resolve_physical_tip_witness(binding, agent.session_id, store_path)
+    except (
+        AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        sqlite3.Error,
+    ) as exc:
+        raise RuntimeStoreError("preservation_owner_unmapped") from exc
+    if witness is None:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+
+
+def _classic_writer_proof_request_context(
+    ctx: TurnContext, *, agent: Any = None, turn_route: Any = None, current_binding: Any = None,
+) -> tuple[Any, bool, Any]:
+    """Return the event, request decision, and one authenticated explicit writer binding."""
+    event = getattr(ctx, "classic_writer_event", None)
+    if getattr(ctx, "classic_writer_binding", None) is not None:
+        return event, True, ctx.classic_writer_binding
+    # A nested I04/I07 turn deliberately has no direct classic binding.  Its existing
+    # authenticated bridge and ContextVar are the only valid way to arm the typed writer
+    # seam.  A native managed admission also has an I04 ContextVar, but without the
+    # source-owned classic bridge it has no writer/physical-tip witness to publish here.
+    try:
+        from gateway.session_classic_custody import ClassicExecutionEventBridge
+        bridge = getattr(event, "_classic_execution_bridge", None)
+        if (
+            not isinstance(bridge, ClassicExecutionEventBridge)
+            or bridge.owner_event is not event
+            or bridge.execution_event is None
+        ):
+            if not _direct_i04_writer_route(agent, turn_route, current_binding):
+                return event, False, None
+            _validate_direct_i04_writer_context(agent, current_binding)
+            return event, True, current_binding
+        # Pass the captured I04 binding through the existing bridge too.  A no-argument
+        # request would reread the ContextVar and could arm a different admission after
+        # classification; classic I06 bindings took the early return above.
+        if _direct_i04_writer_route(agent, turn_route, current_binding):
+            _validate_direct_i04_writer_context(agent, current_binding)
+        return event, current_binding is not None, current_binding
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        if _direct_i04_writer_route(agent, turn_route, current_binding):
+            raise
+        return event, False, None
+
+
+def _request_classic_writer_proof(
+    agent: Any, ctx: TurnContext, requested: bool, binding: Any = None,
+) -> None:
+    """Arm the existing typed writer handoff before the agent's first persistence effect."""
+    if not requested:
+        return
+    from hermes_state_runtime import RuntimeStoreError
+
+    request = getattr(agent, "_request_gateway_writer_proof", None)
+    if not callable(request):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    armed = request(binding=binding) if binding is not None else (
+        request(binding=ctx.classic_writer_binding)
+        if ctx.classic_writer_binding is not None else request()
+    )
+    if armed is not True:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+
+
+def _capture_classic_writer_proof(
+    agent: Any, event: Any, requested: bool, result: Any,
+) -> None:
+    """Move one acknowledged typed handoff to the private occurrence and persistence seam."""
+    if not requested:
+        return
+    from hermes_state_runtime import RuntimeStoreError
+
+    peek = getattr(agent, "_peek_gateway_writer_proof", None)
+    acknowledge = getattr(agent, "_ack_gateway_writer_proof", None)
+    if not callable(peek) or not callable(acknowledge):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    handoff = peek()
+    if handoff is None or not isinstance(result, dict):
+        return
+    if acknowledge(handoff) is not True:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    result["_classic_writer_proof"] = handoff
+    # The recursive queued-turn result must carry the private occurrence that produced this
+    # proof.  Reattaching a follow-up proof to the event that opened the chain would pair a
+    # durable witness from occurrence B with occurrence A's identity at the terminal fence.
+    if event is not None:
+        result["_classic_writer_event"] = event
+    if event is not None:
+        event._classic_writer_handoff = handoff
+
+
 class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     """Per-turn collaborator carrying ``GatewayRunner._run_agent_inner``'s tool-progress callbacks."""
 
@@ -189,6 +343,121 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 generation = authority.db.get_session(owner_id)["runtime_generation"]
                 self._approval_owner = (authority, owner_id, generation)
 
+
+    def _i05_prompt_controls(self):
+        controls = getattr(self, '_i05_prompt_controls_by_id', None)
+        if controls is None:
+            controls = self._i05_prompt_controls_by_id = {}
+        return controls
+
+    def _begin_i05_prompt(self, prompt_id, operation):
+        """Bind a prompt to the current durable turn before its first external side effect."""
+        owner = self._approval_owner
+        if owner is None or not isinstance(prompt_id, str) or not prompt_id:
+            return None
+        authority, session_id, generation = owner
+        key = authority._preservation_prompt_operation_start(
+            session_id=session_id, generation=generation, operation=operation, request_id=prompt_id)
+        self._i05_prompt_controls()[prompt_id] = (authority, key, operation)
+        return key
+
+    def _finish_i05_prompt(self, prompt_id, outcome):
+        entry = self._i05_prompt_controls().pop(prompt_id, None)
+        if entry is None:
+            return
+        authority, key, operation = entry
+        if outcome == 'resolved':
+            authority._preservation_operation_terminal(key, f'prompt:{operation}:{prompt_id}')
+        else:
+            reason = 'read_failed' if outcome == 'storage_failed' else 'join_failed'
+            authority._preservation_operation_unknown(key, reason)
+
+    def _finish_i05_prompt_after_future(self, prompt_id, future):
+        """Keep a prompt producer owned until its real external finalizer completes."""
+        if future is None:
+            self._finish_i05_prompt(prompt_id, 'notify_failed')
+            return
+
+        def finish(done):
+            try:
+                result = done.result()
+            except BaseException:
+                logger.debug("Prompt finalizer failed; custody retained", exc_info=True)
+                self._finish_i05_prompt(prompt_id, 'notify_failed')
+            else:
+                failed = result is False or getattr(result, 'success', None) is False
+                self._finish_i05_prompt(prompt_id, 'notify_failed' if failed else 'resolved')
+
+        add_done_callback = getattr(future, 'add_done_callback', None)
+        if callable(add_done_callback):
+            add_done_callback(finish)
+            return
+        finish(future)
+
+
+    def _register_i05_clarify(self, clarify_mod, *, clarify_id, session_key, question, choices, multi_select):
+        self._begin_i05_prompt(clarify_id, 'clarify')
+        try:
+            return clarify_mod.register(
+                clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
+                multi_select=bool(multi_select),
+            )
+        except BaseException:
+            self._finish_i05_prompt(clarify_id, 'notify_failed')
+            raise
+
+    def _schedule_i05_clarify(self, entry, send_kwargs, clarify_id):
+        try:
+            return self._schedule(
+                self._send_shared_clarify(entry, **send_kwargs),
+                "Clarify send failed to schedule",
+            )
+        except BaseException:
+            self._finish_i05_prompt(clarify_id, 'notify_failed')
+            raise
+
+    def _wait_i05_clarify(self, fut, *, clarify_id, session_key, clarify_mod, fallback):
+        from gateway.run_turn_runner_clarify_delivery import _clarify_send_then_wait
+        try:
+            response, answered = _clarify_send_then_wait(
+                fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod,
+                fallback=fallback)
+        except BaseException:
+            self._finish_i05_prompt(clarify_id, 'join_failed')
+            raise
+        return response, answered
+
+    def _finish_i05_clarify(self, *, clarify_id, response, answered, rearm, ctx):
+        deferred = False
+        try:
+            if self._approval_owner is not None:
+                authority, session_id, generation = self._approval_owner
+                authority.sessions[session_id].controls.snapshot(session_id, generation)
+            if not answered:
+                retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
+                if callable(retire):
+                    future = self._schedule(
+                        retire(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
+                        "Clarify card retire failed to schedule")
+                    self._finish_i05_prompt_after_future(clarify_id, future)
+                    deferred = True
+            elif rearm:
+                sc = self._stream_consumer()
+                if sc is not None:
+                    try:
+                        sc.request_reopen_seed()
+                    except Exception:
+                        logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
+                try:
+                    ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                except Exception:
+                    logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
+        except BaseException:
+            self._finish_i05_prompt(clarify_id, 'join_failed')
+            raise
+        if not deferred:
+            self._finish_i05_prompt(clarify_id, 'resolved' if answered else 'unknown')
+        return response, answered
 
     def _publish_execution(self, event_type, payload):
         if self._approval_owner is not None:
@@ -419,6 +688,57 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         """Per-message state (callbacks, reasoning, voice route) — never baked into the cached agent."""
         ctx = self._ctx
         runner = self._runner
+        agent._current_run_generation = ctx.run_generation
+        from tools.process_registry import process_registry as _process_registry
+
+        def _commit_managed_tool_result(
+            *, proof=None, message=None, lookup_failed=False, tool_call_id=None, **_ignored,
+        ):
+            """Commit foreground custody only after the literal session-row proof."""
+            try:
+                binding_kwargs = dict(
+                    session_id=ctx.session_id or "",
+                    session_key=ctx.session_key or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    run_generation=ctx.run_generation if type(ctx.run_generation) is int else -1,
+                    tool_call_id=tool_call_id or "",
+                )
+                if lookup_failed:
+                    _process_registry.retain_foreground_binding_unknown(
+                        **binding_kwargs,
+                        # Use the coordinator's existing typed unknown reason.  This keeps the
+                        # refusal visible to recovery without widening its reason vocabulary.
+                        reason="unmapped_writer",
+                    )
+                    return False
+                delivery_token = _process_registry.foreground_delivery_token(
+                    **binding_kwargs,
+                )
+                return _process_registry.commit_foreground_delivery(
+                    proof,
+                    message=message,
+                    **binding_kwargs,
+                    delivery_token=delivery_token,
+                )
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+                # A failed consumer is retryable custody, never an acknowledged result.
+                logger.warning("managed foreground delivery could not settle: %s", exc)
+                return False
+
+        def _requires_managed_tool_result(tool_call_id=None, **_ignored):
+            try:
+                return _process_registry.foreground_binding_active(
+                    session_id=ctx.session_id or "",
+                    session_key=ctx.session_key or "",
+                    turn_id=getattr(agent, "_current_turn_id", "") or "",
+                    run_generation=ctx.run_generation if type(ctx.run_generation) is int else -1,
+                    tool_call_id=tool_call_id or "",
+                )
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                return None
+
+        agent.tool_result_committed_callback = _commit_managed_tool_result
+        agent.tool_result_custody_required = _requires_managed_tool_result
         agent._notification_config = ctx.user_config
         agent._notification_platform = ctx.source.platform
         # ALWAYS attached (never gated to None): its body gates each event class, and subagent-
@@ -579,8 +899,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
         """One card: register, send, wait, then retire it (no answer) or re-arm (answer).
         Returns ``(response, answered)``; the caller decides what "no answer" means."""
-        from gateway.run_turn_runner_clarify_delivery import (
-            UNDELIVERED_NO_SURFACE, _clarify_send_then_wait, text_fallback_coro)
+        from gateway.run_turn_runner_clarify_delivery import UNDELIVERED_NO_SURFACE, text_fallback_coro
         from tools import clarify_gateway as clarify_mod
         import uuid
         ctx = self._ctx
@@ -600,10 +919,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             """Schedule the plain-text prompt when the native card cannot render; None = no such path."""
             coro = text_fallback_coro(ctx._status_adapter, **send_kwargs)
             return None if coro is None else self._schedule(coro, "Clarify text fallback failed to schedule")
-        entry = clarify_mod.register(
-            clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
-            multi_select=bool(multi_select),
-        )
+        entry = self._register_i05_clarify(
+            clarify_mod, clarify_id=clarify_id, session_key=session_key, question=question,
+            choices=choices, multi_select=multi_select)
         # Unlike approval, clarify passes reopen=True so the continuation re-opens a native stream
         # below the question; if the re-seed fails the consumer degrades to send() automatically.
         self._close_native_stream_boundary("Clarify", t("gateway.clarify.native_stream_placeholder"), reopen=True)
@@ -620,62 +938,42 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 flush(timeout=3.0)
         except Exception:
             logger.debug("Stream-consumer flush before clarify prompt failed", exc_info=True)
-        fut = self._schedule(
-            self._send_shared_clarify(entry, **send_kwargs),
-            "Clarify send failed to schedule",
-        )
+        fut = self._schedule_i05_clarify(entry, send_kwargs, clarify_id)
         # Boundary rule (see _approval_send_outcome): a send timeout is AMBIGUOUS — the card may
         # have posted with a late ack. Only a definitive failure tears down the registration;
         # ambiguous falls through to the bounded wait so a late reply resolves. A definitive
         # failure — immediate or late — retries once as plain text before giving up.
-        response, answered = _clarify_send_then_wait(
+        response, answered = self._wait_i05_clarify(
             fut, clarify_id=clarify_id, session_key=session_key, clarify_mod=clarify_mod,
             fallback=_text_fallback)
-        if self._approval_owner is not None:
-            authority, session_id, generation = self._approval_owner
-            authority.sessions[session_id].controls.snapshot(session_id, generation)
-        # Branch on the explicit flag, never on the text: a real answer can start with '[' (a
-        # "[A] staging" label, "[urgent] ..." free text) and must not be mistaken for a sentinel.
-        if not answered:
-            # No answer arrived (timeout, /new, run end): retire the native card so it stops
-            # looking answerable. Adapters without a persistent card have no such method.
-            retire = getattr(type(ctx._status_adapter), "retire_clarify_card", None)
-            if callable(retire):
-                self._schedule(
-                    retire(ctx._status_adapter, clarify_id, _clarify_expired_notice()),
-                    "Clarify card retire failed to schedule")
-        elif rearm:
-            # Reopen typing IMMEDIATELY, not on the LLM's first post-answer token (native streaming
-            # otherwise re-seeds lazily on the first delta: ~48s of dead air). request_reopen_seed is
-            # a no-op outside the reopen-pending native state.
-            sc = self._stream_consumer()
-            if sc is not None:
-                try:
-                    sc.request_reopen_seed()
-                except Exception:
-                    logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
-            try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
-            except Exception:
-                logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
-        return response, answered
+        return self._finish_i05_clarify(
+            clarify_id=clarify_id, response=response, answered=answered, rearm=rearm, ctx=ctx)
 
     def _approval_notify_sync(self, approval_data: dict) -> None:
-        if self._approval_owner is not None:
-            authority, session_id, generation = self._approval_owner
-            authority.check_approval_generation(session_id, generation)
-        # A native decline must finish before any observer can authorize work.
-        self._render_approval_sync(approval_data)
-        if self._approval_owner is not None:
-            from gateway import local_viewer_events
-            authority.register_approval(session_id, generation, self._ctx.session_key, approval_data,
-                                        timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"))
+        prompt_id = approval_data.get('request_id')
+        try:
+            if self._approval_owner is not None:
+                authority, session_id, generation = self._approval_owner
+                authority.check_approval_generation(session_id, generation)
+                self._begin_i05_prompt(prompt_id, 'approval')
+            # A native decline must finish before any observer can authorize work.
+            command, card_message_id = self._render_approval_sync(approval_data)
+            if self._approval_owner is not None:
+                from gateway import local_viewer_events
+                authority.register_approval(session_id, generation, self._ctx.session_key, approval_data,
+                                            timeout_s=local_viewer_events.prompt_timeout_s(self, "approval"))
+            from gateway.run_turn_runner_approval_settle import register_timeout_notice
+            register_timeout_notice(
+                self, approval_data, command=command, card_message_id=card_message_id,
+                on_settle=lambda reason: self._finish_i05_prompt(prompt_id, reason))
+        except BaseException:
+            self._finish_i05_prompt(prompt_id, 'notify_failed')
+            raise
 
-    def _render_approval_sync(self, approval_data: dict) -> None:
+    def _render_approval_sync(self, approval_data: dict) -> tuple[str, str | None]:
         """Send the approval request from the agent thread: the adapter's interactive button
         approvals (``send_exec_approval``) when available, else plain text with ``/approve`` steps."""
         from gateway.run import _approval_send_outcome, _format_exec_approval_fallback, _interim_metadata, _redact_approval_command
-        from gateway.run_turn_runner_approval_settle import register_timeout_notice
         ctx = self._ctx
         adapter = ctx._status_adapter
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
@@ -701,12 +999,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                     raise RuntimeError("send_exec_approval: loop unavailable")
                 outcome = _approval_send_outcome(fut, timeout=15)
                 if outcome == "sent":
-                    # Without this, a card whose timer runs out keeps live buttons and nobody
-                    # learns the command did NOT run (only the TUI registered a settle hook).
-                    register_timeout_notice(
-                        self, approval_data, command=cmd,
-                        card_message_id=getattr(fut.result(timeout=0), "message_id", None))
-                    return
+                    # The central approval queue is armed by the caller after this send returns,
+                    # once the authority projection has registered the same prompt identity.
+                    return cmd, getattr(fut.result(timeout=0), "message_id", None)
                 if outcome == "ambiguous":
                     # Timeout ≠ failure: the card may have posted with a late ack. The prompt
                     # registration stays alive so a tap still resolves; re-sending made duplicate
@@ -716,7 +1011,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                         "as possibly-delivered (no re-send; the prompt "
                         "stays armed for a late tap)"
                     )
-                    return
+                    return cmd, None
                 if outcome == "declined":
                     # P5(b): the connector AUTHORIZED this destination and
                     # refused it. The text fallback below re-sends the same
@@ -764,9 +1059,10 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 fut.result(timeout=15)
                 # No card to edit on the text path: the prompt has no buttons to drop and carries
                 # the /approve instructions, so the timeout notice is posted as a new message.
-                register_timeout_notice(self, approval_data, command=cmd, card_message_id=None)
         except Exception as e:
             logger.error("Failed to send approval request: %s", e)
+
+        return cmd, None
 
     # ── run_sync phases ─────────────────────────────────────────────────────────────────────
 
@@ -1252,6 +1548,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         runner._reasoning_config = reasoning_config
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
+        _require_external_process_turn_parent(turn_route["runtime"].get("provider"))
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
@@ -1259,6 +1556,18 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)
+        # A direct classic admission owns the writer proof for this occurrence.  Arm the existing
+        # typed SessionDB handoff before the agent can persist its turn; a classic child of an I04/I07
+        # parent keeps the real managed binding in the ContextVar.
+        from gateway.runtime_service_custody import current_turn_binding
+        _current_turn_binding = current_turn_binding()
+        (
+            _classic_writer_event,
+            _classic_writer_requested,
+            _classic_writer_binding,
+        ) = _classic_writer_proof_request_context(
+            ctx, agent=agent, turn_route=turn_route, current_binding=_current_turn_binding,
+        )
         from gateway.run_turn_progress import local_viewer_turn
         local_sinks = None
         if local_viewer_turn(self) and not ctx.mute_notification_reply:
@@ -1268,6 +1577,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             from gateway.session_usage import TURN_BASE_ATTR
             setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
         try:
+            _request_classic_writer_proof(
+                agent, ctx, _classic_writer_requested, _classic_writer_binding,
+            )
             agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
             persist_msg, persist_ts = self._prepare_turn_message(agent_history)
             compressions = getattr(getattr(agent, "context_compressor", None), "compression_count", None)
@@ -1277,6 +1589,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent):
                 result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
                     agent, agent_history, observed_group_context, persist_msg, persist_ts))
+            _capture_classic_writer_proof(
+                agent, _classic_writer_event, _classic_writer_requested, result,
+            )
         finally:
             if local_sinks is not None:
                 from gateway import local_viewer_events
@@ -1336,6 +1651,17 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             **usage,
             **({"persisted_turn": persisted_turn} if persisted_turn else {}),
         }
+        # Keep the typed writer envelope private while carrying it across this result-shaping
+        # boundary.  The transcript persistence consumer removes it before any public projection;
+        # dropping it here would leave the already-written classic operation unknown.
+        _classic_writer_fields = (
+            {
+                "_classic_writer_proof": result["_classic_writer_proof"],
+                **({"_classic_writer_event": result["_classic_writer_event"]}
+                   if result.get("_classic_writer_event") is not None else {}),
+            }
+            if result.get("_classic_writer_proof") is not None else {}
+        )
         previewed = result.get("response_previewed", False)
         viewer_meta = {}
         if local_sinks is not None:
@@ -1356,6 +1682,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if local_sinks is not None:
                 return {
                     "final_response": final_response, **common, **viewer_meta,
+                    **_classic_writer_fields,
                     "last_reasoning": result.get("last_reasoning"),
                     "response_previewed": previewed,
                     "response_transformed": bool(result.get("response_transformed")),
@@ -1366,6 +1693,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # failed/interrupted turn is still titled.
         return {
             "final_response": final_response, "last_reasoning": result.get("last_reasoning"), **common, **viewer_meta,
+            **_classic_writer_fields,
             "response_previewed": previewed,
             "response_transformed": result.get("response_transformed", False),
             "response_reused": result.get("response_reused", False),

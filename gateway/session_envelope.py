@@ -33,6 +33,148 @@ _WHATSAPP_NATIVE_KEYS = frozenset({'video', 'audio', 'sticker', 'location', 'con
 _WHATSAPP_NATIVE_MAX_BYTES = 16 * 1024
 _MEDIA_FIELDS = ('media_urls', 'media_types', 'media_text_inlined')
 
+# ``own_policy`` is a durable request to re-check the live adapter policy.  It is
+# never an authorization verdict and it is never populated from a caller flag.
+# The object marker keeps a restored descriptor distinct from an initial event;
+# only ``restore_native_source`` can create this exact in-process marker.
+_NATIVE_OWN_POLICY_DESCRIPTOR = 'own_policy'
+_NATIVE_OWN_POLICY_RESTORED = object()
+_NATIVE_OWN_POLICY_UNTRUSTED = object()
+
+
+def _native_event_identity(event):
+    """Return the source-owned identity/content projection frozen across an await.
+
+    ``prepare_native`` copies the source object before role reauthorization.  The
+    copied object is expected to be a value-equivalent event, not the same Python
+    object as the producer's event.  Role authorization is deliberately omitted:
+    the live role recheck may update that field; all routing, content, media and
+    wire-visible source identity remains immutable.
+    """
+    source = event.source
+    source_identity = source.to_dict() if source is not None else None
+    if source is not None:
+        source_identity = {
+            'wire': source_identity,
+            'is_bot': source.is_bot,
+            'profile_route_rejected': getattr(source, 'profile_route_rejected', False),
+            'delivered_via_upstream_relay': getattr(source, 'delivered_via_upstream_relay', False),
+        }
+    values = {
+        name: deepcopy(getattr(event, name))
+        for name in _EVENT_FIELDS + _CONTEXT_FIELDS + _MEDIA_FIELDS
+    }
+    values.update({
+        'source': source_identity,
+        'text': deepcopy(event.text),
+        'message_type': getattr(event.message_type, 'value', event.message_type),
+        'timestamp': event.timestamp.isoformat() if event.timestamp is not None else None,
+        # Arbitrary adapter metadata is intentionally not a native identity field;
+        # only the closed WhatsApp projection is durable at this boundary.
+        'metadata': deepcopy(_native_metadata(event)) if source is not None else None,
+        'internal': bool(getattr(event, 'internal', False)),
+        'prompt_response': bool(getattr(event, 'prompt_response', False)),
+        'inherit_channel_pin': getattr(event, 'inherit_channel_pin', None),
+    })
+    return values
+
+
+def _native_own_policy_adapter(runner, source):
+    """Return the live own-policy adapter/profile, or ``(None, None)``."""
+    if source is None or getattr(source, 'platform', None) is None:
+        return None, None
+    profile = runner._adapter_profile_for_source(source)
+    if not runner._adapter_flag(source.platform, 'enforces_own_access_policy', profile):
+        return None, profile
+    adapter = runner._adapter_for_source(source)
+    return adapter, profile
+
+
+def _native_payload_is_canonical(runner, payload) -> bool:
+    """Accept an own-policy descriptor only when it is the exact persisted row.
+
+    The descriptor is a request for a fresh policy read, not a caller-supplied grant.  The
+    existing admission ledger is the canonical source for that distinction; a copied payload,
+    including one that only adds ``reauthorize: own_policy``, must not create the in-process
+    restored marker.
+    """
+    if runner is None or not isinstance(payload, dict):
+        return False
+    envelope = payload.get('native_text_v1')
+    route = envelope.get('route') if isinstance(envelope, dict) else None
+    store = getattr(runner, 'session_store', None)
+    if not isinstance(route, str) or not route or store is None:
+        return False
+    entry = store.lookup_by_session_key(route)
+    if entry is None:
+        return False
+    from gateway.session_authorities import all_authorities
+    from hermes_state_runtime import list_session_admissions
+
+    for authority in all_authorities(runner):
+        if authority is None:
+            continue
+        rows = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
+        if any(row.get('payload') == payload for row in rows):
+            return True
+    return False
+
+
+def _native_handoff_is_current(runner, event, handoff) -> bool:
+    """Validate the actual producer handoff before own-policy native admission.
+
+    This consumes no token and creates no new ledger.  It only checks that the
+    context handoff still names the live registration and exact original event.
+    """
+    if not handoff:
+        return False
+    registry = getattr(runner, '_preservation_source_close', None)
+    if registry is None or event is None:
+        return False
+    tokens = tuple(handoff)
+    if not tokens or any(token is None for token in tokens):
+        return False
+    active = tuple(getattr(registry, 'active_leases', ()) or ())
+    bound = tuple(registry.tokens_for_event(event))
+    if len(bound) != len(tokens) or any(
+            not any(token is bound_token for bound_token in bound) for token in tokens):
+        return False
+    adapter = runner._adapter_for_source(event.source)
+    profile = runner._adapter_profile_for_source(event.source)
+    if adapter is None:
+        return False
+    # Use the coordinator's canonical current-registration validator.  A same-instance handler or
+    # contract replacement deliberately leaves the old registration in the map while its lease is
+    # retained UNKNOWN; a direct _registrations lookup would mistake that retained object for live.
+    current = registry._registration_for_adapter(adapter, profile)
+    if current is None:
+        return False
+    close_generation = registry.close_generation
+    if len({id(token) for token in tokens}) != len(tokens):
+        return False
+    for token in tokens:
+        registration = getattr(token, 'registration', None)
+        identity = getattr(token, 'identity', ())
+        expected_identity = (
+            current.adapter, current.profile, current.transport_owner,
+            current.generation, close_generation,
+        )
+        if (not any(token is active_token for active_token in active)
+                or registration is not current
+                or getattr(registration, 'adapter', None) is not adapter
+                or getattr(registration, 'profile', None) != profile
+                or getattr(registration, 'transport_owner', None) is not adapter
+                or getattr(registration, 'retired', False)
+                or getattr(token, 'event', None) is not event
+                or getattr(token, 'state', None) == 'unknown'
+                or len(identity) != 5
+                or identity[0] is not adapter
+                or identity[2] is not current.transport_owner
+                or token.close_generation != close_generation
+                or identity != expected_identity):
+            return False
+    return True
+
 
 def _native_metadata(event):
     """JSON projection of the adapter metadata a native replay keeps; ``None`` refuses the event.
@@ -120,14 +262,32 @@ def _event_clause(runner, event, provenance, fresh_roles):
     return None
 
 
-def _validate_native(runner, event, provenance=None, fresh_roles=False):
+def _validate_native(
+    runner, event, provenance=None, fresh_roles=False, *,
+    own_policy_initial=False, source_handoff=(), source_handoff_event=None,
+):
     source = event.source
     if (clause := _event_clause(runner, event, provenance, fresh_roles)) is not None:
         _refuse(event, 'invalid_params', clause)
     if provenance is not None:
         from gateway.session_ingress_context import restore_provenance
         restore_provenance(runner, source, provenance)
-    delegated = fresh_roles or bool(provenance and 'relay' in provenance)
+    restored_marker = getattr(source, '_native_own_policy_reauth', None)
+    if restored_marker is _NATIVE_OWN_POLICY_UNTRUSTED:
+        _refuse(event, 'permission_denied', 'own_policy_restore')
+    restored_own_policy = restored_marker is _NATIVE_OWN_POLICY_RESTORED
+    if own_policy_initial:
+        handoff_event = source_handoff_event or event
+        if not _native_handoff_is_current(runner, handoff_event, source_handoff):
+            _refuse(event, 'permission_denied', 'source_handoff')
+        own_adapter, _profile = _native_own_policy_adapter(runner, source)
+        if own_adapter is None:
+            _refuse(event, 'permission_denied', 'own_policy_adapter')
+    elif restored_own_policy:
+        own_adapter, _profile = _native_own_policy_adapter(runner, source)
+        if own_adapter is None:
+            _refuse(event, 'permission_denied', 'own_policy_adapter')
+    delegated = own_policy_initial or restored_own_policy or fresh_roles or bool(provenance and 'relay' in provenance)
     if not delegated:
         # An adapter declaring ``authorization_is_upstream`` (A2A peers: bearer-token
         # authenticated in do_POST) owns the whole authorization, so its fresh native inputs
@@ -168,21 +328,45 @@ def snapshot_native(runner, event):
 
 
 async def prepare_native(runner, event):
+    from gateway.preservation_source_close import current_source_handoff
     from gateway.session_ingress_context import capture_provenance, reauthorize_roles
     provenance = capture_provenance(runner, event)
+    handoff = current_source_handoff()
+    own_adapter, _profile = _native_own_policy_adapter(runner, event.source)
+    own_policy_initial = own_adapter is not None
+    if own_policy_initial and not _native_handoff_is_current(runner, event, handoff):
+        _refuse(event, 'permission_denied', 'source_handoff')
+    original_identity = _native_event_identity(event)
     # Freeze caller-owned identity and content before the first network yield.
     # Preserve dynamic trust fields too: validation must reject forged ones,
     # not silently discard them while freezing the caller's source identity.
     frozen = _adapter_event(event, source=copy(event.source))
+    if _native_event_identity(frozen) != original_identity:
+        _refuse(event, 'invalid_params', 'native_identity')
     fresh_roles = await reauthorize_roles(runner, frozen.source, provenance)
-    encoded_source = _validate_native(runner, frozen, provenance, fresh_roles)
+    if _native_event_identity(frozen) != original_identity:
+        _refuse(event, 'invalid_params', 'native_identity')
+    if own_policy_initial and not _native_handoff_is_current(runner, event, handoff):
+        _refuse(event, 'permission_denied', 'source_handoff')
+    encoded_source = _validate_native(
+        runner, frozen, provenance, fresh_roles,
+        own_policy_initial=own_policy_initial,
+        source_handoff=handoff,
+        source_handoff_event=event,
+    )
     # Copy + SHA-256 + fsyncs of up to max_inbound_media_bytes stay off the owner loop; the
     # copied context carries the admission's capture lease.
     media = await asyncio.to_thread(capture_native_media, frozen.media_urls) if frozen.media_urls else None
-    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media)
+    return _snapshot_native(
+        runner, frozen, provenance, fresh_roles, encoded_source, media,
+        own_policy_initial=own_policy_initial,
+    )
 
 
-def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+def _snapshot_native(
+    runner, event, provenance, fresh_roles=False, encoded_source=None, media=None,
+    *, own_policy_initial=False,
+):
     if encoded_source is None:
         encoded_source = _validate_native(runner, event, provenance, fresh_roles)
     envelope = {'source': encoded_source,
@@ -199,6 +383,8 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         envelope['webhook_route'] = route_digest(adapter, event.source.chat_id)
     if event.source.role_authorized:
         envelope['reauthorize'] = 'roles'
+    elif own_policy_initial:
+        envelope['reauthorize'] = _NATIVE_OWN_POLICY_DESCRIPTOR
     if provenance is not None:
         envelope['provenance'] = provenance
     # Omit new defaults so an identical retry of an older text admission retains
@@ -241,7 +427,17 @@ def restore_native_source(payload, runner=None):
     source = SessionSource.from_dict(envelope['source'])
     source.is_bot = envelope['source']['is_bot']
     # Private descriptor requests a fresh check, never supplies the verdict.
-    source.role_authorized = envelope.get('reauthorize') == 'roles'
+    descriptor = envelope.get('reauthorize')
+    source.role_authorized = descriptor == 'roles'
+    if descriptor == _NATIVE_OWN_POLICY_DESCRIPTOR:
+        # The descriptor asks the live adapter to re-check its policy.  It is not
+        # itself an allow decision and never substitutes for the initial handoff.  A marker
+        # from a non-canonical payload is retained as an explicit refusal, so a direct caller
+        # cannot turn this wire string into delegated authorization.
+        marker = (_NATIVE_OWN_POLICY_RESTORED
+                  if _native_payload_is_canonical(runner, payload)
+                  else _NATIVE_OWN_POLICY_UNTRUSTED)
+        source._native_own_policy_reauth = marker
     if 'provenance' in envelope:
         from gateway.session_ingress_context import callback_runner, restore_provenance
         runner = runner or callback_runner()

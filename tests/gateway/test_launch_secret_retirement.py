@@ -12,6 +12,7 @@ async def test_delete_prunes_launch_and_config_secrets(tmp_path, monkeypatch):
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
+    from tests.gateway.conftest import bind_authority_runtime_custody
     config = {'platform_toolsets': {'cli': []}, 'model': {
         'provider': 'custom', 'api_key': 'config-secret', 'base_url': 'http://127.0.0.1:9/v1'}}
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a, **k: config)
@@ -20,6 +21,7 @@ async def test_delete_prunes_launch_and_config_secrets(tmp_path, monkeypatch):
                              _cached_agent_for=lambda route: None, _adapter_for_source=lambda source: None,
                              _evict_cached_agent=lambda route: None)
     owner = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='fixture')
+    bind_authority_runtime_custody(runner, owner)
     connection = AuthorityConnection(owner, object(), {'user_id': 'owner'})
     def create(request_id):
         return create_local_session(owner, connection.actor, {'request_id': request_id, 'source': 'cli',

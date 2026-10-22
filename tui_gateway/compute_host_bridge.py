@@ -136,7 +136,15 @@ def _get_compute_host_supervisor(cfg: dict | None = None):
                 expected_hermes_home=str(target.home),
                 rpc_sink=_target_rpc_sink,
                 heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
-                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3))
+                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
+                autostart=False)
+            from tui_gateway.hosted_tui_custody import bind_supervisor, host_start_failed
+            bind_supervisor(supervisor, target.home, target.key)
+            try:
+                supervisor.start()
+            except BaseException:
+                host_start_failed(supervisor)
+                raise
             # If the last session detached while a host callback was running, the close path
             # could not retire the target yet.  The supervisor retries after its callback count
             # reaches zero, while preserving the per-home pool for any sibling session.
@@ -217,10 +225,13 @@ def _retire_compute_host_target(sid: str, session: dict) -> None:
             _compute_host_supervisor_retiring.add(target.key)
     shutdown_succeeded = False
     try:
-        supervisor.shutdown()
-        shutdown_succeeded = True
+        receipt = supervisor.shutdown()
+        from tui_gateway.hosted_tui_custody import host_shutdown
+        shutdown_succeeded = host_shutdown(supervisor, receipt)
     except Exception:
         # Leave the target in the pool for a later retry; a failed close is not proof of cleanup.
+        from tui_gateway.hosted_tui_custody import host_shutdown_failed
+        host_shutdown_failed(supervisor)
         logger.warning("compute-host target shutdown failed home=%s", target.home, exc_info=True)
         return
     finally:
@@ -555,7 +566,35 @@ def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> No
         session["_metadata_mirror_updated_at"] = time.time()
 
 
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
+_UNKNOWN_COMPUTE_HOST_REASONS = frozenset({
+    "crash", "shutdown", "transport_unknown", "turn_unknown", "host_exit",
+    "owner_unknown", "completion_unknown",
+})
+
+
+def _compute_host_terminal_is_settled(frame: dict) -> bool:
+    """Accept only a source-bound terminal that can release the session custody.
+
+    The supervisor may publish an observation when a child or pipe disappears,
+    but that observation is deliberately not a completion receipt.  Keeping the
+    turn marker in that case is what prevents close/reap code from releasing the
+    active-session lease while the accepted work is still unresolved.
+    """
+    if not isinstance(frame, dict) or frame.get("custody") == "unknown":
+        return False
+    if frame.get("producer_complete") is False:
+        return False
+    return str(frame.get("reason") or "") not in _UNKNOWN_COMPUTE_HOST_REASONS
+
+
+def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> bool:
+    if not _compute_host_terminal_is_settled(frame):
+        # Preserve the exact in-flight marker and lease.  A later authenticated
+        # producer/owner receipt can retry this callback through HostSupervisor;
+        # an unknown observation must never create a false idle session.
+        with session["history_lock"]:
+            session["_compute_host_turn_custody"] = "unknown"
+        return False
     with session["history_lock"]:
         _compute_host_adopt_frame_meta(session, frame)
         session["running"] = False
@@ -577,6 +616,9 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
     if not frame.get("session_info_emitted"):
         _emit("session.info", sid, info)
     _drain_queued_prompt(rid, sid, session)
+    with session["history_lock"]:
+        session.pop("_compute_host_turn_custody", None)
+    return True
 
 
 def _submit_prompt_to_compute_host(
@@ -594,25 +636,32 @@ def _submit_prompt_to_compute_host(
         session["_compute_host_turn_id"] = turn_id
         session.pop("_compute_host_activity_ns", None)
 
-    def _complete(done: dict) -> None:
+    def _complete(done: dict) -> bool:
         # submit_turn reports a synchronous pipe failure via the callback before re-raising;
         # leave the session untouched so prompt.submit can fail open to the in-process path.
         if done.get("reason") != "send_failed":
+            if not _compute_host_terminal_is_settled(done):
+                with session["history_lock"]:
+                    if session.get("_compute_host_turn_id") == turn_id:
+                        session["_compute_host_turn_custody"] = "unknown"
+                return False
             with session["history_lock"]:
                 if session.get("_compute_host_turn_id") != turn_id:
-                    return
+                    return False
                 session.pop("_compute_host_turn_id", None)
                 session.pop("_compute_host_activity_ns", None)
-            _on_compute_host_turn_done(rid, sid, session, done)
+            return _on_compute_host_turn_done(rid, sid, session, done)
+        return False
+
     try:
         target, supervisor = _compute_host_target_and_supervisor(sid, session, cfg)
         _complete_target = target
 
-        def _target_complete(done: dict) -> None:
+        def _target_complete(done: dict) -> bool:
             if not _compute_host_target_matches(_complete_target, sid, session, allow_detached=True):
-                return
+                return False
             try:
-                _complete(done)
+                return _complete(done)
             finally:
                 # A close may detach the session while its last host turn is still producing a
                 # terminal frame.  Retry target retirement after that callback drains, rather than
@@ -620,12 +669,26 @@ def _submit_prompt_to_compute_host(
                 if session.get("_closing"):
                     _retire_compute_host_target(sid, session)
 
-        supervisor.submit_turn(frame, on_complete=_target_complete)
+        # HostSupervisor keeps this callback in its typed pending record.  A
+        # plain compatibility callback used by narrow callers retains the old
+        # tuple path, while this production bridge opts into source-bound
+        # terminal gating even though the active-session lease is owned by the
+        # session lifecycle rather than by the supervisor.
+        _target_complete._requires_custody = True
+
+        from tui_gateway.hosted_tui_custody import submit_turn
+        submit_turn(supervisor, frame, _target_complete)
     except Exception as exc:
         with session["history_lock"]:
             if session.get("_compute_host_turn_id") == turn_id:
-                session.pop("_compute_host_turn_id", None)
-                session.pop("_compute_host_activity_ns", None)
+                if getattr(exc, "custody_unknown", False):
+                    # The supervisor already retained the typed pending turn after an
+                    # ambiguous write. Keep the session marker until that exact source
+                    # receipt resolves it; clearing it here would manufacture idle.
+                    session["_compute_host_turn_custody"] = "unknown"
+                else:
+                    session.pop("_compute_host_turn_id", None)
+                    session.pop("_compute_host_activity_ns", None)
         return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
     with session["history_lock"]:
         session["_compute_host_active"] = True
@@ -644,13 +707,16 @@ def _send_compute_host_control(
     if on_late_ack is not None:
         original_late_ack = on_late_ack
 
-        def _target_late_ack(ack: dict) -> None:
+        def _target_late_ack(ack: dict) -> bool:
             if _compute_host_target_matches(target, sid, target.session):
                 original_late_ack(ack)
+                return True
+            return False
 
         on_late_ack = _target_late_ack
-    return supervisor.control(sid, route_name=route_name, payload=frame, wait=wait, timeout=timeout,
-                             on_late_ack=on_late_ack)
+    from tui_gateway.hosted_tui_custody import control
+    return control(supervisor, sid, route_name=route_name, payload=frame, wait=wait,
+                   timeout=timeout, on_late_ack=on_late_ack)
 
 
 def _compute_host_ack_error(rid, ack: dict, code: int, default: str):

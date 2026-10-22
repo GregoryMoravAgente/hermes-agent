@@ -17,22 +17,28 @@ def test_runs_adopt_legacy_declared_session_key(tmp_path):
 
 async def probe():
     import aiohttp
-    from gateway.config import Platform, PlatformConfig
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    runner = GatewayRunner()
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='legacy-test')
+    home = Path(os.environ['HERMES_HOME']).resolve()
+    home_token = set_hermes_home_override(home)
+    process_ownership.reserve([home])
+    runner = GatewayRunner(GatewayConfig(sessions_dir=home / 'sessions'))
+    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'legacy-probe-secret', 'port': 0}))
+    adapter.gateway_runner = runner
+    runner.adapters = {Platform.API_SERVER: adapter}
+    await initialize_gateway_runtime(runner)
+    runner._wire_adapter_handlers(adapter)
+    authority = runner.session_authority
     db = authority.db
     # Rows exactly as earlier releases left them: the declared key verbatim, no binding receipt.
     for sid in ('legacy1', 'legacy2', 'legacy3'):
         db.create_session(sid, source='api_server')
         db.record_gateway_session_peer(sid, source='api_server', session_key='webui:' + sid)
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'legacy-probe-secret', 'port': 0}))
-    adapter.gateway_runner = runner
-    adapter.set_message_handler(runner._handle_message)
-    runner.adapters[Platform.API_SERVER] = adapter
     assert await adapter.connect()
     port = adapter._site._server.sockets[0].getsockname()[1]
     out = {}
@@ -69,6 +75,12 @@ async def probe():
         Path(os.environ['HERMES_HOME'], 'legacy-receipt.json').write_text(encoding='utf-8', data=json.dumps(out))
     finally:
         await adapter.disconnect()
+        adapter._response_store.close()
+        adapter._run_idempotency_store.close()
+        runner.session_store.close_all_db_handles()
+        runner.close_all_session_db_handles()
+        process_ownership.close()
+        reset_hermes_home_override(home_token)
 
 
 if __name__ == '__main__':

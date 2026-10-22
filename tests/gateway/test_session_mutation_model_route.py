@@ -11,7 +11,16 @@ import threading
 
 import pytest
 
-from tests.gateway.test_session_follow_profile_config import _create, _owner, _route
+from tests.gateway.test_session_follow_profile_config import _create, _route
+
+
+def _owner(home):
+    from tests.gateway import test_session_follow_profile_config as profile_config
+    from tests.gateway.conftest import bind_authority_runtime_custody
+
+    store, runner, authority, owner = profile_config._owner(home)
+    bind_authority_runtime_custody(runner, authority)
+    return store, runner, authority, owner
 
 MODELS = ('original', 'current', 'picked')
 

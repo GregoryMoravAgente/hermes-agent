@@ -930,6 +930,37 @@ class GatewayAgentCacheMixin:
         self._commit_memory_before_soft_evict(agent, key, boundary)
         self._release_evicted_agent_soft(agent)
 
+    def _close_external_process_parent(self, agent: Any) -> bool:
+        """Retire an evicted external producer only after its exact physical finalizers settle.
+
+        A cache eviction is not an ownership release. The neutral operation adapter retains the
+        same parent when readers, native scope, durable publication, or cache readback are unknown;
+        this method therefore leaves the agent's parent fields intact on failure and never creates
+        a replacement process or profile lock.
+        """
+        parent = getattr(agent, "_external_process_parent", None)
+        if parent is None:
+            return True
+        try:
+            from gateway.runtime_service_operations import (
+                close_after_finalizers, mark_unknown, release_agent_process_parent,
+            )
+            if close_after_finalizers(parent) is not True:
+                with suppress(Exception):
+                    mark_unknown(parent, "cache_finalizer_incomplete")
+                logger.warning("External producer parent retained after cache eviction: %s",
+                               getattr(parent, "operation_id", "?"))
+                return False
+            if release_agent_process_parent(agent) is not True:
+                logger.warning("External producer parent terminalized but could not be detached: %s",
+                               getattr(parent, "operation_id", "?"))
+                return False
+            return True
+        except Exception:
+            logger.warning("External producer parent finalization failed; retaining custody: %s",
+                           getattr(parent, "operation_id", "?"), exc_info=True)
+            return False
+
     def _release_evicted_agent_soft(self, agent: Any) -> None:
         """Soft cleanup for cache-evicted agents: unlike _cleanup_agent_resources, the session may
         resume, so terminal sandbox, browser daemon and bg processes outlive the AIAgent instance."""
@@ -941,6 +972,7 @@ class GatewayAgentCacheMixin:
             else:
                 # Older agent instance (shouldn't happen in practice) — legacy full-close path.
                 self._cleanup_agent_resources(agent)
+        self._close_external_process_parent(agent)
         # Free conversation history — tens of MB of tool output on heavy 100+-tool-call sessions.
         # release_clients() preserves session tool state for resume, but the message list is rebuilt from
         # persisted session JSON on the next turn, so dropping it here is safe.

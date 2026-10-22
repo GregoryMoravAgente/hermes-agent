@@ -40,7 +40,9 @@ class GatewaySessionEndMixin:
         finalize: a viewer's ``/new`` resets its conversation on the owner (gateway/session_viewer_close)."""
         def _call() -> None:
             from hermes_cli.lifecycle import invoke_hook
-            invoke_hook("on_session_reset", **kwargs)
+            from agent.shell_hook_scope import managed_hook_route
+            with managed_hook_route():
+                invoke_hook("on_session_reset", **kwargs)
 
         try:
             await asyncio.wait_for(
@@ -64,8 +66,10 @@ class GatewaySessionEndMixin:
 
         def _call() -> None:
             from hermes_cli.lifecycle import finalize_session, session_end_messages
-            messages.extend(session_end_messages(
-                finalize_session(session_id=session_id, platform=platform, reason=reason, **extra)))
+            from agent.shell_hook_scope import managed_hook_route
+            with managed_hook_route():
+                messages.extend(session_end_messages(
+                    finalize_session(session_id=session_id, platform=platform, reason=reason, **extra)))
 
         try:
             await asyncio.wait_for(

@@ -12,6 +12,7 @@ import contextvars
 import logging
 import queue
 import threading
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -46,8 +47,9 @@ def _put_drop_oldest(events: queue.Queue[Any], item: Any) -> bool:
         return True
     except queue.Full:
         try:
-            events.get_nowait()
+            dropped = events.get_nowait()
             events.task_done()
+            _mark_item_unknown(dropped, "stream_queue_drop")
         except queue.Empty:
             pass
     try:
@@ -55,6 +57,18 @@ def _put_drop_oldest(events: queue.Queue[Any], item: Any) -> bool:
         return True
     except queue.Full:
         return False
+
+
+def _mark_item_unknown(item: Any, reason: str) -> None:
+    """Mark a dropped callback's copied custody context before forgetting it."""
+    if not isinstance(item, tuple) or len(item) != 2 or not isinstance(item[0], contextvars.Context):
+        return
+    try:
+        from agent.shell_hook_scope import mark_current_hook_unknown
+
+        item[0].copy().run(mark_current_hook_unknown, reason)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        logger.debug("stream hook custody drop marker failed", exc_info=True)
 
 
 def _worker(dispatcher: _ConsumerDispatcher) -> None:
@@ -72,8 +86,17 @@ def _worker(dispatcher: _ConsumerDispatcher) -> None:
                 # secrets), not an unbound context that fail-closed plugin bindings refuse (#118538).
                 # ``copy()``: one snapshot fans out to N consumer threads and a Context can only be
                 # entered by one thread at a time.
-                context.copy().run(dispatcher.callback, **payload)
+                from agent.shell_hook_custody import managed_dispatch_active
+                from agent.shell_hook_scope import hook_invocation_scope, managed_hook_route
+
+                def _deliver() -> Any:
+                    route = managed_hook_route() if managed_dispatch_active() else nullcontext()
+                    with route, hook_invocation_scope(dispatcher.hook_name):
+                        return dispatcher.callback(**payload)
+
+                context.copy().run(_deliver)
             except Exception as exc:
+                _mark_item_unknown(item, "stream_callback_failed")
                 # Fires once per streaming delta: a mis-declared callback fails identically every
                 # time, so it goes through the manager's warn-once reporter (#111922).
                 from hermes_cli.plugins import get_plugin_manager
@@ -96,6 +119,15 @@ def _stop_dispatcher(dispatcher: _ConsumerDispatcher, timeout: float = 1.0) -> N
     _put_drop_oldest(dispatcher.events, _STOP)
     if dispatcher.thread is not None:
         dispatcher.thread.join(timeout=timeout)
+    if dispatcher.thread is None or not dispatcher.thread.is_alive():
+        while True:
+            try:
+                pending = dispatcher.events.get_nowait()
+            except queue.Empty:
+                break
+            dispatcher.events.task_done()
+            if pending is not _STOP:
+                _mark_item_unknown(pending, "stream_dispatcher_shutdown")
 
 
 def _start_dispatcher(hook_name: str, callback: Callable[..., Any]) -> _ConsumerDispatcher:
@@ -138,6 +170,7 @@ def enqueue_plugin_stream_hook(hook_name: str, **payload: Any) -> bool:
         if _put_drop_oldest(dispatcher.events, item):
             queued = True
         else:
+            _mark_item_unknown(item, "stream_queue_drop")
             logger.debug(
                 "plugin stream hook queue full after drop-oldest: %s callback=%s",
                 hook_name, _callback_name(dispatcher.callback),

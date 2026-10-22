@@ -1,6 +1,7 @@
 """Session-scoped busy preferences and controls of the existing execution only."""
 import asyncio
 from functools import partial
+import hashlib
 from pathlib import Path
 
 from hermes_state_runtime import RuntimeStoreError
@@ -180,22 +181,27 @@ async def correct(connection, ref, params, *, verb):
     authority = connection.authority
     generation = params['execution_generation']
     live = authority.sessions[ref.session_id]
-    with live.event_stream.lock:
-        authority.check_approval_generation(ref.session_id, generation)
-        # Managed workers have a separate control channel, not a cached owner
-        # agent. Refuse explicitly instead of acknowledging undeliverable text.
-        if ref.session_id in getattr(authority, '_managed_workers', {}):
-            raise RuntimeStoreError('unsupported_control')
-        # Accepted for this exact claim before its turn built an agent: steer_agent latches it for
-        # the agent this generation adopts, never a later one.
-        agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None)
-        if latched:
-            return {'status': 'queued', 'text': params['text'], 'execution_generation': generation,
+    async def call():
+        with live.event_stream.lock:
+            authority.check_approval_generation(ref.session_id, generation)
+            # Managed workers have a separate control channel, not a cached owner
+            # agent. Refuse explicitly instead of acknowledging undeliverable text.
+            if ref.session_id in getattr(authority, '_managed_workers', {}):
+                raise RuntimeStoreError('unsupported_control')
+            # Accepted for this exact claim before its turn built an agent: steer_agent latches it for
+            # the agent this generation adopts, never a later one.
+            agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None)
+            if latched:
+                return {'status': 'queued', 'text': params['text'], 'execution_generation': generation,
+                        'authority_epoch': authority.epoch}
+            method = getattr(agent, verb, None)
+            if not callable(method):
+                raise RuntimeStoreError('execution_not_ready')
+            accepted = method(params['text'])
+            return {'status': ({'steer': 'queued', 'redirect': 'redirected'}[verb] if accepted else 'rejected'),
+                    'text': params['text'], 'execution_generation': generation,
                     'authority_epoch': authority.epoch}
-        method = getattr(agent, verb, None)
-        if not callable(method):
-            raise RuntimeStoreError('execution_not_ready')
-        accepted = method(params['text'])
-        return {'status': ({'steer': 'queued', 'redirect': 'redirected'}[verb] if accepted else 'rejected'),
-                'text': params['text'], 'execution_generation': generation,
-                'authority_epoch': authority.epoch}
+    return await authority._preservation_control_call(
+        principal_id=connection.actor.subject, session_id=ref.session_id, operation=verb,
+        request_id=f'{verb}:{generation}:{hashlib.sha256(params["text"].encode()).hexdigest()}',
+        generation=generation, call=call)

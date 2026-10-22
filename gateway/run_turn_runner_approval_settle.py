@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def register_timeout_notice(
-    runner, approval_data: dict, *, command: str, card_message_id: Optional[str]) -> None:
+    runner, approval_data: dict, *, command: str, card_message_id: Optional[str], on_settle=None) -> bool:
     """Arm a settle hook that posts the timed-out notice for ``approval_data['request_id']``.
 
     ``runner`` is the ``TurnRunner`` (for ``_ctx`` and ``_schedule``); ``card_message_id`` is the
@@ -30,31 +30,78 @@ def register_timeout_notice(
     drop and rewriting it would erase the record of what was asked. ``command`` is the
     already-redacted command shown to the user. The notice is skipped when the run is no longer
     current (``ctx._run_still_current``).
+    Return ``True`` when the live approval entry accepted the hook; otherwise the caller receives
+    ``notify_failed`` through ``on_settle`` and can retain the custody record as unknown.
     """
     from tools.approval import register_gateway_settle
 
     request_id = approval_data.get("request_id")
     session_key = runner._ctx.session_key or ""
     if not request_id or not session_key:
-        return
+        if on_settle is not None:
+            on_settle('notify_failed')
+        return False
     timeout_s = approval_timeout_seconds()
+
+    def finish(outcome: str) -> None:
+        if on_settle is None:
+            return
+        try:
+            on_settle(outcome)
+        except Exception:
+            logger.debug("Approval custody settle hook failed", exc_info=True)
+
+    def finish_notice(done) -> None:
+        """Settle the producer only after the actual timeout notice future finishes."""
+        try:
+            delivered = bool(done.result())
+        except BaseException:
+            logger.debug("Approval notice future failed; custody retained", exc_info=True)
+            delivered = False
+        finish("resolved" if delivered else "notify_failed")
 
     def settle(reason: str) -> None:
         if reason != "timeout":
-            return  # answered / interrupted / notify_failed already produced their own feedback
+            # Answered / interrupted / notify_failed have no later notice send. The queue's
+            # settle callback is the producer's actual completion boundary for these outcomes.
+            finish(reason)
+            return
         # Same guard as every other late notice in TurnRunner: after /stop, /new or a restart the
         # turn is over and this chat belongs to a newer run — do not edit or post into it.
         still_current = getattr(runner._ctx, "_run_still_current", None)
         if callable(still_current) and not still_current():
+            finish("notify_failed")
             return
-        runner._schedule(
-            _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s),
-            "Approval timeout notice scheduling error")
+        try:
+            future = runner._schedule(
+                _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s),
+                "Approval timeout notice scheduling error")
+        except BaseException:
+            logger.debug("Approval notice scheduling failed; custody retained", exc_info=True)
+            finish("notify_failed")
+            return
+        if future is None:
+            finish("notify_failed")
+            return
+        add_done_callback = getattr(future, "add_done_callback", None)
+        if callable(add_done_callback):
+            add_done_callback(finish_notice)
+            return
+        # Small synchronous test doubles and legacy schedulers may expose only result().
+        try:
+            delivered = bool(future.result())
+        except BaseException:
+            logger.debug("Approval notice future failed; custody retained", exc_info=True)
+            delivered = False
+        finish("resolved" if delivered else "notify_failed")
 
-    register_gateway_settle(session_key, request_id, settle)
+    armed = register_gateway_settle(session_key, request_id, settle)
+    if not armed and on_settle is not None:
+        on_settle('notify_failed')
+    return armed
 
 
-async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int) -> None:
+async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str], timeout_s: int) -> bool:
     from gateway.run import _interim_metadata
 
     adapter = ctx._status_adapter
@@ -65,10 +112,14 @@ async def _post_timeout_notice(ctx, command: str, card_message_id: Optional[str]
         if card_message_id and await _edit_card(
                 adapter, ctx._status_chat_id, card_message_id,
                 t("gateway.exec_approval.timed_out_card_body", notice=notice, command=command)):
-            return
-        await adapter.send(ctx._status_chat_id, notice, metadata=metadata)
+            return True
+        result = await adapter.send(ctx._status_chat_id, notice, metadata=metadata)
+        # Existing adapters historically returned None after a successful send; preserve that
+        # compatibility while treating an explicit SendResult(success=False) as an unknown send.
+        return bool(getattr(result, "success", True))
     except Exception:
         logger.debug("Approval timeout notice failed", exc_info=True)
+        return False
 
 
 async def _edit_card(adapter, chat_id: str, message_id: str, content: str) -> bool:

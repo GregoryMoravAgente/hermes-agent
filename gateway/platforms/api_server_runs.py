@@ -5,12 +5,14 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
 import uuid
 from collections import deque
 from contextlib import suppress
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
@@ -26,6 +28,8 @@ except ImportError:
 
 from gateway.platforms.api_server_room_grants import _json_error, _room_grant_error_response
 from gateway.platforms.api_server_run_idempotency import TERMINAL_STATUSES
+from gateway.platforms.api_server_run_execution import finalize_api_run
+from gateway.runtime_custody import CustodyRefusal
 
 
 logger = logging.getLogger("gateway.platforms.api_server")
@@ -132,9 +136,9 @@ class _RunStream:
         self.next_seq = 0
         self.terminal = False
 
-    def put_nowait(self, event: Optional[dict[str, Any]]) -> None:
+    def put_nowait(self, event: Optional[dict[str, Any]]) -> bool:
         if self.terminal:
-            return
+            return False
         seq = self.next_seq
         self.next_seq += 1
         self.backlog.append((seq, event))
@@ -148,6 +152,7 @@ class _RunStream:
                 while not queue.empty():
                     queue.get_nowait()
                 queue.put_nowait((seq, _RUN_STREAM_SUBSCRIBER_OVERFLOW))
+        return True
 
     def attach(
         self, last_seq: int = -1
@@ -205,6 +210,31 @@ def terminal_run_status(result: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return status, fields
 
 
+def canonical_terminal_decision(status: str, fields: dict[str, Any], receipt: Any):
+    """Use a source-owned terminal outcome when a wrapper raced its worker."""
+    outcome = receipt.get("terminal_outcome") if isinstance(receipt, dict) else None
+    if outcome not in TERMINAL_STATUSES:
+        return status, fields
+    result = receipt.get("terminal_result")
+    if isinstance(result, dict):
+        source_status, source_fields = terminal_run_status(result)
+        if source_status != outcome:
+            return "unknown", {"error": "Canonical terminal outcome is inconsistent."}
+        canonical_fields = dict(source_fields)
+        if outcome == "completed":
+            canonical_fields["output"] = result.get("final_response", "")
+        if isinstance(receipt.get("terminal_usage"), dict):
+            canonical_fields["usage"] = receipt["terminal_usage"]
+        if result.get("runtime") is not None:
+            canonical_fields["runtime"] = result["runtime"]
+        return outcome, canonical_fields
+    return outcome, {
+        "completed": outcome == "completed",
+        "partial": outcome == "failed",
+        "interrupted": outcome in {"cancelled", "interrupted"},
+    }
+
+
 def _run_not_found(_openai_error, run_id: str) -> web.Response:
     return _json_error(_openai_error, f"Run not found: {run_id}", code="run_not_found", status=404)
 
@@ -234,8 +264,15 @@ def _initialize_run_state(self, *, store_factory) -> None:
     self._run_admission_aliases: dict[str, str] = {}
     (
         self._run_owners, self._run_streams, self._run_streams_created, self._active_run_agents,
-        self._active_run_tasks, self._run_statuses, self._run_approval_sessions,
-    ) = ({} for _ in range(7))
+        self._active_run_tasks, self._run_statuses, self._run_approval_sessions, self._run_custody,
+    ) = ({} for _ in range(8))
+    # Retain the original launch object until its source-owned status record ages out.  This is
+    # the read-only witness seam; it is not a second custody ledger or a replacement for the
+    # coordinator's exact handle.
+    self._run_launches: dict[str, _RunLaunch] = {}
+    # Set only when a real API-run custody reservation reaches the adapter. Startup with no
+    # producer activity must not be mistaken for I03 source registration or quiescence.
+    self._api_run_owner_registered = False
 
 
 def _http_routes(self) -> list[tuple[str, str, Any]]:
@@ -257,6 +294,11 @@ def _idempotency_capabilities(self, *, store_type) -> dict[str, Any]:
 
 
 def _close_run_state(self) -> None:
+    # The idempotency store is part of the custody boundary: a late worker or retry reader must
+    # not reopen it after shutdown has closed the handle. Unknown custody remains retained.
+    if _active_run_custody_count(self):
+        logger.warning("Keeping API run idempotency store open while custody is active/unknown")
+        return
     try:
         if getattr(self, "_run_idempotency_store", None) is not None:
             self._run_idempotency_store.close()
@@ -264,8 +306,18 @@ def _close_run_state(self) -> None:
         logger.debug("Failed to close run idempotency store for %s", self.name, exc_info=True)
 
 
-def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
-    """Update pollable run status without exposing private agent objects."""
+def _close_cached_session_dbs_if_clear(self) -> None:
+    """Keep cached SessionDB handles open while an API custody lease can still write."""
+    if _active_run_custody_count(self):
+        logger.warning("Keeping API SessionDB handles open while run custody is active/unknown")
+        return
+    self._close_cached_session_dbs()
+
+
+def _set_run_status(
+    self, run_id: str, status: str, *, _return_receipt: bool = False, **fields: Any,
+):
+    """Update pollable run status and optionally return an exact durable-store receipt."""
     now = time.time()
     current = self._run_statuses.get(run_id, {})
     previous_status = str(current.get("status") or "")
@@ -284,12 +336,27 @@ def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, 
         or status in TERMINAL_STATUSES
         or bool(field_names & {
             "output", "error", "usage", "pending_steer", "session_id", "shutdown_requested_at"}))
-    if run_id in self._run_idempotency_ids and should_persist:
+    status_receipt: dict[str, Any] | None = {
+        "committed": True,
+        "storage": "in_memory_projection",
+        "rowcount": 1,
+        "run_id": run_id,
+    }
+    if run_id in self._run_idempotency_ids and (should_persist or _return_receipt):
         try:
-            self._run_idempotency_store.update_status(run_id, current)
+            custody = getattr(self, "_run_custody", {}).get(run_id)
+            expectations = (
+                custody.status_identity_expectations()
+                if custody is not None else {})
+            status_receipt = self._run_idempotency_store.update_status_receipt(
+                run_id, current, **expectations)
         except Exception:
             logger.exception("[api_server] failed to persist idempotent run status %s", run_id)
-    return current
+            status_receipt = None
+    launch = getattr(self, "_run_launches", {}).get(run_id)
+    if launch is not None and status in TERMINAL_STATUSES:
+        launch.status_receipt = status_receipt
+    return (current, status_receipt) if _return_receipt else current
 
 
 def _mark_shutdown_interrupted_runs(self, run_ids) -> None:
@@ -326,6 +393,12 @@ def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop,
     redact_sensitive_text = _api_server.redact_sensitive_text
 
     def _push(event: dict[str, Any]) -> None:
+        custody = getattr(self, "_run_custody", {}).get(run_id)
+        if custody is not None and (getattr(custody, "transport_retired", False)
+                                    or getattr(custody, "released", False)):
+            # Executor callbacks can arrive after TTL/disconnect retirement.  A stale callback
+            # must not reopen the pollable status or write into a successor transport.
+            return
         self._set_run_status(
             run_id, self._run_statuses.get(run_id, {}).get("status", "running"), last_event=event.get("event"))
         q = self._run_streams.get(run_id)
@@ -429,12 +502,26 @@ def _durable_run_status(self, request: web.Request, run_id: str) -> dict[str, An
     if record is None:
         return None
     status = dict(record["status"])
-    if status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
+    if status.get("status") != "unknown" and status.get("status") not in TERMINAL_STATUSES and not _owner_alive(
         int(record.get("owner_pid") or 0), int(record.get("owner_started") or 0)):
         status.update(
             status="interrupted", error="The gateway restarted before this run settled.",
             last_event="run.interrupted", updated_at=time.time())
-        self._run_idempotency_store.update_status(run_id, status)
+        try:
+            receipt = self._run_idempotency_store.update_status_receipt(
+                run_id, status, expected_scope=record.get("scope"),
+                expected_idempotency_key=record.get("idempotency_key"),
+                expected_fingerprint=record.get("fingerprint"),
+                expected_owner_pid=record.get("owner_pid"),
+                expected_owner_started=record.get("owner_started"))
+        except Exception:
+            logger.exception("[api_server] failed to prove interrupted status update %s", run_id)
+            return None
+        if receipt is None:
+            # A restarted reader has no live custody object to mark unknown.  Do not cache or
+            # publish a locally invented interruption when the exact row commit was not proven.
+            logger.warning("[api_server] could not prove interrupted status update for %s", run_id)
+            return None
     self._run_statuses[run_id] = status
     self._run_idempotency_ids.add(run_id)
     self._run_owners[run_id] = scope
@@ -541,16 +628,128 @@ class _RunLaunch:
     turn_author: Optional[dict[str, Any]] = None  # memory-attribution label only; grants nothing
     admission: Any = None
     walked_from: Optional[str] = None  # the swept stored session the chain moved past (``bind_api_steps``)
+    custody: Any = None  # opaque I03 handle retained beyond transport/task retirement
+    execution_task: Any = None  # the original asyncio.Task for this run
+    worker_future: Any = None  # the original executor Future, when the route uses one
+    terminal_event_outcome: Optional[bool] = None
+    stream_close_outcome: Optional[bool] = None
+    status_receipt: Any = None
+    delivery_record: Any = None
+    task_retirement_callback_registered: bool = False
+    control_finalizer_receipt: Any = None
+    transport_retirement_receipt: Any = None
+
+    def __post_init__(self) -> None:
+        launches = getattr(self.owner, "_run_launches", None)
+        if isinstance(launches, dict):
+            launches[self.run_id] = self
+        custody = self.custody
+        if custody is not None and getattr(custody, "source_launch", None) is None:
+            # The structured launch is the source-owned witness for an unkeyed direct run too.
+            # Legacy ``_run_agent`` creates its own queue-less launch before this class exists;
+            # never replace that distinct source boundary.
+            custody.source_launch = self
 
     @property
     def approval_session_key(self) -> str:
         # Isolated per run: session ids are conversation scopes, not authorization namespaces.
         return self.run_id
 
-    def put_event(self, event: Optional[dict]) -> None:
-        """Enqueue only while this run still owns live transport state."""
+    def put_event(self, event: Optional[dict]) -> bool:
+        """Enqueue only while this run still owns live transport state and return the receipt."""
         if self.owner._run_streams.get(self.run_id) is self.queue:
-            self.queue.put_nowait(event)
+            try:
+                accepted = self.queue.put_nowait(event)
+            except (asyncio.QueueFull, OSError, RuntimeError):
+                if event is None and self.custody is not None:
+                    self.custody.mark_stream_closed(False)
+                return False
+            if event is None:
+                self.stream_close_outcome = accepted
+            if event is None and self.custody is not None:
+                self.custody.mark_stream_closed(accepted)
+            return accepted
+        if event is None and self.custody is not None:
+            self.custody.mark_stream_closed(False)
+        return False
+
+
+def _make_legacy_launch(adapter: Any, custody: Any, *, session_id: Optional[str] = None):
+    """Retain the original legacy source boundary beside its custody handle."""
+    launch = SimpleNamespace(
+        owner=adapter, run_id=custody.run_id, queue=None, session_id=session_id,
+        gateway_session_key=None, declared_selected=False, user_message="",
+        conversation_history=[], session_history_delivery=False, agent_kwargs={},
+        request_profile=custody.profile_id, browser_control_principal=None,
+        browser_control_transport_family=None, turn_author=None,
+        admission=None, walked_from=None, custody=custody, execution_task=None,
+        worker_future=None, terminal_event_outcome=None, stream_close_outcome=None,
+        status_receipt=None, delivery_record=None,
+        task_retirement_callback_registered=False, control_finalizer_receipt=None,
+        transport_retirement_receipt=None)
+    launches = getattr(adapter, "_run_launches", None)
+    if isinstance(launches, dict):
+        launches[custody.run_id] = launch
+    return launch
+
+
+def _enqueue_terminal_event(run: _RunLaunch, event: dict) -> None:
+    """Publish one terminal event and pass the actual transport receipt into custody."""
+    accepted = run.put_event(event)
+    run.terminal_event_outcome = accepted
+    if run.custody is not None:
+        run.custody.mark_event_enqueued(accepted)
+
+
+def _enqueue_terminal_sentinel(run: _RunLaunch) -> None:
+    """Publish the source stream's terminal sentinel and retain its operation result."""
+    accepted = run.put_event(None)
+    if not accepted and run.custody is not None:
+        # Keep the lifecycle fence source-owned even when a test or transport wrapper declines
+        # the sentinel before the launch method can record its own close receipt.
+        run.custody.mark_stream_closed(False)
+    if (run.execution_task is not None
+            and run.execution_task.done()):
+        _retire_live_run(run.owner, run.run_id)
+
+
+def _settle_structured_run_after_task(self, launch: _RunLaunch, task: Any) -> None:
+    """Consume an I02 completion only after the structured task and transport are terminal."""
+    task = task or getattr(launch, "execution_task", None)
+    custody = getattr(launch, "custody", None)
+    if (task is None or not task.done() or getattr(launch, "queue", None) is None
+            or custody is None or getattr(custody, "producer_phase", None) != "api_i02"
+            or launch.terminal_event_outcome is not True
+            or launch.stream_close_outcome is not True
+            or custody.worker_done is not True
+            or custody.control_finalizers is not True):
+        return
+    from gateway.platforms.api_server_run_custody import (
+        complete_legacy_source, retire_legacy_source_with_completion,
+    )
+    try:
+        refusal = complete_legacy_source(custody, active_run_id=None)
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, "code", "structured_completion_unknown"))
+            return
+        completion = getattr(custody, "finalizer_completion", None)
+        if (getattr(completion, "receipt", None) is None
+                and getattr(completion, "_pending_parent_release", False)):
+            return
+        if getattr(getattr(completion, "receipt", None), "state", None) != "complete":
+            custody.mark_completion_unknown("structured_finalizer_completion_unknown")
+            return
+        if getattr(custody, "reservation_key", None) is None:
+            # An unkeyed run has only the in-memory status/event projection as its public
+            # readback boundary. Keep the exact source launch until the status TTL sweep;
+            # keyed runs have the durable idempotency receipt and can retire immediately.
+            return
+        if not retire_legacy_source_with_completion(custody):
+            custody.mark_completion_unknown("structured_completion_retire_pending")
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            TypeError, ValueError, sqlite3.Error):
+        logger.exception("[api_server] structured finalizer failed for run %s", launch.run_id)
+        custody.mark_unknown("structured_completion_error")
 
 
 def _forget_run(self, run_id: str, *tables) -> None:
@@ -561,18 +760,184 @@ def _forget_run(self, run_id: str, *tables) -> None:
 
 
 def _retire_live_run(self, run_id: str) -> None:
-    """Retire agent/task/approval control state once the executor-backed task is done."""
-    _forget_run(self, run_id, self._active_run_agents, self._active_run_tasks, self._run_approval_sessions,
-                self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+    """Retire transport control; the opaque custody handle outlives this function."""
+    custody = getattr(self, "_run_custody", {}).get(run_id)
+    if custody is not None:
+        custody.mark_control_finalizers()
+    launch = getattr(self, "_run_launches", {}).get(run_id)
+    if launch is not None:
+        launch.control_finalizer_receipt = ("retired", run_id)
+    task = getattr(self, "_active_run_tasks", {}).get(run_id)
+    if task is not None and not task.done() and launch is not None:
+        if not launch.task_retirement_callback_registered:
+            launch.task_retirement_callback_registered = True
+            task.add_done_callback(lambda _completed: _retire_live_run(self, run_id))
+    active_tables = (
+        self._active_run_agents, self._run_approval_sessions,
+        self._stopping_run_ids, self._shutdown_interrupted_run_ids)
+    if task is None or task.done():
+        if launch is not None:
+            _settle_structured_run_after_task(self, launch, task)
+        active_tables = (*active_tables, self._active_run_tasks)
+    _forget_run(self, run_id, *active_tables)
+
+
+def _preclaim_cancel_readback(custody: Any) -> bool:
+    """Authenticate a queued API run cancelled before any execution generation was claimed."""
+    if (getattr(custody, "producer_phase", None) != "api_i02"
+            or getattr(custody, "producer_principal", None) != "api"
+            or getattr(custody, "execution_generation", None) is not None):
+        return False
+    authority = getattr(custody, "admission_authority", None)
+    admission_id = getattr(custody, "admission_id", None)
+    db = getattr(authority, "db", None)
+    if db is None or not isinstance(admission_id, str) or not admission_id:
+        return False
+    try:
+        from hermes_state_runtime import get_session_admission
+        row = get_session_admission(db, admission_id=admission_id)
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            sqlite3.Error, TypeError, ValueError):
+        return False
+    return (
+        isinstance(row, dict)
+        and row.get("admission_id") == admission_id
+        and row.get("status") == "terminal"
+        and row.get("outcome") == "cancelled"
+        and row.get("generation") is None
+        and row.get("owner_epoch") == getattr(custody, "authority_epoch", None)
+        and row.get("principal_id") == "api"
+        and row.get("target_session_id") == getattr(custody, "admission_session_id", None)
+        and getattr(authority, "epoch", None) == getattr(custody, "authority_epoch", None)
+    )
+
+
+async def _await_original_work(run: _RunLaunch):
+    """Fence the source-owned worker Task/Future before a cancelled wrapper finalizes."""
+    work = run.worker_future or getattr(run.custody, "worker_task", None)
+    if work is None or not callable(getattr(work, "done", None)) or work.done():
+        return
+    with suppress(asyncio.CancelledError, Exception):
+        await asyncio.shield(work)
+
+
+def _source_status_receipt(run: _RunLaunch, projected_receipt: Any):
+    """Use a canonical admission/result readback for unkeyed runs."""
+    custody = run.custody
+    if custody is None or custody.reservation_key is not None:
+        return projected_receipt
+    source_receipt = custody.status_receipt_from_source()
+    return source_receipt
 
 
 def _drop_run_transport(self, run_id: str) -> None:
+    custody = getattr(self, "_run_custody", {}).get(run_id)
+    if custody is not None:
+        custody.mark_transport_retired()
+    launch = getattr(self, "_run_launches", {}).get(run_id)
+    if launch is not None:
+        launch.transport_retirement_receipt = ("retired", run_id)
     _forget_run(
         self,
         run_id,
         self._run_streams,
         self._run_streams_created,
     )
+
+
+def _active_run_custody_count(self, *, excluded_run_ids=(), exclude_legacy=False) -> int:
+    """Count retained API custody that is not already represented by legacy work.
+
+    Legacy ``_run_agent`` turns keep their source launch indexed until the durable
+    result fence settles, while the adapter's handler count already represents that
+    live turn. Structured ``/v1/runs`` custody has no legacy source launch and stays
+    in this projection.
+    """
+    from gateway.platforms.api_server_run_custody import active_count
+    excluded = set(excluded_run_ids)
+    custody = getattr(self, "_run_custody", {})
+    return sum(
+        1 for run_id, item in custody.items()
+        if run_id not in excluded
+        and not getattr(item, "released", False)
+        and not (
+            exclude_legacy
+            and getattr(getattr(item, "source_launch", None), "queue", object()) is None
+        )
+    )
+
+
+def _run_custody_error(_openai_error, refusal) -> web.Response:
+    code = getattr(refusal, "code", "custody_refused")
+    return _json_error(
+        _openai_error, "API run ownership could not be proven; the run was retained for reconciliation.",
+        code=f"run_custody_{code}", status=503)
+
+
+def _release_unaccepted_custody(self, run_id: str) -> None:
+    custody = getattr(self, "_run_custody", {}).get(run_id)
+    if custody is None:
+        return
+    refusal = custody.release_unaccepted()
+    if refusal is None:
+        self._run_custody.pop(run_id, None)
+    else:
+        custody.mark_unknown("accepted_row_unknown")
+
+
+def _bind_run_parent(custody, admission) -> Any:
+    if custody is None:
+        return None
+    refusal = custody.bind_admission(admission)
+    if refusal is not None:
+        custody.mark_unknown(getattr(refusal, "code", "parent_owner_unmapped"))
+    return refusal
+
+
+def _terminal_replay_response(self, launch, openai_error):
+    """Return an existing terminal admission without retaining a new I03/I02 edge."""
+    from gateway.platforms.api_server_authority_runs import run_projection
+    projection = run_projection(self, launch.run_id)
+    if not isinstance(projection, dict) or projection.get("status") not in TERMINAL_STATUSES:
+        return _run_custody_error(
+            openai_error,
+            CustodyRefusal("terminal_replay_unknown", "I03_api_run_direct"),
+        )
+    _release_unaccepted_custody(self, launch.run_id)
+    getattr(self, "_run_launches", {}).pop(launch.run_id, None)
+    _forget_run(self, launch.run_id, self._run_streams, self._run_streams_created,
+                self._run_approval_sessions)
+    self._run_statuses[launch.run_id] = projection
+    return _accepted_response(
+        launch.run_id, projection["status"], launch.gateway_session_key, replayed=True)
+
+
+def _reconcile_idempotency_reservation_failure(
+    self, run_id: str, scope: str, key: str, fingerprint: str, retention_until: float,
+):
+    """Re-read one failed reservation before deciding whether its opaque custody may be released."""
+    custody = getattr(self, "_run_custody", {}).get(run_id)
+    try:
+        outcome, record = self._run_idempotency_store.lookup(
+            scope, key, fingerprint, retention_until=retention_until)
+    except (OSError, RuntimeError, ValueError, TypeError, sqlite3.Error):
+        if custody is not None:
+            custody.mark_unknown("idempotency_reservation_unreadable")
+        return CustodyRefusal("idempotency_reservation_unknown", "I03_api_run_direct")
+    # A missing row, or a row owned by a different run, proves that this local reservation did not
+    # commit.  Never delete a row owned by the other run.
+    if outcome == "missing" or (record is not None and record.get("run_id") != run_id):
+        if custody is None:
+            return None
+        refusal = custody.release_unaccepted()
+        if refusal is None:
+            self._run_custody.pop(run_id, None)
+            return None
+        custody.mark_unknown("accepted_row_unknown")
+        return CustodyRefusal("idempotency_reservation_unknown", "I03_api_run_direct")
+    if custody is not None:
+        custody.mark_unknown("idempotency_reservation_ambiguous")
+    return CustodyRefusal("idempotency_reservation_unknown", "I03_api_run_direct")
 
 
 async def _resolve_live_session_id(self, session_id: str) -> str:
@@ -698,16 +1063,26 @@ async def _admit_run_to_authority(
                 history_from_session=session_history_delivery,
                 session_history_delivery='1' if session_history_delivery else '',
                 bind_declared_conversation=_declared_selected, walked_from=launch.walked_from,
-                **launch.agent_kwargs)
+                custody=launch.custody, **launch.agent_kwargs)
+            refusal = _bind_run_parent(launch.custody, launch.admission)
+            if refusal is not None:
+                if getattr(refusal, "code", None) == "terminal_replay_readonly":
+                    return _terminal_replay_response(self, launch, _openai_error)
+                return _run_custody_error(_openai_error, refusal)
     except Exception as exc:  # health: allow BLE001 -- answered below; a committed admission is kept
         # A storage failure after the admission committed (a later media-release write) still
         # owns that run: forgetting it would let a keyed retry admit the same work twice.
         owned = None if isinstance(exc, RuntimeStoreError) else await asyncio.to_thread(run_admission, self, run_id)
         if owned is not None:
             launch.admission = (owned[0], SessionRef(owned[0].profile_id, owned[1]['target_session_id']), owned[1])
+            refusal = _bind_run_parent(launch.custody, launch.admission)
+            if refusal is not None:
+                if getattr(refusal, "code", None) == "terminal_replay_readonly":
+                    return _terminal_replay_response(self, launch, _openai_error)
+                return _run_custody_error(_openai_error, refusal)
             return None
-        # A refused admission owns no run: drop every reservation so an exact
-        # retry is refused again instead of replaying a run nobody executes.
+        # A refused admission owns no run: release only the still-unaccepted opaque custody.
+        _release_unaccepted_custody(self, run_id)
         _forget_run(
             self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
             self._run_statuses, self._run_owners, self._run_idempotency_ids)
@@ -719,139 +1094,8 @@ async def _admit_run_to_authority(
 
 async def _handle_runs(self, request: web.Request, *, _api_server) -> web.Response:
     """POST /v1/runs — start an agent run, return run_id immediately."""
-    _openai_error = _api_server._openai_error
-    # Long-term memory scope header (see chat_completions for details).
-    gateway_session_key, key_err = self._parse_session_key_header(request)
-    if key_err is not None:
-        return key_err
-    try:
-        body = await request.json()
-    except Exception:
-        return _json_error(_openai_error, "Invalid JSON", status=400)
-    body, room_error = await self._normalize_room_dispatch(request, body)
-    if room_error is not None:
-        return room_error
-    room_dispatch, room_execution_policy = (
-        v if isinstance(v, dict) else None for v in (
-            (body.get("hosted_room_dispatch"), body.get("_room_execution_policy"))
-            if isinstance(body, dict) else (None, None)))
-    idempotency_key = request.headers.get("Idempotency-Key", "").strip()
-    if len(idempotency_key) > 255 or any(ord(ch) < 33 or ord(ch) > 126 for ch in idempotency_key):
-        return _json_error(
-            _openai_error, "Idempotency-Key must be 1-255 visible ASCII characters",
-            code="invalid_idempotency_key", status=400)
-    idempotency_scope, idempotency_fingerprint = _run_idempotency_identity(
-        self, request, body, gateway_session_key, idempotency_key)
-    raw_input = body.get("input")
-    user_message, input_err = _run_user_message(raw_input, _openai_error)
-    if input_err is not None:
-        return input_err
-    try:
-        turn_author = _api_server._request_turn_author(body)
-    except ValueError as exc:
-        return _json_error(_openai_error, str(exc), code="invalid_author", status=400)
-    conversation_history, instructions, stored_session_id, history_err, walked_from = await _resolve_chained_history(
-        self, body, raw_input, _openai_error=_openai_error)
-    if history_err is not None:
-        return history_err
-    previous_response_id = body.get("previous_response_id")
-    session_id = body.get("session_id") or stored_session_id
-    route = self._resolve_route(body.get("model"))
-    agent_overrides = _api_server._request_agent_overrides(body, virtual_model=self._model_name)
-    selection_error = self._request_route_conflict_error(
-        session_id=session_id, gateway_session_key=gateway_session_key,
-        requested_model=agent_overrides.get("requested_model"),
-        requested_provider=agent_overrides.get("requested_provider"), route=route)
-    if selection_error:
-        return _json_error(_openai_error, selection_error, status=400)
-    # A lost-acceptance replay must resolve even while the original run holds the last
-    # concurrency slot; this read reserves nothing (the atomic reserve below closes the race).
-    if idempotency_key:
-        outcome, record = self._run_idempotency_store.lookup(
-            idempotency_scope, idempotency_key, idempotency_fingerprint,
-            retention_until=_room_retention_until(request))
-        if outcome == "conflict" or (outcome == "reused" and record is not None):
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-    # Enforce concurrency only for a genuinely new run.
-    limited = self._concurrency_limited_response()
-    if limited is not None:
-        return limited
-    run_id = f"run_{uuid.uuid4().hex}"
-    self._run_owners[run_id] = self._run_idempotency_scope(request)
-    # Same precedence as /v1/responses: body session_id > response chain > X-Hermes-Session-Key
-    # conversation > run_id (which would otherwise re-key every affinity surface per run).
-    # An explicit or chained session owns its routing key and is never rebound to the header.
-    _declared_selected = not session_id and bool(gateway_session_key)
-    selected_session_id = session_id or (
-        await asyncio.to_thread(self._declared_conversation_session, gateway_session_key)
-        if _declared_selected else None)
-    # A client-addressed id from before a compression rotation must adopt the live tip (#98619):
-    # history loads from it, the turn writes to it, and a detached delivery row persisted to it
-    # is what the next same-id run consumes below.
-    if selected_session_id:
-        selected_session_id = await _resolve_live_session_id(self, str(selected_session_id))
-    session_id = selected_session_id or run_id
-    # History loads for the session the request actually selected — including one resolved from
-    # a declared X-Hermes-Session-Key, whose persisted delivery rows must reach the next
-    # same-key run's context (#98619).  previous_response_id continuations keep their
-    # ResponseStore snapshot as history (they cannot consume a SessionDB delivery row and are
-    # accordingly denied wake capability in _run_agent_sync); the fresh run_id fallback has
-    # nothing persisted to load yet.  Wake authority is fixed here, before the load can
-    # overwrite ``conversation_history``: a caller-supplied history is authoritative for this
-    # turn, never consumes the SessionDB delivery row, and is denied on the same contract.
-    session_history_delivery = not previous_response_id and not conversation_history
-    if not conversation_history and selected_session_id and not previous_response_id:
-        conversation_history = await self._conversation_history_for_session(str(selected_session_id))
-    q = self._run_streams[run_id] = _RunStream()
-    created_at = self._run_streams_created[run_id] = time.time()
-    self._run_approval_sessions[run_id] = run_id  # approval session key (see _RunLaunch)
-    initial_status = self._set_run_status(
-        run_id, "queued", created_at=created_at, session_id=session_id, model=body.get("model", self._model_name))
-    if idempotency_key:
-        outcome, record = self._run_idempotency_store.reserve(
-            idempotency_scope, idempotency_key, idempotency_fingerprint, run_id, initial_status,
-            owner_pid=self._run_owner_pid, owner_started=self._run_owner_started,
-            retention_until=_room_retention_until(request))
-        if outcome != "created":
-            _forget_run(
-                self, run_id, self._run_streams, self._run_streams_created, self._run_approval_sessions,
-                self._run_statuses, self._run_owners)
-            return _replay_or_conflict(self, request, outcome, record, gateway_session_key, _openai_error)
-        self._run_idempotency_ids.add(run_id)
-    launch = _RunLaunch(
-        self, run_id, q, session_id, gateway_session_key, _declared_selected, user_message,
-        conversation_history, session_history_delivery,
-        agent_kwargs=dict(
-            ephemeral_system_prompt=instructions, session_id=session_id, gateway_session_key=gateway_session_key,
-            route=route, room_dispatch=room_dispatch, room_execution_policy=room_execution_policy,
-            **{k: agent_overrides.get(k) for k in ("requested_model", "requested_provider", "model_options")}),
-        request_profile=_api_server._api_request_profile.get(),
-        browser_control_principal=_api_server._api_request_browser_control_principal.get(),
-        browser_control_transport_family=_api_server._api_request_browser_control_transport_family.get(),
-        turn_author=turn_author, walked_from=walked_from if session_id == stored_session_id else None)
-    # A canonical Bot Chat that a Desktop holds live is that Desktop's to run: executing here would
-    # be a second writer beside its lease (#114959). The owner's mailbox takes the turn and its
-    # receipt drives this run's status, so `peer run` keeps its run_id and `peer status` still works.
-    # Under session authority the same call admits the turn to the Bot Chat's own FIFO, which is
-    # why it is decided BEFORE ``admit_api_turn`` would bind the chat as an API conversation.
-    admitted = await self._admit_to_live_bot_chat(session_id, user_message, turn_author) if selected_session_id else None
-    if admitted is None and getattr(self.gateway_runner, 'session_authority', None) is not None:
-        refused = await _admit_run_to_authority(
-            self, launch, run_id, session_history_delivery, _declared_selected,
-            idempotency_scope, idempotency_key, _openai_error)
-        if refused is not None:
-            return refused
-    self._activate_admitted_request()
-    if admitted is not None:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(
-            _execute_run_via_live_owner(self, launch, *admitted, _api_server=_api_server))
-    else:
-        task = self._active_run_tasks[run_id] = asyncio.create_task(_execute_run(self, launch, _api_server=_api_server))
-    with suppress(TypeError):
-        self._background_tasks.add(task)  # tracked for shutdown drain
-    if hasattr(task, "add_done_callback"):
-        task.add_done_callback(self._background_tasks.discard)
-    return _accepted_response(run_id, "started", gateway_session_key, replayed=False)
+    from gateway.platforms.api_server_run_dispatch import handle_runs
+    return await handle_runs(self, request, api_server=_api_server)
 
 
 def _run_usage(agent) -> dict[str, int]:
@@ -879,6 +1123,9 @@ def _served_runtime(agent) -> dict[str, str]:
 def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_server):
     """Executor-thread body of one run; returns ``(result, usage, served_runtime)``."""
     from gateway.session_context import clear_session_vars
+    from gateway.platforms.api_server_run_execution import (
+        arm_legacy_process_custody, close_legacy_process_custody, reset_legacy_process_custody,
+    )
     from gateway.hosted_room_execution_policy import (
         RoomExecutionPolicy, bind_room_execution_policy, reset_room_execution_policy)
     # No eager slash-worker pre-warm: slash.exec spawns one on demand (its error path already relies on that
@@ -890,9 +1137,13 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import reset_current_session_key, set_current_session_key
     session_id = run.session_id
-    effective_task_id = session_id or run.run_id
+    # The process registry proof is per API run, never per shared conversation session.  A
+    # concurrent turn in the same session must not satisfy this run's I15 evidence.
+    effective_task_id = run.session_id or run.run_id
+    owner_task_id = run.run_id
     # (token, reset) pairs unwound in the finally block; bound only once each step succeeds.
     resets: list[tuple[Any, Callable]] = []
+    binding_token = None
     with self._profile_scope(run.request_profile):
         try:
             # Contextvars, not process env: concurrent runs must not share identity.
@@ -919,10 +1170,28 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             if run.agent_kwargs["room_dispatch"] is not None:
                 policy = RoomExecutionPolicy.from_mapping(run.agent_kwargs["room_execution_policy"] or {})
                 resets.append((bind_room_execution_policy(policy), reset_room_execution_policy))
+            if run.custody is not None:
+                # The executor has its own ContextVar context.  Re-enter the authenticated
+                # binding here, even though the scope was reserved before agent construction on
+                # the event loop, so process-registry producers in this worker cannot fall back
+                # to an ambient profile or an unrelated API run.
+                binding_token = arm_legacy_process_custody(
+                    run.custody, effective_task_id, owner_task_id=owner_task_id)
             register_gateway_notify(run.approval_session_key, approval_notify)
             # /v1/runs owns its agent lifecycle (no TurnRunner): record process ownership
             # so stop/cancel reaps only the background processes this run created.
-            _api_server._publish_turn_process_ownership(agent, effective_task_id)
+            if run.custody is not None:
+                # The public agent task identity follows the conversation session, while
+                # custody retains the opaque per-run process witness for exact ownership.
+                run.custody.mark_process_started(effective_task_id, owner_task_id)
+            # The public conversation task id and the per-run process owner are distinct.  Keep
+            # the latter in the agent's existing hard-close owner set until the normal agent
+            # close/finalizer boundary so a run-owned child cannot outlive an API stop.
+            if isinstance(owner_task_id, str) and owner_task_id:
+                agent._process_owner_task_ids = {
+                    *getattr(agent, "_process_owner_task_ids", ()), owner_task_id,
+                }
+            _api_server._publish_turn_process_ownership(agent, owner_task_id)
             # Passed only when set: a human turn keeps today's call shape.
             author_kwargs = {"turn_author": run.turn_author} if run.turn_author is not None else {}
             r = agent.run_conversation(
@@ -931,6 +1200,12 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
         finally:
             # Clear ownership now so a later stop can't reap work this run left running.
             _api_server._clear_turn_process_ownership(agent)
+            if run.custody is not None:
+                # Close the exact process scope before the worker barrier can be terminal.  A
+                # childful scope is then checked through the existing process-registry owner
+                # proof; a failed close/observation remains typed unknown and cannot release.
+                close_legacy_process_custody(run.custody)
+                run.custody.mark_worker_done()
             self._memory_sessions.checkin(agent)
             # Declared-conversation binding, same precedence gate as _run_agent.
             if run.declared_selected:
@@ -939,6 +1214,7 @@ def _run_agent_sync(self, run: _RunLaunch, agent, approval_notify, *, _api_serve
             try:
                 unregister_gateway_notify(run.approval_session_key)
             finally:
+                reset_legacy_process_custody(binding_token)
                 for token, reset in resets:
                     with suppress(Exception):
                         reset(token)
@@ -950,6 +1226,10 @@ def _make_approval_notify(self, run: _RunLaunch, *, _api_server) -> Callable[[di
     run_id, q, loop = run.run_id, run.queue, asyncio.get_running_loop()
 
     def _approval_notify(approval_data: dict[str, Any]) -> None:
+        custody = getattr(self, "_run_custody", {}).get(run_id)
+        if custody is not None and (getattr(custody, "transport_retired", False)
+                                    or getattr(custody, "released", False)):
+            return
         # Clients must never receive the raw flagged command (#48456): the shared builder redacts.
         event = _api_server._approval_request_event(run_id, approval_data)
         self._set_run_status(run_id, "waiting_for_approval", last_event="approval.request", approval=event)
@@ -971,49 +1251,234 @@ async def _execute_run_via_live_owner(self, run: _RunLaunch, home, record: dict[
     from gateway.platforms.api_server_bot_chat import await_live_delivery
 
     run_id = run.run_id
+    run.execution_task = asyncio.current_task()
+    run.delivery_record = record
     delivery_id = record["delivery_id"]
+    worker_finished = False
+    worker_refusal = None
+    if run.custody is not None:
+        worker_refusal = run.custody.mark_worker_submitted()
 
     def _finish(status: str, **fields: Any) -> None:
         if run_id in self._shutdown_interrupted_run_ids:
             # Shutdown already published "interrupted"; the cancel that follows must not
             # rewrite it as a plain "cancelled" (same guard as the native _execute_run).
             status, fields = "interrupted", {"error": "Gateway shutdown interrupted the run."}
-        self._set_run_status(run_id, status, **fields, last_event=f"run.{status}")
+        _, status_receipt = self._set_run_status(
+            run_id, status, _return_receipt=True, **fields, last_event=f"run.{status}")
+        event_status = status
+        event_fields = fields
+        if run.custody is not None:
+            status_receipt = _source_status_receipt(run, status_receipt)
+            run.status_receipt = status_receipt
+            run.owner._run_launches[run_id].status_receipt = status_receipt
+            if run.custody is not None and status_receipt is None:
+                run.custody.mark_unknown("status_commit_unproven")
+            if status_receipt is not None:
+                event_status, event_fields = canonical_terminal_decision(
+                    status, event_fields, status_receipt)
+                if event_status == "unknown":
+                    run.custody.mark_unknown("canonical_terminal_outcome_inconsistent")
+                elif event_status != status:
+                    _, status_receipt = self._set_run_status(
+                        run_id, event_status, _return_receipt=True,
+                        **event_fields, last_event=f"run.{event_status}")
+                    status_receipt = _source_status_receipt(run, status_receipt)
+                    run.status_receipt = status_receipt
+                    run.owner._run_launches[run_id].status_receipt = status_receipt
+            status_refusal = run.custody.mark_status_receipt(
+                status_receipt, require_store=run_id in self._run_idempotency_ids)
+            if status_refusal is None and run.custody.unknown_reason:
+                status_refusal = CustodyRefusal("custody_unknown", "I03_api_run_direct")
+            if status_refusal is not None:
+                from gateway.platforms.api_server_run_recovery import publish_unknown_status
+                event_status = "unknown"
+                event_fields = publish_unknown_status(
+                    self, run_id, run.custody, status_refusal)
         with suppress(Exception):
-            run.put_event(_run_event(run_id, f"run.{status}", **fields))
+            _enqueue_terminal_event(run, _run_event(run_id, f"run.{event_status}", **event_fields))
 
     try:
+        if worker_refusal is not None:
+            _finish("failed", error="Bot Chat admission worker ownership became unknown.")
+            return
         self._set_run_status(run_id, "running", delivery_id=delivery_id)
         record = await await_live_delivery(
             self, home, record, None, should_stop=lambda: run_id in self._stopping_run_ids)
+        run.delivery_record = record
+        if run.custody is not None:
+            refusal = run.custody.bind_peer_final_record(record)
+            if refusal is not None:
+                run.custody.mark_unknown(getattr(refusal, "code", "peer_final_record_unknown"))
         if record["status"] in ("queued", "claimed"):
+            if run.custody is not None:
+                run.custody.mark_unknown("peer_delivery_pending")
             _finish("cancelled", completed=False, partial=False, interrupted=True)
             return
         if record["status"] == "settled":
+            worker_finished = True
             _finish("completed", completed=True, partial=False, interrupted=False,
                     output=record.get("reply") or "", usage={})
         elif record["status"] == "cancelled":
+            worker_finished = True
             _finish("cancelled", completed=False, partial=False, interrupted=True)
         else:
+            worker_finished = record["status"] == "failed"
+            if not worker_finished and run.custody is not None:
+                run.custody.mark_unknown("peer_delivery_unknown")
             _finish("failed", completed=False, partial=False, interrupted=False,
                     error=record.get("error") or f"Bot Chat delivery {record['status']}",
                     **({"reason": record["reason"]} if record.get("reason") else {}))
     except asyncio.CancelledError:
-        _finish("cancelled", completed=False, partial=False, interrupted=True)
+        cancellation_status, cancellation_fields = "cancelled", {
+            "completed": False, "partial": False, "interrupted": True,
+        }
+        final_record = run.delivery_record
+        if run.custody is not None and isinstance(final_record, dict) and (
+                final_record.get("status") in {"settled", "failed", "cancelled"}):
+            refusal = run.custody.bind_peer_final_record(final_record)
+            if refusal is None:
+                worker_finished = True
+                cancellation_status = {
+                    "settled": "completed", "failed": "failed", "cancelled": "cancelled",
+                }[final_record["status"]]
+                cancellation_fields = {
+                    "completed": cancellation_status == "completed",
+                    "partial": cancellation_status == "failed",
+                    "interrupted": cancellation_status == "cancelled",
+                }
+                if cancellation_status == "completed":
+                    cancellation_fields["output"] = final_record.get("reply") or ""
+            else:
+                run.custody.mark_unknown(getattr(refusal, "code", "peer_delivery_interrupted"))
+        elif run.custody is not None:
+            run.custody.mark_unknown("peer_delivery_interrupted")
+        _finish(cancellation_status, **cancellation_fields)
         raise
     except Exception as exc:
+        if run.custody is not None:
+            run.custody.mark_unknown("peer_delivery_unknown")
         logger.exception("[api_server] run %s (live Bot Chat) failed", run_id)
         _finish("failed", completed=False, partial=False, interrupted=False, error=str(exc))
     finally:
         with suppress(Exception):
-            run.put_event(None)  # sentinel: close the SSE stream
+            _enqueue_terminal_sentinel(run)  # sentinel: close the SSE stream
+        if run.custody is not None:
+            if worker_finished and run.custody.worker_submitted:
+                run.custody.mark_worker_done()
+            elif not run.custody.worker_submitted and not run.custody.worker_done:
+                run.custody.request_no_worker()
         _retire_live_run(self, run_id)
+
+
+async def _execute_run_worker(
+    self, run: _RunLaunch, *, loop, _api_server, text_callback: Callable[[Optional[str]], None],
+    interim_callback: Callable[..., None], finish: Callable[..., None],
+) -> Optional[tuple[Any, Any, dict[str, Any]]]:
+    """Run the admitted worker phase while retaining its exact task/future on the launch."""
+    run_id = run.run_id
+    if run.admission is not None:
+        if run.custody is not None:
+            refusal = run.custody.mark_worker_submitted()
+            if refusal is not None:
+                finish("failed", error="API admission worker ownership became unknown.")
+                return None
+        from gateway.session_api_turn import observe_api_controls, observe_api_turn
+        tool_cb = self._make_run_event_callback(run_id, loop)
+
+        def _control_cb(event_type, prompt):
+            # Same authority prompt the WS viewer and GET pending_controls expose, on the
+            # run's own stream so a streaming-only client learns it must respond.
+            with suppress(Exception):
+                loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **prompt))
+
+        def _tool_start(call_id, name, args):
+            from agent.display import build_tool_preview
+            tool_cb("tool.started", name, build_tool_preview(name, args or {}) or "", args, tool_call_id=call_id)
+
+        def _tool_complete(call_id, name, args, result):
+            from agent.display import _detect_tool_failure
+            is_error, _ = _detect_tool_failure(name, result)
+            tool_cb("tool.completed", name, None, args, tool_call_id=call_id, is_error=bool(is_error))
+
+        with observe_api_controls(run.admission, _control_cb):
+            run.worker_future = asyncio.create_task(observe_api_turn(
+                run.admission, stream_delta_callback=text_callback,
+                tool_start_callback=_tool_start, tool_complete_callback=_tool_complete))
+            if run.custody is not None:
+                run.custody.worker_task = run.worker_future
+            result, usage = await asyncio.shield(run.worker_future)
+        if run.custody is not None:
+            refusal = None
+            if not _preclaim_cancel_readback(run.custody):
+                refusal = run.custody.refresh_admission_generation()
+            if refusal is not None:
+                run.custody.mark_unknown(getattr(refusal, "code", "admission_generation_missing"))
+                finish("failed", error="API admission generation could not be read back.")
+                return None
+        # The canonical turn has no agent object here; the served pair rides on the
+        # committed usage/result runtime metadata when the turn recorded one.
+        served_runtime = ((usage or {}).get("runtime") if isinstance(usage, dict) else None) or (
+            result.get("runtime") if isinstance(result, dict) else None) or {}
+        return result, usage, served_runtime
+
+    binding_token = None
+    reset_binding = None
+    try:
+        if run.custody is not None:
+            from gateway.platforms.api_server_run_execution import (
+                arm_legacy_process_custody, reset_legacy_process_custody,
+            )
+            # Reserve the scope before _create_agent can initialize a provider or any tool
+            # effect.  The executor worker re-enters the same binding independently below.
+            binding_token = arm_legacy_process_custody(
+                run.custody, run.session_id or run.run_id, owner_task_id=run.run_id)
+            reset_binding = reset_legacy_process_custody
+        with self._profile_scope(run.request_profile):
+            agent = self._create_agent(
+                stream_delta_callback=text_callback,
+                tool_progress_callback=self._make_run_event_callback(run_id, loop),
+                interim_assistant_callback=interim_callback, **run.agent_kwargs)
+    except BaseException:
+        if run.custody is not None:
+            from gateway.platforms.api_server_run_execution import close_legacy_process_custody
+            close_legacy_process_custody(run.custody)
+        raise
+    finally:
+        if reset_binding is not None:
+            reset_binding(binding_token)
+    self._active_run_agents[run_id] = agent
+    approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
+    try:
+        worker_future = _submit_api_worker(
+            loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        run.worker_future = worker_future
+        if run.custody is not None:
+            run.custody.worker_future = worker_future
+            run.custody.execution_task = worker_future
+    except BaseException:
+        # The submission helper decrements its worker counter when the executor is
+        # already quiescing, so this run has a proven no-worker outcome.  Leave the
+        # custody barrier open until the finalizer records that fact.
+        if run.custody is not None:
+            from gateway.platforms.api_server_run_execution import close_legacy_process_custody
+            close_legacy_process_custody(run.custody)
+            run.custody.request_no_worker()
+        raise
+    if run.custody is not None:
+        refusal = run.custody.mark_worker_submitted()
+        if refusal is not None:
+            finish("failed", error="API executor submission became unknown.")
+            return None
+    result, usage, served_runtime = await asyncio.shield(worker_future)
+    return result, usage, served_runtime
 
 
 async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
     """Drive one admitted run, publish its terminal event/status, release live state."""
     _redact_api_error_text = _api_server._redact_api_error_text
     run_id, loop = run.run_id, asyncio.get_running_loop()
+    run.execution_task = asyncio.current_task()
     _run_started_at = time.perf_counter()
 
     def _text_cb(delta: Optional[str]) -> None:
@@ -1034,16 +1499,7 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
 
     def _finish(status: str, extra: Optional[dict] = None, **fields: Any) -> None:
         """Terminal status, then best-effort ``run.<status>`` event; key order is wire shape."""
-        extra = extra or {}
-        if run_id in self._shutdown_interrupted_run_ids:
-            status = "interrupted"
-            fields = {"error": "Gateway shutdown interrupted the run."}
-            extra = {}
-        self._set_run_status(run_id, status, **fields, last_event=f"run.{status}", **extra)
-        with suppress(Exception):
-            # A worker can finish before its Future is wrapped, so awaiting it
-            # need not yield to already-scheduled commentary/tool callbacks.
-            loop.call_soon(run.put_event, _run_event(run_id, f"run.{status}", **fields, **extra))
+        finalize_api_run(self, run, _api_server, loop, status, extra, **fields)
 
     try:
         # Shutdown landed between admission and the task's first tick: nothing to
@@ -1055,42 +1511,12 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         if run_id in self._stopping_run_ids:
             _finish("cancelled")
             return
-        if run.admission is not None:
-            from gateway.session_api_turn import observe_api_controls, observe_api_turn
-            tool_cb = self._make_run_event_callback(run_id, loop)
-
-            def _control_cb(event_type, prompt):
-                # Same authority prompt the WS viewer and GET pending_controls expose, on the
-                # run's own stream so a streaming-only client learns it must respond.
-                with suppress(Exception):
-                    loop.call_soon_threadsafe(run.put_event, _run_event(run_id, event_type, **prompt))
-
-            def _tool_start(call_id, name, args):
-                from agent.display import build_tool_preview
-                tool_cb("tool.started", name, build_tool_preview(name, args or {}) or "", args, tool_call_id=call_id)
-
-            def _tool_complete(call_id, name, args, result):
-                from agent.display import _detect_tool_failure
-                is_error, _ = _detect_tool_failure(name, result)
-                tool_cb("tool.completed", name, None, args, tool_call_id=call_id, is_error=bool(is_error))
-
-            with observe_api_controls(run.admission, _control_cb):
-                result, usage = await observe_api_turn(
-                    run.admission, stream_delta_callback=_text_cb,
-                    tool_start_callback=_tool_start, tool_complete_callback=_tool_complete)
-            # The canonical turn has no agent object here; the served pair rides on the
-            # committed usage/result runtime metadata when the turn recorded one.
-            served_runtime = ((usage or {}).get("runtime") if isinstance(usage, dict) else None) or (
-                result.get("runtime") if isinstance(result, dict) else None) or {}
-        else:
-            with self._profile_scope(run.request_profile):
-                agent = self._create_agent(
-                    stream_delta_callback=_text_cb, tool_progress_callback=self._make_run_event_callback(run_id, loop),
-                    interim_assistant_callback=_interim_cb, **run.agent_kwargs)
-            self._active_run_agents[run_id] = agent
-            approval_notify = _make_approval_notify(self, run, _api_server=_api_server)
-            result, usage, served_runtime = await _submit_api_worker(
-                loop, lambda: _run_agent_sync(self, run, agent, approval_notify, _api_server=_api_server))
+        worker_result = await _execute_run_worker(
+            self, run, loop=loop, _api_server=_api_server,
+            text_callback=_text_cb, interim_callback=_interim_cb, finish=_finish)
+        if worker_result is None:
+            return
+        result, usage, served_runtime = worker_result
         # Publish request metrics (daily counters + latency) with each completed run (#52323).
         self._record_api_metrics(usage, time.perf_counter() - _run_started_at)
         if not isinstance(result, dict):
@@ -1113,7 +1539,20 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
                               else "raw_request" if any(requested.values()) else "global"))
             _finish(status, fields, output=result.get("final_response", ""), usage=usage, runtime=served_runtime)
     except asyncio.CancelledError:
-        _finish("cancelled")
+        await _await_original_work(run)
+        cancellation_status, cancellation_fields = "cancelled", {}
+        worker = run.worker_future
+        if worker is not None and callable(getattr(worker, "done", None)) and worker.done():
+            with suppress(asyncio.CancelledError, Exception):
+                completed_result = worker.result()
+                if isinstance(completed_result, tuple) and completed_result:
+                    result = completed_result[0] if isinstance(completed_result[0], dict) else {}
+                    cancellation_status, cancellation_fields = terminal_run_status(result)
+                    if cancellation_status == "completed":
+                        cancellation_fields["output"] = result.get("final_response", "")
+                    if len(completed_result) > 1 and isinstance(completed_result[1], dict):
+                        cancellation_fields["usage"] = completed_result[1]
+        _finish(cancellation_status, cancellation_fields)
         raise
     except _api_server._ProviderAuthResolutionError as exc:
         # Same controlled provider-auth message the _run_agent() endpoints give.
@@ -1134,7 +1573,18 @@ async def _execute_run(self, run: _RunLaunch, *, _api_server) -> None:
         # Event; unregistering releases it. Idempotent on normal completion.
         _unregister_approval_notify(run.approval_session_key)
         with suppress(Exception):
-            loop.call_soon(run.put_event, None)  # close after the queued events
+            loop.call_soon(_enqueue_terminal_sentinel, run)  # close after the queued events
+        if run.custody is not None:
+            worker_done = (
+                run.worker_future is None
+                or (callable(getattr(run.worker_future, "done", None))
+                    and run.worker_future.done()))
+            if run.admission is not None and run.custody.worker_submitted and worker_done:
+                run.custody.mark_worker_done()
+            elif run.admission is not None and run.custody.worker_submitted:
+                run.custody.mark_unknown("worker_unsettled")
+            elif not run.custody.worker_submitted and not run.custody.worker_done:
+                run.custody.request_no_worker()
         _retire_live_run(self, run_id)
 
 
@@ -1151,6 +1601,9 @@ def _release_run_owner_if_forgotten(self, run_id: str) -> None:
     outlive every surface it protects (retired on different clocks); ownerless = fail-closed."""
     live = (self._run_statuses, self._active_run_agents, self._active_run_tasks, self._run_streams,
             self._run_approval_sessions)
+    custody = getattr(self, "_run_custody", {}).get(run_id)
+    if custody is not None and not getattr(custody, "released", False):
+        return
     if not any(run_id in table for table in live):
         self._run_owners.pop(run_id, None)
 
@@ -1478,6 +1931,10 @@ async def _handle_resolve_unknown_run(
     self, request: web.Request, *, _api_server
 ) -> web.Response:
     """POST /v1/runs/{run_id}/resolve-unknown — acknowledge one lost owner epoch."""
+    from gateway.platforms.api_server_run_recovery import resolve_local_unknown
+    local = await resolve_local_unknown(self, request, api_server=_api_server)
+    if local is not None:
+        return local
     run_id, _, _, _, err = _load_owned_run(
         self, request, _api_server=_api_server, permission="stop", active_fallback=False)
     if err is not None:
@@ -1518,6 +1975,22 @@ def _sweep_orphaned_runs_once(self, now: Optional[float] = None) -> None:
             _unregister_approval_notify(self._run_approval_sessions.get(run_id))
             _retire_live_run(self, run_id)
     for run_id, status in list(self._run_statuses.items()):
-        if (status.get("status") in {"completed", "failed", "cancelled"}
-                and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL):
+        custody = getattr(self, "_run_custody", {}).get(run_id)
+        if (status.get("status") in {"completed", "failed", "cancelled", "interrupted"}
+                and now - float(status.get("updated_at", 0) or 0) > self._RUN_STATUS_TTL
+                and (custody is None
+                     or (getattr(custody, "released", False)
+                         and not getattr(custody, "unknown_reason", None)))):
+            # The source launch and custody are retained for recovery only through the public
+            # status TTL.  Retire the exact source-owned pair before dropping the projection;
+            # a failed retirement keeps the ownership maps available for reconciliation.
+            if custody is None:
+                launch = getattr(self, "_run_launches", {}).get(run_id)
+                if launch is not None:
+                    continue
+                _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)
+                continue
+            from gateway.platforms.api_server_run_custody import retire_legacy_source
+            if not retire_legacy_source(custody):
+                continue
             _forget_run(self, run_id, self._run_statuses, self._run_idempotency_ids)

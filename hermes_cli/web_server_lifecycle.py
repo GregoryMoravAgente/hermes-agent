@@ -521,7 +521,8 @@ def _dashboard_forwarded_allow_ips(dashboard_config: dict[str, Any]) -> list[str
 
 def build_listener_server(served_app, host: str, port: int, *, auth_required: bool,
                           ws_ping: Optional[tuple[float, float]] = None,
-                          timeout_graceful_shutdown: Optional[float] = 3, lifespan: str = "auto"):
+                          timeout_graceful_shutdown: Optional[float] = 3, lifespan: str = "auto",
+                          inherit_logging: bool = False):
     """uvicorn ``Config`` + ``Server`` for a dashboard or gateway-session listener (FastAPI-free, so
     the gateway can build its session listener without importing the dashboard app).
 
@@ -532,6 +533,10 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
     loopback; non-loopback sits behind a Cloudflare Tunnel (~100s idle) and keeps a config-driven
     cadence (dashboard.ws_ping_interval/_timeout, #79635) defaulting to 20/20. *ws_ping* overrides
     both (SSH-isolated Desktop backends).
+
+    ``inherit_logging`` is for an embedded listener in a process that already owns Hermes'
+    ``QueueListener``. It disables only uvicorn's global ``dictConfig`` call; the default keeps
+    standalone uvicorn logging configuration unchanged.
     """
     import uvicorn
     from hermes_cli.config import load_config
@@ -551,23 +556,26 @@ def build_listener_server(served_app, host: str, port: int, *, auth_required: bo
     if ws_ping is None:
         ws_ping = (None, None) if host in _LOOPBACK_HOST_VALUES else (
             _ws_ping_setting("ws_ping_interval"), _ws_ping_setting("ws_ping_timeout"))
-    config = uvicorn.Config(
-        served_app, host=host, port=port, log_level="warning",
+    config_options: dict[str, Any] = {
+        "host": host, "port": port, "log_level": "warning",
         # Off by default so _ws_client_is_allowed sees the real peer, not
         # X-Forwarded-For. Gated mode runs behind a TLS terminator and needs
         # X-Forwarded-Proto for cookie Secure flags.
-        proxy_headers=auth_required,
+        "proxy_headers": auth_required,
         # Loopback-only unless the operator trusts a bounded upstream proxy, so
         # spoofed X-Forwarded-* from arbitrary callers is never honoured.
-        forwarded_allow_ips=_dashboard_forwarded_allow_ips(dash_cfg),
-        ws_ping_interval=ws_ping[0],
-        ws_ping_timeout=ws_ping[1],
-        ws_max_size=_DESKTOP_ATTACHMENT_WS_MAX_BYTES,
+        "forwarded_allow_ips": _dashboard_forwarded_allow_ips(dash_cfg),
+        "ws_ping_interval": ws_ping[0],
+        "ws_ping_timeout": ws_ping[1],
+        "ws_max_size": _DESKTOP_ATTACHMENT_WS_MAX_BYTES,
         # Desktop sends a single SIGTERM and escalates to SIGKILL ~5s later;
         # uvicorn's default (None) waits on lingering ASGI tasks forever, so a
         # mid-turn request orphans the backend past that budget (#76244). 3s
         # leaves room for lifespan shutdown + cron_stop before the kill.
-        timeout_graceful_shutdown=timeout_graceful_shutdown,
-        lifespan=lifespan,
-    )
+        "timeout_graceful_shutdown": timeout_graceful_shutdown,
+        "lifespan": lifespan,
+    }
+    if inherit_logging:
+        config_options["log_config"] = None
+    config = uvicorn.Config(served_app, **config_options)
     return config, uvicorn.Server(config)

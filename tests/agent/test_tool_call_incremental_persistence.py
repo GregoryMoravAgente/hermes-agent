@@ -34,6 +34,13 @@ import pytest
 from agent.tool_dispatch_helpers import make_tool_result_message
 from agent.agent_runtime_helpers import sanitize_api_messages
 from agent.tool_executor import execute_tool_calls_segmented
+from agent.tool_result_custody import (
+    _flush_managed_tool_result,
+    _payload_digest,
+    read_managed_tool_row,
+    _payload_equal,
+    commit_managed_tool_result_if_needed,
+)
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -123,6 +130,185 @@ def _mock_response(content="Hello", finish_reason="stop", tool_calls=None):
     msg = SimpleNamespace(content=content, tool_calls=tool_calls)
     choice = SimpleNamespace(message=msg, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], model="test/model", usage=None)
+
+
+def test_managed_flush_requires_literal_true_and_real_store(tmp_path):
+    agent = _make_agent()
+    agent._persist_disabled = True
+    message = make_tool_result_message("terminal", "done", "call-managed")
+    assert _flush_managed_tool_result(
+        agent, [message], message, tool_call_id="call-managed", stage="missing-store",
+    ) is None
+
+    db_path = tmp_path / "managed-session.db"
+    agent = _make_agent()
+    db = _attach_real_session_db(agent, db_path, "managed-session")
+    message = make_tool_result_message("terminal", "done", "call-managed")
+    proof = _flush_managed_tool_result(
+        agent, [message], message, tool_call_id="call-managed", stage="real-store",
+    )
+    assert proof is not None
+    assert proof.raw_flush_result is True
+    assert proof.database is db
+    assert proof.session_id == "managed-session"
+    assert proof.message is message
+    assert db.get_message_role("managed-session", proof.row_id) == "tool"
+    persisted_rows = db.get_messages_as_conversation("managed-session", include_row_ids=True)
+    persisted = next(row for row in persisted_rows if row.get("_row_id") == proof.row_id)
+    assert _payload_equal(proof.readback, persisted)
+    assert len(proof.readback_digest) == 64
+    assert len(proof.message_digest) == 64
+    assert persisted["content"] == message["content"]
+    assert persisted["tool_call_id"] == "call-managed"
+
+
+def test_managed_row_snapshot_freezes_nested_payloads():
+    message = {
+        "role": "tool",
+        "content": "nested",
+        "tool_call_id": "call-nested",
+        "display_metadata": {"items": [{"label": "original"}]},
+    }
+    row = {"_row_id": 7, **copy.deepcopy(message)}
+
+    class _Rows:
+        def get_messages_as_conversation(self, _session_id, *, include_row_ids):
+            assert include_row_ids is True
+            return [row]
+
+    readback = read_managed_tool_row(_Rows(), "session-nested", 7, "call-nested", message)
+    assert readback is not None
+    digest = _payload_digest(readback)
+    with pytest.raises(TypeError):
+        readback["display_metadata"]["items"] = ()
+    assert read_managed_tool_row(
+        _Rows(), "session-nested", 7, "call-nested", message,
+        expected_readback=readback, expected_digest=digest,
+    ) is not None
+
+
+def test_managed_lookup_failure_refuses_without_legacy_flush(tmp_path):
+    """An installed managed boundary cannot silently fall back to the legacy flush."""
+    agent = _make_agent()
+    db = _attach_real_session_db(agent, tmp_path / "lookup-failure.db", "lookup-failure")
+    message = make_tool_result_message("terminal", "done", "call-lookup-failure")
+    messages = [message]
+    calls = []
+    agent.tool_result_custody_required = lambda **_kwargs: (_ for _ in ()).throw(
+        RuntimeError("coordinator lookup unavailable")
+    )
+    agent.tool_result_committed_callback = lambda **kwargs: calls.append(kwargs)
+    original_flush = agent._flush_messages_to_session_db
+    agent._flush_messages_to_session_db = MagicMock(side_effect=original_flush)
+
+    assert commit_managed_tool_result_if_needed(
+        agent,
+        messages,
+        message,
+        tool_call_id="call-lookup-failure",
+        function_result="done",
+        persisted_result="done",
+        stage="lookup failure",
+    ) is False
+    assert calls and calls[0]["lookup_failed"] is True
+    assert agent._flush_messages_to_session_db.call_count == 0
+    assert db.get_messages_as_conversation("lookup-failure") == []
+
+
+def test_partial_managed_boundary_refuses_without_legacy_flush(tmp_path):
+    """One missing managed callback is an indeterminate owner, never known-unmanaged."""
+    agent = _make_agent()
+    _attach_real_session_db(agent, tmp_path / "partial-boundary.db", "partial-boundary")
+    message = make_tool_result_message("terminal", "done", "call-partial-boundary")
+    agent.tool_result_custody_required = lambda **_kwargs: True
+    agent._flush_messages_to_session_db = MagicMock(return_value=True)
+
+    assert commit_managed_tool_result_if_needed(
+        agent,
+        [message],
+        message,
+        tool_call_id="call-partial-boundary",
+        function_result="done",
+        persisted_result="done",
+        stage="partial boundary",
+    ) is False
+    assert agent._flush_messages_to_session_db.call_count == 0
+
+
+def test_managed_callback_failure_does_not_ack_real_db_proof(tmp_path):
+    """A real row proof is retained when its managed callback refuses settlement."""
+    agent = _make_agent()
+    db = _attach_real_session_db(agent, tmp_path / "callback-failure.db", "callback-failure")
+    message = make_tool_result_message("terminal", "done", "call-callback-failure")
+    messages = [message]
+    callbacks = []
+
+    agent.tool_result_custody_required = lambda **_kwargs: True
+
+    def _callback(**kwargs):
+        callbacks.append(kwargs)
+        return len(callbacks) > 1
+
+    agent.tool_result_committed_callback = _callback
+    original_flush = agent._flush_messages_to_session_db
+    agent._flush_messages_to_session_db = MagicMock(side_effect=original_flush)
+    assert commit_managed_tool_result_if_needed(
+        agent,
+        messages,
+        message,
+        tool_call_id="call-callback-failure",
+        function_result="done",
+        persisted_result="done",
+        stage="callback failure",
+    ) is False
+    assert len(callbacks) == 1
+    proof = callbacks[0]["proof"]
+    assert proof is not None
+    assert proof.raw_flush_result is True
+    assert proof.message is message
+    assert db.get_message_role("callback-failure", proof.row_id) == "tool"
+    persisted_rows = db.get_messages_as_conversation("callback-failure", include_row_ids=True)
+    persisted = next(row for row in persisted_rows if row.get("_row_id") == proof.row_id)
+    assert _payload_equal(proof.readback, persisted)
+    assert persisted["content"] == message["content"]
+    assert persisted["tool_call_id"] == "call-callback-failure"
+    assert callbacks[0]["lookup_failed"] is False
+
+    # Recovery consumes the exact proof the first callback received; it does not rerun the
+    # command or manufacture a second database row.  The registry callback owns the retry.
+    assert agent.tool_result_committed_callback(**callbacks[0]) is True
+    assert callbacks[1]["proof"] is proof
+    assert agent._flush_messages_to_session_db.call_count == 1
+    assert proof.database.get_message_role(proof.session_id, proof.row_id) == "tool"
+
+
+def test_managed_callback_exception_keeps_real_proof_retryable(tmp_path):
+    """A typed callback exception is a refusal after the row is durable, not success."""
+    agent = _make_agent()
+    db = _attach_real_session_db(agent, tmp_path / "callback-exception.db", "callback-exception")
+    message = make_tool_result_message("terminal", "done", "call-callback-exception")
+    received = []
+
+    agent.tool_result_custody_required = lambda **_kwargs: True
+
+    def _callback(**kwargs):
+        received.append(kwargs)
+        raise OSError("native settlement unavailable")
+
+    agent.tool_result_committed_callback = _callback
+    assert commit_managed_tool_result_if_needed(
+        agent,
+        [message],
+        message,
+        tool_call_id="call-callback-exception",
+        function_result="done",
+        persisted_result="done",
+        stage="callback exception",
+    ) is False
+    assert received and received[0]["proof"] is not None
+    proof = received[0]["proof"]
+    assert proof.database.get_message_role(proof.session_id, proof.row_id) == "tool"
+    assert db.get_messages_as_conversation("callback-exception")[-1]["role"] == "tool"
 
 
 # ---------------------------------------------------------------------------

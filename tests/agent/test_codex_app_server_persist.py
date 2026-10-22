@@ -48,6 +48,7 @@ def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
+    agent._codex_session._require_custody = False
     agent._codex_session.run_turn.return_value = _make_turn()
     agent._codex_session_prompt = None  # seeded session: no recorded composition to compare
     agent.tool_progress_callback = None

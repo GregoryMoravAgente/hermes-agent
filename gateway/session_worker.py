@@ -16,6 +16,32 @@ from hermes_state_runtime import (
 _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
 
 
+def _canonical_worker_birth(pid, supplied):
+    """Normalize legacy/raw worker input to the canonical integer fingerprint."""
+    from gateway.status import get_process_start_time
+    try:
+        canonical = get_process_start_time(pid)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        canonical = None
+    if type(canonical) is not int or canonical < 0:
+        raise RuntimeStoreError('worker_not_live')
+    if type(supplied) is int:
+        if supplied != canonical:
+            raise RuntimeStoreError('permission_denied')
+        return canonical
+    if type(supplied) is float:
+        # Existing launchers/tests can still present psutil's raw epoch value at
+        # the boundary; it is never persisted or used as the internal fence.
+        import psutil
+        try:
+            if psutil.Process(pid).create_time() == supplied:
+                return canonical
+        except psutil.Error as exc:
+            raise RuntimeStoreError('worker_not_live') from exc
+        raise RuntimeStoreError('permission_denied')
+    raise RuntimeStoreError('invalid_params')
+
+
 def _claim(connection, ref, params):
     import psutil
     authority = connection.authority
@@ -30,18 +56,21 @@ def _claim(connection, ref, params):
         raise RuntimeStoreError('invalid_params')
     try:
         process = psutil.Process(pid)
-        if (process.create_time() != birth or not process.is_running()
-                or process.status() == psutil.STATUS_ZOMBIE
+        canonical_birth = _canonical_worker_birth(pid, birth)
+        if (not process.is_running() or process.status() == psutil.STATUS_ZOMBIE
                 or process.username() != psutil.Process().username()):
             raise RuntimeStoreError('permission_denied')
     except psutil.Error as exc:
         raise RuntimeStoreError('worker_not_live') from exc
     # Reuse the durable adoption digest as the producer claim. Changing any
     # assignment, principal, profile, PID birth or secret cannot adopt it.
+    # The digest sees the canonical integer, so raw and canonical handshakes
+    # identify the same worker without persisting a float birth.
     from hermes_state_worker_compression import worker_claim_origin
-    origin = worker_claim_origin(authority.db, params)
+    canonical_params = dict(params, birth=canonical_birth)
+    origin = worker_claim_origin(authority.db, canonical_params)
     return admission_fingerprint(canonical_target=origin, payload={
-        key: params[key] for key in _SCOPE} | {'session_id': origin, 'principal': connection.actor.subject})
+        key: canonical_params[key] for key in _SCOPE} | {'session_id': origin, 'principal': connection.actor.subject})
 
 
 def _verify(connection, ref, params, claim):
@@ -87,8 +116,15 @@ async def worker_request(connection, ref, params, *, operation):
         raise RuntimeStoreError('permission_denied')
     _verify(connection, ref, params, claim)
     if operation == 'adopt':
-        return await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
-                                       **scope, adoption_secret=claim)
+        result = await asyncio.to_thread(adopt_worker_execution, authority.db, epoch=authority.epoch,
+                                         **scope, adoption_secret=claim)
+        from gateway.session_worker_delegation import rebind_adopted_async_delegations
+        await asyncio.to_thread(
+            rebind_adopted_async_delegations, authority.db, execution_id=params['execution_id'],
+            session_id=params['session_id'], generation=params['generation'], epoch=authority.epoch,
+            profile_id=authority.profile_id, worker_pid=params['pid'],
+            worker_birth=_canonical_worker_birth(params['pid'], params['birth']))
+        return result
     result = await asyncio.to_thread(mutate_worker_execution, authority.db, epoch=params['epoch'],
         **scope, sequence=params['sequence'], operation=params['operation'], payload=params['payload'])
     if params['operation'] == 'execution.finish':

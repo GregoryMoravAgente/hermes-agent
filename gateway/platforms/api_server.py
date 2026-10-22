@@ -27,6 +27,8 @@ from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from gateway.runtime_custody import CustodyRefusal
+
 # _resolve_request_profile result for a /p/<profile>/ prefix this gateway does not serve (-> 404);
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
@@ -141,6 +143,7 @@ from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
+from gateway.platforms.api_server_session_chat import retired_session_error, session_chat_user_message
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
     validate_media_delivery_path)
@@ -632,17 +635,6 @@ def _clear_turn_process_ownership(agent: Any) -> None:
     agent._gateway_turn_process_task_id = ""
     agent._gateway_turn_process_baseline = frozenset()
     agent._gateway_turn_process_epoch = None
-
-
-def _session_chat_user_message(body: dict[str, Any], *, param: str = "message") -> tuple[Any, Optional[web.Response]]:
-    """Parse and normalize session chat ``message`` / ``input`` like chat completions."""
-    user_message = body.get("message") or body.get("input")
-    if not _content_has_visible_payload(user_message):
-        return None, _error_response("Missing 'message' field", 400, code="missing_message")
-    try:
-        return _normalize_multimodal_content(user_message), None
-    except ValueError as exc:
-        return None, _multimodal_validation_error(exc, param=param)
 
 
 def _request_turn_author(body: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1192,15 +1184,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         self._metrics_last_request_at: Optional[float] = None
         self._metrics_last_heartbeat_at: Optional[float] = None
 
-    def active_agent_work_count(self) -> int:
-        """All live agent work: pending admissions + in-flight turns + live /v1/runs tasks
-        (task-based, since ``_active_run_agents`` has a queued-before-agent gap)."""
+    def active_agent_work_count(self, *, excluded_run_ids=()) -> int:
+        """All live work, including accepted and unknown API-run custody."""
         try:
-            return (int(getattr(self, "_pending_agent_requests", 0))
-                    + int(self._inflight_agent_runs)
-                    + sum(not task.done() for task in self._active_run_tasks.values()))
+            active_run_ids = {
+                run_id for run_id, task in self._active_run_tasks.items() if not task.done()
+            }
+            return (int(getattr(self, "_pending_agent_requests", 0)) + int(self._inflight_agent_runs)
+                    + len(active_run_ids)
+                    + _api_runs._active_run_custody_count(
+                        self, excluded_run_ids=(*active_run_ids, *excluded_run_ids),
+                        exclude_legacy=True))
         except Exception:
-            return 0
+            return 1
 
     def interrupt_active_runs(self, reason: str) -> int:
         """Interrupt every adapter-owned agent during shutdown (they are not in
@@ -1837,47 +1833,14 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _ensure_session_db(self):
         """SessionDB for the active profile home (the runtime scope redirects ``get_hermes_home()``
         per profile). Sync, for ``_create_agent``; handlers use ``_ensure_session_db_async``."""
-        if self.gateway_runner is not None:
-            from hermes_constants import get_hermes_home
-            from gateway.platforms.api_server_store import selected_session_db
-            return selected_session_db(self, get_hermes_home())
-        if self._session_db is not None:
-            return self._session_db
-        try:
-            from hermes_constants import get_hermes_home
-            return self._open_and_cache_session_db(get_hermes_home())
-        except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
-            return None
+        from gateway.platforms.api_server_session_runtime import ensure_session_db
+        return ensure_session_db(self)
 
     async def _ensure_session_db_async(self):
         """Async variant: the profile home is captured on the loop thread (its scope is invisible
         inside ``to_thread``), only the blocking open runs in the worker, single-flight locked."""
-        if self.gateway_runner is not None:
-            from hermes_constants import get_hermes_home
-            from gateway.platforms.api_server_store import selected_session_db
-            return selected_session_db(self, get_hermes_home())
-        if self._session_db is not None:
-            return self._session_db
-        try:
-            from hermes_constants import get_hermes_home
-            home = get_hermes_home()
-            key = str(home)
-            with self._session_db_cache_lock:
-                cached = self._cached_session_db_locked(key)
-            if cached is not None:
-                return cached
-            if self._session_db_lock is None:
-                self._session_db_lock = asyncio.Lock()
-            async with self._session_db_lock:
-                with self._session_db_cache_lock:
-                    cached = self._cached_session_db_locked(key)
-                if cached is not None:
-                    return cached
-                return await asyncio.to_thread(self._open_and_cache_session_db, home)
-        except Exception as e:
-            logger.debug("SessionDB unavailable for API server: %s", e)
-            return None
+        from gateway.platforms.api_server_session_runtime import ensure_session_db_async
+        return await ensure_session_db_async(self)
 
     # -- Agent creation ---------------------------------------------------------------
 
@@ -3311,10 +3274,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         session, err = await self._get_existing_session_or_404(session_id)
         if err:
             return None, err
+        retired_error = retired_session_error(session)
+        if retired_error is not None:
+            return None, retired_error
         body, err = await self._read_json_body(request)
         if err:
             return None, err
-        user_message, err = _session_chat_user_message(body)
+        user_message, err = session_chat_user_message(body)
         if err is not None:
             return None, err
         try:
@@ -3378,21 +3344,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return headers
 
     def _effective_turn_runtime(self, runtime_request: dict[str, Any], result: Any, usage: Any) -> dict[str, Any]:
-        """Sanitized runtime metadata for a finished session-chat turn."""
-        runtime = self._result_runtime(result, usage)
-        return self._sanitize_runtime_metadata(
-            # Same shared ladder /api/status uses. Before this was unified, the two endpoints disagreed on
-            # the same page load — the sidebar strip read "running" (it probed GATEWAY_HEALTH_URL and scoped
-            # to the requested profile) while the Channels page rendered "The gateway is not running" (it
-            # did neither). Cross-container, profile-scoped, and launch-service-managed deployments each hit
-            # that split. profile_home is passed when the request was scoped to a named profile:
-            # gateway/status readers resolve process-level paths and do NOT follow the HERMES_HOME
-            # contextvar override (#56986 / #69143), so the profile's directory has to be handed over
-            # explicitly or messaging silently reports another profile's gateway (#71211).
-            runtime=runtime,
-            requested_runtime=runtime_request.get("requested"),
-            route_source=runtime_request.get("route_source") or "global",
-            model_lock=self._model_lock_state(runtime_request, runtime))
+        from gateway.platforms.api_server_session_runtime import effective_turn_runtime
+        return effective_turn_runtime(self, runtime_request, result, usage)
 
     @staticmethod
     def _result_runtime(result: Any, usage: Any) -> dict[str, Any]:
@@ -3408,146 +3361,65 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return "confirmed" if runtime else "accepted"
 
     async def _admit_to_live_bot_chat(
-        self, session_id: str, message: Any, author: Optional[dict[str, Any]],
+        self, session_id: str, message: Any, author: Optional[dict[str, Any]], *, custody=None,
     ) -> Optional[tuple[Path, dict[str, Any]]]:
-        """Admit a turn aimed at the canonical Bot Chat to the Desktop session that holds it live.
+        from gateway.platforms import api_server_live_bot
+        return await api_server_live_bot.admit_to_live_bot_chat(
+            self, session_id, message, author, custody=custody)
 
-        ``(profile home, mailbox record)`` when a live owner took it; None when this process should
-        run the turn itself — the session is not the canonical Bot Chat's own lineage, or nobody
-        holds that chat. Both peer transports (``/api/sessions/{id}/chat`` for ``peer dm``,
-        ``/v1/runs`` for ``peer run``) go through here, so the two lanes cannot drift.
-        """
-        if not isinstance(message, str):
-            return None
-        # Under session authority the Bot Chat is a LOCAL session whose only writer is the
-        # authority FIFO (a Desktop showing it is a viewer, not a lease holder): the turn enters
-        # through the same door as ``bot_relay.deliver`` and the receipt is its admission's.
-        if getattr(self.gateway_runner, "session_authority", None) is not None:
-            from gateway.platforms.api_server_bot_chat import admit_peer_turn
-            return await admit_peer_turn(self.gateway_runner, session_id, message, author)
-        db = await self._ensure_session_db_async()
-        if db is None:
-            return None
-        home = Path(db.db_path).parent
-        from tools.bot_live_delivery import deliver_to_live_owner, find_canonical_live_owner
+    async def _answer_through_live_bot_chat(self, ctx: dict[str, Any], *, custody=None) -> Optional[web.Response]:
+        from gateway.platforms import api_server_live_bot
+        return await api_server_live_bot.answer_through_live_bot_chat(
+            self, ctx, custody=custody)
 
-        def _admit() -> Optional[dict[str, Any]]:
-            try:
-                owner = find_canonical_live_owner(home)
-            except ValueError:
-                # No reachable profile authority to hand the chat to: this process runs the turn.
-                return None
-            # Only the canonical Bot Chat's own lineage: a peer turn into any other session runs here.
-            if owner is None or db.get_compression_tip(session_id) != owner["session_id"]:
-                return None
-            return deliver_to_live_owner(home, owner, message, author=author)
+    async def _await_live_bot_chat_receipt(
+        self, home: Path, record: dict[str, Any], *, keepalive=None
+    ) -> dict[str, Any]:
+        from gateway.platforms import api_server_live_bot
+        return await api_server_live_bot.await_live_bot_chat_receipt(
+            self, home, record, keepalive=keepalive)
 
-        record = await asyncio.to_thread(_admit)
-        return None if record is None else (home, record)
-
-    async def _answer_through_live_bot_chat(self, ctx: dict[str, Any]) -> Optional[web.Response]:
-        """Hand a turn aimed at a canonical Bot Chat that a Desktop holds live to that owner.
-
-        This is the ``hermes peer dm`` transport. Running the turn here would make this process a
-        second writer beside the lease holder: the open chat never shows the message or the reply,
-        its live context never learns of them, and the two transcripts interleave in state.db.
-        Local and relayed DMs already hand such a message to the owner's mailbox
-        (``tools/bot_mode_dm.py``, ``tui_gateway/methods_bot_relay.py``). This waits for the owner's
-        receipt on the same budget as the local path, so the peer still gets the reply on this call.
-        """
-        session_id = ctx["session_id"]
-        admitted = await self._admit_to_live_bot_chat(session_id, ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        if admitted is None:
-            return None
-        record = await self._await_live_bot_chat_receipt(*admitted)
-        delivery_id = record["delivery_id"]
-        headers = self._session_headers(session_id, ctx["gateway_session_key"])
-        if record["status"] == "settled":
-            return web.json_response(
-                {"object": "hermes.session.chat.completion", "session_id": session_id,
-                 "message": {"role": "assistant", "content": record.get("reply") or ""},
-                 "usage": {}, "runtime": {}, "delivery_id": delivery_id}, headers=headers)
-        if record["status"] in ("queued", "claimed"):
-            return web.json_response(
-                {"object": "hermes.session.chat.queued", "session_id": session_id,
-                 "status": record["status"], "delivery_id": delivery_id}, status=202, headers=headers)
-        return _error_response(record.get("error") or f"Bot Chat delivery {record['status']}", 502,
-                               code=record.get("reason") or record["status"], headers=headers)
-
-    async def _await_live_bot_chat_receipt(self, home: Path, record: dict[str, Any], *, keepalive=None) -> dict[str, Any]:
-        """Wait on the live Bot Chat's receipt (the authority admission's waiter, or the legacy owner
-        mailbox through ``await_delivery_async``) until it settles or the local DM budget runs out;
-        ``keepalive`` (async) is called every SSE keepalive interval so a streaming caller's proxy
-        keeps the socket."""
-        from gateway.platforms.api_server_bot_chat import await_live_delivery
-        from tools.bot_mode_dm import _LIVE_WAIT_SECONDS
-        deadline = time.monotonic() + _LIVE_WAIT_SECONDS
-        while record["status"] in ("queued", "claimed"):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            budget = remaining if keepalive is None else min(remaining, CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS)
-            record = await await_live_delivery(self, home, record, budget)
-            if keepalive is not None and record["status"] in ("queued", "claimed"):
-                await keepalive()
-        return record
-
-    async def _stream_through_live_bot_chat(self, request: web.Request, ctx: dict[str, Any]) -> Optional[web.StreamResponse]:
-        """``_answer_through_live_bot_chat`` for the SSE sibling route: the owner's settled receipt is
-        the run's single ``assistant.completed`` event; a receipt still open at the budget is a
-        ``run.queued`` event (the 202 shape), a failed one an ``error`` event carrying the reason."""
-        session_id = ctx["session_id"]
-        admitted = await self._admit_to_live_bot_chat(session_id, ctx["user_message"], ctx["run_kwargs"].get("turn_author"))
-        if admitted is None:
-            return None
-        events = _SessionEventQueue(session_id, f"run_{uuid.uuid4().hex}")
-        response = await self._prepare_sse_response(request, session_id, ctx["gateway_session_key"])
-
-        async def _write(name: str, payload: dict[str, Any]) -> None:
-            name, payload = events.payload(name, payload)
-            await response.write(_sse_frame(payload, event=name, ensure_ascii=False))
-
-        async def _keepalive() -> None:
-            await response.write(b": keepalive\n\n")
-
-        try:
-            await _write("run.started", {"user_message": {"role": "user", "content": ctx["user_message"]}, "runtime": {}})
-            record = await self._await_live_bot_chat_receipt(*admitted, keepalive=_keepalive)
-            delivery_id = record["delivery_id"]
-            if record["status"] == "settled":
-                message_id = f"msg_{uuid.uuid4().hex}"
-                await _write("message.started", {"message": {"id": message_id, "role": "assistant"}})
-                await _write("assistant.completed", {
-                    "message_id": message_id, "content": record.get("reply") or "", "delivery_id": delivery_id, "runtime": {}})
-                await _write("run.completed", {"message_id": message_id, "delivery_id": delivery_id, "usage": {}, "runtime": {}})
-            elif record["status"] in ("queued", "claimed"):
-                await _write("run.queued", {"status": record["status"], "delivery_id": delivery_id})
-            else:
-                await _write("error", {"message": record.get("error") or f"Bot Chat delivery {record['status']}",
-                                       "code": record.get("reason") or record["status"], "delivery_id": delivery_id})
-            await _write("done", {})
-        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, OSError):
-            logger.info("Session SSE client disconnected while a live Bot Chat held the turn")
-        return response
+    async def _stream_through_live_bot_chat(
+        self, request: web.Request, ctx: dict[str, Any], *, custody=None
+    ) -> Optional[web.StreamResponse]:
+        from gateway.platforms import api_server_live_bot
+        return await api_server_live_bot.stream_through_live_bot_chat(
+            self, request, ctx, custody=custody)
 
     @_admit_api_agent_request
     async def _handle_session_chat(self, request: web.Request) -> web.Response:
         """POST /api/sessions/{session_id}/chat — one synchronous agent turn (plus the delivery lanes'
         one bounded re-run of a transient failure; ``hermes peer dm`` is the client)."""
         from tools.bot_failure_reasons import RETRY_NONE, result_retry_action
+        from gateway.platforms import api_server_live_bot
+        from gateway.platforms.api_server_run_custody import ApiRunCustodyError
+        handoff_id = f"chat_{uuid.uuid4().hex}"
+        try:
+            handoff_custody = api_server_live_bot.reserve_peer_custody(
+                self, _api_request_profile.get(), handoff_id)
+        except ApiRunCustodyError as exc:
+            return _api_runs._run_custody_error(_openai_error, exc.refusal)
         # This turn runs through _run_agent, so it already COUNTS toward the cap (#7483).
         # Spending the budget without checking it refused every other caller while never
         # refusing this route — and a fleet's cross-machine DMs all arrive here.
-        limited = self._concurrency_limited_response()
+        limited = self._concurrency_limited_response(excluded_run_ids={handoff_id})
         if limited is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return limited
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return err
         from gateway.platforms.api_server_openai_routes import _response_status
-        handed_off = await self._answer_through_live_bot_chat(ctx)
+        try:
+            handed_off = await self._answer_through_live_bot_chat(ctx, custody=handoff_custody)
+        except BaseException:
+            handoff_custody.mark_unknown("peer_handoff_interrupted")
+            raise
         if handed_off is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return handed_off
+        api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
@@ -3579,15 +3451,31 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     @_admit_api_agent_request
     async def _handle_session_chat_stream(self, request: web.Request) -> web.StreamResponse:
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
-        limited = self._concurrency_limited_response()
+        from gateway.platforms import api_server_live_bot
+        from gateway.platforms.api_server_run_custody import ApiRunCustodyError
+        handoff_id = f"chat_{uuid.uuid4().hex}"
+        try:
+            handoff_custody = api_server_live_bot.reserve_peer_custody(
+                self, _api_request_profile.get(), handoff_id)
+        except ApiRunCustodyError as exc:
+            return _api_runs._run_custody_error(_openai_error, exc.refusal)
+        limited = self._concurrency_limited_response(excluded_run_ids={handoff_id})
         if limited is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return limited
         ctx, err = await self._prepare_session_chat(request)
         if err is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return err
-        handed_off = await self._stream_through_live_bot_chat(request, ctx)
+        try:
+            handed_off = await self._stream_through_live_bot_chat(request, ctx, custody=handoff_custody)
+        except BaseException:
+            handoff_custody.mark_unknown("peer_handoff_interrupted")
+            raise
         if handed_off is not None:
+            api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return handed_off
+        api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
         gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
         user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
         runtime_meta = self._sanitize_runtime_metadata(
@@ -3596,6 +3484,19 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             model_lock=("accepted" if ctx["lock_active"] else ""))
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        request_profile = _api_request_profile.get()
+        try:
+            from gateway.platforms.api_server_run_execution import reserve_legacy_stream
+            legacy_custody = reserve_legacy_stream(self, request_profile, run_id)
+        except Exception as exc:
+            refusal = getattr(exc, "refusal", None)
+            if refusal is not None:
+                return _api_runs._run_custody_error(_openai_error, refusal)
+            logger.exception("session stream custody reservation failed run_id=%s", run_id)
+            return web.json_response(
+                {"error": _openai_error("Run custody unavailable", code="run_custody_unavailable")},
+                status=503)
+        legacy_custody.source_launch.stream_owner = True
         events = _SessionEventQueue(session_id, run_id)
         queue, _event_payload = events.queue, events.payload
         # Claim ownership inside the request's profile scope before any run-keyed state
@@ -3630,18 +3531,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         approval_notify = self._register_session_stream_approval(run_id, events, message_id)
 
         async def _run_and_signal() -> None:
+            worker_task = None
+            binding_token = None
             try:
+                from gateway.platforms.api_server_run_execution import (
+                    begin_legacy_stream_turn, finish_legacy_stream_source,
+                    submit_legacy_stream_worker,
+                )
+                binding_token = begin_legacy_stream_turn(
+                    self, legacy_custody, task_id=session_id or legacy_custody.run_id,
+                    profile_id=legacy_custody.profile_id, session_id=session_id)
                 await queue.put(_event_payload("run.started", {
                     "user_message": {"role": "user", "content": user_message},
                     "runtime": runtime_meta}))
                 self._set_run_status(run_id, "running", last_event="run.started")
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
                 history = await self._conversation_history_for_session(session_id)
-                result, usage = await self._run_agent(
+                # Retain the actual route worker even when _run_agent is replaced by a producer
+                # seam.  The normal implementation replaces this binding with its executor
+                # future; the outer task remains the source-owned worker for the direct route.
+                worker_task = asyncio.create_task(self._run_agent(
                     conversation_history=history, stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress, interim_assistant_callback=_commentary,
                     active_run_id=run_id, approval_notify_callback=approval_notify,
-                    approval_session_key=run_id, **ctx["run_kwargs"])
+                    approval_session_key=run_id, **ctx["run_kwargs"]))
+                submit_legacy_stream_worker(legacy_custody, worker_task)
+                result, usage = await worker_task
+                legacy_custody.mark_worker_done()
                 await events.flush()
                 is_dict = isinstance(result, dict)
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if is_dict else "")
@@ -3654,30 +3570,93 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await queue.put(_event_payload("assistant.completed", {
                     "session_id": effective_session_id, "message_id": message_id,
                     "content": final_response, **fields, "runtime": effective_runtime}))
-                await queue.put(_event_payload(f"run.{status}", {
-                    "session_id": effective_session_id, "message_id": message_id, **fields,
-                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
-                self._set_run_status(
+                _, status_receipt = self._set_run_status(
                     run_id, status, session_id=effective_session_id,
                     # The reply text, so a caller whose stream died can still read it from
                     # GET /v1/runs/{run_id}; POST /v1/runs already records output in `_finish`.
                     output=final_response, usage=usage,
-                    last_event=f"run.{status}", **fields)
+                    last_event=f"run.{status}", _return_receipt=True, **fields)
+                status_receipt = legacy_custody.authoritative_status_receipt(status_receipt)
+                event_status, event_fields = status, fields
+                if status_receipt is not None:
+                    event_status, event_fields = _api_runs.canonical_terminal_decision(
+                        status, fields, status_receipt)
+                    if event_status == "unknown":
+                        legacy_custody.mark_unknown("canonical_terminal_outcome_inconsistent")
+                    elif event_status != status:
+                        _, status_receipt = self._set_run_status(
+                            run_id, event_status, session_id=effective_session_id,
+                            last_event=f"run.{event_status}", _return_receipt=True, **event_fields)
+                        status_receipt = legacy_custody.authoritative_status_receipt(status_receipt)
+                status_refusal = legacy_custody.mark_status_receipt(
+                    status_receipt, require_store=run_id in self._run_idempotency_ids)
+                if status_refusal is None and legacy_custody.unknown_reason:
+                    status_refusal = CustodyRefusal("custody_unknown", "I03_api_run_direct")
+                await queue.put(_event_payload(f"run.{event_status}" if status_refusal is None else "run.unknown", {
+                    "session_id": effective_session_id, "message_id": message_id, **event_fields,
+                    "messages": turn_messages, "usage": usage, "runtime": effective_runtime}))
+                legacy_custody.mark_event_enqueued(True)
             except asyncio.CancelledError:
-                self._set_run_status(run_id, "cancelled", last_event="run.cancelled")
+                _, status_receipt = self._set_run_status(
+                    run_id, "cancelled", _return_receipt=True, last_event="run.cancelled")
+                status_receipt = legacy_custody.authoritative_status_receipt(status_receipt)
+                event_status, event_fields = "cancelled", {
+                    "completed": False, "partial": False, "interrupted": True,
+                }
+                if status_receipt is not None:
+                    event_status, event_fields = _api_runs.canonical_terminal_decision(
+                        "cancelled", event_fields, status_receipt)
+                    if event_status == "unknown":
+                        legacy_custody.mark_unknown("canonical_terminal_outcome_inconsistent")
+                    elif event_status != "cancelled":
+                        _, status_receipt = self._set_run_status(
+                            run_id, event_status, _return_receipt=True,
+                            last_event=f"run.{event_status}", **event_fields)
+                        status_receipt = legacy_custody.authoritative_status_receipt(status_receipt)
+                status_refusal = legacy_custody.mark_status_receipt(
+                    status_receipt, require_store=run_id in self._run_idempotency_ids)
+                if status_refusal is None and legacy_custody.unknown_reason:
+                    status_refusal = CustodyRefusal("custody_unknown", "I03_api_run_direct")
+                await queue.put(_event_payload(
+                    f"run.{event_status}" if status_refusal is None else "run.unknown",
+                    {"session_id": session_id, **event_fields}))
+                legacy_custody.mark_event_enqueued(True)
                 raise
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
-                self._set_run_status(
-                    run_id, "failed", error=_redact_api_error_text(exc), last_event="run.failed")
-                await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
+                error_text = _redact_api_error_text(exc)
+                _, status_receipt = self._set_run_status(
+                    run_id, "failed", _return_receipt=True,
+                    error=error_text, last_event="run.failed")
+                status_receipt = legacy_custody.authoritative_status_receipt(status_receipt)
+                status_refusal = legacy_custody.mark_status_receipt(
+                    status_receipt, require_store=run_id in self._run_idempotency_ids)
+                if status_refusal is None and legacy_custody.unknown_reason:
+                    status_refusal = CustodyRefusal("custody_unknown", "I03_api_run_direct")
+                await queue.put(_event_payload(
+                    "run.failed" if status_refusal is None else "run.unknown",
+                    {"session_id": session_id, "error": error_text}))
+                legacy_custody.mark_event_enqueued(True)
+                await queue.put(_event_payload("error", {"message": error_text}))
             finally:
                 self._active_run_agents.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
-                self._release_run_owner_if_forgotten(run_id)
+                if (
+                    legacy_custody.worker_submitted
+                    and not legacy_custody.worker_done
+                    and worker_task is not None
+                    and worker_task.done()
+                ):
+                    legacy_custody.mark_worker_done()
                 await events.flush()
                 await queue.put(_event_payload("done", {}))
                 await queue.put(None)
+                legacy_custody.mark_stream_closed(True)
+                legacy_custody.mark_control_finalizers()
+                if not legacy_custody.worker_done and not legacy_custody.worker_submitted:
+                    legacy_custody.request_no_worker()
+                finish_legacy_stream_source(legacy_custody, session_id or legacy_custody.run_id, binding_token)
+                self._release_run_owner_if_forgotten(run_id)
 
         # NOT in _active_run_tasks: _run_agent already counts this turn for the shutdown drain.
         task = asyncio.create_task(_run_and_signal())
@@ -3948,85 +3927,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             lambda jid: _cron_trigger(jid, extra_prompt=extra_prompt), job_id, notify=False)
 
     async def _handle_cron_fire(self, request: web.Request) -> web.Response:
-        """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
-        NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
-        a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
-        # Startup-wait budget starts here so a slow JWKS fetch cannot outlast the forwarder timeout.
-        received_at = asyncio.get_running_loop().time()
-        from hermes_cli.config import cfg_get, load_config
-        from plugins.cron_providers.chronos.verify import get_fire_verifier
-        auth = request.headers.get("Authorization", "")
-        token = auth[7:].strip() if auth.startswith("Bearer ") else ""
-        cfg = load_config()
-        verifier = get_fire_verifier()
-        verify_kwargs = dict(
-            token=token,
-            expected_audience=cfg_get(cfg, "cron", "chronos", "expected_audience", default=""),
-            jwks_or_key=cfg_get(cfg, "cron", "chronos", "nas_jwks_url", default="") or None,
-            issuer=cfg_get(cfg, "cron", "chronos", "portal_url", default="") or None)
-        try:
-            claims = await _call_verifier(verifier, **verify_kwargs)
-        except Exception:
-            # Fail closed: a crashing verifier must never admit a fire.
-            logger.exception("cron fire: verifier crashed; rejecting token")
-            claims = None
-        if claims is None:
-            logger.warning("cron fire: rejected invalid token: %s", self._request_audit_log_suffix(request))
-            return web.json_response({"error": "invalid fire token"}, status=401)
-        draining = self._draining_response()
-        if draining is not None:
-            return draining
-        with _reserve_pending_api_work(self) as reservation:
-            body = {}
-            with suppress(Exception):
-                body = await request.json()
-            job_id = (body or {}).get("job_id")
-            if not job_id:
-                return web.json_response({"error": "missing job_id"}, status=400)
-            # `hermes pause` ESTOP: refuse the fire and ask NAS to retry later.
-            # Placed after JWT verify (don't leak pause state to unauth callers)
-            # and after the drain check (drain is transient shutdown, ESTOP is
-            # operator override). 503 + Retry-After reschedules the job via NAS
-            # retry or the misfire backstop rather than silently dropping it —
-            # matches _CRON_FIRE_RETRY_AFTER_SECONDS in web_routers/cron.py.
-            with suppress(ImportError):
-                from agent.estop import check_paused as _estop_check_paused
-                if _estop_check_paused("cron-webhook", logger):
-                    return web.json_response(
-                        {"error": "hermes is paused (ESTOP)", "job_id": job_id},
-                        status=503,
-                        headers={"Retry-After": str(60)},
-                    )
-            from cron.scheduler_provider import provider_supports_split_fire, resolve_cron_scheduler
-            provider = resolve_cron_scheduler()
-            loop = asyncio.get_running_loop()
-            from gateway.platforms.api_server_fire_startup import live_adapters_once_started
-            refusal, adapters = await live_adapters_once_started(self, request, job_id, received_at=received_at)
-            if refusal is not None:
-                return refusal
+        """POST /api/cron/fire — Chronos fire webhook admission seam."""
+        from gateway.platforms.api_server_cron_fire import handle_cron_fire
 
-            def _detach_fire(fire_fn, *fire_args) -> web.Response:
-                # The done callback owns the reservation once the task is detached.
-                task = asyncio.create_task(asyncio.to_thread(fire_fn, *fire_args, adapters=adapters, loop=loop))
-                reservation["detached"] = True
-                task.add_done_callback(lambda _task: _release_pending_api_work(self, reservation))
-                self._track_background_task(task, tolerate_missing=True)
-                return web.json_response({"status": "accepted", "job_id": job_id}, status=202)
-
-            if not provider_supports_split_fire(provider):
-                # A legacy single-phase provider overrides ``fire_due`` but inherits the base
-                # ``claim_fire``; the split path would silently bypass that override.
-                return _detach_fire(provider.fire_due, job_id)
-            # Persist the attempt + exact store owner before acknowledging NAS; a failure here
-            # is retryable and the reservation remains attached.
-            try:
-                claimed_job = await asyncio.to_thread(provider.claim_fire, job_id)
-            except Exception as exc:
-                logger.error("cron fire admission failed for %s: %s", job_id, exc)
-                return web.json_response({"error": "cron fire admission failed", "job_id": job_id}, status=503)
-            if claimed_job is None:
-                return web.json_response({"status": "duplicate", "job_id": job_id}, status=200)
-            return _detach_fire(provider.fire_claimed, claimed_job)
+        return await handle_cron_fire(self, request)
 
     # -- Agent execution --------------------------------------------------------------
 
@@ -4044,13 +3948,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if hasattr(task, "add_done_callback"):
             task.add_done_callback(self._background_tasks.discard)
 
-    def _concurrency_limited_response(self) -> Optional[web.Response]:
+    def _concurrency_limited_response(self, *, excluded_run_ids=()) -> Optional[web.Response]:
         """429 when the concurrent-run cap is reached (0 disables), else None. Uses the same
         adapter-owned work count as shutdown draining (admitted requests included)."""
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self.active_agent_work_count()
+        try:
+            inflight = self.active_agent_work_count(excluded_run_ids=excluded_run_ids)
+        except TypeError:
+            # Compatibility adapters keep the original no-argument work-count hook.
+            inflight = self.active_agent_work_count()
         # The current request's own reservation must not consume its last available slot.
         reservation = _api_agent_request_reservation.get()
         if reservation and reservation["active"]:
@@ -4127,28 +4035,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     def _finish_turn_result(
         self, agent: Any, result: Any, session_id: Optional[str], *, route, requested_runtime, route_source,
         confirmed_runtime_lock: bool) -> tuple:
-        """Attach usage, effective session id, ``_compressed`` and runtime metadata to a finished turn."""
-        usage = {"input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
-                 "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,
-                 "total_tokens": getattr(agent, "session_total_tokens", 0) or 0}
-        # Effective session id lets callers track compression-triggered rotations.
-        # (#16938)
-        _eff_sid = getattr(agent, "session_id", session_id)
-        if isinstance(_eff_sid, str) and _eff_sid:
-            result["session_id"] = _eff_sid
-        # _compressed tells _build_response_conversation_history to store the compacted
-        # transcript as-is (rotation changes session_id; in-place compaction sets a flag).
-        _session_rotated = isinstance(_eff_sid, str) and isinstance(session_id, str) and _eff_sid != session_id
-        if getattr(agent, "_last_compaction_in_place", False) or _session_rotated:
-            result["_compressed"] = True
-        if requested_runtime or route or confirmed_runtime_lock or (route_source and route_source != "global"):
-            runtime = self._turn_runtime_metadata(
-                agent, route=route, requested_runtime=requested_runtime,
-                route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock)
-            if isinstance(result, dict):
-                result["runtime"] = runtime
-            usage["runtime"] = runtime
-        return result, usage
+        from gateway.platforms.api_server_legacy_turn import finish_turn_result
+        return finish_turn_result(
+            self, agent, result, session_id, route=route,
+            requested_runtime=requested_runtime, route_source=route_source,
+            confirmed_runtime_lock=confirmed_runtime_lock)
 
     async def _run_agent(
         self, user_message: str, conversation_history: list[dict[str, str]],
@@ -4180,25 +4071,32 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         already persisted: the transcript's unanswered tail row is adopted from ``conversation_history``
         as THIS turn's user message instead of being appended a second time
         (``agent.session_persistence.adopt_unanswered_turn``; #115325)."""
+        # Every legacy/session route reserves the same I03 handle before it can create local
+        # task state.  A streaming caller already reserved its run id in the route; ordinary
+        # chat gets a private owner id here.  The handle is passed into the canonical I02 path
+        # so its parent is the admission that actually owns this turn.
+        request_profile = _api_request_profile.get()
+        existing_custody = (
+            getattr(self, "_run_custody", {}).get(active_run_id) if active_run_id else None)
+        if existing_custody is None:
+            from gateway.platforms.api_server_run_custody import reserve_legacy
+            legacy_custody = reserve_legacy(self, request_profile, active_run_id)
+        else:
+            legacy_custody = existing_custody
         if getattr(self.gateway_runner, "session_authority", None) is not None:
-            from gateway.session_api_turn import run_api_turn
-            return await run_api_turn(self, user_message=user_message, conversation_history=conversation_history,
-                ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
-                stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
-                tool_start_callback=tool_start_callback, tool_complete_callback=tool_complete_callback,
-                interim_assistant_callback=interim_assistant_callback, reasoning_callback=reasoning_callback,
-                status_callback=status_callback, walked_from=walked_from,
-                agent_ref=agent_ref, active_run_id=active_run_id, gateway_session_key=gateway_session_key,
-                requested_model=requested_model, requested_provider=requested_provider, model_options=model_options,
-                route=route, session_model=session_model, requested_runtime=requested_runtime,
-                route_source=route_source, confirmed_runtime_lock=confirmed_runtime_lock,
-                bind_declared_conversation=bind_declared_conversation, request_id=request_id, run_owner_scope=run_owner_scope,
-                history_from_session=history_from_session, session_history_delivery=session_history_delivery,
-                turn_author=turn_author, resume_unanswered_turn=resume_unanswered_turn, relay_metadata=relay_metadata,
-                approval_notify_callback=approval_notify_callback, approval_session_key=approval_session_key)
+            from gateway.platforms.api_server_run_custody import run_legacy_authority_turn
+            return await run_legacy_authority_turn(
+                self, legacy_custody, active_run_id=active_run_id, run_kwargs=locals())
+        from gateway.platforms.api_server_run_custody import (
+            finalize_legacy_cancelled, finalize_legacy_failed,
+            record_legacy_failure, record_legacy_status,
+        )
+        from gateway.platforms.api_server_run_execution import (
+            arm_legacy_process_custody, begin_legacy_direct_turn, bind_legacy_worker,
+            reset_legacy_process_custody,
+        )
         loop = asyncio.get_running_loop()
         # ContextVars do not follow run_in_executor threads: capture here, re-enter in _run().
-        request_profile = _api_request_profile.get()
         request_browser_control_principal = _api_request_browser_control_principal.get()
         request_browser_control_transport_family = _api_request_browser_control_transport_family.get()
 
@@ -4212,10 +4110,15 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     browser_control_transport_family=request_browser_control_transport_family,
                     session_history_delivery=session_history_delivery)
                 agent = None
+                binding_token = None
+                effective_task_id = session_id or legacy_custody.run_id
                 from agent.notification_presentation import notification_turn
                 from gateway.warning_notifications import diagnostic_turn_muted
                 muted = diagnostic_turn_muted({"notification_category": notification_category}, "api_server")
+                defer_custody_finalization = bool(
+                    getattr(getattr(legacy_custody, "source_launch", None), "stream_owner", False))
                 try:
+                    binding_token = arm_legacy_process_custody(legacy_custody, effective_task_id)
                     agent = self._create_agent(
                         ephemeral_system_prompt=ephemeral_system_prompt, session_id=session_id,
                         stream_delta_callback=stream_delta_callback, tool_progress_callback=tool_progress_callback,
@@ -4236,15 +4139,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                         adopt_unanswered_turn(conversation_history, user_message, agent)
                     if active_run_id:
                         self._active_run_agents[active_run_id] = agent
-                    effective_task_id = session_id or str(uuid.uuid4())
-                    # Process baseline for disconnect reaping (this surface bypasses TurnRunner)
-                    # + shutdown-interrupt registration, once for every caller.
-                    # Baseline for selective background-process reaping on SSE client disconnect — mirrors
-                    # gateway/run.py's gateway-turn cleanup (#76115); this API-server surface runs its own
-                    # agent lifecycle and doesn't go through TurnRunner, so it needs its own baseline.
-                    # /v1/runs runs its own agent lifecycle (no TurnRunner, no _run_agent) — record turn
-                    # process ownership so stop/cancel can reap only the background processes this run
-                    # created (#76115).
+                    # API-server surface bypasses TurnRunner, so this baseline lets stop/cancel reap
+                    # only processes this run created (#76115).
                     _publish_turn_process_ownership(agent, effective_task_id)
                     # Registering here, once, covers every _run_agent() caller — the same reason the
                     # _ProviderAuthResolutionError handler below lives here rather than in each route. Only
@@ -4307,6 +4203,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     # background work this turn deliberately left running.
                     if active_run_id:
                         self._active_run_agents.pop(active_run_id, None)
+                    if not defer_custody_finalization:
+                        legacy_custody.close_process_scope()
+                        legacy_custody.finish(effective_task_id)
+                    reset_legacy_process_custody(binding_token)
                     if agent is not None:
                         _clear_turn_process_ownership(agent)
                         self._shutdown_interruptible_agents.pop(id(agent), None)
@@ -4327,10 +4227,33 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         started_at = time.perf_counter()
         usage: Optional[dict[str, Any]] = None
         try:
-# Worker-scoped count rides along so the shutdown close gate still sees the thread
-            # after this handler task is cancelled (#116535); released in the worker's finally.
-            result, usage = await _api_runs._submit_api_worker(loop, _run)
+            begin_legacy_direct_turn(
+                self, legacy_custody, profile_id=request_profile, session_id=session_id)
+            worker_future = _api_runs._submit_api_worker(loop, _run)
+            bind_legacy_worker(legacy_custody, worker_future)
+            refusal = legacy_custody.mark_worker_submitted()
+            if refusal is not None:
+                legacy_custody.mark_unknown(getattr(refusal, "code", "worker_submission_unknown"))
+                raise RuntimeError("API worker custody submission became unknown")
+            result, usage = await asyncio.shield(worker_future)
+            from gateway.platforms.api_server_run_execution import record_legacy_direct_result
+            record_legacy_direct_result(
+                self, legacy_custody, result, usage, active_run_id=active_run_id)
             return result, usage
+        except asyncio.CancelledError:
+            await finalize_legacy_cancelled(
+                legacy_custody, finalize_source=active_run_id is None)
+            record_legacy_failure(
+                self, legacy_custody, "cancelled", interrupted=True,
+                error="Legacy API turn was cancelled.", active_run_id=active_run_id)
+            raise
+        except BaseException:
+            await finalize_legacy_failed(
+                legacy_custody, finalize_source=active_run_id is None)
+            record_legacy_failure(
+                self, legacy_custody, "failed", failed=True,
+                error="Legacy API turn failed.", active_run_id=active_run_id)
+            raise
         finally:
             self._inflight_agent_runs -= 1
             if usage is not None:
@@ -4342,7 +4265,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> dict[str, Any]:
+    def _set_run_status(self, run_id: str, status: str, **fields: Any):
         return _api_runs._set_run_status(self, run_id, status, **fields)
 
     def _make_run_event_callback(self, run_id: str, loop: asyncio.AbstractEventLoop):
@@ -4590,7 +4513,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 await self._runner.cleanup()
                 self._runner = None
         finally:
-            self._close_cached_session_dbs()
+            _api_runs._close_cached_session_dbs_if_clear(self)
             self._app = None
         logger.info("[%s] API server stopped", self.name)
 

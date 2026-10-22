@@ -11,6 +11,7 @@ async def _owner(home, monkeypatch):
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     monkeypatch.setattr(run, '_hermes_home', home)
     monkeypatch.setenv('HERMES_HOME', str(home))  # a single-profile owner: this IS the launch home
     store = SessionStore(home / 'sessions', GatewayConfig())
@@ -18,6 +19,7 @@ async def _owner(home, monkeypatch):
                              _cached_agent_for=lambda route: None, _adapter_for_source=lambda source: None,
                              _evict_cached_agent=lambda route: None)
     owner = await initialize_session_authority(runner, profile_id=str(home), instance_id='fixture')
+    bind_authority_runtime_custody(runner, owner)
     return owner, AuthorityConnection(owner, object(), {'user_id': 'owner'})
 
 

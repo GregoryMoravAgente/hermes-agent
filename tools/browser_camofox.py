@@ -235,8 +235,43 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[dict[str,
 
 
 # ---- Session management ----
-_sessions: dict[str, dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
+_sessions: dict[str, dict[str, Any]] = {}  # registry key -> owner-bound session record
 _sessions_lock = threading.Lock()
+
+
+def _current_session_owner() -> tuple[str, str]:
+    """Return the canonical profile and Camofox endpoint for the active scope."""
+    return hermes_home_key(), get_camofox_url()
+
+
+def _session_matches_owner(session: dict[str, Any], task_id: str, owner_home: str, endpoint: str) -> bool:
+    """Match the immutable owner tuple captured before a remote session was created."""
+    return (session.get("task_id") == task_id
+            and session.get("owner_home") == owner_home
+            and session.get("endpoint") == endpoint)
+
+
+def _find_session_entry(
+    task_id: str, owner_home: str, endpoint: str,
+) -> tuple[Optional[str], Optional[dict[str, Any]]]:
+    """Find only the current profile/endpoint's record in the one session registry."""
+    for registry_key, session in _sessions.items():
+        if _session_matches_owner(session, task_id, owner_home, endpoint):
+            return registry_key, session
+    return None, None
+
+
+def _registry_key(task_id: str, owner_home: str, endpoint: str) -> str:
+    """Keep the legacy first-owner key while disambiguating same task ids across owners."""
+    if task_id not in _sessions:
+        return task_id
+    suffix = f"{task_id}\x1f{owner_home}\x1f{endpoint}"
+    candidate = suffix
+    serial = 1
+    while candidate in _sessions:
+        serial += 1
+        candidate = f"{suffix}\x1f{serial}"
+    return candidate
 
 
 def _adopt_existing_tab(session: dict[str, Any]) -> dict[str, Any]:
@@ -263,9 +298,11 @@ def _get_session(task_id: Optional[str]) -> dict[str, Any]:
     (CAMOFOX_USER_ID / config) → profile-scoped identity when managed persistence
     is on → random ephemeral userId."""
     task_id = task_id or "default"
+    owner_home, endpoint = _current_session_owner()
     with _sessions_lock:
-        if task_id in _sessions:
-            return _adopt_existing_tab(_sessions[task_id])
+        _, existing = _find_session_entry(task_id, owner_home, endpoint)
+        if existing is not None:
+            return _adopt_existing_tab(existing)
         camofox_cfg = _get_camofox_config()
         identity = _camofox_identity_override(task_id, camofox_cfg)
         if identity is None and _managed_persistence_enabled(camofox_cfg):
@@ -275,9 +312,10 @@ def _get_session(task_id: Optional[str]) -> dict[str, Any]:
             managed, adopt = False, False
         else:
             managed, adopt = True, _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
-        session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
+        session = {"task_id": task_id, "owner_home": owner_home, "endpoint": endpoint,
+                   "user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
                    "managed": managed, "adopt_existing_tab": adopt}
-        _sessions[task_id] = session
+        _sessions[_registry_key(task_id, owner_home, endpoint)] = session
         return _adopt_existing_tab(session)
 
 
@@ -292,8 +330,31 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> dict[str, A
 
 def _drop_session(task_id: Optional[str]) -> Optional[dict[str, Any]]:
     """Remove and return session info."""
+    owner_home, endpoint = _current_session_owner()
     with _sessions_lock:
-        return _sessions.pop(task_id or "default", None)
+        registry_key, _session = _find_session_entry(task_id or "default", owner_home, endpoint)
+        if registry_key is None:
+            return None
+        return _sessions.pop(registry_key, None)
+
+
+def _session_task_ids() -> tuple[str, ...]:
+    """Snapshot only the active profile/endpoint's Camofox keys."""
+    owner_home, endpoint = _current_session_owner()
+    with _sessions_lock:
+        return tuple(dict.fromkeys(
+            session["task_id"] for session in _sessions.values()
+            if isinstance(session.get("task_id"), str)
+            and _session_matches_owner(session, session["task_id"], owner_home, endpoint)
+        ))
+
+
+def _has_session(task_id: Optional[str] = None) -> bool:
+    """Whether an exact Camofox session is still retained for a same-handle retry."""
+    owner_home, endpoint = _current_session_owner()
+    with _sessions_lock:
+        _, session = _find_session_entry(task_id or "default", owner_home, endpoint)
+        return session is not None
 
 
 def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
@@ -302,16 +363,26 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
     to :func:`camofox_close`."""
     camofox_cfg = _get_camofox_config()
     if _managed_persistence_enabled(camofox_cfg) or _camofox_identity_override(task_id, camofox_cfg):
-        _drop_session(task_id)
+        if _drop_session(task_id) is None:
+            logger.warning("Camofox soft cleanup found no owner-matching session for %s", task_id)
+            return False
         logger.debug("Camofox soft cleanup for task %s (managed persistence)", task_id)
         return True
     return False
 
 
 # ---- HTTP helpers ----
-def _request(method: str, path: str, timeout: Optional[int] = None, **kwargs: Any) -> requests.Response:
-    """Issue an authenticated request to camofox and return the raised-for-status response."""
-    resp = getattr(requests, method)(f"{get_camofox_url()}{path}", headers=_auth_headers(),
+def _request(
+    method: str,
+    path: str,
+    timeout: Optional[int] = None,
+    *,
+    base_url: Optional[str] = None,
+    **kwargs: Any,
+) -> requests.Response:
+    """Issue an authenticated request to the selected Camofox endpoint."""
+    request_base_url = get_camofox_url() if base_url is None else base_url
+    resp = getattr(requests, method)(f"{request_base_url}{path}", headers=_auth_headers(),
                                      timeout=_get_command_timeout() if timeout is None else timeout, **kwargs)
     resp.raise_for_status()
     return resp
@@ -330,8 +401,29 @@ def _get_raw(path: str, params: dict | None = None, timeout: Optional[int] = Non
     return _request("get", path, timeout, params=params)
 
 
-def _delete(path: str, body: dict | None = None, timeout: Optional[int] = None) -> dict:
-    return _request("delete", path, timeout, json=body).json()
+def _delete(
+    path: str,
+    body: dict | None = None,
+    timeout: Optional[int] = None,
+    *,
+    base_url: Optional[str] = None,
+) -> bool:
+    """Retire a session only after an explicit close acknowledgment."""
+    response = _request("delete", path, timeout, base_url=base_url, json=body)
+    content = getattr(response, "content", None)
+    if not isinstance(content, (bytes, bytearray)):
+        return False
+    if response.status_code == 204:
+        return not content
+    if response.status_code != 200 or not content:
+        return False
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict) or payload.get("closed") is False:
+        return False
+    return payload.get("closed") is True or payload.get("success") is True or payload.get("ok") is True
 
 
 # ---- Tool implementations ----
@@ -526,13 +618,35 @@ def camofox_press(key: str, task_id: Optional[str] = None) -> str:
 
 def camofox_close(task_id: Optional[str] = None) -> str:
     """Close the browser session via Camofox."""
+    session_key = task_id or "default"
+    owner_home, endpoint = _current_session_owner()
+    with _sessions_lock:
+        registry_key, session = _find_session_entry(session_key, owner_home, endpoint)
+        foreign_record = any(
+            record.get("task_id") == session_key
+            for record in _sessions.values()
+            if isinstance(record, dict)
+        ) and session is None
     try:
-        session = _drop_session(task_id)
-        if session:
-            _delete(f"/sessions/{session['user_id']}")
+        if session is None:
+            if foreign_record:
+                return json.dumps({"success": False, "closed": False,
+                                   "warning": "Camofox session belongs to another profile or endpoint"})
+            return json.dumps({"success": True, "closed": True})
+        if _delete(f"/sessions/{session['user_id']}", base_url=session["endpoint"]) is not True:
+            logger.warning("Camofox close was not acknowledged for %s; retaining session identity", session_key)
+            return json.dumps({"success": False, "closed": False,
+                               "warning": "Camofox close was not confirmed"})
+        # Retire the local binding only after the remote endpoint has acknowledged the
+        # close.  A failed DELETE must leave the exact user/session identity available
+        # for the lifecycle reaper's same-handle retry.
+        with _sessions_lock:
+            if registry_key is not None and _sessions.get(registry_key) is session:
+                _sessions.pop(registry_key, None)
         return json.dumps({"success": True, "closed": True})
     except Exception as e:
-        return json.dumps({"success": True, "closed": True, "warning": str(e)})
+        logger.warning("Camofox session close failed for %s; retaining session identity: %s", session_key, e)
+        return json.dumps({"success": False, "closed": False, "warning": str(e)})
 
 
 def camofox_get_images(task_id: Optional[str] = None) -> str:

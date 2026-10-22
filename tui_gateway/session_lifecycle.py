@@ -26,33 +26,35 @@ def _start_session_work(target, *, name: str, session: dict | None = None):
     from agent.memory_provider import spawn_context_thread
     from hermes_cli.backend_retirement import retirement
 
-    if not retirement.acquire():
+    lease = retirement.acquire()
+    if lease is None:
         return None
 
     def run():
-        try:
-            target()
-        finally:
-            retirement.release()
+        retirement.run_with_lease(lease, target)
 
     try:
         thread = spawn_context_thread(run, name=name)
         if session is not None:
             session["_run_thread"] = thread
-        thread.start()
-        return thread
     except BaseException:
-        retirement.release()
+        retirement.release(lease)
         raise
+    # A start exception can follow native launch. Keep the exact lease until the
+    # worker unwinds rather than publishing idle beside an unobserved worker.
+    thread.start()
+    return thread
 
 
 def _notify_session_boundary(event_type: str, session_id: str | None, platform: str | None = None) -> list[str]:
     """Fire session lifecycle hooks with CLI parity; returns plugin ``on_session_finalize`` user messages."""
     with contextlib.suppress(Exception):
         from hermes_cli.lifecycle import finalize_session, invoke_hook, session_end_messages
-        if event_type == "on_session_finalize":
-            return session_end_messages(finalize_session(session_id=session_id, platform=_resolve_agent_platform(platform)))
-        invoke_hook(event_type, session_id=session_id, platform=_resolve_agent_platform(platform))
+        from agent.shell_hook_scope import managed_hook_route
+        with managed_hook_route():
+            if event_type == "on_session_finalize":
+                return session_end_messages(finalize_session(session_id=session_id, platform=_resolve_agent_platform(platform)))
+            invoke_hook(event_type, session_id=session_id, platform=_resolve_agent_platform(platform))
     return []
 
 
@@ -424,10 +426,12 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
         if agent is not None:
             with contextlib.suppress(Exception):
                 from hermes_cli.lifecycle import invoke_hook
-                invoke_hook(
-                    "on_session_end", completed=False, interrupted=True,
-                    session_id=getattr(agent, "session_id", None) or session.get("session_key", ""),
-                    model=getattr(agent, "model", "unknown"), platform=getattr(agent, "platform", None) or "tui")
+                from agent.shell_hook_scope import managed_hook_route
+                with managed_hook_route():
+                    invoke_hook(
+                        "on_session_end", completed=False, interrupted=True,
+                        session_id=getattr(agent, "session_id", None) or session.get("session_key", ""),
+                        model=getattr(agent, "model", "unknown"), platform=getattr(agent, "platform", None) or "tui")
         if agent is not None and history and hasattr(agent, "commit_memory_session"):
             with contextlib.suppress(Exception):
                 agent.commit_memory_session(history)
@@ -774,11 +778,13 @@ def _interrupt_session_turn(
         # profile (#125063). hydrate_secrets=False: observer-only, /stop must stay fast.
         try:
             from hermes_cli.plugins import invoke_hook as _invoke_hook
+            from agent.shell_hook_scope import managed_hook_route
             with _session_profile_runtime_scope(session, hydrate_secrets=False):
-                _invoke_hook(
-                    "agent_loop_stopped", session_key=session.get("session_key", ""), platform="tui",
-                    reason="user_stop", invalidation_reason="session_interrupt",
-                )
+                with managed_hook_route():
+                    _invoke_hook(
+                        "agent_loop_stopped", session_key=session.get("session_key", ""), platform="tui",
+                        reason="user_stop", invalidation_reason="session_interrupt",
+                    )
         except Exception:
             logger.debug("agent_loop_stopped hook dispatch failed", exc_info=True)
     if not use_compute_host:

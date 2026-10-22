@@ -18,6 +18,7 @@ async def test_automation_after_compression_and_released_media_uses_logical_owne
     from gateway.session_ingress_context import native_callback
     from gateway.session_ingress_media import release_admission_media
     from gateway.session_automation import check_automation_route
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import claim_session_input, settle_session_input, list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -27,6 +28,7 @@ async def test_automation_after_compression_and_released_media_uses_logical_owne
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     photo = tmp_path / 'photo.png'
@@ -63,6 +65,7 @@ async def test_automation_for_an_unserved_scope_never_dereferences_a_missing_aut
     from gateway.session_authority import initialize_session_authority, SessionAuthority
     from gateway.session_ingress_context import native_callback
     from gateway.session_automation import check_automation_route
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import (RuntimeStoreError, claim_session_input, list_session_admissions,
                                       settle_session_input)
@@ -73,6 +76,7 @@ async def test_automation_for_an_unserved_scope_never_dereferences_a_missing_aut
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     human = MessageEvent(text='hi', source=source, message_id='h')
