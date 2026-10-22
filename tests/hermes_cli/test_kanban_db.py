@@ -608,7 +608,6 @@ def test_infrastructure_spawn_refusal_never_charges_the_card(
 
 
 
-
 # ---------------------------------------------------------------------------
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
