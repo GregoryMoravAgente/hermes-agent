@@ -119,7 +119,7 @@ def test_desktop_prompt_during_a_gateway_turn_runs_after_it_in_the_owner_fifo(mo
         from gateway.session_contract import SessionRef
         from gateway.session_settlement_recovery import commit_and_publish
         ref, live = SessionRef("owned", key), authority.sessions[key]
-        authority._stamp_claim(ref, live, row)
+        authority._stamp_claim(ref, live, row=row)
         with live.event_stream.lock:
             authority.executing.pop(key, None)
         commit_and_publish(authority, live, ref, row, "THE ANSWER", "completed", None, {})
