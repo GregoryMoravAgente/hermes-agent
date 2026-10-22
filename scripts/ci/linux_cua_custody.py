@@ -40,6 +40,7 @@ RUNNER_FILE = "scripts/run_tests_parallel.py"
 SOURCE_CONTRACT_FILES = TEST_FILES + (
     RUNNER_FILE,
     "scripts/ci/linux_cua_custody.py",
+    "scripts/ci/linux_cua_process_state.py",
     "scripts/run_tests.sh",
     "tools/browser_tool_session.py",
     "tests/tools/test_browser_open_timeout.py",
@@ -798,6 +799,28 @@ def _linux_proc_stat_record(pid: int) -> dict[str, int]:
     }
 
 
+def _linux_proc_state_record(pid: int) -> dict[str, Any]:
+    """Read bounded state fields without collecting command lines or environments."""
+    from linux_cua_process_state import read_process_state
+
+    return read_process_state(pid, digest_bytes=sha_bytes)
+
+
+def _capture_browser_timeout_process_state(
+    identity: dict[str, Any],
+    deadline: float,
+) -> dict[str, Any]:
+    """Capture one authenticated, bounded state snapshot before cleanup."""
+    from linux_cua_process_state import capture_timeout_process_state
+
+    return capture_timeout_process_state(
+        identity,
+        deadline,
+        group_snapshot=_owned_process_group_snapshot,
+        state_reader=_linux_proc_state_record,
+    )
+
+
 def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> dict[str, Any]:
     """Capture the unique session/group created by this Popen start_new_session."""
     if platform.system() != "Linux" or os.name != "posix":
@@ -1083,14 +1106,23 @@ def _run_browser_preflight_direct_file_variant(
                 stream.close()
         raise
     timed_out = False
+    timeout_process_state: dict[str, Any] | None = None
     try:
         process.wait(timeout=max(variant_deadline - time.monotonic(), 0.0))
     except subprocess.TimeoutExpired:
         timed_out = True
-    cleanup_deadline = min(
-        overall_deadline,
-        time.monotonic() + BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
-    )
+        cleanup_deadline = min(
+            overall_deadline,
+            time.monotonic() + BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+        )
+        timeout_process_state = _capture_browser_timeout_process_state(
+            group_identity, cleanup_deadline
+        )
+    else:
+        cleanup_deadline = min(
+            overall_deadline,
+            time.monotonic() + BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+        )
     cleanup = _terminate_and_reap_browser_variant(
         process, group_identity, cleanup_deadline
     )
@@ -1127,6 +1159,7 @@ def _run_browser_preflight_direct_file_variant(
         "dbus_session_bus_address_present_before": dbus_present,
         "environment_delta_names": environment_delta_names,
         "timed_out": timed_out,
+        "timeout_process_state": timeout_process_state,
         "variant_deadline_seconds": BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
         "cleanup": cleanup,
         "closure_ok": closure_ok,
