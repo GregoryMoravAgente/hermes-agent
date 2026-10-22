@@ -818,6 +818,7 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
         reserved = False
         runner = None
         adapter = None
+        stdio_before = (sys.stdout, sys.stderr)
         public_handles = {
             'control_server': None,
             'native_control_server': None,
@@ -853,8 +854,15 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
             # Stop the real public listeners before profile/database teardown. The helper keeps
             # the exact native server/thread handles because GatewayControlServer.stop() clears
             # its wrapper handle even when native close raises.
-            if start_public_runtime and runner is not None:
-                runtime_stop_proven = await _runtime_owned_stop_public(runner, public_handles)
+            if start_public_runtime:
+                try:
+                    if runner is not None:
+                        runtime_stop_proven = await _runtime_owned_stop_public(runner, public_handles)
+                finally:
+                    # `tui_gateway.server` reserves stdout for JSON-RPC at import time.
+                    # Restore the fixture caller's exact streams after the public runtime stops
+                    # so pytest's terminal reporter retains its original output contract.
+                    sys.stdout, sys.stderr = stdio_before
             cleanup_proven = runtime_stop_proven
             if runner is not None and cleanup_proven:
                 from tui_gateway.hosted_tui_custody import close_profile
