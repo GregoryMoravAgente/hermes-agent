@@ -238,6 +238,13 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     # The process's async-delegation ledger belongs to the adopted execution, never a reserved child.
     binds_delegation_ledger = True
 
+    @staticmethod
+    def _decode_content(content):
+        """Decode an already owner-scoped row without opening the canonical store."""
+        from hermes_state import SessionDB
+
+        return SessionDB._decode_content(content)
+
     def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
         self.rpc = rpc
         self.scope = dict(scope)

@@ -45,6 +45,25 @@ def test_store_offers_every_core_session_db_call_with_its_keywords(name):
     assert missing == [], f'RuntimeSessionStore.{name} rejects {missing}'
 
 
+@pytest.mark.parametrize('content', [
+    None, b'\x00synthetic\xff', 17, 'literal',
+    {'text': ['synthetic', {'nested': True}]},
+    '\x00json:literal-prefix',
+])
+def test_committed_content_codec_preserves_values_without_opening_owner_store(content, monkeypatch):
+    encoded = SessionDB._encode_content(content)
+    monkeypatch.setattr(
+        SessionDB, '__init__',
+        lambda *_args, **_kwargs: pytest.fail('a worker codec must not open the owner database'),
+    )
+    assert RuntimeSessionStore._decode_content(encoded) == content
+
+
+def test_committed_content_codec_preserves_a_malformed_legacy_marker():
+    content = SessionDB._CONTENT_JSON_PREFIX + 'not-json'
+    assert RuntimeSessionStore._decode_content(content) == content
+
+
 def test_tail_reads_answer_like_the_owner(tmp_path):
     db = SessionDB(tmp_path / 'state.db')
     try:
