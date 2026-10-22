@@ -11,6 +11,9 @@ from typing import Any, Dict, List
 from agent.memory_context import sanitize_context
 from agent.message_content import flatten_message_text
 from agent.history_commentary import visible_commentary
+# Resolve the custody adapter while the agent module is loading so the first streamed token
+# does not pay the import cost on its latency-sensitive path.
+from agent.shell_hook_custody import stream_dispatch
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -39,7 +42,6 @@ class StreamDeliveryMixin:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
-            from agent.shell_hook_custody import stream_dispatch
 
             with stream_dispatch(self, event):
                 queued = enqueue_plugin_stream_hook(event, **self._stream_hook_base_payload(), **fields)

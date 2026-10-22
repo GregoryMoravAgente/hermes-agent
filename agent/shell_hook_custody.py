@@ -22,6 +22,8 @@ import time
 import uuid
 from typing import Any, Iterator
 
+from gateway.runtime_service_custody import current_turn_binding
+
 
 logger = logging.getLogger(__name__)
 
@@ -467,8 +469,6 @@ def _agent_turn_binding(agent: Any) -> Any | None:
     the child was started; using that object preserves the owner without deriving one from
     callback payloads.  The live ContextVar remains authoritative when present.
     """
-    from gateway.runtime_service_custody import current_turn_binding
-
     binding = current_turn_binding()
     if binding is not None:
         return binding
