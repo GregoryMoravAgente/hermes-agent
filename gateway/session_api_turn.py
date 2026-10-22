@@ -171,10 +171,8 @@ def admit_api_turn(adapter, **kwargs):
 async def admit_api_turn_async(adapter, steps=None, *, custody=None, **kwargs):
     """``admit_api_turn`` (or *steps*, a generator ending in ``admit_api_steps``) with every SQLite
     write off the owner loop, in admission order."""
-    from gateway.session_authorities import active_authority
-    authority = active_authority(adapter.gateway_runner)
-    if authority is None:
-        raise RuntimeStoreError('profile_mismatch')
+    from gateway.session_authorities import require_active_authority
+    authority = require_active_authority(adapter.gateway_runner)
     if custody is not None:
         refusal = custody.mark_admission_started()
         if refusal is not None:
