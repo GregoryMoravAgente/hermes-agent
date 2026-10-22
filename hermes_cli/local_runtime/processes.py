@@ -116,6 +116,7 @@ class _WindowsJob:
             fn.restype = result
         self._name = name
         self._recovery_only = False
+        self._no_breakaway = False
         # NULL security attributes create a non-inheritable owner handle.  A
         # supervisor supplied name is a random, exact recovery token; an existing
         # object is never accepted as the new owner.
@@ -135,6 +136,7 @@ class _WindowsJob:
             if not self._api.SetInformationJobObject(
                     self._handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
                 raise ctypes.WinError(ctypes.get_last_error())
+            self._no_breakaway = True
         except BaseException:
             self.close()
             raise
@@ -167,6 +169,7 @@ class _WindowsJob:
             fn.restype = result
         job._name = name
         job._recovery_only = True
+        job._no_breakaway = False
         ctypes.set_last_error(0)
         job._handle = job._api.OpenJobObjectW(_JOB_OBJECT_QUERY, False, name)
         if job._handle:
@@ -176,6 +179,15 @@ class _WindowsJob:
         if error == _ERROR_FILE_NOT_FOUND:
             raise _WindowsJobAbsent(error, f"Windows Job not found: {name}")
         raise ctypes.WinError(error)
+
+    def is_canonical_owner_job(self) -> bool:
+        """Return true only for a live newly-created no-breakaway owner Job."""
+        with self._lock:
+            return (
+                self._recovery_only is False
+                and self._no_breakaway is True
+                and self._handle is not None
+            )
 
     @property
     def name(self) -> str | None:

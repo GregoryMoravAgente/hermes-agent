@@ -21,6 +21,12 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 
+# A Windows venv/PM bootstrap may leave the Popen root waiting on a fresh worker
+# interpreter.  Keep the ancestry proof bounded; an unbounded parent walk is not
+# an ownership proof and can cross unrelated process lifetime boundaries.
+MAX_CRON_WORKER_ANCESTRY_HOPS = 3
+
+
 class CronCustodyUnavailable(RuntimeError):
     """The managed gateway has no installed coordinator; the caller must refuse the admission."""
 
@@ -217,6 +223,7 @@ class CronOwnerBinding:
         self._scope_unit = None
         self._scope_proof = None
         self._native_job = None
+        self._native_job_identity = None
         self._native_job_proven = False
         # In-process script writers are tracked separately from detached worker processes.
         # A process exit alone is insufficient while stdout/stderr writers may still hold the
@@ -432,6 +439,25 @@ class CronOwnerBinding:
         return None
 
     @staticmethod
+    def _native_job_is_canonical_owner(native_job: Any) -> bool:
+        """Accept only the newly-created no-breakaway Job used by ``spawn_server``.
+
+        Query-only recovery handles, replaced handles, and duck-typed test/foreign objects cannot
+        supply the transitive split proof.  The private Job method pins the creation contract;
+        root membership is checked separately through the retained Popen handle below.
+        """
+        if native_job is None or sys.platform != "win32":
+            return False
+        try:
+            from hermes_cli.local_runtime.processes import _WindowsJob
+            return (
+                type(native_job) is _WindowsJob
+                and native_job.is_canonical_owner_job() is True
+            )
+        except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+
+    @staticmethod
     def _native_job_contains_process(native_job: Any, process: Any) -> Optional[bool]:
         """Reuse the existing handle-based Windows Job membership proof.
 
@@ -448,6 +474,42 @@ class CronOwnerBinding:
             return native_job.contains_process_handle(SimpleNamespace(raw_handle=raw_handle))
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             return None
+
+    def _native_job_binding_matches(
+        self, native_job: Any, native_job_identity: Any, native_job_proven: bool,
+        process: Any,
+    ) -> bool:
+        """Require the retained canonical Job and exact root handle for every Windows path.
+
+        The same-PID direct path still owns a native Job when launched through ``spawn_server``.
+        Replacing that object with a query-only handle, a foreign canonical Job, or a closed Job
+        must fail closed just like a degraded split; terminal reconciliation cannot drain a
+        different object and call it the original owner.
+        """
+        with self._lock:
+            retained_process = self._process
+            retained_job_identity = self._native_job_identity
+            retained_job_proven = self._native_job_proven
+        if process is not retained_process:
+            return False
+        if native_job is None:
+            # A no-Job binding is valid only when the binding was originally created without
+            # native Job provenance.  In particular, dropping the live Job object after
+            # activation must not turn a retained canonical Job receipt into an unscoped path.
+            return (
+                native_job_identity is None
+                and retained_job_identity is None
+                and native_job_proven is True
+                and retained_job_proven is True
+            )
+        return (
+            native_job_identity is native_job
+            and retained_job_identity is native_job
+            and native_job_proven is True
+            and retained_job_proven is True
+            and self._native_job_is_canonical_owner(native_job) is True
+            and self._native_job_contains_process(native_job, retained_process) is True
+        )
 
     @staticmethod
     def _native_job_is_empty(native_job: Any) -> Optional[bool]:
@@ -508,6 +570,82 @@ class CronOwnerBinding:
             return False
         return True
 
+    def _windows_trampoline_worker_matches(
+        self, record_pid: int, record_started_at: int, process: Any,
+    ) -> bool:
+        """Authenticate a live degraded Windows worker behind the retained Popen root.
+
+        The ACK/ledger PID is authoritative only after the owner corroborates its exact birth
+        fingerprint, liveness, non-zombie status, and bounded ancestry to the Popen handle.  The
+        worker cannot supply or choose this relationship.  A dead root or unreadable ancestry is
+        an ownership failure and remains UNKNOWN.
+        """
+        if sys.platform != "win32" or not isinstance(process, subprocess.Popen):
+            return False
+        try:
+            if process.poll() is not None:
+                return False
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return False
+        with self._lock:
+            bound_pid = self._bound_process_pid
+            bound_started_at = self._bound_process_started_at
+        if (
+            type(bound_pid) is not int
+            or bound_pid <= 0
+            or type(bound_started_at) is not int
+            or process.pid != bound_pid
+            or record_pid <= 0
+            or type(record_started_at) is not int
+            or record_pid == bound_pid
+            or record_pid == os.getpid()
+        ):
+            return False
+        try:
+            import psutil
+        except ImportError:
+            return False
+        try:
+            launcher = psutil.Process(bound_pid)
+            worker = psutil.Process(record_pid)
+            if (
+                launcher.ppid() != os.getpid()
+                or not launcher.is_running()
+                or launcher.status() == psutil.STATUS_ZOMBIE
+                or not worker.is_running()
+                or worker.status() == psutil.STATUS_ZOMBIE
+            ):
+                return False
+            from gateway.status import get_process_start_time
+            if (
+                get_process_start_time(bound_pid) != bound_started_at
+                or get_process_start_time(record_pid) != record_started_at
+            ):
+                return False
+            # Do not use ``Process.parents()[:N]`` here.  psutil builds the complete
+            # ancestry before slicing, so a long or hostile parent chain would turn a
+            # bounded custody check into an unbounded process walk.  The retained Job
+            # handle is the ownership proof; this short chain is only the corroborating
+            # no-breakaway relationship from the ACK worker to that retained root.
+            current = worker
+            for _ in range(MAX_CRON_WORKER_ANCESTRY_HOPS):
+                parent = current.parent()
+                if parent is None:
+                    return False
+                if parent.pid == bound_pid:
+                    # Re-check the retained root birth fingerprint immediately before
+                    # accepting the PID relationship.  A reused PID cannot substitute
+                    # for the Popen handle captured by the owner.
+                    return get_process_start_time(bound_pid) == bound_started_at
+                if parent.pid <= 0 or not parent.is_running():
+                    return False
+                if parent.status() == psutil.STATUS_ZOMBIE:
+                    return False
+                current = parent
+            return False
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, psutil.Error):
+            return False
+
     def _worker_identity_matches(self, record: dict[str, Any], process: Any, dispatch_mode: Optional[str]) -> bool:
         try:
             record_pid = int(record.get("pid", -1))
@@ -523,10 +661,17 @@ class CronOwnerBinding:
             # A direct child may have exited before the ACK is consumed.  The parent captured
             # this exact Popen identity before waiting; never replace that receipt with a later
             # live-PID probe that cannot observe an exited process.
-            return (
+            if (
                 record_pid == bound_pid
                 and type(bound_started_at) is int
                 and record_started_at == bound_started_at
+            ):
+                return True
+            # Only degraded Windows dispatch may use the explicitly bounded launcher/worker
+            # proof.  Direct equality remains the first and preferred admission path.
+            return (
+                dispatch_mode == "degraded"
+                and self._windows_trampoline_worker_matches(record_pid, record_started_at, process)
             )
         with self._lock:
             proof = dict(self._scope_proof) if self._scope_proof is not None else None
@@ -535,6 +680,57 @@ class CronOwnerBinding:
         return (
             proof.get("pid") == record_pid
             and proof.get("process_started_at") == record_started_at
+        )
+
+    def _stored_active_worker_matches(
+        self, record_pid: int, record_started_at: Any, dispatch_mode: Optional[str],
+    ) -> bool:
+        """Validate a terminal row against identity authenticated before process exit.
+
+        Initial split admission requires live ancestry.  The terminal waiter may observe after both
+        launcher and worker have exited, so it must consume the stored authenticated tuple and the
+        retained Job provenance, then let ``observe_terminal`` perform Job-empty and handle-close
+        proof.  It must never infer ownership from a fresh PID/ancestry lookup.
+        """
+        with self._lock:
+            active_pid = self._worker_pid
+            active_started_at = self._worker_started_at
+            bound_pid = self._bound_process_pid
+            process = self._process
+            native_job = self._native_job
+            native_job_proven = self._native_job_proven
+            native_job_identity = self._native_job_identity
+            scope_proof = dict(self._scope_proof) if self._scope_proof is not None else None
+            expected_scope = self._scope_unit
+        if active_pid != record_pid or active_started_at != record_started_at:
+            return False
+        if not self._native_job_binding_matches(
+            native_job, native_job_identity, native_job_proven, process):
+            return False
+        if dispatch_mode == "scoped":
+            return (
+                expected_scope is not None
+                and scope_proof is not None
+                and scope_proof.get("pid") == record_pid
+                and scope_proof.get("process_started_at") == record_started_at
+            )
+        windows_split = (
+            sys.platform == "win32"
+            and dispatch_mode == "degraded"
+            and type(bound_pid) is int
+            and record_pid != bound_pid
+        )
+        if not windows_split:
+            return True
+        return (
+            native_job is not None
+            and scope_proof is not None
+            and scope_proof.get("kind") == "windows_job"
+            and scope_proof.get("pid") == record_pid
+            and scope_proof.get("process_started_at") == record_started_at
+            and scope_proof.get("root_pid") == bound_pid
+            and scope_proof.get("native_job_canonical") is True
+            and scope_proof.get("worker_job_membership") == "transitive_no_breakaway_ancestry"
         )
 
     def _activate_child(
@@ -627,9 +823,29 @@ class CronOwnerBinding:
             self.mark_unknown("foreign_custody")
             raise CronCustodyRefused("worker_execution_not_adopted")
         with self._lock:
+            bound_pid = self._bound_process_pid
+            bound_started_at = self._bound_process_started_at
             native_job = self._native_job
             native_job_proven = self._native_job_proven
-        if native_job is not None and native_job_proven is not True:
+            native_job_identity = self._native_job_identity
+        windows_split = (
+            sys.platform == "win32"
+            and dispatch_mode == "degraded"
+            and type(bound_pid) is int
+            and record_pid != bound_pid
+        )
+        if not self._native_job_binding_matches(
+            native_job, native_job_identity, native_job_proven, process):
+            self.mark_unknown("worker_scope_unproven")
+            raise CronCustodyRefused("worker_job_membership_unproven")
+        # A split worker has no safe degraded custody without the exact canonical no-breakaway
+        # Job that already proved the retained Popen root handle.  Bounded ancestry is transitive
+        # Job membership only under that pinned creation contract; no PID census is accepted.
+        if windows_split and (
+            native_job is None
+            or native_job_proven is not True
+            or native_job_identity is not native_job
+        ):
             self.mark_unknown("worker_scope_unproven")
             raise CronCustodyRefused("worker_job_membership_unproven")
         self._activate_child(
@@ -638,12 +854,22 @@ class CronOwnerBinding:
             scope_proof=scope_proof,
         )
         with self._lock:
+            # _process remains the retained Popen/root handle.  The ACK/ledger identity is the
+            # authenticated worker identity used by terminal reconciliation and Job proof.
+            self._worker_pid = record_pid
             self._worker_started_at = record.get("process_started_at")
             if native_job is not None and scope_proof is None:
                 self._scope_proof = {
                     "kind": "windows_job",
                     "pid": record_pid,
                     "process_started_at": self._worker_started_at,
+                    "root_pid": bound_pid,
+                    "root_process_started_at": bound_started_at,
+                    "native_job_canonical": True,
+                    "worker_job_membership": (
+                        "transitive_no_breakaway_ancestry" if windows_split
+                        else "retained_root_handle"
+                    ),
                     "scope_empty": False,
                 }
 
@@ -661,10 +887,14 @@ class CronOwnerBinding:
             self._bound_process_pid = pid
             self._bound_process_started_at = started_at
             self._native_job = native_job
+            self._native_job_identity = native_job
             self._reaper_expected = True
             self._native_job_proven = (
                 native_job is None
-                or self._native_job_contains_process(native_job, process) is True
+                or (
+                    self._native_job_is_canonical_owner(native_job) is True
+                    and self._native_job_contains_process(native_job, process) is True
+                )
             )
 
     def bind_script_process(self, process: Any) -> None:
@@ -697,10 +927,17 @@ class CronOwnerBinding:
     def reconcile_unacknowledged(
         self, process: Any = None, *, dispatch_mode: Optional[str] = None,
     ) -> str:
-        """Classify a child whose process ended before a verifiable ready acknowledgement."""
+        """Classify a child whose process ended before a verifiable ready acknowledgement.
+
+        The production waiter may also call this after activation when the worker publishes its
+        terminal row before the retained root exits.  In that state the authenticated tuple is
+        immutable: a mismatch is UNKNOWN and cannot re-enter the initial adoption path.
+        """
         from cron.executions import get_execution
 
-        if not hasattr(self.handle, "reservation") or not self.execution_id:
+        with self._lock:
+            pending_child_reservation = hasattr(self.handle, "reservation")
+        if not self.execution_id:
             return "not_applicable"
         try:
             record = get_execution(self.execution_id)
@@ -712,6 +949,9 @@ class CronOwnerBinding:
             and record.get("status") == "claimed"
             and bool(record.get("handoff_pending"))
         ):
+            if not pending_child_reservation:
+                self.mark_unknown("foreign_custody")
+                return "unknown"
             # The durable handoff never adopted; releasing this reservation is proven safe.
             self.cancel_unactivated_child()
             return "unadopted" if self.settled else "unknown"
@@ -723,16 +963,32 @@ class CronOwnerBinding:
             process is not None
             and isinstance(record, dict)
             and record.get("status") in {"completed", "failed"}
-            and self._worker_identity_matches(record, process, dispatch_mode)
         ):
-            scope_proof = None
+            record_started_at = record.get("process_started_at")
             with self._lock:
+                previously_activated = not hasattr(self.handle, "reservation")
                 already_active = (
-                    self._worker_pid == getattr(process, "pid", None)
-                    and self._worker_started_at == record.get("process_started_at")
+                    self._worker_pid == record_pid
+                    and self._worker_started_at == record_started_at
                 )
-            if already_active:
+            if previously_activated:
+                # Once the child lease is active, a terminal row must match the exact tuple
+                # authenticated during activation.  A mismatch is ownership uncertainty; never
+                # reopen live ancestry and re-activate the same lease with a replacement tuple.
+                if not already_active:
+                    self.mark_unknown("foreign_custody")
+                    return "unknown"
+                # The split was authenticated before exit.  Do not re-run live ancestry here;
+                # observe_terminal still has to prove Job empty and close the retained handle.
+                if not self._stored_active_worker_matches(
+                    record_pid, record_started_at, dispatch_mode):
+                    self.mark_unknown("foreign_custody")
+                    return "unknown"
                 return "terminalized"
+            if not self._worker_identity_matches(record, process, dispatch_mode):
+                self.mark_unknown("foreign_custody")
+                return "unknown"
+            scope_proof = None
             if dispatch_mode == "scoped":
                 with self._lock:
                     expected_scope = self._scope_unit
@@ -741,14 +997,31 @@ class CronOwnerBinding:
                     expected_scope is None
                     or scope_proof is None
                     or scope_proof.get("pid") != record_pid
-                    or scope_proof.get("process_started_at") != record.get("process_started_at")
+                    or scope_proof.get("process_started_at") != record_started_at
                 ):
                     self.mark_unknown("foreign_custody")
                     return "unknown"
             with self._lock:
+                bound_pid = self._bound_process_pid
+                bound_started_at = self._bound_process_started_at
                 native_job = self._native_job
                 native_job_proven = self._native_job_proven
-            if native_job is not None and native_job_proven is not True:
+                native_job_identity = self._native_job_identity
+            windows_split = (
+                sys.platform == "win32"
+                and dispatch_mode == "degraded"
+                and type(bound_pid) is int
+                and record_pid != bound_pid
+            )
+            if not self._native_job_binding_matches(
+                native_job, native_job_identity, native_job_proven, process):
+                self.mark_unknown("worker_scope_unproven")
+                return "unknown"
+            if windows_split and (
+                native_job is None
+                or native_job_proven is not True
+                or native_job_identity is not native_job
+            ):
                 self.mark_unknown("worker_scope_unproven")
                 return "unknown"
             try:
@@ -761,13 +1034,20 @@ class CronOwnerBinding:
                 self.mark_unknown("lease_release_failed")
                 return "unknown"
             with self._lock:
-                self._worker_pid = record.get("pid")
-                self._worker_started_at = record.get("process_started_at")
+                self._worker_pid = record_pid
+                self._worker_started_at = record_started_at
                 if self._native_job is not None and dispatch_mode != "scoped":
                     self._scope_proof = {
                         "kind": "windows_job",
-                        "pid": record.get("pid"),
+                        "pid": record_pid,
                         "process_started_at": self._worker_started_at,
+                        "root_pid": bound_pid,
+                        "root_process_started_at": bound_started_at,
+                        "native_job_canonical": True,
+                        "worker_job_membership": (
+                            "transitive_no_breakaway_ancestry" if windows_split
+                            else "retained_root_handle"
+                        ),
                         "scope_empty": False,
                     }
             return "terminalized"

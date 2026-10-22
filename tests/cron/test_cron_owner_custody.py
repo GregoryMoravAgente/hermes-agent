@@ -63,6 +63,17 @@ def _claimed(binding, executions, job_id="job-1"):
     return record
 
 
+def _windows_base_executable():
+    """Return the real interpreter for a direct native-child fixture.
+
+    uv-managed Windows environments commonly expose a launcher shim as ``sys.executable``;
+    ``sys._base_executable`` is the interpreter that executes the child in the direct case.
+    """
+    if sys.platform == "win32":
+        return getattr(sys, "_base_executable", None) or sys.executable
+    return sys.executable
+
+
 def test_i12_holds_real_future_until_terminal_delivery_and_teardown(custody_runtime):
     coordinator, executions, _db = custody_runtime
     from cron.runtime_custody import reserve_execution
@@ -126,7 +137,7 @@ def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(cust
         """
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True)
     worker.bind_process(process)
     assert process.stdout is not None
@@ -178,7 +189,7 @@ def test_i13_terminal_row_before_ready_ack_keeps_exact_worker_identity(custody_r
         """
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
         text=True)
     worker.bind_process(process)
     try:
@@ -228,7 +239,7 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
         """
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     worker.bind_process(process)
     try:
@@ -292,7 +303,7 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
         """
     )
     process, native_job = spawn_server(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         owner_job_name=new_windows_job_name())
     worker.bind_process(process, native_job=native_job)
@@ -320,6 +331,508 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
             process.wait(timeout=5)
         if native_job is not None:
             native_job.close()
+
+
+def _windows_split_fixture(custody_runtime, tmp_path, *, with_job):
+    """Start a real root/worker split; the root waits while the worker owns the ledger."""
+    _coordinator, executions, db = custody_runtime
+    from cron.runtime_custody import reserve_execution
+
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-windows-split", source="builtin", required=True)
+    executions.create_execution(
+        "job-windows-split", source="builtin", execution_id=binding.owner_id)
+    binding.bind_execution_record(executions.get_execution(binding.owner_id))
+    worker = binding.reserve_external_worker()
+    assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
+    ack_path = tmp_path / "worker-ack.json"
+    release_path = tmp_path / "worker-release"
+    worker_code = textwrap.dedent(
+        f"""
+        import json, os, time
+        from pathlib import Path
+        import cron.executions as e
+        e.EXECUTIONS_FILE = Path({str(db)!r})
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        Path({str(ack_path)!r}).write_text(json.dumps({{
+            "execution_id": {binding.execution_id!r},
+            "pid": os.getpid(),
+            "process_started_at": adopted["process_started_at"],
+            "dispatch_mode": "degraded",
+            "scope_unit": None,
+        }}), encoding="utf-8")
+        while not Path({str(release_path)!r}).exists():
+            time.sleep(0.01)
+        assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
+        """
+    )
+    launcher_code = textwrap.dedent(
+        f"""
+        import subprocess, sys
+        worker = subprocess.Popen([sys.executable, "-c", {worker_code!r}])
+        print(worker.pid, flush=True)
+        raise SystemExit(worker.wait())
+        """
+    )
+    native_job = None
+    process = None
+    try:
+        if with_job:
+            from hermes_cli.local_runtime.processes import spawn_server
+            from tui_gateway.windows_owner_recovery import new_windows_job_name
+            process, native_job = spawn_server(
+                [sys.executable, "-c", launcher_code],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, owner_job_name=new_windows_job_name(),
+            )
+        else:
+            process = subprocess.Popen(
+                [sys.executable, "-c", launcher_code],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True,
+            )
+        worker.bind_process(process, native_job=native_job)
+        from tests.waiting import wait_until
+        wait_until(
+            ack_path.exists,
+            timeout=15,
+            what="Windows trampoline worker acknowledgement",
+        )
+        acknowledgement = json.loads(ack_path.read_text(encoding="utf-8"))
+        return binding, worker, process, native_job, acknowledgement, release_path
+    except BaseException:
+        _windows_split_cleanup(process, native_job, release_path)
+        raise
+
+
+def _windows_split_cleanup(process, native_job, release_path):
+    release_path.touch(exist_ok=True)
+    try:
+        if process is not None and process.poll() is None:
+            process.terminate()
+        if process is not None:
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=10)
+    finally:
+        if native_job is not None and getattr(native_job, "_handle", None) is not None:
+            native_job.close()
+
+
+def _windows_direct_fixture(custody_runtime):
+    """Start a real same-PID worker with a retained canonical Job.
+
+    The native Windows PM environment may expose a ``Scripts/python.exe`` uv shim as
+    ``sys.executable``.  Use the interpreter's base executable here so this fixture proves the
+    direct contract; ``_windows_split_fixture`` deliberately uses ``sys.executable`` to prove
+    the trampoline/degraded contract separately.
+    """
+    _coordinator, executions, db = custody_runtime
+    from cron.runtime_custody import reserve_execution
+
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-windows-direct", source="builtin", required=True)
+    executions.create_execution(
+        "job-windows-direct", source="builtin", execution_id=binding.owner_id)
+    binding.bind_execution_record(executions.get_execution(binding.owner_id))
+    worker = binding.reserve_external_worker()
+    assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
+    script = textwrap.dedent(
+        f"""
+        import json, os, sys
+        from pathlib import Path
+        import cron.executions as e
+        e.EXECUTIONS_FILE = Path({str(db)!r})
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        print(json.dumps({{
+            "execution_id": {binding.execution_id!r},
+            "pid": os.getpid(),
+            "process_started_at": adopted["process_started_at"],
+            "dispatch_mode": "direct",
+            "scope_unit": None,
+        }}), flush=True)
+        assert sys.stdin.read(1) == "x"
+        e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered")
+        """
+    )
+    native_job = None
+    process = None
+    try:
+        from hermes_cli.local_runtime.processes import spawn_server
+        from tui_gateway.windows_owner_recovery import new_windows_job_name
+        process, native_job = spawn_server(
+            [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            owner_job_name=new_windows_job_name(),
+        )
+        worker.bind_process(process, native_job=native_job)
+        assert process.stdout is not None
+        acknowledgement = json.loads(process.stdout.readline())
+        return binding, worker, process, native_job, acknowledgement
+    except BaseException:
+        _windows_direct_cleanup(process, native_job)
+        raise
+
+
+def _windows_direct_cleanup(process, native_job):
+    try:
+        if process is not None and process.poll() is None:
+            stream = getattr(process, "stdin", None)
+            if stream is not None:
+                try:
+                    stream.write("x")
+                    stream.close()
+                except (OSError, ValueError):
+                    pass
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=10)
+    finally:
+        if native_job is not None and getattr(native_job, "_handle", None) is not None:
+            native_job.close()
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_authenticates_and_waiter_closes_job(custody_runtime, tmp_path):
+    """A real split is admitted only through canonical Job+ancestry proof and settles via waiter."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert acknowledgement["pid"] != process.pid
+        assert child._bound_process_pid == process.pid
+        assert child._worker_pid == acknowledgement["pid"]
+        assert child._worker_started_at == acknowledgement["process_started_at"]
+        assert child._native_job_proven is True
+        assert child._scope_proof["worker_job_membership"] == "transitive_no_breakaway_ancestry"
+        assert child._scope_proof["native_job_canonical"] is True
+        release_path.touch()
+        from cron.scheduler import _wait_for_external_cron_worker_body
+        assert _wait_for_external_cron_worker_body(
+            process, execution_id=child.execution_id, custody=child, dispatch_mode="degraded") is True
+        if child._reaper is not None:
+            child._reaper.join(timeout=10)
+        assert child.observe_terminal()
+        assert child._scope_proof["scope_empty"] is True
+        assert native_job._handle is None
+        assert child.settled
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_without_job_refuses(custody_runtime, tmp_path):
+    """A split without canonical native Job custody remains UNKNOWN, never settles."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=False)
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        with pytest.raises(CronCustodyRefused) as refusal:
+            child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert refusal.value.code == "worker_job_membership_unproven"
+        assert child._unknown is True
+        assert child.settled is False
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_forged_worker_without_ancestor_refuses(
+    custody_runtime, tmp_path,
+):
+    """A live sibling PID/start without the retained root ancestor cannot be adopted."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    sibling = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(20)"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        from gateway.status import get_process_start_time
+        forged = dict(
+            acknowledgement,
+            pid=sibling.pid,
+            process_started_at=get_process_start_time(sibling.pid),
+        )
+        with pytest.raises(CronCustodyRefused):
+            child.activate_external_worker(forged, process, dispatch_mode="degraded")
+        assert child._unknown is True
+    finally:
+        sibling.terminate()
+        sibling.wait(timeout=10)
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_query_or_replaced_job_refuses(
+    custody_runtime, tmp_path,
+):
+    """Query-only and replaced Jobs cannot cross the canonical owner boundary."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    query_only = None
+    replacement = None
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        from hermes_cli.local_runtime.processes import _WindowsJob
+        query_only = _WindowsJob.open_existing(native_job.name)
+        child._native_job = query_only
+        child._native_job_proven = False
+        with pytest.raises(CronCustodyRefused):
+            child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert child._unknown is True
+    finally:
+        if query_only is not None:
+            query_only.close()
+        _windows_split_cleanup(process, native_job, release_path)
+
+    # A fresh canonical Job with a different handle is also foreign, even if a caller forges the
+    # boolean proof. The retained object identity is part of the authenticated binding.
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path / "replacement", with_job=True)
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        from tui_gateway.windows_owner_recovery import new_windows_job_name
+        replacement = type(native_job)(name=new_windows_job_name())
+        child._native_job = replacement
+        child._native_job_proven = True
+        with pytest.raises(CronCustodyRefused):
+            child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert child._unknown is True
+    finally:
+        if replacement is not None and getattr(replacement, "_handle", None) is not None:
+            replacement.close()
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_closed_job_refuses(
+    custody_runtime, tmp_path,
+):
+    """A closed native Job cannot be promoted to an owner after the worker is launched."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    closed_job = None
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        from tui_gateway.windows_owner_recovery import new_windows_job_name
+
+        # Keep the real retained owner Job alive so the worker remains a live causal fixture;
+        # close a separate canonical handle and make it the candidate binding.  This exercises
+        # the closed-handle path without terminating the real root/worker tree through
+        # KILL_ON_JOB_CLOSE.
+        closed_job = type(native_job)(name=new_windows_job_name())
+        closed_job.close()
+        child._native_job = closed_job
+        child._native_job_identity = closed_job
+        child._native_job_proven = True
+        with pytest.raises(CronCustodyRefused) as refusal:
+            child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert refusal.value.code == "worker_job_membership_unproven"
+        assert child._unknown is True
+        assert child.settled is False
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_stale_worker_birth_refuses(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """A live worker PID with a stale birth fingerprint cannot satisfy the split proof."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    try:
+        from cron.runtime_custody import CronCustodyRefused
+        from gateway.status import get_process_start_time
+
+        real_get_process_start_time = get_process_start_time
+
+        def stale_worker_birth(pid):
+            value = real_get_process_start_time(pid)
+            if pid == acknowledgement["pid"] and isinstance(value, int):
+                return value + 1
+            return value
+
+        monkeypatch.setattr("gateway.status.get_process_start_time", stale_worker_birth)
+        with pytest.raises(CronCustodyRefused):
+            child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert child._unknown is True
+        assert child.settled is False
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_terminal_uses_same_retained_job_after_exit(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """After activation, terminalization uses the stored tuple and retained Job handle only."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        original_job = child._native_job
+        original_identity = child._native_job_identity
+        original_process = child._process
+        release_path.touch()
+        process.wait(timeout=10)
+
+        # Once split admission succeeded, the child may finish after both live ancestry probes
+        # are gone.  Reconciliation must not re-adopt a fresh PID or walk ancestry again.
+        monkeypatch.setattr(
+            child, "_windows_trampoline_worker_matches",
+            lambda *_args, **_kwargs: pytest.fail("terminal reconciliation re-probed ancestry"),
+        )
+        assert child.reconcile_unacknowledged(process, dispatch_mode="degraded") == "terminalized"
+        assert child._process is original_process
+        assert child._native_job is original_job
+        assert child._native_job_identity is original_identity
+        assert child._worker_pid == acknowledgement["pid"]
+        assert child._worker_started_at == acknowledgement["process_started_at"]
+
+        from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+        reaper = reap_terminal_worker_in_background(process)
+        child.bind_reaper(reaper)
+        reaper.join(timeout=10)
+        assert not reaper.is_alive()
+        assert child.observe_terminal()
+        assert child.settled
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("replacement_kind", ("query_only", "foreign_canonical", "dropped"))
+def test_i13_windows_direct_terminal_replaced_or_query_job_refuses(
+    custody_runtime, replacement_kind,
+):
+    """A direct same-PID terminal row cannot drain a replaced, dropped, or query-only Job."""
+    _parent, child, process, native_job, acknowledgement = _windows_direct_fixture(custody_runtime)
+    from cron import executions
+    replacement = None
+    active_handle = None
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="direct")
+        assert acknowledgement["pid"] == process.pid
+        active_handle = child.handle
+        original_job = child._native_job
+        if replacement_kind == "dropped":
+            # Keep the authenticated identity while dropping only the live object.  The
+            # retained Job receipt must still be required during terminal reconciliation.
+            replacement = None
+            child._native_job = None
+            assert child._native_job_identity is original_job
+            assert child._native_job_proven is True
+        elif replacement_kind == "query_only":
+            from hermes_cli.local_runtime.processes import _WindowsJob
+            replacement = _WindowsJob.open_existing(native_job.name)
+        else:
+            from tui_gateway.windows_owner_recovery import new_windows_job_name
+            replacement = type(native_job)(name=new_windows_job_name())
+        if replacement_kind != "dropped":
+            child._native_job = replacement
+            child._native_job_proven = True
+        assert executions.finish_execution(
+            child.execution_id, success=True, delivery_outcome="delivered") is not None
+        assert child.reconcile_unacknowledged(process, dispatch_mode="direct") == "unknown"
+        assert child._unknown is True
+        assert child.settled is False
+        assert child.handle is active_handle
+        assert child._native_job_identity is original_job
+    finally:
+        if replacement is not None and getattr(replacement, "_handle", None) is not None:
+            replacement.close()
+        _windows_direct_cleanup(process, native_job)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_terminal_tuple_mismatch_refuses_without_readoption(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """An activated split with a stale terminal tuple stays UNKNOWN while both processes live."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    from cron import executions
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        active_handle = child.handle
+        active_job = child._native_job
+        assert executions.finish_execution(
+            child.execution_id, success=True, delivery_outcome="delivered") is not None
+        child._worker_started_at += 1
+        reactivation_calls = []
+
+        def _unexpected_reactivation(*args, **kwargs):
+            reactivation_calls.append((args, kwargs))
+            raise AssertionError("activated binding must not re-adopt a mismatched tuple")
+
+        monkeypatch.setattr(child, "_activate_child", _unexpected_reactivation)
+        assert child.reconcile_unacknowledged(process, dispatch_mode="degraded") == "unknown"
+        assert child._unknown is True
+        assert child.settled is False
+        assert reactivation_calls == []
+        assert process.poll() is None
+        assert child.handle is active_handle
+        assert child._native_job is active_job
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_terminal_stored_identity_or_job_failure_is_unknown(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """Terminal reconciliation uses stored identity and still refuses missing Job drain proof."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        original_started = child._worker_started_at
+        child._worker_started_at = original_started + 1
+        release_path.touch()
+        from cron.scheduler import _ExternalWorkerPostHandoffError, _wait_for_external_cron_worker_body
+        with pytest.raises(_ExternalWorkerPostHandoffError):
+            _wait_for_external_cron_worker_body(
+                process, execution_id=child.execution_id, custody=child, dispatch_mode="degraded")
+        assert child._unknown is True
+        assert child.settled is False
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_trampoline_job_drain_failure_is_unknown(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """An authenticated split cannot settle when the retained Job cannot prove empty/close."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True)
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        monkeypatch.setattr(native_job, "empty", lambda: None)
+        release_path.touch()
+        from cron.scheduler import _wait_for_external_cron_worker_body
+        assert _wait_for_external_cron_worker_body(
+            process, execution_id=child.execution_id, custody=child, dispatch_mode="degraded") is True
+        assert child._unknown is True
+        assert child.settled is False
+        assert child._scope_proof["scope_empty"] is False
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
 
 
 def test_i13_birth_fingerprint_mismatch_refuses_worker_adoption(custody_runtime, monkeypatch):
@@ -353,7 +866,7 @@ def test_i13_birth_fingerprint_mismatch_refuses_worker_adoption(custody_runtime,
         """
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         text=True)
     # Capture a deliberately stale parent fingerprint before bind_process. The child adopts the
     # real durable row and publishes its real fingerprint, so activation must refuse the mismatch
@@ -537,7 +1050,7 @@ def test_i13_direct_popen_identity_probe():
         """
     )
     process = subprocess.Popen(
-        [sys.executable, "-c", script], stdin=subprocess.PIPE,
+        [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     try:
         from gateway.status import get_process_start_time
