@@ -38,6 +38,7 @@ async def test_retry_after_a_lost_refresh_replays_the_same_rewind(tmp_path, monk
     from hermes_cli.gateway_chat_commands import run_command
     from hermes_cli.gateway_client import GatewayClientError
     from hermes_cli.gateway_mutations import PreparedMutations
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
@@ -46,6 +47,7 @@ async def test_retry_after_a_lost_refresh_replays_the_same_rewind(tmp_path, monk
                              _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     db = authority.db
     try:
         connection = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})
