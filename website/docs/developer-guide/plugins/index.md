@@ -684,6 +684,9 @@ When both exist the `pyproject.toml` wins. What Hermes does with them:
 - **`--yes-deps`** answers the dependency question up front, so a headless install (CI, SSH
   automation, a container entrypoint) prepares the declared dependencies instead of being refused.
   It is mutually exclusive with `--no-deps`.
+- **A `pyproject.toml` that installs nothing** (`dependencies = []`, no `[build-system]`, extras
+  or dependency groups) counts as no declaration: no dependency question, and enabling or updating
+  the plugin leaves the dependency environment as it is.
 - **`python_runtime: external`** keeps a sidecar's dependencies out of the shared union.
   Hermes does not install that Python runtime or modify its declaration.
 - **Nothing to load is an error** — `hermes plugins validate` rejects `plugin.yaml` without
