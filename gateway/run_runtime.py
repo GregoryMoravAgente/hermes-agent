@@ -403,7 +403,8 @@ _INTEGRATED_PRESERVATION_OWNER_CLASSES = (
     'I02_api_session_turn', 'I04_fifo_turn_execution',
     'I06_busy_followup_delivery',
     # Automation supplies its own observed-ingress and durable/terminal readiness checks.
-    'I07_automation_route_wakes', 'I08_goals_loops_heartbeat',
+    'I05_controls_and_unknown', 'I07_automation_route_wakes', 'I08_goals_loops_heartbeat',
+    'I11_session_mutations_finalizers',
     'I09_a2a_hosted_kanban',
 )
 
@@ -511,46 +512,72 @@ def _authority_owner_ready(authority, owner_class: str, coordinator) -> bool:
         return False
 
 
-def _seal_authority_preservation_owner(
+def _authority_source_owner_evidence(runner, _authority, receipt, owner_class, owner_id):
+    from gateway.preservation_source_close import source_owner_evidence
+
+    return source_owner_evidence(
+        runner, owner_class,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        owner_id=owner_id,
+    )
+
+
+def _authority_goal_owner_evidence(_runner, authority, receipt, _owner_class, owner_id):
+    from gateway.session_goal_tick_custody import source_owner_evidence
+
+    return source_owner_evidence(
+        authority,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        owner_id=owner_id,
+    )
+
+
+def _authority_hosted_owner_evidence(_runner, authority, receipt, _owner_class, owner_id):
+    from gateway.session_hosted_service import preservation_i09_owner_evidence
+
+    return preservation_i09_owner_evidence(
+        authority, process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation, owner_id=owner_id,
+    )
+
+
+def _authority_readiness_owner_evidence(_runner, authority, receipt, owner_class, owner_id):
+    from gateway.session_authority_readiness import preservation_owner_evidence
+
+    return preservation_owner_evidence(
+        authority, owner_class,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        owner_id=owner_id,
+    )
+
+
+_AUTHORITY_OWNER_EVIDENCE_HANDLERS = {
+    'I01_native_inbound': _authority_source_owner_evidence,
+    'I06_busy_followup_delivery': _authority_source_owner_evidence,
+    'I08_goals_loops_heartbeat': _authority_goal_owner_evidence,
+    'I09_a2a_hosted_kanban': _authority_hosted_owner_evidence,
+    'I05_controls_and_unknown': _authority_readiness_owner_evidence,
+    'I11_session_mutations_finalizers': _authority_readiness_owner_evidence,
+}
+
+
+def _authority_preservation_owner_evidence(
     runner, coordinator, receipt, descriptor, authority, owner_class: str,
 ) -> None:
     from gateway.runtime_custody import OWNER_SPECS
 
     owner_id = f'{descriptor.get("instance_id", receipt.process_instance)}:{owner_class}'
-    if owner_class in {'I01_native_inbound', 'I06_busy_followup_delivery'}:
-        from gateway.preservation_source_close import source_owner_evidence
-
-        evidence = source_owner_evidence(
-            runner, owner_class,
-            process_instance=receipt.process_instance,
-            authority_epoch=receipt.authority_epoch,
-            close_generation=receipt.close_generation,
-            owner_id=owner_id,
-        )
-        if evidence is None:
-            return
-    elif owner_class == 'I08_goals_loops_heartbeat':
-        from gateway.session_goal_tick_custody import source_owner_evidence
-
-        evidence = source_owner_evidence(
-            authority,
-            process_instance=receipt.process_instance,
-            authority_epoch=receipt.authority_epoch,
-            close_generation=receipt.close_generation,
-            owner_id=owner_id,
-        )
-        if evidence is None:
-            return
-    elif owner_class == 'I09_a2a_hosted_kanban':
-        from gateway.session_hosted_service import preservation_i09_owner_evidence
-        evidence = preservation_i09_owner_evidence(
-            authority, process_instance=receipt.process_instance,
-            authority_epoch=receipt.authority_epoch,
-            close_generation=receipt.close_generation, owner_id=owner_id)
-        if evidence is None:
-            return
-    else:
-        evidence = {
+    handler = _AUTHORITY_OWNER_EVIDENCE_HANDLERS.get(owner_class)
+    evidence = (
+        handler(runner, authority, receipt, owner_class, owner_id)
+        if handler is not None else {
             'source': OWNER_SPECS[owner_class].source,
             'process_instance': receipt.process_instance,
             'authority_epoch': receipt.authority_epoch,
@@ -558,6 +585,41 @@ def _seal_authority_preservation_owner(
             'owner_id': owner_id,
             'observed': True,
         }
+    )
+    return evidence
+
+
+def _seal_authorities_preservation_owner(
+    runner, coordinator, receipt, descriptor, authorities, owner_class,
+):
+    """Seal once, only after every served authority supplies this close's evidence."""
+    from gateway.runtime_custody import OWNER_SPECS
+
+    observations = []
+    for authority in authorities:
+        try:
+            evidence = _authority_preservation_owner_evidence(
+                runner, coordinator, receipt, descriptor, authority, owner_class,
+            )
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            coordinator.mark_owner_unknown(owner_class, 'read_failed')
+            return
+        if (not isinstance(evidence, dict)
+                or evidence.get('source') != OWNER_SPECS[owner_class].source
+                or evidence.get('process_instance') != receipt.process_instance
+                or evidence.get('authority_epoch') != receipt.authority_epoch
+                or evidence.get('close_generation') != receipt.close_generation
+                or evidence.get('observed') is not True
+                or not isinstance(evidence.get('owner_id'), str) or not evidence['owner_id']):
+            coordinator.mark_owner_unknown(owner_class, 'owner_observation_missing')
+            return
+        observations.append(evidence)
+    if not observations:
+        return
+    # Preserve each source's evidence instead of allowing the last profile's successful seal
+    # to replace an earlier missing observation. Admission is already closed for this generation.
+    evidence = dict(observations[0])
+    evidence['authority_observations'] = tuple(observations)
     refusal = coordinator.seal_owner(owner_class, evidence)
     if refusal is not None:
         coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
@@ -566,9 +628,9 @@ def _seal_authority_preservation_owner(
 def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     """Seal source consumers whose durable terminal paths are wired here.
 
-    Per-authority hooks retain I01/I02/I04/I07 readiness. Cron uses its ledger, process and pipe
-    evidence independently, even without session authorities. Every other class stays unwired
-    until its own source seam proves readiness.
+    Per-authority hooks retain the exact I01/I02/I04/I05/I07/I08/I09/I11 readiness predicates.
+    Cron uses its ledger, process and pipe evidence independently, even without session
+    authorities. Every other class stays unwired until its own source seam proves readiness.
     """
     authorities = _authorities(runner)
     from gateway.runtime_custody import OWNER_SPECS
@@ -582,10 +644,9 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
         for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
             if not all(_authority_owner_ready(authority, owner_class, coordinator) for authority in authorities):
                 continue
-            for authority in authorities:
-                _seal_authority_preservation_owner(
-                    runner, coordinator, receipt, descriptor, authority, owner_class,
-                )
+            _seal_authorities_preservation_owner(
+                runner, coordinator, receipt, descriptor, authorities, owner_class,
+            )
 
     # Direct API runs have a separate adapter-owned source hook.  It may seal only after the
     # adapter registered its run lifecycle and every source-owned run/status/transport/finalizer

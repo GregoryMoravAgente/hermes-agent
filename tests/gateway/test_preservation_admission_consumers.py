@@ -29,6 +29,7 @@ def _install_custody(authority, *source_adapters):
         profile_scope=(ProfileScopeResolver(authority.runner)
                        if getattr(authority.runner, 'session_authorities', None) is not None else None),
     )
+    authority._register_preservation_producer_graph(authority.runner.runtime_custody)
     # These consumer fixtures use the canonical owner fixture, which intentionally does not
     # run the full GatewayRunner adapter bootstrap. Register the real adapter instance through
     # the production source-close seam so begin_preservation_drain observes the same source

@@ -7,6 +7,7 @@ the store under a live gateway would be a second writer, so it never does.
 """
 import asyncio
 from pathlib import Path
+import uuid
 
 from hermes_state_runtime import RuntimeStoreError
 
@@ -35,9 +36,38 @@ async def prune(connection, ref, params):
                                           or never_active < 0)):
         raise RuntimeStoreError('invalid_params')
     filters = _filters(params['filters']) if 'filters' in params else None
-    authority._require_admission_open()
+    # Store-wide pruning creates a new mutation root; it cannot join an external preservation
+    # drain the way an already accepted FIFO continuation can.
+    authority._require_fresh_admission_open()
     from gateway.session_runtime_workers import track_mutation
-    task = track_mutation(authority, _apply(authority, filters, never_active))
+    request_id = f'session-prune:{uuid.uuid4().hex}'
+    preservation_key = authority._preservation_operation_start_direct_mutation(
+        principal_id=actor.subject,
+        session_id=None,
+        operation='session-prune',
+        request_id=request_id,
+        source_identity='session_prune',
+    )
+    operation = _apply(authority, filters, never_active)
+    try:
+        task = track_mutation(authority, operation)
+    except RuntimeError:
+        operation.close()
+        authority._preservation_operation_unknown(preservation_key, 'join_failed')
+        raise
+    if preservation_key is not None:
+        def finish(done):
+            if done.cancelled():
+                authority._preservation_operation_unknown(preservation_key, 'join_failed')
+                return
+            error = done.exception()
+            if error is not None:
+                authority._preservation_operation_unknown(preservation_key, 'join_failed')
+                return
+            authority._preservation_operation_terminal(
+                preservation_key, f'session-prune:{request_id}',
+            )
+        task.add_done_callback(finish)
     return await asyncio.shield(task)
 
 

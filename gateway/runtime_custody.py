@@ -1663,4 +1663,16 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
         profile_scope=ProfileScopeResolver(runner) if registry is not None else None,
     )
     runner.runtime_custody = coordinator
+    authorities = list(registry) if registry is not None else [
+        getattr(runner, 'session_authority', None),
+    ]
+    for authority in authorities:
+        if authority is None:
+            continue
+        bind_graph = getattr(authority, '_register_preservation_producer_graph', None)
+        if callable(bind_graph):
+            # Bootstrap created and registered the exact empty producer containers.  Bind that
+            # witness to this coordinator; a missing or colliding graph must fail closed rather
+            # than leaving a source that can later appear quiescent by default.
+            bind_graph(coordinator)
     return coordinator

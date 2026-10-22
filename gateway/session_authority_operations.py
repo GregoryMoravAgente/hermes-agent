@@ -11,6 +11,7 @@ import asyncio
 import json
 import sqlite3
 
+from gateway.session_authority_operation_graph import PreservationProducerGraph
 from hermes_state_runtime import RuntimeStoreError
 
 
@@ -25,6 +26,94 @@ _AUTOMATION_OWNER_CLASSES = frozenset({
 
 
 class PreservationOperationsMixin:
+    # These are the concrete producer indexes created during authority bootstrap.  A missing or
+    # replaced index is an unknown source graph; only the exact empty containers registered here
+    # may support a zero-producer observation.
+    _PRESERVATION_PRODUCER_INDEX_TYPES = (
+        ('sessions', dict),
+        ('cancel_obligations', set),
+        ('steer_transfers', dict),
+        ('pending_stops', dict),
+        ('pending_steers', dict),
+        ('pending_closes', dict),
+        ('deferred_resets', dict),
+        ('_preservation_operations', dict),
+        ('_local_adoptions', dict),
+        ('_policy_refreshes', dict),
+        ('_pending_adoptions', set),
+        ('_mutation_tasks', set),
+        ('_bot_mailbox_operations', set),
+        ('_bot_receipt_tasks', set),
+        ('_bot_receipt_refreshes', dict),
+        ('_bot_receipt_index', dict),
+        ('_bot_receipt_dirty', set),
+        ('_bot_reply_watchers', dict),
+    )
+
+    def _register_preservation_producer_graph(self, coordinator=None):
+        """Register or bind the exact authority-local producer graph.
+
+        The unbound registration happens at ``SessionAuthority`` construction, before any source
+        can accept work.  Runtime bootstrap later binds the same graph to the current coordinator;
+        a different coordinator or a changed index is never silently adopted.
+        """
+        graph = getattr(self, '_preservation_producer_graph', None)
+        if graph is None:
+            if (
+                not isinstance(getattr(self, 'profile_id', None), str)
+                or not isinstance(getattr(self, 'instance_id', None), str)
+                or not getattr(self, 'profile_id', None)
+                or not getattr(self, 'instance_id', None)
+                or type(getattr(self, 'epoch', None)) is not int
+                or self.epoch < 1
+            ):
+                raise RuntimeStoreError('preservation_source_graph_invalid')
+            indexes = []
+            sentinel = object()
+            for name, expected_type in self._PRESERVATION_PRODUCER_INDEX_TYPES:
+                value = getattr(self, name, sentinel)
+                if value is sentinel or type(value) is not expected_type:
+                    raise RuntimeStoreError('preservation_source_graph_invalid')
+                indexes.append((name, value, expected_type))
+            graph = PreservationProducerGraph(
+                authority=self,
+                profile_id=self.profile_id,
+                instance_id=self.instance_id,
+                authority_epoch=self.epoch,
+                indexes=tuple(indexes),
+            )
+        elif not isinstance(graph, PreservationProducerGraph) or graph.authority is not self:
+            raise RuntimeStoreError('preservation_source_graph_invalid')
+
+        if coordinator is None:
+            self._preservation_producer_graph = graph
+            return graph
+        if getattr(self.runner, 'runtime_custody', None) is not coordinator:
+            raise RuntimeStoreError('preservation_source_graph_binding_mismatch')
+        if getattr(coordinator, 'process_instance', None) != self.instance_id:
+            raise RuntimeStoreError('preservation_source_graph_binding_mismatch')
+        if graph.coordinator is not None and graph.coordinator is not coordinator:
+            previous_records = getattr(graph.coordinator, '_records', None)
+            # A runtime may explicitly replace an idle coordinator during bootstrap/test setup,
+            # but never detach a graph while the previous ledger still owns a lease or is closing.
+            # This keeps the rebind a witnessed current binding rather than silently adopting a
+            # new coordinator over live custody.
+            if (getattr(graph.coordinator, 'state', None) != 'open'
+                    or type(previous_records) is not dict or previous_records):
+                raise RuntimeStoreError('preservation_source_graph_binding_collision')
+        if graph.coordinator is coordinator:
+            return graph
+        graph = PreservationProducerGraph(
+            authority=graph.authority,
+            profile_id=graph.profile_id,
+            instance_id=graph.instance_id,
+            authority_epoch=graph.authority_epoch,
+            indexes=graph.indexes,
+            coordinator=coordinator,
+        )
+        self._preservation_producer_graph = graph
+        return graph
+
     def _preservation_coordinator(self):
         return getattr(self.runner, 'runtime_custody', None)
 
@@ -1480,7 +1569,7 @@ class PreservationOperationsMixin:
         }:
             standalone_mutation = (
                 owner_class == 'I11_session_mutations_finalizers'
-                and source_identity == 'direct_authenticated_mutation'
+                and source_identity in {'direct_authenticated_mutation', 'session_prune'}
                 and admission_id is None
             )
             local_compression_root = (
@@ -1611,13 +1700,14 @@ class PreservationOperationsMixin:
             parent=parent_for_record, parent_handles=parent_handles_for_record)
 
     def _preservation_operation_start_direct_mutation(
-        self, *, principal_id, session_id, operation, request_id=None, admission_id=None, generation=None
+        self, *, principal_id, session_id, operation, request_id=None, admission_id=None,
+        generation=None, source_identity='direct_authenticated_mutation',
     ):
         """Reserve the standalone authenticated mutation root with a source-owned identity."""
         return self._preservation_operation_start(
             'I11_session_mutations_finalizers', principal_id=principal_id, session_id=session_id,
             operation=operation, request_id=request_id, admission_id=admission_id,
-            generation=generation, source_identity='direct_authenticated_mutation')
+            generation=generation, source_identity=source_identity)
 
 
 

@@ -239,6 +239,19 @@ class SessionAuthority(
         # Exact control, busy-delivery, and mutation leases. These are indexes of real
         # RuntimeCustodyCoordinator handles; they are not a second ownership authority.
         self._preservation_operations = {}
+        # Source-owned worker and mailbox indexes are created during bootstrap so an explicitly
+        # empty graph means "no producer registered".  Readiness refuses a missing or lazily
+        # recreated container instead of treating an absent attribute as quiescence.
+        self._local_adoptions = {}
+        self._policy_refreshes = {}
+        self._pending_adoptions = set()
+        self._mutation_tasks = set()
+        self._bot_mailbox_operations = set()
+        self._bot_receipt_tasks = set()
+        self._bot_receipt_refreshes = {}
+        self._bot_receipt_index = {}
+        self._bot_receipt_dirty = set()
+        self._bot_reply_watchers = {}
         # Exact external-process parents registered before a provider spawn.  This is an index
         # on the serving authority, not a second ledger; retirement consumes these object-bound
         # finalizers before releasing the profile.
@@ -253,6 +266,7 @@ class SessionAuthority(
         # Source-backed evidence that this authority has actually consumed the native inbound
         # entrypoint.  An empty native registry is not evidence that the connector source is wired.
         self._native_inbound_seen = False
+        self._register_preservation_producer_graph()
     def register_mcp_source_factory(self, factory):
         """Bind one profile factory before MCP discovery ingress."""
         current = self._mcp_source_factory
