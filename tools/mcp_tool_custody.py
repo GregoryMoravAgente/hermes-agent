@@ -14,20 +14,36 @@ from contextlib import asynccontextmanager
 import inspect
 import os
 import sys
+import threading
 from typing import Any
 
 from gateway.runtime_service_operations import ExternalProcessOperationError
 from gateway.runtime_sidecar_sources import SidecarOwner, bind_process, bind_reader, mark_process_finished, mark_unknown
 
 
-_CAPTURE_LOCK: asyncio.Lock | None = None
+_CAPTURE_GATE = threading.Lock()
 
 
-def _capture_lock() -> asyncio.Lock:
-    global _CAPTURE_LOCK
-    if _CAPTURE_LOCK is None:
-        _CAPTURE_LOCK = asyncio.Lock()
-    return _CAPTURE_LOCK
+class _CrossLoopCaptureLock:
+    """Serialize the shared SDK factory patch without binding a lock to one loop."""
+
+    def __init__(self) -> None:
+        self._held = False
+
+    async def __aenter__(self):
+        while not _CAPTURE_GATE.acquire(blocking=False):
+            await asyncio.sleep(0)
+        self._held = True
+        return self
+
+    async def __aexit__(self, _exc_type, _exc, _traceback) -> None:
+        if self._held:
+            self._held = False
+            _CAPTURE_GATE.release()
+
+
+def _capture_lock() -> _CrossLoopCaptureLock:
+    return _CrossLoopCaptureLock()
 
 
 class MCPProcessAdapter:
@@ -171,6 +187,53 @@ async def captured_stdio_client(
             yield streams, process
         else:
             yield streams, process, witness
+    except BaseException:
+        await cm.__aexit__(*sys.exc_info())
+        raise
+    else:
+        await cm.__aexit__(None, None, None)
+
+
+@asynccontextmanager
+async def captured_stdio_process(
+    stdio_client: Any, server_params: Any, *, include_context: bool = False,
+):
+    """Enter one SDK stdio transport and expose its exact process and streams.
+
+    This is a source-owned observation seam for the CUA backend.  The SDK factory
+    is patched only during the real context entry and restored before protocol work;
+    no PID lookup or replacement process can satisfy the witness.
+    """
+    captured: dict[str, Any] = {}
+    cm = stdio_client(server_params)
+    entered = False
+    async with _capture_lock():
+        module, original_factory = _stdio_factory(stdio_client)
+
+        async def capture_factory(*args, **kwargs):
+            process = await original_factory(*args, **kwargs)
+            captured["process"] = process
+            return process
+
+        current = getattr(module, "_create_platform_compatible_process", None)
+        if current is not original_factory:
+            raise ExternalProcessOperationError("mcp_process_factory_replaced")
+        module._create_platform_compatible_process = capture_factory
+        try:
+            try:
+                streams = await cm.__aenter__()
+                entered = True
+                if captured.get("process") is None:
+                    raise ExternalProcessOperationError("mcp_process_identity_missing")
+            except BaseException:
+                if entered:
+                    await cm.__aexit__(*sys.exc_info())
+                raise
+        finally:
+            module._create_platform_compatible_process = original_factory
+    process = captured["process"]
+    try:
+        yield (streams, process, cm) if include_context else (streams, process)
     except BaseException:
         await cm.__aexit__(*sys.exc_info())
         raise

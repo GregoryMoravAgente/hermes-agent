@@ -524,28 +524,12 @@ class GatewayTurnPersistenceMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
-    async def _hmwa_persist_turn_transcript(
-        self, *, event, source, session_entry, session_key, agent_result, agent_messages,
-        prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
+    async def _hmwa_persist_transcript_rows(
+        self, *, event, source, sid, history, agent_result, agent_messages, prepared, response,
+        agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure, store,
+        agent_persisted, ts, resolve_gateway_model,
     ):
-        """Persist this turn to the transcript (session_meta on first turn, user-only on transient
-        failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
-        cached agent's message count."""
-        from gateway.run import _resolve_gateway_model
-        ts = time.time()  # Unix epoch float — consistent with DB storage
-        store = self.async_session_store
-        sid = session_entry.session_id
-        history = prepared.history
-        # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
-        # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
-        # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
-        # the DB write here to prevent the duplicate-write bug (#860 / #42039). This holds for the codex
-        # app-server runtime too: although it early-returns and bypasses conversation_loop's per-step
-        # flushes, it flushes its own projected assistant/tool messages before returning and reports
-        # agent_persisted=True (see agent/codex_runtime.py). Reading the flag (default = self._session_db is
-        # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
-        # into a gateway-side write by returning False.
-        agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        """Persist the transcript rows and return their typed proofs plus unknown state."""
         _classic_transcript_proofs = []
         _classic_transcript_unknown = False
 
@@ -572,7 +556,7 @@ class GatewayTurnPersistenceMixin:
                 await _append_classic_transcript({
                     "role": "session_meta",
                     "tools": agent_result.get("tools", []) or [],
-                    "model": _resolve_gateway_model(),
+                    "model": resolve_gateway_model(),
                     "platform": source.platform.value if source.platform else "",
                     "timestamp": ts,
                 })
@@ -622,6 +606,38 @@ class GatewayTurnPersistenceMixin:
                             _user_msg_id_attached = True
                         await _append_classic_transcript(entry, skip_db=agent_persisted)
 
+        return _classic_transcript_proofs, _classic_transcript_unknown
+
+    async def _hmwa_persist_turn_transcript(
+        self, *, event, source, session_entry, session_key, agent_result, agent_messages,
+        prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
+    ):
+        """Persist this turn to the transcript (session_meta on first turn, user-only on transient
+        failure, nothing on context overflow), update last_prompt_tokens, and re-baseline the
+        cached agent's message count."""
+        from gateway.run import _resolve_gateway_model
+        ts = time.time()  # Unix epoch float — consistent with DB storage
+        store = self.async_session_store
+        sid = session_entry.session_id
+        history = prepared.history
+        # The agent already persisted this turn's rows (codex app-server reports agent_persisted=True
+        # too); skip the DB write. Default = a session DB exists; non-persisting runtimes pass False.
+        # The agent already persisted these messages to SQLite via _flush_messages_to_session_db(), so skip
+        # the DB write here to prevent the duplicate-write bug (#860 / #42039). This holds for the codex
+        # app-server runtime too: although it early-returns and bypasses conversation_loop's per-step
+        # flushes, it flushes its own projected assistant/tool messages before returning and reports
+        # agent_persisted=True (see agent/codex_runtime.py). Reading the flag (default = self._session_db is
+        # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
+        # into a gateway-side write by returning False.
+        agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
+        _classic_transcript_proofs, _classic_transcript_unknown = await self._hmwa_persist_transcript_rows(
+            event=event, source=source, sid=sid, history=history, agent_result=agent_result,
+            agent_messages=agent_messages, prepared=prepared, response=response,
+            agent_failed_early=agent_failed_early, hidden_reasoning_incomplete=hidden_reasoning_incomplete,
+            is_context_overflow_failure=is_context_overflow_failure, store=store,
+            agent_persisted=agent_persisted, ts=ts, resolve_gateway_model=_resolve_gateway_model,
+        )
+
         # Private custody fields never enter the public result.  A managed writer may provide its
         # canonical SessionDBWriteProof through the explicit typed handoff; without it the managed
         # route remains unknown instead of borrowing a gateway row.
@@ -644,7 +660,21 @@ class GatewayTurnPersistenceMixin:
                 # SessionDB proof and the authenticated direct/I04 binding; separate proof and
                 # binding attributes cannot express that atomic handoff.
                 from agent.session_persistence_proof import GatewayWriterProofHandoff
-                if type(_writer_handoff) is GatewayWriterProofHandoff:
+                # CUA also examines malformed/stale envelopes while its exact owner is
+                # retained; an active CUA parent must not silently fall through to a
+                # different writer family.  With no CUA owner, ``None`` preserves the
+                # existing classic/API typed handoff path.
+                from gateway.runtime_sidecar_cua import consume_cua_writer_handoff
+                from hermes_state_runtime import RuntimeStoreError
+                _cua_writer_consumed = consume_cua_writer_handoff(
+                    _writer_event, _writer_handoff,
+                )
+                if _cua_writer_consumed is False:
+                    raise RuntimeStoreError("cua_durable_result_unknown")
+                if _cua_writer_consumed is True:
+                    if _writer_event is not event:
+                        event._classic_terminal_event = _writer_event
+                elif type(_writer_handoff) is GatewayWriterProofHandoff:
                     _writer_event._classic_writer_handoff = _writer_handoff
                     if _writer_event is not event:
                         event._classic_terminal_event = _writer_event

@@ -197,6 +197,8 @@ class SessionAuthority(
         self._mcp_source_factory = None
         # Profile browser capability; accepted parents stay in the existing finalizer index.
         self._browser_source_factory = None
+        # Profile CUA capability; accepted parents stay in the existing finalizer index.
+        self._cua_source_factory = None
         # Source-backed evidence that this authority has actually consumed the native inbound
         # entrypoint.  An empty native registry is not evidence that the connector source is wired.
         self._native_inbound_seen = False
@@ -225,6 +227,16 @@ class SessionAuthority(
     def browser_source_factory(self):
         """Return the exact profile browser factory, if bootstrap installed one."""
         return self._browser_source_factory
+
+    def register_cua_source_factory(self, factory):
+        """Bind one profile CUA factory before public computer-use ingress."""
+        from gateway.runtime_service_operations import register_cua_source_factory
+        return register_cua_source_factory(self, factory)
+
+    def cua_source_factory(self):
+        """Return the exact profile CUA factory, if bootstrap installed one."""
+        from gateway.runtime_service_operations import cua_source_factory
+        return cua_source_factory(self)
 
     def register_external_process_finalizer(self, operation_id, parent):
         """Register the exact external parent that profile retirement must consume."""
@@ -691,6 +703,16 @@ class SessionAuthority(
             self._preservation_mark_unknown(admission_id, 'join_failed')
             return
         entry['result_durable'] = True
+
+    def _preservation_retire_sidecar(self, admission_id, request):
+        """Stage the exact source request for the canonical service forget fence."""
+        from gateway.runtime_service_operations import retire_cua_sidecar
+        return retire_cua_sidecar(self, admission_id, request)
+
+    def _preservation_forget_sidecar(self, admission_id, request):
+        """Forget only a source request whose exact terminal fence was recorded."""
+        from gateway.runtime_service_operations import forget_cua_sidecar
+        return forget_cua_sidecar(self, admission_id, request)
 
     def _preservation_has_sidecar(self, admission_id):
         return any(entry['admission_id'] == admission_id for entry in self._preservation_sidecars.values())

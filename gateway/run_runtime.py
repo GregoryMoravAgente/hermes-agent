@@ -79,6 +79,8 @@ async def initialize_session_authority(
     register_mcp_source_factory(runner, authority)
     from gateway.runtime_sidecar_browser import register_browser_source_factory
     register_browser_source_factory(runner, authority)
+    from gateway.runtime_sidecar_cua import register_cua_source_factory
+    register_cua_source_factory(runner, authority)
     managed_bootstrap = hasattr(runner, 'session_authorities')
     if not defer_local_recovery:
         from gateway.session_local_adoption import adopt_local_compressions

@@ -13,6 +13,7 @@ import json
 import logging
 import queue
 import re
+import sqlite3
 import threading
 import time
 from contextlib import suppress
@@ -186,31 +187,98 @@ def _require_external_process_turn_parent(provider: Any) -> None:
         raise ServiceCustodyError("preservation_owner_unmapped")
 
 
-def _classic_writer_proof_request_context(ctx: TurnContext) -> tuple[Any, bool]:
-    """Return the private event carrier and whether an authenticated writer route is active."""
+def _direct_i04_writer_route(agent: Any, turn_route: Any, binding: Any) -> bool:
+    """Recognize a direct, SessionDB-backed I04 route before the agent can persist.
+
+    Managed ACP and I07 have their own typed writer paths.  They must not be converted into
+    a direct I04 proof merely because a managed binding happens to be present in the context.
+    The route and constructed agent are checked together; a provider that has already moved
+    onto an external owner is left to its existing ACP custody path.
+    """
+    runtime = turn_route.get("runtime") if isinstance(turn_route, dict) else None
+    if not isinstance(runtime, dict):
+        return False
+    from gateway.runtime_service_operations import _external_provider
+    from gateway.runtime_service_custody import TurnCustodyBinding
+    if not isinstance(binding, TurnCustodyBinding):
+        return False
+    if _external_provider(runtime.get("provider"), runtime.get("base_url")):
+        return False
+    if _external_provider(getattr(agent, "provider", None), getattr(agent, "base_url", None)):
+        return False
+    if getattr(agent, "_external_process_policy", None) is not None:
+        return False
+    if getattr(agent, "_managed_acp_client", None) is not None:
+        return False
+    return True
+
+
+def _validate_direct_i04_writer_context(agent: Any, binding: Any) -> None:
+    """Fail closed on the real I04 binding, agent session/store, and current physical tip."""
+    from hermes_state_runtime import RuntimeStoreError
+    from gateway.runtime_service_custody import TurnCustodyBinding, validate_turn_binding
+
+    if not isinstance(binding, TurnCustodyBinding):
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    validate_turn_binding(binding)
+    # The binding names the logical root; the agent may write its current compressed tip.
+    # The canonical witness below authenticates that relationship and the exact store.
+    if getattr(agent, "_session_db", None) is None:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    from agent.session_persistence_proof import _store_path
+    store_path = _store_path(agent)
+    if not isinstance(store_path, str) or not store_path:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+    try:
+        from gateway.session_turn_physical_tip import resolve_physical_tip_witness
+        witness = resolve_physical_tip_witness(binding, agent.session_id, store_path)
+    except (
+        AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        sqlite3.Error,
+    ) as exc:
+        raise RuntimeStoreError("preservation_owner_unmapped") from exc
+    if witness is None:
+        raise RuntimeStoreError("preservation_owner_unmapped")
+
+
+def _classic_writer_proof_request_context(
+    ctx: TurnContext, *, agent: Any = None, turn_route: Any = None, current_binding: Any = None,
+) -> tuple[Any, bool, Any]:
+    """Return the event, request decision, and one authenticated explicit writer binding."""
     event = getattr(ctx, "classic_writer_event", None)
     if getattr(ctx, "classic_writer_binding", None) is not None:
-        return event, True
+        return event, True, ctx.classic_writer_binding
     # A nested I04/I07 turn deliberately has no direct classic binding.  Its existing
     # authenticated bridge and ContextVar are the only valid way to arm the typed writer
     # seam.  A native managed admission also has an I04 ContextVar, but without the
     # source-owned classic bridge it has no writer/physical-tip witness to publish here.
     try:
         from gateway.session_classic_custody import ClassicExecutionEventBridge
-        from gateway.runtime_service_custody import current_turn_binding
         bridge = getattr(event, "_classic_execution_bridge", None)
         if (
             not isinstance(bridge, ClassicExecutionEventBridge)
             or bridge.owner_event is not event
             or bridge.execution_event is None
         ):
-            return event, False
-        return event, current_turn_binding() is not None
+            if not _direct_i04_writer_route(agent, turn_route, current_binding):
+                return event, False, None
+            _validate_direct_i04_writer_context(agent, current_binding)
+            return event, True, current_binding
+        # Pass the captured I04 binding through the existing bridge too.  A no-argument
+        # request would reread the ContextVar and could arm a different admission after
+        # classification; classic I06 bindings took the early return above.
+        if _direct_i04_writer_route(agent, turn_route, current_binding):
+            _validate_direct_i04_writer_context(agent, current_binding)
+        return event, current_binding is not None, current_binding
     except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
-        return event, False
+        if _direct_i04_writer_route(agent, turn_route, current_binding):
+            raise
+        return event, False, None
 
 
-def _request_classic_writer_proof(agent: Any, ctx: TurnContext, requested: bool) -> None:
+def _request_classic_writer_proof(
+    agent: Any, ctx: TurnContext, requested: bool, binding: Any = None,
+) -> None:
     """Arm the existing typed writer handoff before the agent's first persistence effect."""
     if not requested:
         return
@@ -219,7 +287,7 @@ def _request_classic_writer_proof(agent: Any, ctx: TurnContext, requested: bool)
     request = getattr(agent, "_request_gateway_writer_proof", None)
     if not callable(request):
         raise RuntimeStoreError("preservation_owner_unmapped")
-    armed = (
+    armed = request(binding=binding) if binding is not None else (
         request(binding=ctx.classic_writer_binding)
         if ctx.classic_writer_binding is not None else request()
     )
@@ -1491,7 +1559,15 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # A direct classic admission owns the writer proof for this occurrence.  Arm the existing
         # typed SessionDB handoff before the agent can persist its turn; a classic child of an I04/I07
         # parent keeps the real managed binding in the ContextVar.
-        _classic_writer_event, _classic_writer_requested = _classic_writer_proof_request_context(ctx)
+        from gateway.runtime_service_custody import current_turn_binding
+        _current_turn_binding = current_turn_binding()
+        (
+            _classic_writer_event,
+            _classic_writer_requested,
+            _classic_writer_binding,
+        ) = _classic_writer_proof_request_context(
+            ctx, agent=agent, turn_route=turn_route, current_binding=_current_turn_binding,
+        )
         from gateway.run_turn_progress import local_viewer_turn
         local_sinks = None
         if local_viewer_turn(self) and not ctx.mute_notification_reply:
@@ -1501,7 +1577,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             from gateway.session_usage import TURN_BASE_ATTR
             setattr(agent, TURN_BASE_ATTR, int(getattr(agent, "session_output_tokens", 0) or 0))
         try:
-            _request_classic_writer_proof(agent, ctx, _classic_writer_requested)
+            _request_classic_writer_proof(
+                agent, ctx, _classic_writer_requested, _classic_writer_binding,
+            )
             agent_history, observed_group_context, history_media_paths = self._load_turn_history(agent, reused_cached_agent)
             persist_msg, persist_ts = self._prepare_turn_message(agent_history)
             compressions = getattr(getattr(agent, "context_compressor", None), "compression_count", None)

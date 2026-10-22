@@ -188,6 +188,10 @@ class _CuaDriverSession:
     def __init__(self, bridge: _AsyncBridge, embedded_daemon: Optional[Any] = None) -> None:
         self._bridge, self._embedded_daemon, self._session = bridge, embedded_daemon, None
         self._lock, self._started = threading.Lock(), False
+        # A managed CUA owner is installed by the source-owned gateway bridge before
+        # the first lifecycle task is scheduled.  It is deliberately an object
+        # reference, rather than a caller token or a boolean capability flag.
+        self._managed_owner = None
         # Per-tool capability-token sets from `tools/list` (read via supports_capability). Raw input schemas are
         # the source of truth for action properties: 0.9-era drivers advertise delivery_mode in inputSchema
         # without the ``input.delivery_mode`` token.
@@ -201,11 +205,23 @@ class _CuaDriverSession:
         self._shutdown_event: Optional[asyncio.Event] = None  # created on bridge loop
         self._lifecycle_future = None  # concurrent.futures.Future
         self._setup_error: Optional[BaseException] = None
+        self._managed_retry_prepared = False
         # Declared via start_session; revives an ended-session rejection non-re-entrantly.
         # Stable driver-side identity declared through start_session. Used to revive a logical ended-session
         # rejection without recursive call_tool re-entry or backend-owned state (#71166).
         self._declared_session_id: Optional[str] = None
         self._transport_generation, self._transport_reset_callback = 0, None
+
+    def set_managed_owner(self, owner: Any) -> None:
+        """Attach the source-created owner before opening the SDK transport."""
+        if owner is None or not callable(getattr(owner, "observe_session", None)):
+            raise RuntimeError("cua_managed_owner_invalid")
+        with self._lock:
+            if self._started or self._lifecycle_future is not None:
+                raise RuntimeError("cua_managed_owner_bound_after_start")
+            if self._managed_owner is not None and self._managed_owner is not owner:
+                raise RuntimeError("cua_managed_owner_replaced")
+            self._managed_owner = owner
 
     async def _lifecycle_coro(self) -> None:
         """Owns the stdio MCP contexts: open, signal ready, block on shutdown, clean up — all in one task."""
@@ -233,9 +249,18 @@ class _CuaDriverSession:
             _t_manifest = _time.monotonic()
             # Telemetry policy first (default: disabled), then strip Hermes secrets.
             params = StdioServerParameters(command=command, args=args, env=_sanitize_subprocess_env(child_env))
-            async with stdio_client(params) as (read, write):
+            owner = self._managed_owner
+            if owner is None:
+                transport_context = stdio_client(params)
+            else:
+                from gateway.runtime_sidecar_cua import captured_cua_stdio
+                transport_context = captured_cua_stdio(stdio_client, params, owner)
+            async with transport_context as (read, write):
                 self._startup_phase = "mcp-initialize"
-                async with ClientSession(read, write) as session:
+                session_context = ClientSession(read, write)
+                if owner is not None:
+                    session_context = owner.observe_session(session_context)
+                async with session_context as session:
                     await session.initialize()
                     _t_init = _time.monotonic()
                     # Capabilities BEFORE exposing the session: the first call sees them.
@@ -325,11 +350,15 @@ class _CuaDriverSession:
         self._transport_reset_callback = callback
 
     def _notify_transport_reset(self) -> None:
+        managed_retry = self._managed_retry_prepared
         try:
             if (callback := getattr(self, "_transport_reset_callback", None)) is not None:
                 callback()
         except Exception as exc:
             logger.debug("cua-driver transport reset callback failed: %s", exc)
+        finally:
+            if managed_retry:
+                self._managed_retry_prepared = False
 
     def _stop_lifecycle_locked(self) -> None:
         self._signal_shutdown_locked()
@@ -417,17 +446,39 @@ class _CuaDriverSession:
         finally re-attach the declared public label inside the replacement private lifecycle."""
         logger.warning(log_msg, name)
         if not restart:
-            self.start()
+            owner = self._managed_owner
+            had_previous_lifecycle = self._transport_generation > 0 or self._lifecycle_future is not None
+            if owner is not None and had_previous_lifecycle:
+                prepare = getattr(owner, "prepare_transport_retry", None)
+                if not callable(prepare) or prepare() is not True:
+                    raise RuntimeError("cua_transport_retry_unavailable")
+                self._managed_retry_prepared = True
+            try:
+                self.start()
+            except BaseException:
+                self._managed_retry_prepared = False
+                raise
         else:
             with self._lock:
+                was_started = self._started
+                owner = self._managed_owner
                 try:
-                    if self._started:
+                    if was_started:
                         self._stop_lifecycle_locked()
                 except Exception as e:
                     logger.debug("cua-driver session cleanup before reconnect failed: %s", e)
+                if was_started and owner is not None:
+                    prepare = getattr(owner, "prepare_transport_retry", None)
+                    if not callable(prepare) or prepare() is not True:
+                        raise RuntimeError("cua_transport_retry_unavailable")
+                    self._managed_retry_prepared = True
                 self._started = False
                 self._capabilities, self._tool_schemas, self._capability_version = {}, {}, ""
-                self._start_lifecycle_locked()
+                try:
+                    self._start_lifecycle_locked()
+                except BaseException:
+                    self._managed_retry_prepared = False
+                    raise
                 self._started = True
             if clear_timeout_suspect:
                 self._timeout_suspect = False

@@ -547,6 +547,7 @@ def _run_one_file(
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    strict_owned_descendants: bool = False,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -581,7 +582,7 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, strict_owned_descendants
     )
     attempt = 0
     # A worker killed by signal (OOM, SIGKILL) or the file timeout is a runaway, not a flake:
@@ -592,7 +593,7 @@ def _run_one_file(
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, strict_owned_descendants
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -620,9 +621,22 @@ def _run_one_file_once(
     pytest_args: list[str],
     repo_root: Path,
     file_timeout: float,
+    strict_owned_descendants: bool = False,
 ) -> tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    pytest_cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    if strict_owned_descendants:
+        cmd = [
+            sys.executable,
+            str(repo_root / "scripts/ci/linux_cua_custody.py"),
+            "run-owned-child",
+            "--deadline-seconds",
+            str(file_timeout),
+            "--",
+            *pytest_cmd,
+        ]
+    else:
+        cmd = pytest_cmd
 
     # Give this subprocess its own pytest temp root.
     #
@@ -674,6 +688,7 @@ def _run_one_file_once(
         except (ProcessLookupError, PermissionError):
             pgid = None
 
+    strict_native_success = False
     try:
         output, _ = proc.communicate(timeout=file_timeout)
         rc = proc.returncode
@@ -695,12 +710,18 @@ def _run_one_file_once(
         raise
     else:
         # Happy path: pytest exited on its own. Kill the group anyway in
-        # case it left grandchildren behind; already-dead is a no-op.
-        _kill_tree(proc, pgid=pgid)
+        # default mode. Strict mode's child wrapper returns zero only after
+        # native descendant closure, so signaling here would destroy the
+        # closure proof.
+        if strict_owned_descendants and rc == 0:
+            strict_native_success = True
+        else:
+            _kill_tree(proc, pgid=pgid)
 
         output +=  "\n"
     finally:
-        _kill_detached_leftovers(temproot)
+        if not strict_owned_descendants and not strict_native_success:
+            _kill_detached_leftovers(temproot)
         # Delete the temp root for this attempt. Nothing reads it after the
         # subprocess exits. More than 3000 of them fill the disk of the
         # runner over one suite. Permission fixtures leave read-only dirs
@@ -802,6 +823,72 @@ def _format_file(file: Path, repo_root: Path) -> str:
         return str(file.resolve().relative_to(repo_root.resolve()))
     except ValueError:
         return str(file)
+
+
+def _emit_strict_owned_closure(output: str, file: Path, repo_root: Path) -> int:
+    """Forward native child-closure receipts with their canonical file identity."""
+    prefix = "owned-child-closure "
+    emitted = 0
+    for line in output.splitlines():
+        if not line.startswith(prefix):
+            continue
+        try:
+            payload = json.loads(line[len(prefix) :])
+        except ValueError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        receipt = dict(payload)
+        receipt["file"] = _format_file(file, repo_root)
+        print(prefix + json.dumps(receipt, sort_keys=True), flush=True)
+        emitted += 1
+    return emitted
+
+
+def _apply_strict_owned_outcome(
+    rc: int, output: str, file: Path, repo_root: Path, strict_owned_descendants: bool,
+) -> tuple[int, str]:
+    """Require one source-owned closure receipt for each strict child."""
+    if not strict_owned_descendants:
+        return rc, output
+    closure_count = _emit_strict_owned_closure(output, file, repo_root)
+    if rc == 0 and closure_count != 1:
+        output += (
+            "\nstrict owned closure receipt was missing or ambiguous; "
+            f"expected exactly one record for {_format_file(file, repo_root)}\n"
+        )
+        return 125, output
+    return rc, output
+
+
+def _run_file_batch(
+    files: list[Path],
+    pytest_passthrough: list[str],
+    repo_root: Path,
+    workers: int,
+    file_timeout: float,
+    file_retries: int,
+    strict_owned_descendants: bool,
+    on_done,
+) -> None:
+    """Submit and join the per-file pool without changing runner scheduling policy."""
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    _sweep_killed_run_roots(_runner_scratch_root())
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        timeout_durations = _load_durations(repo_root)
+        futures: list[Future] = []
+        for file in files:
+            t0 = time.monotonic()
+            fut = pool.submit(
+                _run_one_file, file, pytest_passthrough, repo_root,
+                _effective_file_timeout(file, repo_root, file_timeout, timeout_durations),
+                file_retries, strict_owned_descendants,
+            )
+            fut.add_done_callback(lambda f, file=file, t0=t0: on_done(file, t0, f))
+            futures.append(fut)
+        for fut in futures:
+            fut.result() if fut.exception() is None else None
 
 
 def _print_progress(
@@ -1258,6 +1345,15 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--strict-owned-descendants",
+        action="store_true",
+        help=(
+            "Hosted Linux opt-in: wrap each pytest root with the owned "
+            "subreaper/waitid closure helper before reporting a successful file. "
+            "Default runner cleanup is unchanged."
+        ),
+    )
+    parser.add_argument(
         "paths_positional",
         nargs="*",
         metavar="PATH",
@@ -1286,7 +1382,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-h", "--help", "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
-        "--files-from", "--fail-on-skip",
+        "--files-from", "--fail-on-skip", "--strict-owned-descendants",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1501,6 +1597,9 @@ def main() -> int:
         with lock:
             files_done += 1
             tests_done += n_tests
+            rc, output = _apply_strict_owned_outcome(
+                rc, output, fpath, repo_root, args.strict_owned_descendants,
+            )
             # Accumulate test-level counts from parsed summary.
             tests_passed += summary.get("passed", 0)
             tests_failed += summary.get("failed", 0)
@@ -1529,32 +1628,10 @@ def main() -> int:
             if rc != 0:
                 _print_inline_failure(fpath, output, repo_root, pytest_passthrough)
 
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
-    _sweep_killed_run_roots(_runner_scratch_root())
-
-    with ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        # Duration cache for the timeout scaler: known-slow files get
-        # proportional headroom instead of a false timeout-kill under
-        # CI load (see _effective_file_timeout).
-        timeout_durations = _load_durations(repo_root)
-        futures: list[Future] = []
-        for file in files:
-            t0 = time.monotonic()
-            fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                _effective_file_timeout(
-                    file, repo_root, args.file_timeout, timeout_durations
-                ),
-                args.file_retries,
-            )
-            fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
-            futures.append(fut)
-        # Block until everything's done. ThreadPoolExecutor.__exit__ waits
-        # for all submitted work, but doing it explicitly here makes the
-        # control flow obvious.
-        for fut in futures:
-            fut.result() if fut.exception() is None else None
+    _run_file_batch(
+        files, pytest_passthrough, repo_root, args.jobs, args.file_timeout,
+        args.file_retries, args.strict_owned_descendants, _on_done,
+    )
 
     elapsed = time.monotonic() - started
     print()

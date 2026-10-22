@@ -263,6 +263,9 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
                 capability_manifest=raw.strip() if isinstance(raw, str) and raw.strip() else None)
         self._bridge = _AsyncBridge()
         self._session = _CuaDriverSession(self._bridge, self._embedded_daemon)
+        # Installed by the source-owned Gateway CUA bridge before start().  The
+        # backend never manufactures or accepts a caller-supplied custody token.
+        self._cua_owner = None
         # Sticky target (set by capture()/focus_app(), used by actions): `_active_pid`, `_active_window_id`, `_last_app`,
         # `_last_target` (exact identity for capture_after — Linux app names may be generic, e.g. several unrelated Qt
         # windows all say Qt6Application), `_snapshot_tokens` (element_index -> element_token, attached to actions so
@@ -275,7 +278,22 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
 
     def _handle_transport_reset(self) -> None:
         """Invalidate every capability minted by the replaced transport."""
+        owner = self._cua_owner
+        if owner is not None and not getattr(self._session, "_managed_retry_prepared", False):
+            try:
+                owner.mark_unknown("cua_transport_reset")
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                logger.debug("failed to retain CUA owner after transport reset", exc_info=True)
         self._clear_active_target()
+
+    def set_cua_owner(self, owner: Any) -> None:
+        """Bind the source-created CUA owner before the SDK lifecycle starts."""
+        if owner is None or not callable(getattr(owner, "observe_session", None)):
+            raise RuntimeError("cua_managed_owner_invalid")
+        if self._session._started or self._cua_owner is not None and self._cua_owner is not owner:
+            raise RuntimeError("cua_managed_owner_bound_after_start")
+        self._cua_owner = owner
+        self._session.set_managed_owner(owner)
 
     def start(self) -> None:
         # Driver inside the terminal backend: the sandbox image pins its own cua-driver; the host

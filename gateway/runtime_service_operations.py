@@ -14,6 +14,8 @@ from pathlib import Path
 import uuid
 from typing import Any, ContextManager, Literal
 
+from hermes_state_runtime import RuntimeStoreError
+
 
 logger = logging.getLogger(__name__)
 
@@ -346,6 +348,170 @@ def _begin_managed_request(binding: Any, service: Any, parent: ExternalProcessPa
                 logger.debug("managed admission unknown marker failed", exc_info=True)
         raise
     return request
+
+
+def begin_cua_request(service: Any, binding: Any, parent: ExternalProcessParent):
+    """Bind a cached CUA service to one exact current I04 request.
+
+    The persistent service root and its physical receipt remain the same across
+    cached turns.  Only ``ServiceLease.begin_request`` may create the new request
+    child, after the old request map is empty and the parent/service edges still
+    point at the same objects.
+    """
+    from gateway.runtime_service_custody import ServiceCustodyError
+    if (
+        getattr(service, "external_parent", None) is not parent
+        or getattr(parent, "_service", None) is not service
+        or getattr(parent, "root_handle", None) is not getattr(service, "handle", None)
+        or getattr(service, "unknown", False)
+        or getattr(service, "requests", None)
+    ):
+        raise ServiceCustodyError("cua_request_owner_mismatch")
+    old = getattr(service, "binding", None)
+    if old is not None and any(
+        getattr(old, field, None) != getattr(binding, field, None)
+        for field in (
+            "profile_id", "process_instance", "authority_epoch", "session_id",
+            "source_identity", "principal_id",
+        )
+    ):
+        raise ServiceCustodyError("cua_request_owner_mismatch")
+    if old is not None and (
+        getattr(old, "authority", None) is not getattr(binding, "authority", None)
+        or getattr(old, "coordinator", None) is not getattr(binding, "coordinator", None)
+    ):
+        raise ServiceCustodyError("cua_request_owner_mismatch")
+    service.binding = binding
+    try:
+        return service.begin_request(binding)
+    except BaseException:
+        service.binding = old
+        raise
+
+
+def register_cua_source_factory(authority: Any, factory: Any) -> Any:
+    """Bind one profile CUA factory before public computer-use ingress."""
+    current = authority._cua_source_factory
+    if current is not None and current is not factory:
+        raise RuntimeStoreError("cua_factory_registry_collision")
+    if getattr(factory, "authority", None) is not authority:
+        raise RuntimeStoreError("cua_factory_registry_mismatch")
+    authority._cua_source_factory = factory
+    return factory
+
+
+def cua_source_factory(authority: Any) -> Any:
+    """Return the exact profile CUA factory, if bootstrap installed one."""
+    return authority._cua_source_factory
+
+
+def retire_cua_sidecar(authority: Any, admission_id: Any, request: Any) -> None:
+    """Stage the exact source request for the canonical service forget fence."""
+    request_id = getattr(getattr(request, "lease", None), "lease_id", None)
+    entries = authority._preservation_sidecars
+    entry = entries.get(request_id)
+    if (
+        entry is None or entry["request"] is not request
+        or entry["admission_id"] != admission_id
+        or entry["result_durable"] or entry["delivery_complete"]
+    ):
+        raise RuntimeStoreError("stale_service_request")
+    entry["terminal"] = True
+
+
+def forget_cua_sidecar(authority: Any, admission_id: Any, request: Any) -> None:
+    """Forget only a source request whose exact terminal fence was recorded."""
+    request_id = getattr(getattr(request, "lease", None), "lease_id", None)
+    entries = authority._preservation_sidecars
+    entry = entries.get(request_id)
+    if entry is None or entry["request"] is not request or entry["admission_id"] != admission_id:
+        raise RuntimeStoreError("stale_service_request")
+    if not entry["terminal"]:
+        raise RuntimeStoreError("service_request_not_terminal")
+    entries.pop(request_id, None)
+
+
+def _validate_cua_request(service: Any, binding: Any, request: Any, parent: ExternalProcessParent) -> None:
+    from gateway.runtime_service_custody import ServiceCustodyError
+    if (
+        getattr(service, "external_parent", None) is not parent
+        or getattr(parent, "_service", None) is not service
+        or getattr(parent, "root_handle", None) is not getattr(service, "handle", None)
+        or getattr(service, "requests", {}).get(getattr(binding, "admission_id", None)) is not request
+        or getattr(getattr(request, "lease", None), "parent_lease_id", None)
+        != getattr(getattr(service.handle, "lease", None), "lease_id", None)
+        or getattr(service, "binding", None) is not binding
+    ):
+        service.coordinator.mark_unknown(parent.root_handle, "cua_request_identity_mismatch")
+        raise ServiceCustodyError("cua_request_identity_mismatch")
+    service.validate_binding(binding)
+
+
+def _retire_cua_sidecar(binding: Any, request: Any, service: Any) -> None:
+    retire = getattr(getattr(binding, "authority", None), "_preservation_retire_sidecar", None)
+    if not callable(retire):
+        return
+    try:
+        retire(binding.admission_id, request)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        service.unknown = True
+        from gateway.runtime_service_custody import ServiceCustodyError
+        raise ServiceCustodyError("cua_sidecar_retire_failed") from exc
+
+
+def _cua_request_is_terminal(service: Any, request: Any) -> bool:
+    records = getattr(service.coordinator, "_records", None)
+    lease_id = getattr(getattr(request, "lease", None), "lease_id", None)
+    record = records.get(lease_id) if isinstance(records, dict) else None
+    return getattr(record, "handle", None) is request and getattr(record, "state", None) == "terminal"
+
+
+def _cua_root_is_terminal(parent: ExternalProcessParent) -> bool:
+    coordinator = getattr(parent, "coordinator", None)
+    records = getattr(coordinator, "_records", None)
+    lock = getattr(coordinator, "_lock", None)
+    lease = getattr(getattr(parent, "root_handle", None), "lease", None)
+    lease_id = getattr(lease, "lease_id", None)
+    if lock is None or not isinstance(records, dict) or not isinstance(lease_id, str):
+        return False
+    with lock:
+        record = records.get(lease_id)
+        return (
+            getattr(record, "handle", None) is getattr(parent, "root_handle", None)
+            and getattr(record, "state", None) == "terminal"
+        )
+
+
+def release_cua_request(service: Any, binding: Any, request: Any, parent: ExternalProcessParent) -> None:
+    """Retire a CUA request that was refused before the native SDK effect."""
+    from gateway.runtime_service_custody import ServiceCustodyError
+    _validate_cua_request(service, binding, request, parent)
+    _retire_cua_sidecar(binding, request, service)
+    if not _cua_request_is_terminal(service, request) and service.coordinator.mark_terminal_with_secondary_parents(
+        request, (binding.parent_handle,),
+    ) is not None:
+        service.unknown = True
+        raise ServiceCustodyError("cua_release_failed")
+
+
+def complete_cua_request(
+    service: Any, binding: Any, request: Any, parent: ExternalProcessParent, receipt: Any,
+) -> None:
+    """Retire one closed CUA request through the existing secondary-parent edge."""
+    from gateway.runtime_service_custody import ServiceCustodyError
+    _validate_cua_request(service, binding, request, parent)
+    current = getattr(parent, "_cua_receipt", None)
+    if current is None or getattr(receipt, "owner", None) is not getattr(current, "owner", None):
+        raise ServiceCustodyError("cua_receipt_identity_mismatch")
+    if getattr(receipt, "state", None) != "closed" or receipt.readback() is None:
+        service.unknown = True
+        raise ServiceCustodyError("cua_receipt_unknown")
+    _retire_cua_sidecar(binding, request, service)
+    if not _cua_request_is_terminal(service, request) and service.coordinator.mark_terminal_with_secondary_parents(
+        request, (binding.parent_handle,),
+    ) is not None:
+        service.unknown = True
+        raise ServiceCustodyError("cua_request_finalize_failed")
 
 
 def producer_policy_for_turn(
