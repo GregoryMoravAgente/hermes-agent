@@ -116,7 +116,7 @@ def test_dotenv_loading_is_preserved_when_external_secrets_are_skipped(
 
 
 @pytest.mark.platforms("posix")  # the 'command' secret source is POSIX-only
-def test_update_probe_children_skip_external_secret_sources(tmp_path):
+def test_update_probe_children_skip_external_secret_sources(tmp_path, monkeypatch):
     """The critical-module import probe imports ``run_agent``, whose dotenv load must not run a
     configured secret helper: a slow helper (op/bws/command, 120s budget) inside the 120s probe
     surfaced as ``timed out before reporting import health`` on a healthy install (#110823)."""
@@ -125,6 +125,28 @@ def test_update_probe_children_skip_external_secret_sources(tmp_path):
     hit = tmp_path / "helper_hit"
     (home / "config.yaml").write_text(
         f"secrets:\n  command:\n    enabled: true\n    command: 'touch {hit}'\n", encoding="utf-8",
+    )
+    # CI exports the PM tool store through HERMES_RUNTIME_DIR.  The probe therefore boots the
+    # store interpreter and requires a committed dependency generation for the temporary profile;
+    # without this small managed selection, hermes_bootstrap correctly refuses a bare store Python
+    # before the import marker can be printed.  Reuse the test environment's packages through a
+    # symlink so this fixture exercises the production launcher contract without installing or
+    # falling back to the ambient test interpreter.
+    from pm.environments import install_state_dir, runtime_facts_path, site_packages
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    environment = install_state_dir(REPO_ROOT) / "environments" / "probe" / "venv"
+    environment.mkdir(parents=True)
+    (environment / "pyvenv.cfg").write_text(
+        f"home = test\nversion = {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}\n",
+        encoding="utf-8",
+    )
+    managed_site = site_packages(environment)
+    managed_site.parent.mkdir(parents=True, exist_ok=True)
+    managed_site.symlink_to(site_packages(Path(sys.prefix)), target_is_directory=True)
+    runtime_facts_path(REPO_ROOT).write_text(
+        json.dumps({"packages": {"venv": {"environment": str(environment)}}}),
+        encoding="utf-8",
     )
     result = subprocess.run(
         [sys.executable, "-c",
