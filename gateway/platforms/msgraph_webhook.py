@@ -445,6 +445,7 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
                 envelope = {'source': source, 'route': route, 'provenance': provenance,
                     'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
                     'event': {'message_id': event.message_id},
+                    'producer_process_mode': 'direct',
                     'automation': {'identity': event.message_id, 'owner': ref.session_id}}
                 request_id = event.message_id
                 principal_id = 'msgraph:' + route

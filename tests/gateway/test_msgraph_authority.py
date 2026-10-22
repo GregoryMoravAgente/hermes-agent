@@ -68,15 +68,25 @@ async def probe(peer):
             run_runtime._preservation_ownership_reason = lambda _runner, **_kwargs: None
             run_runtime._authorities = lambda _runner: [authority]
             route_entered, route_release = threading.Event(), threading.Event()
+            close_deadline_s = 30
+            original_await_source_close = adapter._preservation_await_source_close
             original_reserve_route = authority._reserve_route
 
             def blocked_reserve_route(source, *, fresh=False):
                 route_entered.set()
-                if not route_release.wait(10):
+                if not route_release.wait(close_deadline_s + 2):
                     raise RuntimeError('Graph route barrier expired')
                 return original_reserve_route(source, fresh=fresh)
 
+            async def source_close_barrier(_generation, timeout):
+                # The source-close response is the handoff boundary.  Refuse it while the
+                # route reservation is still entered so prepare_handoff observes the active I01
+                # root without waiting for the full close deadline.
+                await asyncio.to_thread(route_entered.wait, timeout)
+                return False
+
             authority._reserve_route = blocked_reserve_route
+            adapter._preservation_await_source_close = source_close_barrier
             racing_task = None
             try:
                 racing_notification = {
@@ -90,7 +100,8 @@ async def probe(peer):
                 close_params = {
                     'instance_id': authority.instance_id,
                     'authority_epoch': authority.epoch,
-                    'owner_id': 'graph-preparation-race', 'scope': 'process', 'deadline_s': 30,
+                    'owner_id': 'graph-preparation-race', 'scope': 'process',
+                    'deadline_s': close_deadline_s,
                 }
                 close_receipt = await run_runtime.begin_preservation_drain(
                     runner, close_params, 'test-peer')
@@ -115,6 +126,7 @@ async def probe(peer):
                 if racing_task is not None and not racing_task.done():
                     await racing_task
                 authority._reserve_route = original_reserve_route
+                adapter._preservation_await_source_close = original_await_source_close
 
             for change, status in [({'clientState': 'wrong'}, 403), ({'resource': 'users/foreign'}, 400)]:
                 response = await client.post(url, json={'value': [{**notification, **change}]})
