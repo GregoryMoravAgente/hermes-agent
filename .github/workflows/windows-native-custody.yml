@@ -50,6 +50,7 @@ env:
     tests/gateway/test_runtime_service_native_close_identity.py
     tests/cron/test_cron_owner_custody.py
     tests/gateway/test_managed_api_detached_cron_custody.py
+    tests/gateway/test_managed_scheduler_cron_custody.py
 
 jobs:
   native-custody:
