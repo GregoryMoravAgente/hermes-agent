@@ -44,11 +44,14 @@ async def _busy_owner(monkeypatch, turns):
     from gateway.session_authority import initialize_session_authority
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
+    monkeypatch.setenv('TELEGRAM_HOME_CHANNEL', 'busy-chat')
 
     runner = GatewayRunner(GatewayConfig())
     adapter = Adapter()
     runner.adapters = {Platform.TELEGRAM: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='busy-owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
         response = await turns[message]()
@@ -135,8 +138,10 @@ async def test_detached_busy_completion_failure_still_tells_the_user(monkeypatch
     await asyncio.wait_for(adapter.handle_message(MessageEvent(text='two', source=source, message_id='m2')), 3)
     first_gate.set()
     await _wait_for(lambda: len(adapter.sent) == 2 and not adapter._background_tasks)
-    # Exactly one reply per input; the error notice may race the first turn's own delivery.
+    # Exactly one generic delivery notice is emitted; internal adapter detail stays private.
     assert 'FIRST_REPLY' in adapter.sent
-    assert sum('render exploded' in text for text in adapter.sent) == 1, adapter.sent
+    notices = [text for text in adapter.sent if 'delivery_failed' in text]
+    assert len(notices) == 1, adapter.sent
+    assert 'render exploded' not in notices[0]
     assert _statuses(authority) == {'one': 'terminal', 'two': 'terminal'}
     assert unhandled == []
