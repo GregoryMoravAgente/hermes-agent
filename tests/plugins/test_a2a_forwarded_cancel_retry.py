@@ -1,5 +1,7 @@
 """A2A forwarded tasks: a resend stays a retry after the process-local id memory forgot it
 (andrexibiza 5480715949 P2c)."""
+import asyncio
+
 from gateway.config import PlatformConfig
 from plugins.platforms.a2a import protocol
 from plugins.platforms.a2a.adapter import A2AAdapter
@@ -21,12 +23,20 @@ def test_a_resend_evicted_from_the_process_memory_is_still_a_retry(monkeypatch):
         return "owner reply", protocol.STATE_COMPLETED
 
     adapter._forward_to_profile = forward  # type: ignore[method-assign]
+
+    def prepare(params):
+        async def on_owner_loop():
+            adapter._loop = asyncio.get_running_loop()
+            adapter._message_handler = object()
+            return adapter._prepare_task(params, "peer-x", agent=agent)
+        return asyncio.run(on_owner_loop())
+
     first = protocol.text_message(protocol.ROLE_USER, "first", context_id="ctx-evict")
     other = protocol.text_message(protocol.ROLE_USER, "other", context_id="ctx-elsewhere")
-    adapter._prepare_task({"tenant": "dev", "message": dict(first)}, "peer-x", agent=agent)
-    adapter._prepare_task({"tenant": "dev", "message": other}, "peer-x", agent=agent)  # evicts "first"
+    prepare({"tenant": "dev", "message": dict(first)})
+    prepare({"tenant": "dev", "message": other})  # evicts "first"
     for _ in range(3):
-        task, _ = adapter._prepare_task({"tenant": "dev", "message": dict(first)}, "peer-x", agent=agent)
+        task, _ = prepare({"tenant": "dev", "message": dict(first)})
         assert task["status"]["state"] == protocol.STATE_COMPLETED
     assert len({seen[0], *seen[2:]}) == 1
     log = protocol.load_conversation("ctx-evict", limit=0)
