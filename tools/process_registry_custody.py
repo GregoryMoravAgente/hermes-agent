@@ -1601,8 +1601,7 @@ class ProcessRegistryCustodyMixin:
                 ["systemctl", "--user", "show", unit, "--property=ActiveState",
                  "--property=SubState", "--property=ControlGroup"],
                 check=True, capture_output=True, text=True, timeout=2,
-                stdin=subprocess.DEVNULL,
-                env=systemd_user_bus_env(),
+                stdin=subprocess.DEVNULL, env=systemd_user_bus_env(),
             )
         except (OSError, subprocess.SubprocessError, ValueError):
             return None
