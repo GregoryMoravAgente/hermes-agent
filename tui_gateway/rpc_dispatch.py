@@ -102,7 +102,8 @@ def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
             future = _pool.submit(run_with_custody)
         except BaseException:
             rpc_settle(custody, known=False)
-            retirement.release(lease)
+            # Submission may have accepted the worker before raising. Its wrapper owns the
+            # lease until output settles; an unobserved submission remains UNKNOWN.
             raise
         retirement.observe_future_cancellation(future, lease)
         future.add_done_callback(
