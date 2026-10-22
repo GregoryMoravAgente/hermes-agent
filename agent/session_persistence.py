@@ -438,14 +438,69 @@ def _gateway_writer_reuse_unknown(agent: Any, acp: Any) -> bool:
     return False
 
 
+def _finish_gateway_writer_request(
+    agent: Any, messages: list[dict], conversation_history: Optional[list[dict]],
+    requested_binding: Any, explicit_binding: bool, previous_proof: Any, reused: Any,
+    acp: Any, flush_managed, flush_plain, staged, forget_proof, remember_proof,
+    mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+) -> bool:
+    from agent.session_persistence_proof import (
+        _GATEWAY_WRITER_PREFIX_REPAIR, gateway_writer_proof_extends_prefix,
+    )
+
+    continue_with_proof = reused is _GATEWAY_WRITER_PREFIX_REPAIR
+    if reused is not None and not continue_with_proof:
+        agent._managed_shell_writer_proof = reused
+        return True
+    if not continue_with_proof:
+        forget_proof(agent)
+    writer = flush_managed if (staged(messages) or continue_with_proof) else flush_plain
+    try:
+        proof = writer(agent, messages, conversation_history)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        proof = None
+    if proof is None:
+        # The authenticated prefix remains available for the same-owner retry, but it never
+        # stands in for a terminal suffix that this attempt did not prove.
+        agent._managed_shell_writer_proof = previous_proof if continue_with_proof else None
+        agent._managed_persistence_failed = True
+        mark_gateway_writer_proof_unknown(agent, acp)
+        return False
+    if continue_with_proof and not gateway_writer_proof_extends_prefix(previous_proof, proof):
+        agent._managed_shell_writer_proof = previous_proof
+        agent._managed_persistence_failed = True
+        mark_gateway_writer_proof_unknown(agent, acp)
+        return False
+    agent._managed_shell_writer_proof = proof
+    remembered = remember_proof(agent, proof, requested_binding, explicit_binding)
+    if acp is not None and remembered is not True:
+        if continue_with_proof:
+            agent._managed_shell_writer_proof = previous_proof
+            mark_gateway_writer_proof_unknown(agent, acp)
+        else:
+            retain_gateway_writer_proof_unknown(
+                agent, proof, requested=requested_binding, explicit=explicit_binding,
+            )
+        agent._managed_persistence_failed = True
+        if acp is not None:
+            agent._mark_managed_persistence_unknown(acp)
+        return False
+    if remembered is not True and continue_with_proof:
+        agent._managed_shell_writer_proof = previous_proof
+        mark_gateway_writer_proof_unknown(agent, acp)
+        agent._managed_persistence_failed = True
+        return False
+    return True
+
+
 def _flush_gateway_writer_request(
     agent: Any, messages: list[dict], conversation_history: Optional[list[dict]],
     requested_binding: Any, explicit_binding: bool,
     flush_managed, flush_plain, staged, forget_proof, remember_proof, reuse_proof,
 ):
     """Run the optional direct writer proof without replacing the managed ACP branch."""
+    from agent.session_persistence_proof import _GATEWAY_WRITER_UNKNOWN
     from agent.session_persistence_proof import (
-        _GATEWAY_WRITER_UNKNOWN,
         mark_gateway_writer_proof_unknown,
         retain_gateway_writer_proof_unknown,
     )
@@ -465,31 +520,11 @@ def _flush_gateway_writer_request(
         ) if previous_proof is not None else None
         if reused is _GATEWAY_WRITER_UNKNOWN:
             return _gateway_writer_reuse_unknown(agent, acp)
-        if reused is not None:
-            agent._managed_shell_writer_proof = reused
-            return True
-        forget_proof(agent)
-        writer = flush_managed if staged(messages) else flush_plain
-        try:
-            proof = writer(agent, messages, conversation_history)
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-            proof = None
-        agent._managed_shell_writer_proof = proof
-        if proof is None:
-            agent._managed_persistence_failed = True
-            if acp is not None:
-                mark_gateway_writer_proof_unknown(agent, acp)
-            return False
-        remembered = remember_proof(agent, proof, requested_binding, explicit_binding)
-        if acp is not None and remembered is not True:
-            retain_gateway_writer_proof_unknown(
-                agent, proof, requested=requested_binding, explicit=explicit_binding,
-            )
-            agent._managed_persistence_failed = True
-            if acp is not None:
-                agent._mark_managed_persistence_unknown(acp)
-            return False
-        return True
+        return _finish_gateway_writer_request(
+            agent, messages, conversation_history, requested_binding, explicit_binding,
+            previous_proof, reused, acp, flush_managed, flush_plain, staged, forget_proof,
+            remember_proof, mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+        )
     if acp is not None and acp.has_pending_managed_witness():
         return _GATEWAY_WRITER_FALLTHROUGH
     previous_proof = getattr(agent, "_managed_shell_writer_proof", None)
@@ -498,31 +533,11 @@ def _flush_gateway_writer_request(
     ) if previous_proof is not None else None
     if reused is _GATEWAY_WRITER_UNKNOWN:
         return _gateway_writer_reuse_unknown(agent, acp)
-    if reused is not None:
-        agent._managed_shell_writer_proof = reused
-        return True
-    forget_proof(agent)
-    writer = flush_managed if staged(messages) else flush_plain
-    try:
-        proof = writer(agent, messages, conversation_history)
-    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-        proof = None
-    agent._managed_shell_writer_proof = proof
-    if proof is None:
-        agent._managed_persistence_failed = True
-        if acp is not None:
-            mark_gateway_writer_proof_unknown(agent, acp)
-        return False
-    remembered = remember_proof(agent, proof, requested_binding, explicit_binding)
-    if acp is not None and remembered is not True:
-        retain_gateway_writer_proof_unknown(
-            agent, proof, requested=requested_binding, explicit=explicit_binding,
-        )
-        agent._managed_persistence_failed = True
-        if acp is not None:
-            agent._mark_managed_persistence_unknown(acp)
-        return False
-    return True
+    return _finish_gateway_writer_request(
+        agent, messages, conversation_history, requested_binding, explicit_binding,
+        previous_proof, reused, acp, flush_managed, flush_plain, staged, forget_proof,
+        remember_proof, mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+    )
 
 
 

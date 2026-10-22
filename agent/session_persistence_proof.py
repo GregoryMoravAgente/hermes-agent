@@ -1,3 +1,5 @@
+# health: allow FILE_LINES -- lossless merged-prefix proof keeps carrier lookup, exact row readback,
+# and full-content reconstruction together so no suffix can be claimed without durable evidence.
 """Typed SessionDB write witnesses for managed Codex custody.
 
 The legacy flush API remains a bool/None API.  This sibling opts the one managed
@@ -92,6 +94,7 @@ _GATEWAY_WRITER_INTERMEDIATE_FENCE = "_classic_writer_intermediate_fence"
 _GATEWAY_WRITER_INTERMEDIATE_SEAL = "_classic_writer_intermediate_fence_seal"
 _GATEWAY_WRITER_INTERMEDIATE_PREFIX_HANDOFF = "_classic_writer_intermediate_prefix_handoff"
 _GATEWAY_WRITER_UNKNOWN = object()
+_GATEWAY_WRITER_PREFIX_REPAIR = object()
 _UNSET = object()
 
 def _set_managed_intermediate_fence_aliases(
@@ -1193,6 +1196,24 @@ def remember_gateway_writer_proof(
         setattr(agent, _GATEWAY_WRITER_PROOF_PHYSICAL_REQUIRED, True)
     return True
 
+def gateway_writer_proof_extends_prefix(previous: Any, proof: Any) -> bool:
+    """Require a repaired writer proof to retain the prefix and add a terminal result suffix."""
+    if type(previous) is not SessionDBWriteProof or type(proof) is not SessionDBWriteProof:
+        return False
+    prefix_len = len(previous.row_ids)
+    suffix_roles = proof.row_roles[prefix_len:]
+    return (
+        prefix_len > 0
+        and len(proof.row_ids) > prefix_len
+        and bool(suffix_roles)
+        and previous.row_roles[-1:] == ("user",)
+        and all(role in {"assistant", "tool"} for role in suffix_roles)
+        and (proof.store_path, proof.session_id) == (previous.store_path, previous.session_id)
+        and (proof.row_ids[:prefix_len], proof.row_snapshots[:prefix_len],
+             proof.row_sessions[:prefix_len], proof.row_roles[:prefix_len]) == (
+                 previous.row_ids, previous.row_snapshots,
+                 previous.row_sessions, previous.row_roles)
+    )
 
 def _classic_binding_is_current(binding: Any, session_id: str) -> bool:
     """Re-read a direct classic owner record before reusing its prior proof."""
@@ -1206,7 +1227,6 @@ def _classic_binding_is_current(binding: Any, session_id: str) -> bool:
         return classic_writer_binding_valid(binding, expected_session_id=session_id) is True
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         return False
-
 
 def _gateway_proof_reuse_context(
     agent: Any, proof: Any, requested: Any, explicit: bool,
@@ -1240,7 +1260,6 @@ def _gateway_proof_reuse_context(
         return None
     return turn_id, binding, session_id
 
-
 def _gateway_proof_rows_match(
     agent: Any, messages: Any, proof: SessionDBWriteProof, session_id: str,
 ) -> bool:
@@ -1264,7 +1283,6 @@ def _gateway_proof_rows_match(
         return False
     validated = _proof_from_validated_rows(proof.store_path, session_id, checked)
     return validated == proof
-
 
 def _gateway_writer_prefix_matches(
     agent: Any, messages: Any, proof: SessionDBWriteProof, binding: Any,
@@ -1304,6 +1322,7 @@ def _gateway_writer_prefix_matches(
         return False
 
 
+# health: allow CC -- fail-closed validation keeps carrier identity, witness shape, exact readback, and full-content reconstruction in one security boundary.
 def _gateway_writer_merged_prefix_matches(
     agent: Any, messages: Any, proof: SessionDBWriteProof, binding: Any,
 ) -> bool:
@@ -1318,7 +1337,7 @@ def _gateway_writer_merged_prefix_matches(
     try:
         from agent.context_compressor import _DB_PERSISTED_MARKER
         from agent.conversation_compression_archive import ABSORBED_ROW_IDS, MERGED_DURABLE_ROWS
-        from agent.message_metadata import ABSORBED_MESSAGE_UIDS
+        from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MERGED_TURN_PREFIX, MESSAGE_UID
         from gateway.runtime_service_custody import TurnCustodyBinding
     except (AttributeError, ImportError):
         return False
@@ -1348,7 +1367,12 @@ def _gateway_writer_merged_prefix_matches(
         or anchor.get("role") != "user"
         or anchor.get(_DB_PERSISTED_MARKER) is True
         or type(anchor.get(MERGED_DURABLE_ROWS)) is not int
-        or anchor.get(MERGED_DURABLE_ROWS) < len(proof.row_ids) + 1
+        or anchor.get(MERGED_DURABLE_ROWS) != len(proof.row_ids) + 1
+        or type(anchor.get(MERGED_TURN_PREFIX)) is not str
+        or (
+            anchor.get(MESSAGE_UID) is not None
+            and (type(anchor.get(MESSAGE_UID)) is not str or not anchor.get(MESSAGE_UID))
+        )
     ):
         return False
     absorbed_ids = anchor.get(ABSORBED_ROW_IDS)
@@ -1359,7 +1383,11 @@ def _gateway_writer_merged_prefix_matches(
     ):
         return False
     absorbed_uids = anchor.get(ABSORBED_MESSAGE_UIDS)
-    if type(absorbed_uids) is not list or any(type(uid) is not str or not uid for uid in absorbed_uids):
+    if (
+        type(absorbed_uids) is not list
+        or len(absorbed_uids) != len(proof.row_ids)
+        or any(type(uid) is not str or not uid for uid in absorbed_uids)
+    ):
         return False
     tail = messages[anchor_index:]
     if (
@@ -1375,14 +1403,73 @@ def _gateway_writer_merged_prefix_matches(
         id(message) in {id(item) for item in intended} for message in messages[:anchor_index]
     ):
         return False
+    anchor_row_id = anchor.get("_row_id")
+    if type(anchor_row_id) is not int or anchor_row_id <= 0:
+        anchor_row_id = None
+        try:
+            if anchor.get(MESSAGE_UID):
+                candidates = agent._session_db._read_all(
+                    "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+                    "AND role = 'user' AND message_uid = ? ORDER BY id DESC",
+                    (session_id, anchor[MESSAGE_UID]),
+                )
+            else:
+                candidates = [
+                    row for row in agent._session_db._read_all(
+                        "SELECT * FROM messages WHERE session_id = ? AND active = 1 "
+                        "AND role = 'user' ORDER BY id DESC", (session_id,)
+                    )
+                    if row["id"] not in proof.row_ids
+                    and agent._session_db._decode_content(row["content"]) == anchor[MERGED_TURN_PREFIX]
+                ]
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            return False
+        if not anchor.get(MESSAGE_UID) and len(candidates) == 0:
+            # An API caller may supply a durable-looking history snapshot that is intentionally
+            # external to this SessionDB.  The retained proof still authenticates the current
+            # user row; the snapshot prefix must stay out of the child transcript.
+            candidates = []
+        elif len(candidates) != 1:
+            return False
+        if candidates:
+            anchor_row_id = candidates[0]["id"]
+    if (
+        anchor_row_id is not None
+        and (type(anchor_row_id) is not int or anchor_row_id <= 0 or anchor_row_id in proof.row_ids)
+    ):
+        return False
     expected = tuple(zip(proof.row_ids, proof.row_roles, proof.row_snapshots))
     try:
-        stored = _read_committed_rows(agent._session_db, session_id, proof.row_ids)
+        stored_ids = (*proof.row_ids,) if anchor_row_id is None else (anchor_row_id, *proof.row_ids)
+        stored = _read_committed_rows(agent._session_db, session_id, stored_ids)
     except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return False
-    if len(stored) != len(expected):
+    if len(stored) != len(expected) + (1 if anchor_row_id is not None else 0):
         return False
-    for row, (row_id, role, snapshot) in zip(stored, expected):
+    if anchor_row_id is not None:
+        anchor_row, *proof_rows = stored
+        try:
+            anchor_content = agent._session_db._decode_content(anchor_row["content"])
+            if (
+                anchor_row["id"] != anchor_row_id
+                or anchor_row["session_id"] != session_id
+                or anchor_row["role"] != "user"
+                or anchor_row["active"] != 1
+                or (
+                    anchor.get(MESSAGE_UID) is not None
+                    and anchor_row["message_uid"] != anchor[MESSAGE_UID]
+                )
+                or anchor_content != anchor[MERGED_TURN_PREFIX]
+            ):
+                return False
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+            return False
+    else:
+        anchor_content = anchor[MERGED_TURN_PREFIX]
+        proof_rows = stored
+    proof_contents: list[Any] = []
+    proof_uids: list[str] = []
+    for row, (row_id, role, snapshot) in zip(proof_rows, expected):
         try:
             from agent.transcript_repair import transcript_row_snapshot
             if (
@@ -1392,13 +1479,19 @@ def _gateway_writer_merged_prefix_matches(
                 or row["active"] != 1
                 or transcript_row_snapshot(row) != snapshot
                 or type(row["message_uid"]) is not str
-                or row["message_uid"] not in absorbed_uids
+                or row["message_uid"] != absorbed_uids[len(proof_uids)]
             ):
                 return False
+            proof_contents.append(agent._session_db._decode_content(row["content"]))
+            proof_uids.append(row["message_uid"])
         except (AttributeError, IndexError, KeyError, TypeError, ValueError):
             return False
-    return True
-
+    merged_content = anchor_content
+    for content in proof_contents:
+        if not isinstance(content, str):
+            return False
+        merged_content = f"{merged_content}\n\n{content}" if merged_content and content else (merged_content or content)
+    return merged_content == anchor.get("content")
 
 def reuse_gateway_writer_proof(
     agent: Any, messages: Any, proof: Any, requested: Any, explicit: bool,
@@ -1435,20 +1528,21 @@ def reuse_gateway_writer_proof(
             getattr(agent, "_managed_acp_client", None) is None
             or getattr(agent, "_managed_finalize_shell_turn", False) is True
         )
-        if prefix_repair_allowed and _gateway_writer_prefix_matches(agent, messages, proof, _binding):
+        _prefix_match = _gateway_writer_prefix_matches(agent, messages, proof, _binding)
+        _merged_match = _gateway_writer_merged_prefix_matches(agent, messages, proof, _binding)
+        if prefix_repair_allowed and _prefix_match:
             # The initial user-prefix proof is the same authenticated writer occurrence.  Let
             # the staged writer append the terminal rows and remember the combined readback.
-            return None
-        if prefix_repair_allowed and _gateway_writer_merged_prefix_matches(agent, messages, proof, _binding):
+            return _GATEWAY_WRITER_PREFIX_REPAIR
+        if prefix_repair_allowed and _merged_match:
             # The canonical alternation repair folded the same authenticated user row into its
             # current delivery carrier.  Let the source writer rewrite that carrier and append
             # the terminal rows under the same binding instead of opening a second writer.
-            return None
+            return _GATEWAY_WRITER_PREFIX_REPAIR
         return _GATEWAY_WRITER_UNKNOWN if managed_witness_required else None
     if _gateway_proof_rows_match(agent, messages, proof, session_id):
         return proof
     return _GATEWAY_WRITER_UNKNOWN if managed_witness_required else None
-
 
 def _current_turn_row_specs(messages: Any) -> tuple[tuple[int, str, str], ...] | None:
     """Return the exact final user-to-result suffix, without an agent index hint."""
@@ -1841,6 +1935,69 @@ def _managed_writer_history(
     return True, [item for item in conversation_history if item is not anchor]
 
 
+def _restore_merged_prefix_anchor(
+    agent: Any, messages: list[dict[str, Any]], previous: Any, binding: Any,
+) -> SessionDBWriteProof | None:
+    if not _gateway_writer_merged_prefix_matches(agent, messages, previous, binding):
+        return None
+    merged_prefix = previous
+    # The matcher authenticates the retained row before restoring its identity.
+    anchor_index = _latest_user_index(messages)
+    if (
+        anchor_index is None
+        or len(merged_prefix.row_ids) != 1
+        or len(merged_prefix.row_snapshots) != 1
+        or not isinstance(messages[anchor_index], dict)
+    ):
+        return None
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    anchor = messages[anchor_index]
+    anchor["_row_id"] = merged_prefix.row_ids[0]
+    anchor[DB_ROW_SNAPSHOT] = merged_prefix.row_snapshots[0]
+    anchor[_DB_PERSISTED_MARKER] = True
+    return merged_prefix
+
+
+def _proof_after_merged_close(
+    agent: Any, messages: list[dict[str, Any]], merged_prefix: SessionDBWriteProof | None,
+    store_path: str, session_id: str,
+) -> SessionDBWriteProof | None:
+    """Prove a close-path suffix already committed after a retained merged prefix."""
+    if merged_prefix is None:
+        return None
+    current = _current_turn_row_specs(messages)
+    prefix_specs = tuple(zip(merged_prefix.row_ids, merged_prefix.row_roles, merged_prefix.row_snapshots))
+    if current is None or current[:len(prefix_specs)] != prefix_specs:
+        return None
+    checked = _read_expected_rows(agent, session_id, current)
+    return _proof_from_validated_rows(store_path, session_id, checked) if checked == current else None
+
+
+def _proof_after_managed_batch(
+    agent: Any, messages: list[dict[str, Any]], merged_prefix: SessionDBWriteProof | None,
+    typed_prefix: tuple[tuple[int, str, str], ...],
+    typed_writer: tuple[tuple[int, str, str], ...], store_path: str, session_id: str,
+) -> SessionDBWriteProof | None:
+    if merged_prefix is not None:
+        current = _current_turn_row_specs(messages)
+        prefix_specs = tuple(zip(merged_prefix.row_ids, merged_prefix.row_roles, merged_prefix.row_snapshots))
+        if current != prefix_specs + typed_writer:
+            return None
+        checked = _read_expected_rows(agent, session_id, current)
+        return _proof_from_validated_rows(store_path, session_id, checked) if checked == current else None
+    checked_prefix = _read_expected_rows(agent, session_id, typed_prefix)
+    if checked_prefix is None:
+        return None
+    prefix_id_set = {row_id for row_id, _role, _marker in checked_prefix}
+    writer_ids = tuple(row_id for row_id, _role, _marker in typed_writer)
+    if prefix_id_set.intersection(writer_ids):
+        return None
+    combined_ids = tuple(row_id for row_id, _role, _marker in checked_prefix + typed_writer)
+    if any(left >= right for left, right in pairwise(combined_ids)):
+        return None
+    return _proof_from_validated_rows(store_path, session_id, checked_prefix + typed_writer)
+
+
 def flush_messages_with_proof(
     agent: Any, messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None = None,
 ) -> SessionDBWriteProof | None:
@@ -1862,9 +2019,6 @@ def flush_messages_with_proof(
     if store_path is None or type(session_id) is not str or not session_id:
         return None
     return _proof_from_writer_rows(agent, store_path, session_id, writer_rows)
-
-
-
 def flush_messages_with_managed_current_turn_proof(
     agent: Any, messages: list[dict[str, Any]], conversation_history: list[dict[str, Any]] | None = None,
 ) -> SessionDBWriteProof | None:
@@ -1882,9 +2036,8 @@ def flush_messages_with_managed_current_turn_proof(
         previous = getattr(agent, "_managed_shell_writer_proof", None)
         requested, explicit = _requested_gateway_binding(agent)
         binding = _active_gateway_binding(requested, explicit)
-        if _gateway_writer_merged_prefix_matches(agent, messages, previous, binding):
-            merged_prefix = previous
-        else:
+        merged_prefix = _restore_merged_prefix_anchor(agent, messages, previous, binding)
+        if merged_prefix is None:
             return None
     store_path = _store_path(agent)
     session_id = getattr(agent, "session_id", None)
@@ -1907,7 +2060,8 @@ def flush_messages_with_managed_current_turn_proof(
     replay_history = getattr(agent, "_session_row_replay_pending", None) == session_id
     intended = _intended_messages(messages, writer_history, replay_history=replay_history)
     if not intended:
-        return None
+        # A close-path flush may have committed terminal rows before this proof capture runs.
+        return _proof_after_merged_close(agent, messages, merged_prefix, store_path, session_id)
     result, captured = _capture_writer_batch(agent, messages, writer_history)
     if result is not True:
         return None
@@ -1917,18 +2071,6 @@ def flush_messages_with_managed_current_turn_proof(
     typed_writer = _read_expected_rows(agent, session_id, writer_rows)
     if typed_writer is None:
         return None
-    if merged_prefix is not None:
-        if _current_turn_row_specs(messages) != typed_writer:
-            return None
-        return _proof_from_validated_rows(store_path, session_id, typed_writer)
-    checked_prefix = _read_expected_rows(agent, session_id, typed_prefix)
-    if checked_prefix is None:
-        return None
-    prefix_id_set = {row_id for row_id, _role, _marker in checked_prefix}
-    writer_ids = tuple(row_id for row_id, _role, _marker in typed_writer)
-    if prefix_id_set.intersection(writer_ids):
-        return None
-    combined_ids = tuple(row_id for row_id, _role, _marker in checked_prefix + typed_writer)
-    if any(left >= right for left, right in pairwise(combined_ids)):
-        return None
-    return _proof_from_validated_rows(store_path, session_id, checked_prefix + typed_writer)
+    return _proof_after_managed_batch(
+        agent, messages, merged_prefix, typed_prefix, typed_writer, store_path, session_id,
+    )

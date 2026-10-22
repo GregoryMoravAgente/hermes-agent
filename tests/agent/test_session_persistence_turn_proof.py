@@ -17,6 +17,7 @@ from agent.session_persistence_proof import (
     flush_messages_with_managed_current_turn_proof,
 )
 from hermes_state import SessionDB
+from gateway.runtime_service_custody import TurnCustodyBinding, bind_turn, reset_turn
 from tests.agent.test_api_content_sidecar import _FakeAgent
 
 
@@ -106,6 +107,83 @@ def test_managed_current_turn_proof_is_suffix_bounded_across_turns(tmp_path):
         assert consumer.proofs[-1].row_ids == (second_user["_row_id"], second_assistant["_row_id"])
         assert consumer.proofs[-1].row_roles == ("user", "assistant")
         assert len(db.get_messages(agent.session_id, include_inactive=True)) == 4
+    finally:
+        db.close()
+
+
+def test_merged_prefix_repair_keeps_both_user_rows_before_terminal_suffix(tmp_path):
+    """A merged live carrier must not hide either durable user row from the terminal flush."""
+    agent, db = _agent(tmp_path, "managed-current-turn-merged")
+    old_user = {"role": "user", "content": "old user"}
+    staged_user = {"role": "user", "content": "new user"}
+    try:
+        assert agent._flush_messages_to_session_db([old_user]) is True
+        previous = agent._flush_messages_to_session_db_with_proof([old_user, staged_user])
+        assert isinstance(previous, SessionDBWriteProof)
+        assert previous.row_ids == (staged_user["_row_id"],)
+
+        messages = db.get_messages_as_conversation(
+            agent.session_id, repair_alternation=True, include_row_ids=True,
+        )
+        assert messages[0]["content"] == "old user\n\nnew user"
+        terminal = {"role": "assistant", "content": "terminal result"}
+        messages.append(terminal)
+
+        # The matcher only needs the typed binding identity here; the end-to-end custody validator
+        # is exercised by the gateway tests. Keep this fixture unable to supply any owner state.
+        binding = TurnCustodyBinding(
+            object(), object(), object(), "admission", 1, agent.session_id, "profile", 1, "instance",
+        )
+        token = bind_turn(binding)
+        agent._managed_shell_writer_proof = previous
+        try:
+            proof = flush_messages_with_managed_current_turn_proof(agent, messages)
+        finally:
+            reset_turn(token)
+
+        assert isinstance(proof, SessionDBWriteProof)
+        assert proof.row_ids == (staged_user["_row_id"], terminal["_row_id"])
+        raw = db.get_messages(agent.session_id, include_inactive=True)
+        assert [row["content"] for row in raw] == ["old user", "new user", "terminal result"]
+
+        replay = db.get_messages_as_conversation(agent.session_id, repair_alternation=True)
+        assert [message["content"] for message in replay] == [
+            "old user\n\nnew user", "terminal result",
+        ]
+    finally:
+        db.close()
+
+
+def test_merged_prefix_repair_refuses_stale_carrier_row(tmp_path):
+    """A carrier loaded before its physical row disappears cannot authorize a suffix proof."""
+    agent, db = _agent(tmp_path, "managed-current-turn-stale-merged")
+    old_user = {"role": "user", "content": "old user"}
+    staged_user = {"role": "user", "content": "new user"}
+    try:
+        assert agent._flush_messages_to_session_db([old_user]) is True
+        previous = agent._flush_messages_to_session_db_with_proof([old_user, staged_user])
+        messages = db.get_messages_as_conversation(
+            agent.session_id, repair_alternation=True, include_row_ids=True,
+        )
+        terminal = {"role": "assistant", "content": "must remain unknown"}
+        messages.append(terminal)
+        db._conn.execute("UPDATE messages SET active = 0 WHERE id = ?", (messages[0]["_row_id"],))
+        db._conn.commit()
+
+        binding = TurnCustodyBinding(
+            object(), object(), object(), "admission", 1, agent.session_id, "profile", 1, "instance",
+        )
+        token = bind_turn(binding)
+        agent._managed_shell_writer_proof = previous
+        try:
+            assert flush_messages_with_managed_current_turn_proof(agent, messages) is None
+        finally:
+            reset_turn(token)
+
+        assert "_row_id" not in terminal
+        assert [row["content"] for row in db.get_messages(agent.session_id, include_inactive=True)] == [
+            "old user", "new user",
+        ]
     finally:
         db.close()
 

@@ -8,6 +8,7 @@ row addresses and snapshots back after the one canonical flush.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -161,6 +162,66 @@ def test_managed_proof_does_not_promote_truthy_legacy_result():
 
     message = {"role": "assistant", "content": "x", "_row_id": 1, DB_ROW_SNAPSHOT: "snapshot"}
     assert flush_messages_with_proof(_TruthyLegacy(), [message]) is None
+
+
+@pytest.mark.parametrize("writer_result", [None, "partial"], ids=["no-result", "partial-result"])
+def test_prefix_repair_writer_failure_retains_prefix_as_unknown(writer_result):
+    """A repaired prefix remains retryable; it never substitutes for an unproved suffix."""
+    from agent.session_persistence import _finish_gateway_writer_request
+    from agent.session_persistence_proof import (
+        _GATEWAY_WRITER_PREFIX_REPAIR, mark_gateway_writer_proof_unknown,
+    )
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1,), ("user-snapshot",), ("session",), ("user",), "prefix",
+    )
+    result = None if writer_result is None else prefix
+    agent = SimpleNamespace(
+        _managed_shell_writer_proof=prefix,
+        _managed_persistence_failed=False,
+    )
+
+    def forbidden_forget(_agent):
+        raise AssertionError("validated prefix must remain available for retry")
+
+    def forbidden_plain(*_args):
+        raise AssertionError("prefix repair must use the managed writer")
+
+    def remember(*_args):
+        return True
+
+    def forbidden_retain(*_args, **_kwargs):
+        raise AssertionError("an unproved suffix must not replace the retained prefix")
+
+    assert _finish_gateway_writer_request(
+        agent, [], None, object(), True, prefix, _GATEWAY_WRITER_PREFIX_REPAIR, None,
+        lambda *_args: result, forbidden_plain, lambda _messages: False,
+        forbidden_forget, remember,
+        mark_gateway_writer_proof_unknown,
+        forbidden_retain,
+    ) is False
+    assert agent._managed_shell_writer_proof is prefix
+    assert agent._classic_writer_proof_unknown is True
+    assert agent._managed_persistence_failed is True
+
+
+def test_prefix_repair_rejects_user_only_suffix():
+    from agent.session_persistence_proof import gateway_writer_proof_extends_prefix
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1,), ("user-snapshot",), ("session",), ("user",), "prefix",
+    )
+    user_only_suffix = SessionDBWriteProof(
+        "state.db", "session", (1, 2), ("user-snapshot", "next-user-snapshot"),
+        ("session", "session"), ("user", "user"), "user-only",
+    )
+    assistant_suffix = SessionDBWriteProof(
+        "state.db", "session", (1, 3), ("user-snapshot", "assistant-snapshot"),
+        ("session", "session"), ("user", "assistant"), "assistant-result",
+    )
+
+    assert gateway_writer_proof_extends_prefix(prefix, user_only_suffix) is False
+    assert gateway_writer_proof_extends_prefix(prefix, assistant_suffix) is True
 
 
 @pytest.mark.asyncio

@@ -124,7 +124,8 @@ async def test_api_work_queued_before_the_park_is_recovered_by_the_rescan(multip
     ref = bind_api_session(first, 'api-queued')
     admit_session_input(first.db, epoch=first.epoch, principal_id='api', session_id=ref.session_id,
                         request_id='chat:scope:queued',
-                        payload={'text': 'do the queued work', 'api_turn_v1': {'history': [], 'settings': {}}})
+                        payload={'text': 'do the queued work', 'api_turn_v1': {
+                            'history': [], 'settings': {}, 'producer_process_mode': 'managed_turn'}})
     await _boot_with_beta_parked(runner, beta, monkeypatch)
     await _rescan(runner, beta, monkeypatch)
     # A cold boot schedules it when the API adapter is published (recover_api_turns).
