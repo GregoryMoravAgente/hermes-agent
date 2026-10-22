@@ -270,7 +270,14 @@ def _classic_writer_proof_request_context(
             and getattr(ctx, "classic_writer_binding", None) is None
             and not isinstance(bridge, ClassicExecutionEventBridge)
         ):
-            return event, False, None
+            # A direct uncompressed I04 turn uses the logical session as its physical
+            # tip.  It still needs the same authenticated writer handoff as a compressed
+            # turn; the equal session IDs only mean that no child tip was created.  Keep
+            # managed ACP/I07 routes on their existing typed path.
+            if not _direct_i04_writer_route(agent, turn_route, current_binding):
+                return event, False, None
+            _validate_direct_i04_writer_context(agent, current_binding)
+            return event, True, current_binding
     except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
         pass
     # A nested I04/I07 turn deliberately has no direct classic binding.  Its existing
