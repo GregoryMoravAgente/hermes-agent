@@ -287,7 +287,8 @@ async def test_public_browser_navigate_snapshot_and_cdp_connect_use_real_custody
             "params": {"action": "connect", "url": cdp_discovery},
         })
         assert connected["result"]["connected"] is True
-        assert os.environ["BROWSER_CDP_URL"].startswith("http://127.0.0.1:")
+        from tools.browser_tool_cdp import live_cdp_override
+        assert live_cdp_override().startswith("http://127.0.0.1:")
 
         accepted, captured = await _run_public_browser_turn(
             fixture, task_id=task_id, url=f"http://127.0.0.1:{page_server.server_port}/page",
