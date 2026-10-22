@@ -56,6 +56,10 @@ USER_NAMESPACE_PROC_FILES = (
     Path("/proc/sys/kernel/unprivileged_userns_clone"),
     Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
 )
+BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS = 10.0
+BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS = 2.0
+BROWSER_PRE_FLIGHT_TERM_WAIT_SECONDS = 0.5
+BROWSER_PRE_FLIGHT_GROUP_SOFT_GRACE_SECONDS = 0.5
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
 SYSTEM_PACKAGES = (
@@ -775,25 +779,342 @@ def _browser_preflight_stderr_detail(value: bytes) -> str:
     return f"; stderr_tail={tail!r}"
 
 
+def _linux_proc_stat_record(pid: int) -> dict[str, int]:
+    """Read the identity fields needed to authenticate one Linux process group."""
+    if pid <= 0:
+        raise OSError("invalid process id")
+    value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8-sig")
+    closing_parenthesis = value.rfind(")")
+    if closing_parenthesis < 0:
+        raise OSError("malformed Linux process stat")
+    fields = value[closing_parenthesis + 2 :].split()
+    if len(fields) < 20:
+        raise OSError("incomplete Linux process stat")
+    return {
+        "pid": pid,
+        "pgid": int(fields[2]),
+        "session": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+
+def _capture_owned_process_group(process: subprocess.Popen[bytes]) -> dict[str, Any]:
+    """Capture the unique session/group created by this Popen start_new_session."""
+    if platform.system() != "Linux" or os.name != "posix":
+        raise SystemExit("browser preflight process-group custody requires Linux POSIX")
+    try:
+        pgid = os.getpgid(process.pid)
+        session = os.getsid(process.pid)
+        stat_record = _linux_proc_stat_record(process.pid)
+    except (OSError, ValueError) as exc:
+        raise SystemExit("browser preflight could not authenticate its process group") from exc
+    if (
+        pgid != process.pid
+        or session != process.pid
+        or stat_record["pgid"] != pgid
+        or stat_record["session"] != session
+    ):
+        raise SystemExit("browser preflight process did not retain its owned session")
+    identity: dict[str, Any] = {
+        "pid": process.pid,
+        "pgid": pgid,
+        "session": session,
+        "start_ticks": stat_record["start_ticks"],
+    }
+    initial_snapshot = _owned_process_group_snapshot(identity)
+    if not initial_snapshot["verified"] or not initial_snapshot["root_present"]:
+        raise SystemExit("browser preflight could not retain its pre-exit group witness")
+    identity["initial_members"] = initial_snapshot["members"]
+    return identity
+
+
+def _owned_process_group_snapshot(
+    identity: dict[str, Any],
+    *,
+    deadline: float | None = None,
+) -> dict[str, Any]:
+    """Revalidate the captured session/group before signaling after root exit."""
+    members: list[dict[str, int]] = []
+    scan_errors: list[str] = []
+    deadline_exceeded = False
+    if deadline is not None and time.monotonic() >= deadline:
+        return {
+            "verified": False,
+            "members": members,
+            "root_present": False,
+            "root_identity_matches": False,
+            "member_identity_matches": False,
+            "scan_errors": ["snapshot_deadline"],
+            "deadline_exceeded": True,
+        }
+    try:
+        entries = list(Path("/proc").iterdir())
+    except OSError as exc:
+        return {
+            "verified": False,
+            "members": members,
+            "root_present": False,
+            "root_identity_matches": False,
+            "member_identity_matches": False,
+            "scan_errors": [type(exc).__name__],
+            "deadline_exceeded": False,
+        }
+    if deadline is not None and time.monotonic() >= deadline:
+        deadline_exceeded = True
+        scan_errors.append("snapshot_deadline")
+        entries = []
+    for entry in entries:
+        if deadline is not None and time.monotonic() >= deadline:
+            deadline_exceeded = True
+            scan_errors.append("snapshot_deadline")
+            break
+        if not entry.name.isdigit():
+            continue
+        try:
+            record = _linux_proc_stat_record(int(entry.name))
+        except FileNotFoundError:
+            continue
+        except (OSError, ValueError):
+            scan_errors.append(entry.name)
+            continue
+        if record["pgid"] == identity["pgid"] and record["session"] == identity["session"]:
+            members.append(record)
+    root_records = [record for record in members if record["pid"] == identity["pid"]]
+    root_identity_matches = bool(root_records) and all(
+        record["start_ticks"] == identity["start_ticks"] for record in root_records
+    )
+    captured_members = identity.get("initial_members", [])
+    captured_keys = {
+        (record["pid"], record["pgid"], record["session"], record["start_ticks"])
+        for record in captured_members
+    }
+    current_keys = {
+        (record["pid"], record["pgid"], record["session"], record["start_ticks"])
+        for record in members
+    }
+    member_identity_matches = bool(captured_keys & current_keys)
+    # Once the root has exited, an absent root record is not proof.  A signal
+    # is permitted only when a surviving member matches the pre-exit snapshot.
+    identity_proven = root_identity_matches if root_records else member_identity_matches
+    return {
+        "verified": not scan_errors and not deadline_exceeded and identity_proven,
+        "members": members,
+        "root_present": bool(root_records),
+        "root_identity_matches": root_identity_matches,
+        "member_identity_matches": member_identity_matches,
+        "scan_errors": scan_errors,
+        "deadline_exceeded": deadline_exceeded,
+    }
+
+
+def _signal_verified_owned_group(
+    process: subprocess.Popen[bytes],
+    identity: dict[str, Any],
+    signal_name: str,
+    cleanup_deadline: float,
+) -> tuple[dict[str, Any], bool]:
+    snapshot = _owned_process_group_snapshot(identity, deadline=cleanup_deadline)
+    if not snapshot["verified"] or not snapshot["members"]:
+        return snapshot, False
+    try:
+        _kill_owned_process_group(process, signal_name)
+    except (ProcessLookupError, OSError):
+        return snapshot, False
+    return snapshot, True
+
+
+def _reap_complete(receipt: dict[str, Any]) -> bool:
+    return (
+        receipt["reached_echild"]
+        and not receipt["live_children"]
+        and receipt["waitid_error"] is None
+        and not receipt["deadline_exceeded"]
+    )
+
+
+def _terminate_and_reap_browser_variant(
+    process: subprocess.Popen[bytes],
+    group_identity: dict[str, Any],
+    cleanup_deadline: float,
+) -> dict[str, Any]:
+    """Terminate/reap only the Popen-owned group within the cleanup budget."""
+    term_snapshot, term_signal_sent = _signal_verified_owned_group(
+        process, group_identity, "SIGTERM", cleanup_deadline
+    )
+    if not term_signal_sent and process.poll() is None:
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+    direct_wait = min(
+        BROWSER_PRE_FLIGHT_TERM_WAIT_SECONDS,
+        max(cleanup_deadline - time.monotonic(), 0.0),
+    )
+    if process.poll() is None and direct_wait:
+        try:
+            process.wait(timeout=direct_wait)
+        except subprocess.TimeoutExpired:
+            pass
+    soft_deadline = min(
+        cleanup_deadline,
+        time.monotonic() + BROWSER_PRE_FLIGHT_GROUP_SOFT_GRACE_SECONDS,
+    )
+    reap = _reap_owned_descendants(soft_deadline)
+    kill_snapshot: dict[str, Any] | None = None
+    kill_signal_sent = False
+    if not _reap_complete(reap):
+        kill_snapshot, kill_signal_sent = _signal_verified_owned_group(
+            process, group_identity, "SIGKILL", cleanup_deadline
+        )
+        if kill_signal_sent:
+            reap = _reap_owned_descendants(cleanup_deadline)
+        else:
+            # The group identity could not be revalidated after root exit.  Do
+            # not signal by a stale numeric PID; retain the failed receipt.
+            reap = _reap_owned_descendants(cleanup_deadline)
+    return {
+        "group_identity": group_identity,
+        "term_snapshot": term_snapshot,
+        "term_signal_sent": term_signal_sent,
+        "kill_snapshot": kill_snapshot,
+        "kill_signal_sent": kill_signal_sent,
+        "direct_wait_seconds": round(direct_wait, 6),
+        "cleanup_budget_seconds": BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+        "reap": reap,
+    }
+
+
+def _run_browser_preflight_variant(
+    *,
+    browser_env: dict[str, str],
+    base_command: list[str],
+    proof: Path,
+    profile_name: str,
+    url: str,
+    overall_deadline: float,
+) -> dict[str, Any]:
+    """Run one fresh-profile causal variant with a bounded cleanup receipt."""
+    profile = proof / (
+        "browser-preflight-profile" if profile_name == "default" else f"browser-preflight-profile-{profile_name}"
+    )
+    profile.mkdir(mode=0o700)
+    command = [*base_command, f"--user-data-dir={profile}", url]
+    started = time.monotonic()
+    variant_deadline = min(
+        overall_deadline,
+        started + BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
+    )
+    process = subprocess.Popen(
+        command,
+        env=browser_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        group_identity = _capture_owned_process_group(process)
+    except SystemExit:
+        # A group/session that cannot be authenticated must never be signaled
+        # by an untrusted numeric PID.  Reap only this exact Popen child before
+        # returning the fail-closed startup error.
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            process.wait(timeout=BROWSER_PRE_FLIGHT_TERM_WAIT_SECONDS)
+        except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+            pass
+        raise
+    timed_out = False
+    stdout: bytes = b""
+    stderr: bytes = b""
+    try:
+        observed_stdout, observed_stderr = process.communicate(
+            timeout=max(variant_deadline - time.monotonic(), 0.0)
+        )
+        stdout = observed_stdout or b""
+        stderr = observed_stderr or b""
+    except subprocess.TimeoutExpired as exc:
+        timed_out = True
+        if exc.stdout is not None:
+            stdout = exc.stdout
+        if exc.stderr is not None:
+            stderr = exc.stderr
+
+    cleanup_deadline = min(
+        overall_deadline,
+        time.monotonic() + BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+    )
+    if timed_out:
+        cleanup = _terminate_and_reap_browser_variant(
+            process, group_identity, cleanup_deadline
+        )
+        try:
+            remaining = max(cleanup_deadline - time.monotonic(), 0.0)
+            if remaining:
+                observed_stdout, observed_stderr = process.communicate(timeout=remaining)
+                stdout = observed_stdout or stdout
+                stderr = observed_stderr or stderr
+        except subprocess.TimeoutExpired as exc:
+            if exc.stdout is not None:
+                stdout = exc.stdout
+            if exc.stderr is not None:
+                stderr = exc.stderr
+    else:
+        cleanup = _terminate_and_reap_browser_variant(
+            process, group_identity, cleanup_deadline
+        )
+
+    reap = cleanup["reap"]
+    closure_ok = (
+        process.poll() is not None
+        and reap["reached_echild"]
+        and not reap["live_children"]
+        and reap["waitid_error"] is None
+        and not reap["deadline_exceeded"]
+    )
+    result_ok = not timed_out and process.returncode == 0 and closure_ok
+    _write_browser_preflight_output(f"browser-preflight-{profile_name}.stdout", stdout)
+    _write_browser_preflight_output(f"browser-preflight-{profile_name}.stderr", stderr)
+    return {
+        "name": profile_name,
+        "url": url,
+        "profile": str(profile),
+        "argv": command,
+        "pid": process.pid,
+        "returncode": process.returncode,
+        "stdout_sha256": sha_bytes(stdout),
+        "stderr_sha256": sha_bytes(stderr),
+        "stdout_path": f"browser-preflight-{profile_name}.stdout",
+        "stderr_path": f"browser-preflight-{profile_name}.stderr",
+        "timed_out": timed_out,
+        "variant_deadline_seconds": BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
+        "cleanup": cleanup,
+        "closure_ok": closure_ok,
+        "result_ok": result_ok,
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "_stdout": stdout,
+        "_stderr": stderr,
+    }
+
+
 def browser_preflight() -> None:
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
     sandbox = _verify_sealed_sandbox(tools["sandbox"])
     chrome_sandbox = sandbox.get("helper")
-    profile = proof_dir() / "browser-preflight-profile"
-    profile.mkdir(mode=0o700)
-    sandbox_page_url = "chrome://sandbox" if sandbox["mode"] == "user_namespace" else "data:,"
-    command = [
+    proof = proof_dir()
+    tools_receipt_sha256 = sha_file(proof / "resolved-tools.json")
+    base_command = [
         browser,
         "--headless=new",
         "--disable-gpu",
         "--no-first-run",
         "--no-default-browser-check",
-        f"--user-data-dir={profile}",
         "--dump-dom",
         "--timeout=5000",
         "--allow-chrome-scheme-url",
-        sandbox_page_url,
     ]
     context = _enable_subreaper()
     started = time.monotonic()
@@ -805,103 +1126,103 @@ def browser_preflight() -> None:
         browser_env["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
     else:
         browser_env.pop("CHROME_DEVEL_SANDBOX", None)
-    process = subprocess.Popen(
-        command,
-        env=browser_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
-    timed_out = False
-    stdout: bytes = b""
-    stderr: bytes = b""
-    communicate_checkpoints: list[dict[str, Any]] = []
-    completed = False
-    for checkpoint_seconds in (10.0, 20.0, 30.0):
-        elapsed = max(time.monotonic() - started, 0.0)
-        remaining = max(deadline - time.monotonic(), 0.0)
-        if remaining <= 0.0:
-            timed_out = True
+    if sandbox["mode"] == "user_namespace":
+        variant_specs = (("about-blank", "about:blank"), ("chrome-sandbox", "chrome://sandbox"))
+    else:
+        variant_specs = (("default", "data:,"),)
+    variants: list[dict[str, Any]] = []
+    for profile_name, url in variant_specs:
+        variant = _run_browser_preflight_variant(
+            browser_env=browser_env,
+            base_command=base_command,
+            proof=proof,
+            profile_name=profile_name,
+            url=url,
+            overall_deadline=deadline,
+        )
+        variants.append(variant)
+        if not variant["closure_ok"]:
             break
-        checkpoint_remaining = max(checkpoint_seconds - elapsed, 0.0)
-        timeout = min(remaining, checkpoint_remaining)
-        try:
-            observed_stdout, observed_stderr = process.communicate(timeout=timeout)
-            stdout = observed_stdout
-            stderr = observed_stderr
-            completed = True
-            break
-        except subprocess.TimeoutExpired as exc:
-            if exc.stdout is not None:
-                stdout = exc.stdout
-            if exc.stderr is not None:
-                stderr = exc.stderr
-            checkpoint_elapsed = max(time.monotonic() - started, 0.0)
-            checkpoint_remaining = max(deadline - time.monotonic(), 0.0)
-            communicate_checkpoints.append(
-                {
-                    "checkpoint_seconds": checkpoint_seconds,
-                    "elapsed_seconds": round(checkpoint_elapsed, 6),
-                    "remaining_deadline_seconds": round(checkpoint_remaining, 6),
-                    "returncode": process.poll(),
-                    "stdout_bytes": len(stdout),
-                    "stderr_bytes": len(stderr),
-                    "stdout_sha256": sha_bytes(stdout),
-                    "stderr_sha256": sha_bytes(stderr),
-                }
-            )
-    if not completed:
-        timed_out = True
-        terminate_owned_process(process, timeout=max(deadline - time.monotonic(), 0.0))
-    _write_browser_preflight_output("browser-preflight.stdout", stdout)
-    _write_browser_preflight_output("browser-preflight.stderr", stderr)
-    remaining = max(deadline - time.monotonic(), 0.0)
-    reap = _reap_owned_descendants(deadline)
+    primary = next((item for item in variants if item["name"] == "chrome-sandbox"), variants[-1])
+    _write_browser_preflight_output("browser-preflight.stdout", primary["_stdout"])
+    _write_browser_preflight_output("browser-preflight.stderr", primary["_stderr"])
     after_subreaper = _subreaper_state()
     after_sigchld = _signal_is_default("SIGCHLD")
-    closure_ok = (
-        after_subreaper
-        and after_sigchld
-        and reap["reached_echild"]
-        and not reap["live_children"]
-        and reap["waitid_error"] is None
+    requires_causal_pair = sandbox["mode"] == "user_namespace"
+    all_variants_ok = (
+        all(item["result_ok"] for item in variants)
+        and (not requires_causal_pair or len(variants) == 2)
     )
-    native_page_status = "unresolved" if sandbox["mode"] == "user_namespace" else "not_applicable"
-    success = not timed_out and process.returncode == 0 and closure_ok and native_page_status != "unresolved"
+    if sandbox["mode"] != "user_namespace":
+        native_page_status = "not_applicable"
+    elif primary["name"] == "chrome-sandbox":
+        native_page_status = "unresolved"
+    else:
+        native_page_status = "not_executed"
+    success = all_variants_ok and after_subreaper and after_sigchld and native_page_status != "unresolved"
+    timed_out = any(item["timed_out"] for item in variants)
+    first_failure = next((item for item in variants if not item["result_ok"]), None)
+    primary_stdout = primary["_stdout"]
+    primary_stderr = primary["_stderr"]
     receipt = {
-        "pid": process.pid,
-        "argv": command,
-        "returncode": process.returncode,
-        "stdout_sha256": sha_bytes(stdout),
-        "stderr_sha256": sha_bytes(stderr),
+        "pid": primary["pid"],
+        "argv": primary["argv"],
+        "returncode": primary["returncode"],
+        "stdout_sha256": sha_bytes(primary_stdout),
+        "stderr_sha256": sha_bytes(primary_stderr),
         "stdout_path": "browser-preflight.stdout",
         "stderr_path": "browser-preflight.stderr",
         "chrome_sandbox": chrome_sandbox,
         "sandbox": sandbox,
-        "sandbox_page_url": sandbox_page_url,
+        "sandbox_page_url": primary["url"],
         "sandbox_page_status": native_page_status,
-        "sandbox_page_output_sha256": sha_bytes(stdout) if sandbox["mode"] == "user_namespace" else None,
+        "sandbox_page_output_sha256": (
+            sha_bytes(primary_stdout)
+            if primary["name"] == "chrome-sandbox"
+            else None
+        ),
         "timed_out": timed_out,
         "subreaper_before_launch": context["enabled"],
         "subreaper_after_wait": after_subreaper,
         "sigchld_default_before_launch": context["sigchld"] == "SIG_DFL",
         "sigchld_default_after_wait": after_sigchld,
         "original_deadline_seconds": 30.0,
-        "remaining_deadline_seconds": remaining,
-        "communicate_checkpoint_targets_seconds": [10.0, 20.0, 30.0],
-        "communicate_checkpoints": communicate_checkpoints,
+        "remaining_deadline_seconds": max(deadline - time.monotonic(), 0.0),
+        "tools_receipt_sha256": tools_receipt_sha256,
+        "variant_timeout_seconds": BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
+        "variant_cleanup_grace_seconds": BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+        "variants": [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in variants
+        ],
+        "experiment_complete": (
+            (requires_causal_pair and len(variants) == 2)
+            or (not requires_causal_pair and len(variants) == 1)
+        ),
+        "experiment_result": (
+            "both_variants_closed"
+            if requires_causal_pair and all_variants_ok
+            else "setuid_default_closed"
+            if not requires_causal_pair and all_variants_ok
+            else "causal_variant_failed"
+        ),
         "success": success,
-        **reap,
     }
     write_json("browser-preflight.json", receipt)
-    stderr_detail = _browser_preflight_stderr_detail(stderr)
-    if timed_out:
-        raise SystemExit(f"owned Chromium preflight exceeded 30 seconds{stderr_detail}")
-    if process.returncode != 0:
-        raise SystemExit(f"owned Chromium preflight failed{stderr_detail}")
-    if not closure_ok:
-        raise SystemExit(f"owned Chromium preflight descendants did not reach ECHILD{stderr_detail}")
+    failure_stderr = primary_stderr if first_failure is None else first_failure["_stderr"]
+    stderr_detail = _browser_preflight_stderr_detail(failure_stderr)
+    if first_failure is not None:
+        if first_failure["timed_out"]:
+            raise SystemExit(f"owned Chromium causal variant exceeded 10 seconds: {first_failure['name']}{stderr_detail}")
+        if not first_failure["closure_ok"]:
+            raise SystemExit(f"owned Chromium causal variant descendants did not reach ECHILD: {first_failure['name']}{stderr_detail}")
+        raise SystemExit(f"owned Chromium causal variant failed: {first_failure['name']}{stderr_detail}")
     if sandbox["mode"] == "user_namespace":
+        if primary["name"] != "chrome-sandbox":
+            raise SystemExit(
+                "Chromium chrome://sandbox variant was not executed after the about:blank "
+                "variant failed closed"
+            )
         raise SystemExit(
             "Chromium chrome://sandbox readback was captured, but its native status "
             "has no pinned receipt contract"
