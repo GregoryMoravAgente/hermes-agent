@@ -12,9 +12,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from gateway.config import PlatformConfig
 from gateway.hosted_rooms import local_authority_gateway_id
-from gateway.platforms.api_server import APIServerAdapter
+from tests.gateway.test_api_server_custody_fixtures import make_adapter, use_idempotency_db
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient
 from tui_gateway.hosted_room_peer_transport import PeerMemberRoute
 from tui_gateway.hosted_room_service import HostedRoomService
@@ -66,17 +65,13 @@ def _target_app(adapter):
 
 @pytest.mark.asyncio
 async def test_in_process_scoped_transport_contract_finishes_headlessly(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
-    target = APIServerAdapter(
-        PlatformConfig(enabled=True, extra={"key": "target-peer-key-1234567890"})
+    target = make_adapter(
+        "target-peer-key-1234567890", process_instance="tui-scoped-target",
+        monkeypatch=monkeypatch,
     )
-    target._run_idempotency_store.close()
-    from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
-
-    target._run_idempotency_store = RunIdempotencyStore(
-        str(tmp_path / "target-runs.db")
-    )
+    use_idempotency_db(target, tmp_path / "target-runs.db")
     server = TestServer(_target_app(target))
     await server.start_server()
     client = PeerRunsHTTPClient(
