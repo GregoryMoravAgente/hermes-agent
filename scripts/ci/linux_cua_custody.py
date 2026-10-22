@@ -367,6 +367,20 @@ def _docker_environment_receipt() -> dict[str, Any]:
     }
 
 
+def _write_user_namespace_probe_output(name: str, value: bytes) -> None:
+    destination = proof_dir() / name
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_bytes(value)
+    temporary.replace(destination)
+
+
+def _user_namespace_probe_stderr_detail(value: bytes) -> str:
+    if not value:
+        return ""
+    tail = value.decode("utf-8", errors="replace")[-4096:]
+    return f"; stderr_tail={tail!r}"
+
+
 def _user_namespace_receipt() -> dict[str, Any]:
     if platform.system() != "Linux" or os.name != "posix":
         raise SystemExit("the hosted CUA user-namespace probe requires Linux POSIX support")
@@ -385,18 +399,65 @@ def _user_namespace_receipt() -> dict[str, Any]:
     unshare_path = Path(unshare).resolve()
     if not unshare_path.is_file() or not os.access(unshare_path, os.X_OK):
         raise SystemExit("the resolved unshare executable is not an owned executable")
+    command = [str(unshare_path), "--user", "--map-root-user", "--mount-proc", "/bin/true"]
     try:
         probe = subprocess.run(
-            [str(unshare_path), "--user", "--map-root-user", "--mount-proc", "/bin/true"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
+            command,
+            capture_output=True,
             timeout=USER_NAMESPACE_PROBE_TIMEOUT_SECONDS,
             check=False,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or b""
+        stderr = exc.stderr or b""
+        _write_user_namespace_probe_output("user-namespace-probe.stdout", stdout)
+        _write_user_namespace_probe_output("user-namespace-probe.stderr", stderr)
+        write_json(
+            "user-namespace-probe.json",
+            {
+                "argv": command,
+                "returncode": None,
+                "timed_out": True,
+                "stdout_path": "user-namespace-probe.stdout",
+                "stderr_path": "user-namespace-probe.stderr",
+                "stdout_sha256": sha_bytes(stdout),
+                "stderr_sha256": sha_bytes(stderr),
+            },
+        )
+        detail = _user_namespace_probe_stderr_detail(stderr)
+        raise SystemExit(f"the Linux user-namespace capability probe did not complete{detail}") from exc
+    except OSError as exc:
+        write_json(
+            "user-namespace-probe.json",
+            {
+                "argv": command,
+                "returncode": None,
+                "timed_out": False,
+                "error_type": type(exc).__name__,
+            },
+        )
         raise SystemExit("the Linux user-namespace capability probe did not complete") from exc
+    stdout = probe.stdout or b""
+    stderr = probe.stderr or b""
+    _write_user_namespace_probe_output("user-namespace-probe.stdout", stdout)
+    _write_user_namespace_probe_output("user-namespace-probe.stderr", stderr)
+    write_json(
+        "user-namespace-probe.json",
+        {
+            "argv": command,
+            "returncode": probe.returncode,
+            "timed_out": False,
+            "stdout_path": "user-namespace-probe.stdout",
+            "stderr_path": "user-namespace-probe.stderr",
+            "stdout_sha256": sha_bytes(stdout),
+            "stderr_sha256": sha_bytes(stderr),
+        },
+    )
     if probe.returncode != 0:
-        raise SystemExit("the Linux user-namespace capability probe was refused")
+        detail = _user_namespace_probe_stderr_detail(stderr)
+        raise SystemExit(
+            f"the Linux user-namespace capability probe was refused (returncode {probe.returncode}){detail}"
+        )
     kernel = {
         str(path): read_integer(path)
         for path in USER_NAMESPACE_PROC_FILES
