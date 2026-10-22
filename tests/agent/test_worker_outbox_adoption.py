@@ -1,19 +1,28 @@
 """A retained worker outbox follows verified owner adoption (epoch replacement, physical-target
 rotation) without a second receipt, and is still refused for anything but the verified successor."""
+import os
+
 import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
+from gateway.status import get_process_start_time
 from hermes_state import SessionDB
 from hermes_state_runtime import (adopt_worker_execution, begin_runtime_epoch,
                                   mutate_worker_execution, register_worker_execution)
 
 
 def _owner(db):
-    return lambda method, **params: mutate_worker_execution(db, **params)
+    def persist(method, **params):
+        params.pop('pid', None)
+        params.pop('birth', None)
+        return mutate_worker_execution(db, **params)
+    return persist
 
 
 def _lose_ack(db, store):
     def lost(method, **params):
+        params.pop('pid', None)
+        params.pop('birth', None)
         mutate_worker_execution(db, **params)  # commits for real; only the reply is lost
         raise TimeoutError('lost_ack')
     store.rpc = lost
@@ -23,13 +32,19 @@ def _receipts(db):
     return db._read_one('SELECT COUNT(*) FROM worker_receipts')[0]
 
 
+def _scope(epoch, session_id):
+    return dict(epoch=epoch, execution_id='worker', session_id=session_id, generation=0,
+                pid=os.getpid(), birth=get_process_start_time(os.getpid()))
+
+
 def test_lost_ack_receipt_reconciles_under_the_adopted_epoch_once(tmp_path):
     path, outbox = tmp_path / 'state.db', tmp_path / 'outbox'
     db = SessionDB(path)
     db.create_session('s', 'cli')
     first = begin_runtime_epoch(db, instance_id='first')
-    scope = dict(epoch=first, execution_id='worker', session_id='s', generation=0)
-    register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
+    scope = _scope(first, 's')
+    register_worker_execution(db, **{key: scope[key] for key in ('epoch', 'execution_id', 'session_id', 'generation')},
+                              kind='compute', adoption_secret='private')
     store = RuntimeSessionStore(_owner(db), scope, outbox)
     _lose_ack(db, store)
     with pytest.raises(TimeoutError):
@@ -66,8 +81,9 @@ def test_pending_publication_follows_adoption_onto_the_rotated_target(tmp_path):
     db = SessionDB(path)
     db.create_session('root', 'cli', system_prompt='PREFIX')
     first = begin_runtime_epoch(db, instance_id='first')
-    scope = dict(epoch=first, execution_id='worker', session_id='root', generation=0)
-    register_worker_execution(db, **scope, kind='compute', adoption_secret='private')
+    scope = _scope(first, 'root')
+    register_worker_execution(db, **{key: scope[key] for key in ('epoch', 'execution_id', 'session_id', 'generation')},
+                              kind='compute', adoption_secret='private')
     store = RuntimeSessionStore(_owner(db), scope, outbox)
     assert store.try_acquire_compression_lock('root', 'holder')
     _lose_ack(db, store)

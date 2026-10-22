@@ -609,7 +609,10 @@ def _local_recovery_intake(authority, sid, *, allow_legacy):
         raise RuntimeStoreError('runtime_custody_unavailable')
     absence_fences = _local_recovery_absence_fences(authority, sid, allow_legacy=allow_legacy)
     handles = _local_recovery_handles(authority, local)
-    blocked = bool(foreign or unknown or terminal_local or absence_fences)
+    # Settled local history may coexist with a fresh local admission. Keep the
+    # terminal fence for terminal-only sessions while allowing the active local
+    # admission to be restored and drained after a restart.
+    blocked = bool(foreign or unknown or (terminal_local and not local) or absence_fences)
     if not allow_legacy:
         handles, handles_blocked = _managed_local_recovery_handles(
             authority, local, terminal_local,

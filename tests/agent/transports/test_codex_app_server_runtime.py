@@ -196,6 +196,9 @@ while True:
 
         monkeypatch.setattr(mod, "kill_process_tree", kill_tree)
         monkeypatch.setattr(mod, "_snapshot_descendants", lambda pid: [])
+        # close() budgets the graceful wait from a monotonic deadline. Freeze
+        # that clock so this assertion checks the requested budget, not runner jitter.
+        monkeypatch.setattr(mod.time, "monotonic", lambda: 0.0)
 
         client = mod.CodexAppServerClient.__new__(mod.CodexAppServerClient)
         client._proc = proc
