@@ -992,6 +992,145 @@ def _run_browser_preflight_variant(
     profile_name: str,
     url: str,
     overall_deadline: float,
+    output_transport: str = "pipes",
+) -> dict[str, Any]:
+    """Select one bounded output transport without changing the pipe path."""
+    if output_transport == "direct_files":
+        return _run_browser_preflight_direct_file_variant(
+            browser_env=browser_env,
+            base_command=base_command,
+            proof=proof,
+            profile_name=profile_name,
+            url=url,
+            overall_deadline=overall_deadline,
+        )
+    if output_transport != "pipes":
+        raise ValueError(f"unsupported browser preflight output transport: {output_transport}")
+    return _run_browser_preflight_pipe_variant(
+        browser_env=browser_env,
+        base_command=base_command,
+        proof=proof,
+        profile_name=profile_name,
+        url=url,
+        overall_deadline=overall_deadline,
+    )
+
+
+def _run_browser_preflight_direct_file_variant(
+    *,
+    browser_env: dict[str, str],
+    base_command: list[str],
+    proof: Path,
+    profile_name: str,
+    url: str,
+    overall_deadline: float,
+) -> dict[str, Any]:
+    """Run one direct-file diagnostic variant with the normal custody boundary."""
+    profile = proof / (
+        "browser-preflight-profile" if profile_name == "default" else f"browser-preflight-profile-{profile_name}"
+    )
+    profile.mkdir(mode=0o700)
+    command = [*base_command, f"--user-data-dir={profile}", url]
+    started = time.monotonic()
+    variant_deadline = min(
+        overall_deadline,
+        started + BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
+    )
+    raw_stdout_path = proof / f"browser-preflight-{profile_name}.direct.stdout"
+    raw_stderr_path = proof / f"browser-preflight-{profile_name}.direct.stderr"
+    stdout_stream = None
+    stderr_stream = None
+    try:
+        stdout_stream = raw_stdout_path.open("wb")
+        stderr_stream = raw_stderr_path.open("wb")
+        process = subprocess.Popen(
+            command,
+            env=browser_env,
+            stdout=stdout_stream,
+            stderr=stderr_stream,
+            start_new_session=True,
+        )
+    except BaseException:
+        for stream in (stdout_stream, stderr_stream):
+            if stream is not None:
+                stream.close()
+        raise
+    try:
+        group_identity = _capture_owned_process_group(process)
+    except SystemExit:
+        try:
+            process.kill()
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            process.wait(timeout=BROWSER_PRE_FLIGHT_TERM_WAIT_SECONDS)
+        except (ProcessLookupError, OSError, subprocess.TimeoutExpired):
+            pass
+        for stream in (stdout_stream, stderr_stream):
+            if stream is not None:
+                stream.close()
+        raise
+    timed_out = False
+    try:
+        process.wait(timeout=max(variant_deadline - time.monotonic(), 0.0))
+    except subprocess.TimeoutExpired:
+        timed_out = True
+    cleanup_deadline = min(
+        overall_deadline,
+        time.monotonic() + BROWSER_PRE_FLIGHT_CLEANUP_GRACE_SECONDS,
+    )
+    cleanup = _terminate_and_reap_browser_variant(
+        process, group_identity, cleanup_deadline
+    )
+    for stream in (stdout_stream, stderr_stream):
+        if stream is not None:
+            stream.close()
+    stdout = raw_stdout_path.read_bytes()
+    stderr = raw_stderr_path.read_bytes()
+    reap = cleanup["reap"]
+    closure_ok = (
+        process.poll() is not None
+        and reap["reached_echild"]
+        and not reap["live_children"]
+        and reap["waitid_error"] is None
+        and not reap["deadline_exceeded"]
+    )
+    result_ok = not timed_out and process.returncode == 0 and closure_ok
+    _write_browser_preflight_output(f"browser-preflight-{profile_name}.stdout", stdout)
+    _write_browser_preflight_output(f"browser-preflight-{profile_name}.stderr", stderr)
+    return {
+        "name": profile_name,
+        "url": url,
+        "profile": str(profile),
+        "argv": command,
+        "pid": process.pid,
+        "returncode": process.returncode,
+        "stdout_sha256": sha_bytes(stdout),
+        "stderr_sha256": sha_bytes(stderr),
+        "stdout_path": f"browser-preflight-{profile_name}.stdout",
+        "stderr_path": f"browser-preflight-{profile_name}.stderr",
+        "output_transport": "direct_files",
+        "raw_stdout_path": raw_stdout_path.name,
+        "raw_stderr_path": raw_stderr_path.name,
+        "timed_out": timed_out,
+        "variant_deadline_seconds": BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
+        "cleanup": cleanup,
+        "closure_ok": closure_ok,
+        "result_ok": result_ok,
+        "elapsed_seconds": round(time.monotonic() - started, 6),
+        "_stdout": stdout,
+        "_stderr": stderr,
+    }
+
+
+def _run_browser_preflight_pipe_variant(
+    *,
+    browser_env: dict[str, str],
+    base_command: list[str],
+    proof: Path,
+    profile_name: str,
+    url: str,
+    overall_deadline: float,
 ) -> dict[str, Any]:
     """Run one fresh-profile causal variant with a bounded cleanup receipt."""
     profile = proof / (
@@ -1099,7 +1238,10 @@ def _run_browser_preflight_variant(
     }
 
 
-def browser_preflight() -> None:
+def browser_preflight(*, output_transport: str = "pipes") -> None:
+    if output_transport not in {"pipes", "direct_files"}:
+        raise ValueError(f"unsupported browser preflight output transport: {output_transport}")
+    diagnostic_direct_file = output_transport == "direct_files"
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
     sandbox = _verify_sealed_sandbox(tools["sandbox"])
@@ -1126,8 +1268,14 @@ def browser_preflight() -> None:
         browser_env["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
     else:
         browser_env.pop("CHROME_DEVEL_SANDBOX", None)
+    if diagnostic_direct_file and sandbox["mode"] != "user_namespace":
+        raise SystemExit("the direct-file diagnostic requires the user-namespace sandbox mode")
     if sandbox["mode"] == "user_namespace":
-        variant_specs = (("about-blank", "about:blank"), ("chrome-sandbox", "chrome://sandbox"))
+        variant_specs = (
+            (("about-blank-direct-file", "about:blank"),)
+            if diagnostic_direct_file
+            else (("about-blank", "about:blank"), ("chrome-sandbox", "chrome://sandbox"))
+        )
     else:
         variant_specs = (("default", "data:,"),)
     variants: list[dict[str, Any]] = []
@@ -1139,6 +1287,7 @@ def browser_preflight() -> None:
             profile_name=profile_name,
             url=url,
             overall_deadline=deadline,
+            output_transport=output_transport,
         )
         variants.append(variant)
         if not variant["closure_ok"]:
@@ -1148,7 +1297,7 @@ def browser_preflight() -> None:
     _write_browser_preflight_output("browser-preflight.stderr", primary["_stderr"])
     after_subreaper = _subreaper_state()
     after_sigchld = _signal_is_default("SIGCHLD")
-    requires_causal_pair = sandbox["mode"] == "user_namespace"
+    requires_causal_pair = sandbox["mode"] == "user_namespace" and not diagnostic_direct_file
     all_variants_ok = (
         all(item["result_ok"] for item in variants)
         and (not requires_causal_pair or len(variants) == 2)
@@ -1159,7 +1308,13 @@ def browser_preflight() -> None:
         native_page_status = "unresolved"
     else:
         native_page_status = "not_executed"
-    success = all_variants_ok and after_subreaper and after_sigchld and native_page_status != "unresolved"
+    success = (
+        not diagnostic_direct_file
+        and all_variants_ok
+        and after_subreaper
+        and after_sigchld
+        and native_page_status != "unresolved"
+    )
     timed_out = any(item["timed_out"] for item in variants)
     first_failure = next((item for item in variants if not item["result_ok"]), None)
     primary_stdout = primary["_stdout"]
@@ -1196,11 +1351,16 @@ def browser_preflight() -> None:
             for item in variants
         ],
         "experiment_complete": (
-            (requires_causal_pair and len(variants) == 2)
+            (diagnostic_direct_file and len(variants) == 1)
+            or (requires_causal_pair and len(variants) == 2)
             or (not requires_causal_pair and len(variants) == 1)
         ),
         "experiment_result": (
-            "both_variants_closed"
+            "direct_file_variant_closed"
+            if diagnostic_direct_file and all_variants_ok
+            else "direct_file_variant_failed"
+            if diagnostic_direct_file
+            else "both_variants_closed"
             if requires_causal_pair and all_variants_ok
             else "setuid_default_closed"
             if not requires_causal_pair and all_variants_ok
@@ -1208,6 +1368,14 @@ def browser_preflight() -> None:
         ),
         "success": success,
     }
+    if diagnostic_direct_file:
+        receipt.update(
+            {
+                "output_transport": output_transport,
+                "diagnostic_only": True,
+                "comparison_control": "d2_about_blank_pipe",
+            }
+        )
     write_json("browser-preflight.json", receipt)
     failure_stderr = primary_stderr if first_failure is None else first_failure["_stderr"]
     stderr_detail = _browser_preflight_stderr_detail(failure_stderr)
@@ -1217,6 +1385,8 @@ def browser_preflight() -> None:
         if not first_failure["closure_ok"]:
             raise SystemExit(f"owned Chromium causal variant descendants did not reach ECHILD: {first_failure['name']}{stderr_detail}")
         raise SystemExit(f"owned Chromium causal variant failed: {first_failure['name']}{stderr_detail}")
+    if diagnostic_direct_file:
+        return
     if sandbox["mode"] == "user_namespace":
         if primary["name"] != "chrome-sandbox":
             raise SystemExit(
@@ -1733,6 +1903,7 @@ def main() -> int:
     child_parser.add_argument("child_argv", nargs=argparse.REMAINDER)
     subparsers.add_parser("resolve-tools")
     subparsers.add_parser("browser-preflight")
+    subparsers.add_parser("browser-preflight-direct-file")
     snapshot_parser = subparsers.add_parser("snapshot")
     snapshot_parser.add_argument("--label", required=True, choices=("before-static", "before-sut", "after-sut"))
     verify_parser = subparsers.add_parser("verify")
@@ -1746,6 +1917,7 @@ def main() -> int:
         "run-owned-child": lambda: _dispatch_owned_child(args),
         "resolve-tools": resolve_tools,
         "browser-preflight": browser_preflight,
+        "browser-preflight-direct-file": lambda: browser_preflight(output_transport="direct_files"),
         "snapshot": lambda: snapshot(args.label),
         "verify": lambda: verify(args.test_outcome),
     }

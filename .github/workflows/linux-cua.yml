@@ -163,15 +163,38 @@ jobs:
         run: >-
           "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-sut
 
-      - name: Initialize and seal the PM Chromium process
-        run: >-
-          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py browser-preflight
+      - name: Run direct-file Chromium diagnostic only
+        id: browser-direct-file
+        continue-on-error: true
+        shell: bash
+        run: |
+          set +e
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py browser-preflight-direct-file
+          status=$?
+          set -e
+          printf 'exit_status=%s\n' "$status" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      - name: Stop after direct-file diagnostic before capacity and SUT
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          status='${{ steps.browser-direct-file.outputs.exit_status }}'
+          if [[ ! "$status" =~ ^[0-9]+$ ]]; then
+            echo "direct-file diagnostic did not produce an exit status"
+            exit 1
+          fi
+          echo "direct-file diagnostic completed with exit status $status; stopping before qualification/SUT"
+          exit 1
 
       - name: Capacity gate after browser initialization
+        if: ${{ steps.browser-direct-file.outcome == 'skipped' }}
         run: >-
           "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-browser --source-floor
 
       - name: Run both complete CUA modules
+        if: ${{ steps.browser-direct-file.outcome == 'skipped' }}
         id: cua-tests
         continue-on-error: true
         shell: bash
@@ -196,13 +219,13 @@ jobs:
           fi
 
       - name: Snapshot source and owned inputs after SUT
-        if: always()
+        if: ${{ always() && steps.browser-direct-file.outcome == 'skipped' }}
         continue-on-error: true
         run: >-
           "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label after-sut
 
       - name: Verify CUA receipt and owned descendant closure
-        if: always()
+        if: ${{ always() && steps.browser-direct-file.outcome == 'skipped' }}
         run: >-
           "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py verify
           --test-outcome "${{ steps.cua-tests.outcome }}"
