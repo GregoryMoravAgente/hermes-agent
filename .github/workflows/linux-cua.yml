@@ -126,6 +126,11 @@ jobs:
             libpango-1.0-0 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 \
             libxfixes3 libxrandr2 libxshmfence1
 
+      - name: Select a supported PM bootstrap interpreter
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
       - name: Set up the locked PM environment and native tools
         id: pm
         uses: ./.github/actions/setup-pm
