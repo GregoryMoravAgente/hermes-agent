@@ -323,8 +323,11 @@ async def test_public_shell_reservation_refusal_reconciles_exact_owner_to_comple
         def bind_then_fail(admission_id, parent, service, request):
             nonlocal bind_failed
             original_bind(admission_id, parent, service, request)
-            binder_calls.append((service, request, parent))
-            if not bind_failed:
+            # The managed ACP provider binds its own request before shell hooks run.  Inject
+            # this publication-boundary fault only for the shell-hook-owned child under test;
+            # failing the provider bind aborts the public API turn before shell custody exists.
+            if str(getattr(service, "owner_id", "")).startswith("shell-hook:") and not bind_failed:
+                binder_calls.append((service, request, parent))
                 bind_failed = True
                 raise RuntimeError("shell_reservation_publication_boundary")
 
