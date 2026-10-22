@@ -520,6 +520,33 @@ def _assert_terminal_i12(binding, job, executions, coordinator, owner_classes_be
     return record
 
 
+async def _await_public_fire_custody_settlement(binding, deadline):
+    """Wait for the detached worker's real reaper callback within the test's deadline."""
+    from tests.waiting import async_wait_until
+
+    def settled():
+        if binding.settled is not True:
+            return False
+        child = binding.child
+        if child is None:
+            return True
+        if child.settled is not True:
+            return False
+        reaper = child._reaper
+        return (
+            reaper is not None
+            and reaper.is_alive() is False
+            and getattr(reaper, "_cron_reap_succeeded", False) is True
+        )
+
+    loop = asyncio.get_running_loop()
+    await async_wait_until(
+        settled,
+        timeout=max(0.0, deadline - loop.time()),
+        what="public fire_due custody and native reaper settlement",
+    )
+
+
 def _find_cron_admission(authority, job_id, execution_id):
     from gateway.session_results import admission_result
     from gateway.session_local_recovery import local_identity
@@ -673,12 +700,15 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
             deliver="local",
         )
         provider = InProcessCronScheduler()
+        deadline = asyncio.get_running_loop().time() + 90.0
         assert await asyncio.wait_for(
-            asyncio.to_thread(provider.fire_due, job["id"]), timeout=90.0,
+            asyncio.to_thread(provider.fire_due, job["id"]),
+            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
         ) is True
 
     assert len(captured) == 1
     binding = captured[0]
+    await _await_public_fire_custody_settlement(binding, deadline)
     record = _assert_terminal_i12(
         binding, job, executions, coordinator, owner_classes_before,
     )
