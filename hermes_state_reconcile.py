@@ -167,7 +167,44 @@ def _lockless_gateway_holder(path: Path) -> str | None:
     multiplexer serves named profiles without reserving their per-profile lock, so the lock alone
     misses it. Only holders whose command line is a Hermes ``gateway`` run count; plain readers
     (Desktop, sibling browses, CLI reads) are not owners. Returns a description, else None."""
-    from hermes_state_holders import _looks_like_hermes, _read_proc_argv, describe_holder_pid, foreign_state_db_holders
+    from hermes_state_holders import (
+        _argv_scoped_to_other_home, _looks_like_hermes, _read_proc_argv, _sqlite_family,
+        canonical_sqlite_path, describe_holder_pid, foreign_state_db_holders,
+    )
+
+    # On macOS, psutil's ``process_iter(['pid', 'open_files'])`` asks launchd for every process's
+    # descriptors and can take several seconds on a developer machine. This caller only accepts
+    # Hermes processes as legacy owners, so first select those cheaply by argv and inspect files
+    # for that small set. The general holder scan remains the fallback for other platforms and
+    # environments without psutil.
+    import sys
+    if sys.platform == 'darwin':
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        if psutil is not None:
+            watched = {
+                canonical_sqlite_path(os.path.realpath(candidate))
+                for candidate in _sqlite_family(os.path.realpath(os.fspath(path)))
+            }
+            for process in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    pid = int(process.info['pid'])
+                    argv = process.info.get('cmdline')
+                    if (pid == os.getpid() or not argv or not _looks_like_hermes(argv)
+                            or _argv_scoped_to_other_home(argv, path)):
+                        continue
+                    opened = process.open_files() or ()
+                except (KeyError, OSError, TypeError, ValueError, psutil.Error):
+                    continue
+                if any(
+                    canonical_sqlite_path(os.path.realpath(getattr(item, 'path', ''))) in watched
+                    for item in opened
+                ):
+                    return describe_holder_pid(pid)
+            return None
+
     for pid, _target in foreign_state_db_holders(path):
         if pid <= 0:
             continue

@@ -729,13 +729,13 @@ class SessionAuthority(
             # custody seam is installed. Keep the legacy route functional for lightweight
             # embedders that do not install that seam; they must not be mislabeled as managed
             # and then fail at execution for a binding that cannot exist in that runtime.
+            producer_process_mode = None
             if self._preservation_coordinator() is not None:
                 from gateway.session_classic_custody import classic_direct_route_marker
-                payload['native_text_v1']['producer_process_mode'] = (
+                producer_process_mode = (
                     classic_direct_route_marker(self, event) or 'managed_turn'
                 )
-            if fingerprint := getattr(event, '_ingress_sha256', None):
-                payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite
+            ingress_fingerprint = getattr(event, '_ingress_sha256', None)
             self._require_fresh_admission_open()
             if fence is not None:
                 fence()
@@ -795,6 +795,8 @@ class SessionAuthority(
                 return await tracked_write(self, partial(
                     self._admit_native_write, principal_id=principal_id, session_id=session_id,
                     request_id=request_id, payload=payload,
+                    producer_process_mode=producer_process_mode,
+                    ingress_fingerprint=ingress_fingerprint,
                     authorize=session_retry_admission.compose(rewrite, self._admission_gate(fence, fresh=True)),
                     raw=getattr(event, 'raw_message', None)),
                     then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]),
@@ -819,13 +821,39 @@ class SessionAuthority(
                         coordinator.mark_unknown(preservation_handle, 'read_failed')
             raise
 
-    def _admit_native_write(self, *, principal_id, session_id, request_id, payload, authorize, raw=None):
+    def _admit_native_write(
+        self, *, principal_id, session_id, request_id, payload,
+        producer_process_mode=None, ingress_fingerprint=None, authorize, raw=None,
+    ):
         # Off the loop and in admission order: the redelivery reconcile reads the ledger it decides
         # against, so a concurrent first delivery of the same message cannot slip between them.
         from gateway.session_ingress_media import drop_capture_lease, reconcile_native_retry, release_unheld_media
         fresh = payload.get('native_text_v1', {}).get('media', [])
         session_id = self._current_owner(session_id)
         try:
+            existing = find_session_admission(
+                self.db, principal_id=principal_id, session_id=session_id, request_id=request_id,
+            )
+            retained_payload = (existing or {}).get('payload')
+            retained_native = retained_payload.get('native_text_v1') if isinstance(retained_payload, dict) else None
+            legacy_identity = isinstance(retained_native, dict) and 'producer_process_mode' not in retained_native
+            if not legacy_identity:
+                descriptor = payload.get('native_text_v1')
+                if not isinstance(descriptor, dict):
+                    raise RuntimeStoreError('invalid_params')
+                payload = {
+                    **payload,
+                    'native_text_v1': {**descriptor},
+                }
+                if producer_process_mode is not None:
+                    payload['native_text_v1']['producer_process_mode'] = producer_process_mode
+                if ingress_fingerprint:
+                    # The fingerprint is the delivery before any rewrite; keep it alongside
+                    # the custody marker on fresh rows and exact retries with that marker.
+                    payload['native_text_v1']['ingress_sha256'] = ingress_fingerprint
+            # A pre-custody row keeps its original payload shape. The ordinary retry
+            # reconciliation and admission digest still decide exact replay or conflict;
+            # this identity lookup cannot authorize changed content.
             payload = reconcile_native_retry(self.db, principal_id=principal_id, session_id=session_id,
                                              request_id=request_id, payload=payload, raw=raw)
             return admit_session_input(self.db, epoch=self.epoch, principal_id=principal_id, session_id=session_id,

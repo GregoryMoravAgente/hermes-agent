@@ -1,6 +1,5 @@
 """Opposing transport/runtime policy and restart controls, no vendor credentials."""
 import asyncio
-from copy import deepcopy
 import json
 from tests.waiting import async_wait_until
 
@@ -22,7 +21,7 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
     from gateway.config import Platform
     from gateway.platforms.event import MessageEvent
     from gateway.profile_routing import ProfileRoute
-    from hermes_state_runtime import admit_session_input, list_session_admissions
+    from hermes_state_runtime import list_session_admissions
 
     transport = state / 'profiles' / 'transport'
     transport.mkdir(parents=True, exist_ok=True)
@@ -132,12 +131,20 @@ async def multiplex_probe(runner, authority, primary, state, mode, peer):
         assert all(row['outcome'] == 'completed' for row in rows(entry.session_id))
         assert worker_scopes == [(str(state), 'runtime-fixture-key')] * 2 + [(str(state), 'runtime-fresh-key')], worker_scopes
     if mode == 'capture':
-        # A queued storage fixture derived from the actual committed callback envelope.
-        # This is restart reauthorization evidence, not a native post-ACK kill claim.
-        payload = deepcopy(committed[0]['payload'])
-        payload['text'] = 'RESTART_SOURCE_REAUTH'
-        admit_session_input(authority.db, epoch=authority.epoch, principal_id=committed[0]['principal_id'],
-                            session_id=entry.session_id, request_id='restart-fixture', payload=payload)
+        # Build the recovery row through the same native producer/authority boundary as a live
+        # callback. Suppress only the local scheduler: this process is the capture owner and the
+        # next process must perform the execution after reauthorization.
+        restart_event = MessageEvent(text='RESTART_SOURCE_REAUTH', source=source, message_id='restart-fixture')
+        runner._canonicalize(source, transport_profile='transport')
+        source._authorization_profile_home = transport
+        from gateway.session_ingress_context import native_callback
+        _schedule_admitted = authority._schedule_admitted
+        authority._schedule_admitted = lambda *_args, **_kwargs: None
+        try:
+            with native_callback(runner, restart_event, transport, 'transport'):
+                await authority.admit_native(restart_event)
+        finally:
+            authority._schedule_admitted = _schedule_admitted
         (state / 'multiplex.json').write_text(json.dumps({'sid': entry.session_id}))
     print(json.dumps({'mode': mode, 'model_calls': len(peer.requests), 'rows': rows(entry.session_id),
                       'deliveries': adapter.deliveries, 'worker_scopes': worker_scopes}))

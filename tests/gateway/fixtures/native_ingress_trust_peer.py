@@ -47,7 +47,12 @@ async def probe(mode, peer):
 
     state = Path(os.environ['HERMES_HOME'])
     runner = GatewayRunner()
+    from gateway.session_authorities import SessionAuthorities
+    runner.session_authorities = SessionAuthorities(state, multiplexed=False)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='trust-' + mode)
+    runner.session_authorities.add(state, authority, name='default')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     adapter = Adapter()
     adapter.gateway_runner = runner
     runner.adapters[Platform.TELEGRAM] = adapter
@@ -133,12 +138,15 @@ if __name__ == '__main__':
         # running turn instead, so the outcome raced agent construction under load.
         + ('display:\n  busy_input_mode: queue\n' if sys.argv[1] == 'multiplex' else ''))
     status = 0
+    from gateway.runtime_ownership import process_ownership
+    process_ownership.reserve([Path(os.environ['HERMES_HOME'])])
     try:
         asyncio.run(probe(sys.argv[1], peer))
     except BaseException:
         traceback.print_exc()
         status = 1
     finally:
+        process_ownership.close()
         peer.shutdown()
         peer.server_close()
         sys.stdout.flush()
