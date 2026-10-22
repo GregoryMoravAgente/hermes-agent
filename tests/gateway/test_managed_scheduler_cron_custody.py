@@ -557,11 +557,19 @@ def _assert_external_worker_physical_ownership(binding):
     process = child._process
     assert process is not None and process.pid > 0 and process.poll() is not None
     assert child._bound_process_pid == process.pid
-    assert child._worker_pid == process.pid
+    assert type(child._worker_pid) is int and child._worker_pid > 0
+    assert type(child._worker_started_at) is int
+    # Preserve the direct-child contract; only a degraded Windows trampoline may split the
+    # authenticated worker identity from the retained Popen/root identity.
+    if child._dispatch_mode != "degraded" or child._worker_pid == process.pid:
+        assert child._worker_pid == process.pid
     assert child._reaper is not None
     assert child._reaper.is_alive() is False
     assert getattr(child._reaper, "_cron_reap_succeeded", False) is True
     assert child._dispatch_mode in {"scoped", "degraded"}
+    if child._dispatch_mode == "degraded" and child._worker_pid != process.pid:
+        # A Windows trampoline split is accepted only with the retained native Job proof.
+        assert child._native_job is not None
 
     if child._dispatch_mode == "scoped":
         proof = child._scope_proof
@@ -574,9 +582,17 @@ def _assert_external_worker_physical_ownership(binding):
         assert child._native_job_proven is True
         assert isinstance(proof, dict)
         assert proof["kind"] == "windows_job"
-        assert proof["pid"] == process.pid
+        assert proof["pid"] == child._worker_pid
         assert proof["process_started_at"] == child._worker_started_at
+        assert proof["root_pid"] == process.pid
+        assert proof["native_job_canonical"] is True
         assert proof["scope_empty"] is True
+        if child._worker_pid == process.pid:
+            # Existing direct Windows Job proof remains an exact root/worker handle proof.
+            assert proof["worker_job_membership"] == "retained_root_handle"
+        else:
+            assert child._dispatch_mode == "degraded"
+            assert proof["worker_job_membership"] == "transitive_no_breakaway_ancestry"
 
 
 @pytest.mark.asyncio
