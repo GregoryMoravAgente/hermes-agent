@@ -32,12 +32,13 @@ def _startup(monkeypatch, tmp_path):
     from agent import memory_provider
     from gateway import lifecycle_ledger as ledger
     from gateway import run_api, run_runtime
+    from gateway.run_adapters import GatewayAdapterLifecycleMixin
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     events, release, scan_entered = [], threading.Event(), threading.Event()
     state = {"evidence": None}
 
-    class _LiveRunner:
+    class _LiveRunner(GatewayAdapterLifecycleMixin):
         def __init__(self, config):
             from gateway.session import SessionStore
             from hermes_constants import get_hermes_home
@@ -53,6 +54,9 @@ def _startup(monkeypatch, tmp_path):
             self.exit_reason = None
             self.exit_code = None
             self.adapters = {}
+            self._failed_platforms = {}
+            self._profile_failed_platforms = {}
+            self._profile_adapters = {}
 
         async def start(self):
             events.append("runner_started")
