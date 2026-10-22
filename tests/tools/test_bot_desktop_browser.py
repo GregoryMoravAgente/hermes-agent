@@ -306,7 +306,11 @@ def test_janitor_keeps_the_shared_browser_alive_while_a_human_holds_the_lease(mo
     holder = {"human": True}
     monkeypatch.setattr(lease, "human_holds", lambda *a, **k: holder["human"])
     reaped: list = []
-    monkeypatch.setattr(lifecycle, "cleanup_browser", lambda task_id: reaped.append(task_id))
+    def cleanup_successfully(task_id):
+        reaped.append(task_id)
+        return True
+
+    monkeypatch.setattr(lifecycle, "cleanup_browser", cleanup_successfully)
     monkeypatch.setattr(lifecycle._bt, "BROWSER_SESSION_INACTIVITY_TIMEOUT", 1)
     monkeypatch.setattr(lifecycle._bt, "_active_sessions", {
         "bot": {"session_name": "h_bot", "features": {"local": True}},
