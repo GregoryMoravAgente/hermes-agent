@@ -27,8 +27,10 @@ from typing import Any
 
 MIN_FREE_MB = 1536
 METADATA_SUBPROCESS_TIMEOUT_SECONDS = 30.0
-DRIVER_SHA256 = "cf29bfaad16737e31e72f38dad2a6424f24b21a4ac2edea885e83cb9d5034135"
-CHROMIUM_SHA256 = "b5e3195041af345a668d110f5daf5581961fa3608626ea588c97dd0fe81c4e38"
+# Executable-member hashes derived from the Linux x64 archives verified against
+# pm/lock.json. Archive hashes and extracted executable hashes are distinct.
+DRIVER_SHA256 = "43d926a1b938012379db57cf351530f81e75a574017676815f85d1e13aff23f7"
+CHROMIUM_SHA256 = "481fea1516a1f2b76454664272f12cd9dd1f20117b21e1f1498e08bc7f872c00"
 TEST_FILES = (
     "tests/gateway/test_cua_managed_admission_delivery.py",
     "tests/tools/test_computer_use_cua_custody.py",
