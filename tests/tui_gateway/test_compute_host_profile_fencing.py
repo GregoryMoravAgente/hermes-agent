@@ -7,13 +7,13 @@ source or start a provider/model process.
 
 from __future__ import annotations
 
-import os
 import sys
 import threading
 from pathlib import Path
 
 import pytest
 
+from tests.tui_gateway.host_supervisor_test_env import synthetic_host_env
 from tui_gateway import server
 from tui_gateway.host_supervisor import HostSupervisor
 
@@ -476,8 +476,7 @@ def test_detached_close_does_not_start_retired_captured_host(
     registry = home / "state" / "dashboard-compute-host.json"
     fixture_child = Path(__file__).with_name("profile_owner_child.py")
     repo = Path(__file__).resolve().parents[2]
-    env = dict(os.environ)
-    env["HERMES_HOME"] = str(home)
+    env = synthetic_host_env(home, repo)
     supervisor = HostSupervisor(
         registry_path=registry,
         argv=[sys.executable, str(fixture_child)],

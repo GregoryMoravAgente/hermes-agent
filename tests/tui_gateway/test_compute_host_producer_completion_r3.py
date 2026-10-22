@@ -15,6 +15,7 @@ import pytest
 
 from hermes_cli import backend_retirement
 from tests.waiting import wait_until
+from tests.tui_gateway.host_supervisor_test_env import synthetic_host_env
 from tui_gateway import compute_host as compute_host_module
 from tui_gateway.compute_host import ComputeHost
 from tui_gateway import host_supervisor as host_supervisor_module
@@ -74,7 +75,7 @@ def _removed_session_supervisor(monkeypatch, tmp_path: Path):
         registry_path=tmp_path / "compute-host.json",
         argv=args,
         cwd=root,
-        env={"HERMES_HOME": str(hermes_home), "PYTHONPATH": str(root)},
+        env=synthetic_host_env(hermes_home, root),
         expected_build_sha="unknown",
         expected_hermes_home=str(hermes_home),
         heartbeat_secs=60,
@@ -112,7 +113,7 @@ def _watcher_failure_supervisor(monkeypatch, tmp_path: Path, failure: str):
         registry_path=tmp_path / "compute-host.json",
         argv=args,
         cwd=root,
-        env={"HERMES_HOME": str(hermes_home), "PYTHONPATH": str(root)},
+        env=synthetic_host_env(hermes_home, root),
         expected_build_sha="unknown",
         expected_hermes_home=str(hermes_home),
         heartbeat_secs=60,

@@ -18,6 +18,7 @@ import pytest
 
 from hermes_cli import backend_retirement
 from tests.waiting import wait_until
+from tests.tui_gateway.host_supervisor_test_env import synthetic_host_env
 from tui_gateway.host_supervisor import HostSupervisor
 
 
@@ -80,8 +81,7 @@ def _supervisor(monkeypatch, tmp_path: Path, mode: str):
         argv=args,
         cwd=root,
         env={
-            "HERMES_HOME": str(hermes_home),
-            "PYTHONPATH": str(root),
+            **synthetic_host_env(hermes_home, root),
             "HERMES_ISO_CERTIFY_SYNTH_TURN": "1",
         },
         rpc_sink=lambda frame: rpc_frames.append(dict(frame)),

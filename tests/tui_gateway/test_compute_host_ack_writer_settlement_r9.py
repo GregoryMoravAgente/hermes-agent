@@ -11,6 +11,7 @@ import threading
 import pytest
 
 from tests.waiting import wait_until
+from tests.tui_gateway.host_supervisor_test_env import synthetic_host_env
 from tui_gateway.host_supervisor import HostSupervisor
 
 
@@ -44,7 +45,7 @@ def _ack_supervisor(tmp_path: Path, paths: dict[str, Path]) -> HostSupervisor:
             "--reader-finished", str(paths["reader-finished"]),
         ],
         cwd=root,
-        env={"HERMES_HOME": str(hermes_home), "PYTHONPATH": str(root)},
+        env=synthetic_host_env(hermes_home, root),
         expected_build_sha="unknown",
         expected_hermes_home=str(hermes_home),
         heartbeat_secs=60,

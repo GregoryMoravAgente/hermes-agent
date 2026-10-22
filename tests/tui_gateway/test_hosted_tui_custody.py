@@ -32,6 +32,7 @@ from gateway.session_authorities import all_authorities
 from hermes_cli import backend_retirement
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tests.waiting import wait_until
+from tests.tui_gateway.host_supervisor_test_env import synthetic_host_env
 from tui_gateway import hosted_tui_custody
 from tui_gateway.host_supervisor import HostSupervisor
 from tui_gateway.hosted_room_driver import HostedRoomRuntime
@@ -406,7 +407,7 @@ def _supervisor(
         registry_path=tmp_path / "compute-host.json",
         argv=argv,
         cwd=root,
-        env={"HERMES_HOME": str(home), "PYTHONPATH": str(root)},
+        env=synthetic_host_env(home, root),
         rpc_sink=rpc_sink,
         expected_build_sha="unknown",
         expected_hermes_home=str(home),
