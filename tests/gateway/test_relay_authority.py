@@ -75,6 +75,26 @@ async def probe(peer):
             reconnect=True, reconnect_backoff_s=.05)
         runner = GatewayRunner()
         authority = await initialize_session_authority(runner, profile_id='default', instance_id='relay-test')
+        from gateway.runtime_ownership import process_ownership
+        from gateway.session_authorities import SessionAuthorities
+        from pathlib import Path
+        from gateway.runtime_custody import install_runtime_custody
+        home = str(Path(authority.db.db_path).resolve().parent)
+        process_ownership.reserve([Path(home)])
+        authorities = SessionAuthorities(Path(home))
+        authorities.add(Path(home), authority)
+        runner.session_authorities = authorities
+        runtime_descriptor = dict(getattr(runner, 'session_runtime_descriptor', None) or {})
+        runtime_descriptor.update({
+            'state': 'ready',
+            'capabilities': ['session-authority-v1'],
+            'instance_id': authority.instance_id,
+            'authority_epoch': authority.epoch,
+            'profile_id': authority.profile_id,
+            'served_profiles': [{'profile_id': authority.profile_id, 'home': home}],
+        })
+        runner.session_runtime_descriptor = runtime_descriptor
+        install_runtime_custody(runner)
         adapter = RelayAdapter(PlatformConfig(enabled=True),
             descriptor, transport)
         adapter.gateway_runner = runner
@@ -257,6 +277,7 @@ async def probe(peer):
         finally:
             await adapter.disconnect()
             await stop_gateway_api(api)
+            process_ownership.close()
 
 
 def main():
