@@ -852,43 +852,46 @@ def started_mux(tmp_path, monkeypatch, unused_tcp_port):
 
     try:
         with FakeLLMServer(default_text="started-mux-fixture-ok") as provider:
-            write_hermes_home(root, provider.base_url)
-            process_ownership.reserve([home for _name, home in homes])
-            reserved = True
-            runner = GatewayRunner(config)
-            call(initialize_gateway_runtime(runner))
-            control_server = runner.session_control_server = GatewayControlServer(
-                root, verb_handlers={"identify": lambda: runner.session_runtime_descriptor}
-            )
-            call(control_server.start())
-            # This is the same listener startup used by gateway.run.start_gateway; it is required
-            # before GatewayRunner.start(), because publish_gateway_runtime_ready checks its live task.
-            call(start_gateway_runtime_api(runner))
-            assert call(runner.start()) is True
-            started = True
-            call_sync(publish_gateway_runtime_ready, runner)
-            assert runner._running is True
-            assert runner.session_runtime_descriptor["state"] == "ready"
-            yield runner, dict(homes), loop, call
+            try:
+                write_hermes_home(root, provider.base_url)
+                process_ownership.reserve([home for _name, home in homes])
+                reserved = True
+                runner = GatewayRunner(config)
+                call(initialize_gateway_runtime(runner))
+                control_server = runner.session_control_server = GatewayControlServer(
+                    root, verb_handlers={"identify": lambda: runner.session_runtime_descriptor}
+                )
+                call(control_server.start())
+                # This is the same listener startup used by gateway.run.start_gateway; it is required
+                # before GatewayRunner.start(), because publish_gateway_runtime_ready checks its live task.
+                call(start_gateway_runtime_api(runner))
+                assert call(runner.start()) is True
+                started = True
+                call_sync(publish_gateway_runtime_ready, runner)
+                assert runner._running is True
+                assert runner.session_runtime_descriptor["state"] == "ready"
+                yield runner, dict(homes), loop, call
+            finally:
+                if runner is not None:
+                    if started:
+                        yuanbao = getattr(runner, "adapters", {}).get(Platform.YUANBAO)
+                        if yuanbao is not None and getattr(
+                            getattr(yuanbao, "_connection", None), "ws", None
+                        ) is not None:
+                            call(yuanbao.disconnect())
+                        # Drain detached work while the provider is still alive.
+                        call(runner.stop())
+                    else:
+                        if getattr(runner, "session_runtime_descriptor", None) is not None:
+                            call(drain_gateway_runtime(runner))
+                    if control_server is not None:
+                        call(control_server.stop())
+                    for authority in tuple(getattr(runner, "session_authorities", []) or ()):
+                        assert close_profile(authority), "I17 profile root did not close during fixture cleanup"
+                        authority.db.close()
+                    runner.session_store.close_all_db_handles()
+                    runner.close_all_session_db_handles()
     finally:
-        if runner is not None:
-            if started:
-                yuanbao = getattr(runner, "adapters", {}).get(Platform.YUANBAO)
-                if yuanbao is not None and getattr(
-                    getattr(yuanbao, "_connection", None), "ws", None
-                ) is not None:
-                    call(yuanbao.disconnect())
-                call(runner.stop())
-            else:
-                if getattr(runner, "session_runtime_descriptor", None) is not None:
-                    call(drain_gateway_runtime(runner))
-            if control_server is not None:
-                call(control_server.stop())
-            for authority in tuple(getattr(runner, "session_authorities", []) or ()):
-                assert close_profile(authority), "I17 profile root did not close during fixture cleanup"
-                authority.db.close()
-            runner.session_store.close_all_db_handles()
-            runner.close_all_session_db_handles()
         if reserved:
             process_ownership.close()
         loop.call_soon_threadsafe(loop.stop)
