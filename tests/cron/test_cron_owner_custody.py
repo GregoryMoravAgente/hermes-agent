@@ -496,6 +496,28 @@ def test_i12_provider_claim_fire_returns_real_execution_receipt(custody_runtime,
         binding.execution_id, success=True, delivery_outcome="delivered") is not None
     assert binding.observe_terminal()
 
+
+def test_i12_provider_claim_fire_refuses_during_retirement_close(custody_runtime, monkeypatch):
+    """A provider fire cannot create an I12 root after the managed close barrier is held."""
+    coordinator, _executions, _db = custody_runtime
+    from cron import jobs
+    from cron.runtime_custody import CronCustodyRefused
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    monkeypatch.setattr(
+        jobs,
+        "claim_job_for_fire",
+        lambda *_args, **_kwargs: pytest.fail("provider claimed a job after retirement began"),
+    )
+    close = coordinator.begin_close(owner_id="provider-close")
+    assert close is not None
+    try:
+        with pytest.raises(CronCustodyRefused, match="runtime_draining"):
+            InProcessCronScheduler().claim_fire("job-provider-close")
+    finally:
+        assert coordinator.abort_before_handoff(close) is None
+
+
 @pytest.mark.platforms("windows")
 def test_i13_direct_popen_identity_probe():
     """Diagnostic only: compare real child identity with the parent Popen receipt."""
