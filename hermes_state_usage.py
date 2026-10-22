@@ -266,6 +266,23 @@ class SessionUsageMixin:
         if batch:
             self._apply_claimed_batch(batch)
 
+    def _token_writer_quiescent(self) -> bool:
+        """Return whether the token writer owns no live or accepted work.
+
+        A checked SessionDB close must not release the native writer connection while a
+        background writer is still applying an accepted batch.  The stop flag alone is not
+        sufficient: ``_stop_token_writer`` deliberately returns after its bounded join when
+        an apply is blocked, and that writer still owns the exact connection until it exits.
+        """
+        with self._token_queue_cond:
+            thread = self._token_writer_thread
+            return (
+                self._token_writer_stop is True
+                and (thread is None or not thread.is_alive())
+                and self._token_writer_busy is False
+                and not self._token_queue
+            )
+
     def _drain_token_queue_at_exit(self) -> None:
         with contextlib.suppress(Exception):  # never fatal at interpreter shutdown
             self._stop_token_writer()

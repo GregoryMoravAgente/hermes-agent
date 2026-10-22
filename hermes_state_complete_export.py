@@ -17,6 +17,7 @@ from __future__ import annotations
 import atexit
 import base64
 import json
+import logging
 import math
 import numbers
 import sqlite3
@@ -51,6 +52,7 @@ from hermes_state_complete_export_policy import (
 )
 
 CORE_CAPTURE_API_VERSION = "agc1663-core-state-capture/v1"
+logger = logging.getLogger(__name__)
 _PAGE_SIZE = 256
 _JSON_LINE_SUFFIX = b"\n"
 
@@ -1499,12 +1501,12 @@ def _new_existing_profile_session_db(path: Path) -> Any:
                 lockguard.release(guard)
                 self._wal_lock_guard = {}
 
-        def _close_connection_quietly(self, conn: Any) -> None:
+        def _close_connection_quietly(self, conn: Any) -> bool:
             # SessionDB.__init__ invokes this dynamically from its failure-finally
             # block.  Release the OFD guard before the base close can drop SQLite's
             # own descriptors; the official guard contract requires this ordering.
             self._release_capture_guard()
-            super()._close_connection_quietly(conn)
+            return super()._close_connection_quietly(conn)
 
         def _open_writer(self) -> None:
             if not self.db_path.is_file():
@@ -1557,7 +1559,18 @@ def _new_existing_profile_session_db(path: Path) -> Any:
                 from hermes_state_registry import release
                 release(self)
                 return
+            self._last_native_close_succeeded = True if self._conn is None else None
             self._stop_token_writer()
+            if (
+                self.__dict__.get("_registry_checked_teardown_required") is True
+                and not self._token_writer_quiescent()
+            ):
+                self._last_native_close_succeeded = False
+                logger.warning(
+                    "Deferring checked SessionDB capture close for %s until token writer work is quiescent",
+                    self.db_path,
+                )
+                return
             hook, self._token_atexit_hook = self._token_atexit_hook, None
             if hook is not None:
                 atexit.unregister(hook)
@@ -1565,6 +1578,7 @@ def _new_existing_profile_session_db(path: Path) -> Any:
                 self._read_conns_closed = True
             while self._evict_one_idle_read_conn():
                 pass
+            self._retry_failed_read_conns()
             with self._lock:
                 if self._conn is not None:
                     generation_lost = not self.read_only and (
@@ -1582,9 +1596,16 @@ def _new_existing_profile_session_db(path: Path) -> Any:
                         self._conn = None
                     else:
                         self._release_capture_guard()
-                        conn, self._conn = self._conn, None
+                        conn = self._conn
                         self._close_connection_quietly(conn)
-                        self._db_sidecar_identity = {}
+                        if self._last_native_close_succeeded is True:
+                            self._conn = None
+                            self._db_sidecar_identity = {}
+                        else:
+                            with suppress(Exception):
+                                self._wal_lock_guard = lockguard.hold(
+                                    self.db_path, self._wal_lock_guard,
+                                )
             self._read_budget.unregister(self)
 
     try:

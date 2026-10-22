@@ -245,18 +245,22 @@ class SessionPersistenceMixin:
             return self._db
         return self._db_for_key(self._owner_key_for_session_id(session_id))
 
-    def close_all_db_handles(self) -> None:
+    def close_all_db_handles(self):
         """Close every SessionDB handle this store opened (one per path). Closing only ``store._db``
         would strand secondary profiles' handles with their WAL lock held ('database is locked' on
-        restart). Drained under the lock, closed outside it; a pinned handle is the pinner's."""
-        def _close(db) -> None:
-            from hermes_state_registry import release_or_close  # shared instances no-op on close()
+        restart). Drained under the lock, closed outside it; a pinned handle is the pinner's.
+
+        The typed return is consumed by lifecycle shutdown. Legacy callers may ignore it.
+        """
+        def _close(db) -> bool:
+            from hermes_state_registry import release_or_close_checked
             try:
-                release_or_close(db)
+                return release_or_close_checked(db).verified
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
+                return False
 
-        self._db_handle_cache.close_all(_close)
+        return self._db_handle_cache.close_all_checked(_close)
 
     def _ensure_loaded(self) -> None:
         """Load sessions index from disk if not already loaded."""
