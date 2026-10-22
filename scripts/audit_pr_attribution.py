@@ -6,10 +6,12 @@ branches never bounce off the check-attribution job. Run it from the branch
 you are about to push:
 
     python3 scripts/audit_pr_attribution.py            # report only
+    python3 scripts/audit_pr_attribution.py --base-ref origin/main
     python3 scripts/audit_pr_attribution.py --fix      # create mapping files
 
 Logic (kept in sync with contributor-check.yml):
-  - scans ``git log $(git merge-base origin/main HEAD)..HEAD --format=%ae``
+  - scans ``git log <base-ref>..HEAD --format=%ae``; ``origin/main`` is the
+    default, while CI passes the pull request's actual base SHA
   - skips teknium/bot emails and ``<id>+<login>@users.noreply.github.com``
     (CI auto-resolves those)
   - everything else must have ``contributors/emails/<email>`` or a legacy
@@ -56,8 +58,18 @@ def run(*args: str, check: bool = True) -> str:
     return result.stdout.strip()
 
 
-def new_emails() -> list[str]:
-    base = run("git", "merge-base", "origin/main", "HEAD")
+def resolve_base_ref(base_ref: str) -> str:
+    """Resolve a caller-selected base revision, refusing unknown revisions."""
+    if not base_ref.strip():
+        raise RuntimeError("unknown base ref: empty value")
+    try:
+        return run("git", "rev-parse", "--verify", f"{base_ref}^{{commit}}")
+    except RuntimeError as exc:
+        raise RuntimeError(f"unknown base ref: {base_ref!r}") from exc
+
+
+def new_emails(base_ref: str = "origin/main") -> list[str]:
+    base = resolve_base_ref(base_ref)
     log = run("git", "log", f"{base}..HEAD", "--format=%ae", "--no-merges", check=False)
     return sorted({e for e in log.splitlines() if e.strip()})
 
@@ -102,11 +114,21 @@ def resolve_login(email: str) -> tuple[str, str] | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--base-ref",
+        default="origin/main",
+        metavar="REF",
+        help="base revision to exclude from the audit (default: origin/main)",
+    )
     parser.add_argument("--fix", action="store_true",
                         help="auto-create contributors/emails/ mapping files")
     args = parser.parse_args()
 
-    unmapped = [e for e in new_emails() if not is_mapped(e)]
+    try:
+        unmapped = [e for e in new_emails(args.base_ref) if not is_mapped(e)]
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     if not unmapped:
         print("✅ All contributor emails on this branch are mapped.")
         return 0
