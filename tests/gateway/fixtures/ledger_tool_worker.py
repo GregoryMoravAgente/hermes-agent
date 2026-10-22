@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-import psutil
+from gateway.status import get_process_start_time
 
 from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
 from tests.gateway.fixtures.agent_persistence_worker import writable_fds
@@ -20,7 +20,7 @@ def main():
     sys.addaudithook(audit)
     rpc = WorkerRPC(home)
     scope = dict(profile_id=str(home), session_id=command['session_id'], execution_id='tool-worker', generation=0,
-                 pid=os.getpid(), birth=psutil.Process().create_time(), secret='private-tool-worker')
+                 pid=os.getpid(), birth=get_process_start_time(os.getpid()), secret='private-tool-worker')
     registered = rpc('worker.register', **scope, kind='compute')
     scope['epoch'] = registered['owner_epoch']
     store = RuntimeSessionStore(rpc, scope, home / 'worker-outboxes' / 'tool-worker')
