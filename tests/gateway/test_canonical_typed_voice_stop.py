@@ -29,6 +29,8 @@ def voice_owner(tmp_path, monkeypatch):
     runner._voice_key_for_source = lambda src: src.chat_id
     runner._save_voice_modes = lambda: None
     runner.session_authority = authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     monkeypatch.setattr(run_api, '_ACTIVE_RUNNER', runner)
     monkeypatch.setattr(server, '_tts_stream_stop', lambda user_barge=False: None)
     return SimpleNamespace(db=db, authority=authority, runner=runner)
@@ -36,6 +38,27 @@ def voice_owner(tmp_path, monkeypatch):
 
 def _ledger(db):
     return [row['request_id'] for row in list_session_admissions(db, session_id='s', pending_only=False)]
+
+
+def _running_control(voice_owner):
+    """Seed the exact active claim and parent custody required by a busy control."""
+    from hermes_state_runtime import admit_session_input, claim_session_input
+    from gateway.session_identity import authenticated_subject
+
+    admitted = admit_session_input(
+        voice_owner.db, epoch=voice_owner.authority.epoch,
+        principal_id=authenticated_subject({'user_id': 'human'}), session_id='s',
+        request_id='busy-control-fixture', payload={'text': 'running'})
+    parent = voice_owner.authority._preservation_root(
+        'I02_api_session_turn', admitted['admission_id'])
+    voice_owner.authority._preservation_handles[admitted['admission_id']] = parent
+    running = claim_session_input(voice_owner.db, epoch=voice_owner.authority.epoch, session_id='s')
+    voice_owner.authority.sessions['s'].event_stream.execution = {
+        'authority_epoch': voice_owner.authority.epoch,
+        'execution_generation': running['generation'],
+        'admission_id': running['admission_id'],
+    }
+    return running
 
 
 @pytest.mark.asyncio
@@ -122,8 +145,9 @@ async def test_other_busy_corrections_still_reach_the_turn(voice_owner):
     voice_owner.authority.steer_agent = lambda *a: (None, True)
     voice_owner.authority.check_approval_generation = lambda *a: None
     with voice_owner.db:
+        running = _running_control(voice_owner)
         reply = await _call(_connection(voice_owner.authority), 'session.steer', text='stop doing that',
-                            execution_generation=0)
+                            execution_generation=running['generation'])
     assert reply['result']['status'] == 'queued', reply
     assert voice_owner.runner._voice_mode['s'] == 'voice_only'
 
