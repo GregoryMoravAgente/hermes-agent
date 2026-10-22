@@ -251,6 +251,25 @@ def _classic_writer_proof_request_context(
     event = getattr(ctx, "classic_writer_event", None)
     if getattr(ctx, "classic_writer_binding", None) is not None:
         return event, True, ctx.classic_writer_binding
+    # A native API authority turn already has its I02 admission/terminal receipt.  Its
+    # ContextVar carries a managed child binding for the canonical turn, but no classic
+    # writer event owns that binding.  Treating that child as a direct I04 writer here
+    # requests the classic handoff on every checkpoint; the terminal proof then rejects
+    # the assistant/tool prefix as an invalid prefix repair and turns a valid run into
+    # ``session_persistence_failed``.  Only a source-owned classic event may opt this
+    # route into the legacy writer proof.
+    try:
+        from gateway.session_api_turn import api_execution
+        from gateway.session_classic_custody import ClassicExecutionEventBridge
+        bridge = getattr(event, "_classic_execution_bridge", None)
+        if (
+            api_execution.get() is not None
+            and getattr(ctx, "classic_writer_binding", None) is None
+            and not isinstance(bridge, ClassicExecutionEventBridge)
+        ):
+            return event, False, None
+    except (ImportError, AttributeError, RuntimeError, TypeError, ValueError):
+        pass
     # A nested I04/I07 turn deliberately has no direct classic binding.  Its existing
     # authenticated bridge and ContextVar are the only valid way to arm the typed writer
     # seam.  A native managed admission also has an I04 ContextVar, but without the
