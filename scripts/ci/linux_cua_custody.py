@@ -486,6 +486,20 @@ def terminate_owned_process(process: subprocess.Popen[bytes], timeout: float = 5
                 pass
 
 
+def _write_browser_preflight_output(name: str, value: bytes) -> None:
+    destination = proof_dir() / name
+    temporary = destination.with_name(destination.name + ".tmp")
+    temporary.write_bytes(value)
+    temporary.replace(destination)
+
+
+def _browser_preflight_stderr_detail(value: bytes) -> str:
+    if not value:
+        return ""
+    tail = value.decode("utf-8", errors="replace")[-4096:]
+    return f"; stderr_tail={tail!r}"
+
+
 def browser_preflight() -> None:
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
@@ -520,6 +534,8 @@ def browser_preflight() -> None:
             stdout = exc.stdout or b""
             stderr = exc.stderr or b""
             terminate_owned_process(process, timeout=max(deadline - time.monotonic(), 0.0))
+    _write_browser_preflight_output("browser-preflight.stdout", stdout)
+    _write_browser_preflight_output("browser-preflight.stderr", stderr)
     remaining = max(deadline - time.monotonic(), 0.0)
     reap = _reap_owned_descendants(deadline)
     after_subreaper = _subreaper_state()
@@ -537,6 +553,8 @@ def browser_preflight() -> None:
         "returncode": process.returncode,
         "stdout_sha256": sha_bytes(stdout),
         "stderr_sha256": sha_bytes(stderr),
+        "stdout_path": "browser-preflight.stdout",
+        "stderr_path": "browser-preflight.stderr",
         "timed_out": timed_out,
         "subreaper_before_launch": context["enabled"],
         "subreaper_after_wait": after_subreaper,
@@ -548,12 +566,13 @@ def browser_preflight() -> None:
         **reap,
     }
     write_json("browser-preflight.json", receipt)
+    stderr_detail = _browser_preflight_stderr_detail(stderr)
     if timed_out:
-        raise SystemExit("owned Chromium preflight exceeded 30 seconds")
+        raise SystemExit(f"owned Chromium preflight exceeded 30 seconds{stderr_detail}")
     if process.returncode != 0:
-        raise SystemExit("owned Chromium preflight failed")
+        raise SystemExit(f"owned Chromium preflight failed{stderr_detail}")
     if not closure_ok:
-        raise SystemExit("owned Chromium preflight descendants did not reach ECHILD")
+        raise SystemExit(f"owned Chromium preflight descendants did not reach ECHILD{stderr_detail}")
 
 
 def _subreaper_state() -> bool:
