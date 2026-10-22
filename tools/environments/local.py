@@ -671,13 +671,24 @@ def _resolve_hermes_bin_dir() -> str | None:
 
 
 def _prepend_hermes_bin_dir(existing_path: str) -> str:
-    """Prepend the hermes install dir to ``existing_path`` if missing. A sealed payload's
-    launcher dir moves to the front even when already listed: a login PATH can list
-    another install's ``hermes`` ahead of it."""
+    """Make the Hermes install dir available on ``existing_path``.
+
+    A locally accepted client's declared PATH is authoritative for terminal tools, so
+    the Hermes dir is a fallback there. Remote sessions and local sessions without a
+    client PATH keep the gateway's Hermes-first ordering. A sealed payload still owns
+    the leading entry so its launcher cannot be shadowed by another install.
+    """
     bin_dir = _resolve_hermes_bin_dir()
     if bin_dir and _HERMES_BIN_DIR_IS_PAYLOAD:
         rest = [entry for entry in existing_path.split(os.pathsep) if entry and entry != bin_dir]
         return os.pathsep.join([bin_dir, *rest])
+    if bin_dir:
+        from agent.session_client_env import tool_env
+        if tool_env().get("PATH") is not None:
+            entries = [entry for entry in existing_path.split(os.pathsep) if entry]
+            if bin_dir not in entries:
+                return os.pathsep.join([*entries, bin_dir])
+            return existing_path
     return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
 
 
