@@ -1016,6 +1016,17 @@ def _run_browser_preflight_variant(
     )
 
 
+def _direct_file_browser_environment(
+    browser_env: dict[str, str],
+) -> tuple[dict[str, str], bool, list[str]]:
+    """Remove only the DBus address for the explicit direct-file A/B."""
+    child_env = dict(browser_env)
+    dbus_name = "DBUS_SESSION_BUS_ADDRESS"
+    dbus_present = dbus_name in child_env
+    child_env.pop(dbus_name, None)
+    return child_env, dbus_present, [dbus_name] if dbus_present else []
+
+
 def _run_browser_preflight_direct_file_variant(
     *,
     browser_env: dict[str, str],
@@ -1031,6 +1042,7 @@ def _run_browser_preflight_direct_file_variant(
     )
     profile.mkdir(mode=0o700)
     command = [*base_command, f"--user-data-dir={profile}", url]
+    direct_env, dbus_present, environment_delta_names = _direct_file_browser_environment(browser_env)
     started = time.monotonic()
     variant_deadline = min(
         overall_deadline,
@@ -1045,7 +1057,7 @@ def _run_browser_preflight_direct_file_variant(
         stderr_stream = raw_stderr_path.open("wb")
         process = subprocess.Popen(
             command,
-            env=browser_env,
+            env=direct_env,
             stdout=stdout_stream,
             stderr=stderr_stream,
             start_new_session=True,
@@ -1112,6 +1124,8 @@ def _run_browser_preflight_direct_file_variant(
         "output_transport": "direct_files",
         "raw_stdout_path": raw_stdout_path.name,
         "raw_stderr_path": raw_stderr_path.name,
+        "dbus_session_bus_address_present_before": dbus_present,
+        "environment_delta_names": environment_delta_names,
         "timed_out": timed_out,
         "variant_deadline_seconds": BROWSER_PRE_FLIGHT_VARIANT_TIMEOUT_SECONDS,
         "cleanup": cleanup,
