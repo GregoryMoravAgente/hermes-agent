@@ -33,7 +33,7 @@ def test_remove_dashboard_launchd_jobs_boots_out_and_deletes_matching_plists(
                     agents_dir)
     serve = job("com.user.hermes-serve", ["hermes", "serve"], agents_dir)
     unrelated = job("com.user.keep", ["/usr/bin/say", "hello"], agents_dir)
-    daemon = job("io.nousresearch.hermes-agent.dashboard", ["hermes_cli.main", "dashboard"],
+    daemon = job("io.nousresearch.hermes-agent.dashboard", ["python", "-m", "hermes_cli.main", "dashboard"],
                  daemons_dir)
 
     booted = []
