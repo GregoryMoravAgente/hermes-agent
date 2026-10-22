@@ -49,6 +49,13 @@ SOURCE_CONTRACT_FILES = TEST_FILES + (
 CHROME_PACKAGE = "google-chrome-stable"
 CHROME_SANDBOX_PATH = Path("/opt/google/chrome/chrome-sandbox")
 CHROME_SANDBOX_MODE = 0o4755
+SANDBOX_MODE_ENV = "AGC_LINUX_CUA_SANDBOX_MODE"
+SANDBOX_MODES = {"setuid_helper", "user_namespace"}
+USER_NAMESPACE_PROBE_TIMEOUT_SECONDS = 5.0
+USER_NAMESPACE_PROC_FILES = (
+    Path("/proc/sys/kernel/unprivileged_userns_clone"),
+    Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns"),
+)
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
 SYSTEM_PACKAGES = (
@@ -64,7 +71,7 @@ SYSTEM_PACKAGES = (
     "x11-xkb-utils",
     "xauth",
     "fonts-dejavu-core",
-    "libasound2t64",
+    "libasound2",
     "libatk-bridge2.0-0",
     "libatk1.0-0",
     "libcairo2",
@@ -342,10 +349,107 @@ def chrome_sandbox_receipt() -> dict[str, Any]:
     }
 
 
+def _docker_environment_receipt() -> dict[str, Any]:
+    marker = Path("/.dockerenv")
+    try:
+        cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise SystemExit("cannot attest whether the hosted runner is outside Docker") from exc
+    cgroup_markers = [
+        marker_name
+        for marker_name in ("docker", "containerd", "kubepods")
+        if marker_name in cgroup.lower()
+    ]
+    return {
+        "marker_present": marker.exists(),
+        "cgroup_markers": cgroup_markers,
+        "containerized": marker.exists() or bool(cgroup_markers),
+    }
+
+
+def _user_namespace_receipt() -> dict[str, Any]:
+    if platform.system() != "Linux" or os.name != "posix":
+        raise SystemExit("the hosted CUA user-namespace probe requires Linux POSIX support")
+    uid_reader = getattr(os, "geteuid", None)
+    if not callable(uid_reader):
+        raise SystemExit("the hosted CUA runner cannot attest its effective UID")
+    effective_uid = uid_reader()
+    if effective_uid == 0:
+        raise SystemExit("the user-namespace sandbox path is not accepted for a root runner")
+    docker = _docker_environment_receipt()
+    if docker["containerized"]:
+        raise SystemExit("the user-namespace sandbox path is not accepted inside Docker")
+    unshare = shutil.which("unshare")
+    if not unshare:
+        raise SystemExit("unshare is required to attest the Linux user-namespace capability")
+    unshare_path = Path(unshare).resolve()
+    if not unshare_path.is_file() or not os.access(unshare_path, os.X_OK):
+        raise SystemExit("the resolved unshare executable is not an owned executable")
+    try:
+        probe = subprocess.run(
+            [str(unshare_path), "--user", "--map-root-user", "--mount-proc", "/bin/true"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=USER_NAMESPACE_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("the Linux user-namespace capability probe did not complete") from exc
+    if probe.returncode != 0:
+        raise SystemExit("the Linux user-namespace capability probe was refused")
+    kernel = {
+        str(path): read_integer(path)
+        for path in USER_NAMESPACE_PROC_FILES
+    }
+    if all(value is None for value in kernel.values()):
+        raise SystemExit("the user-namespace kernel facts could not be read")
+    return {
+        "mode": "user_namespace",
+        "helper": None,
+        "effective_uid": effective_uid,
+        "docker": docker,
+        "unshare": {
+            "path": str(unshare_path),
+            "sha256": sha_file(unshare_path),
+            "returncode": probe.returncode,
+            "stderr_sha256": sha_bytes(probe.stderr),
+        },
+        "kernel": kernel,
+        # A successful unshare is only a kernel capability receipt.  The
+        # Chromium page's native sandbox status is intentionally unresolved
+        # until a pinned browser-status contract is available.
+        "chrome_sandbox_page": {
+            "url": "chrome://sandbox",
+            "status": "unresolved",
+        },
+    }
+
+
+def sandbox_receipt() -> dict[str, Any]:
+    """Select the workflow-trusted sandbox mode without weakening either path."""
+    requested = os.environ.get(SANDBOX_MODE_ENV, "setuid_helper")
+    if requested not in SANDBOX_MODES:
+        raise SystemExit(f"{SANDBOX_MODE_ENV} must select a supported sandbox mode")
+    if requested == "user_namespace":
+        if "CHROME_DEVEL_SANDBOX" in os.environ:
+            raise SystemExit("user-namespace mode refuses inherited CHROME_DEVEL_SANDBOX")
+        return _user_namespace_receipt()
+    return {"mode": "setuid_helper", "helper": chrome_sandbox_receipt()}
+
+
 def _verify_sealed_chrome_sandbox(expected: dict[str, Any]) -> dict[str, Any]:
     actual = chrome_sandbox_receipt()
     if actual != expected:
         raise SystemExit("the package-owned Chrome sandbox helper changed after resolution")
+    return actual
+
+
+def _verify_sealed_sandbox(expected: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(expected, dict) or expected.get("mode") not in SANDBOX_MODES:
+        raise SystemExit("the sealed Chromium sandbox mode is missing or unsupported")
+    actual = sandbox_receipt()
+    if actual != expected:
+        raise SystemExit("the sealed Chromium sandbox mode or kernel receipt changed")
     return actual
 
 
@@ -500,7 +604,8 @@ def resolve_tools() -> None:
     chromium_link.symlink_to(chromium_path)
     if chromium_link.resolve() != Path(chromium_path).resolve():
         raise SystemExit("owned Chromium PATH entry does not resolve to the sealed PM binary")
-    chrome_sandbox = chrome_sandbox_receipt()
+    sandbox = sandbox_receipt()
+    chrome_sandbox = sandbox.get("helper")
     receipt = {
         "architecture": platform.machine(),
         "cua_driver": {"path": driver_path, "sha256": DRIVER_SHA256},
@@ -511,16 +616,21 @@ def resolve_tools() -> None:
             "path_entry_target": str(chromium_link.resolve()),
         },
         "chrome_sandbox": chrome_sandbox,
+        "sandbox": sandbox,
     }
     write_json("resolved-tools.json", receipt)
     existing_path = os.environ.get("PATH", "")
-    append_github_env({
+    environment = {
         "HERMES_CUA_DRIVER_CMD": driver_path,
         "AGC_CUA_PUBLIC_DRIVER": driver_path,
         "AGENT_BROWSER_EXECUTABLE_PATH": chromium_path,
-        "CHROME_DEVEL_SANDBOX": chrome_sandbox["path"],
         "PATH": f"{path_bin}:{existing_path}",
-    })
+    }
+    if sandbox["mode"] == "setuid_helper":
+        if not isinstance(chrome_sandbox, dict):
+            raise SystemExit("the setuid sandbox receipt has no helper metadata")
+        environment["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
+    append_github_env(environment)
 
 
 def _required_linux_signal(name: str) -> int:
@@ -599,9 +709,11 @@ def _browser_preflight_stderr_detail(value: bytes) -> str:
 def browser_preflight() -> None:
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
-    chrome_sandbox = _verify_sealed_chrome_sandbox(tools["chrome_sandbox"])
+    sandbox = _verify_sealed_sandbox(tools["sandbox"])
+    chrome_sandbox = sandbox.get("helper")
     profile = proof_dir() / "browser-preflight-profile"
     profile.mkdir(mode=0o700)
+    sandbox_page_url = "chrome://sandbox" if sandbox["mode"] == "user_namespace" else "data:,"
     command = [
         browser,
         "--headless=new",
@@ -610,13 +722,18 @@ def browser_preflight() -> None:
         "--no-default-browser-check",
         f"--user-data-dir={profile}",
         "--dump-dom",
-        "data:,",
+        sandbox_page_url,
     ]
     context = _enable_subreaper()
     started = time.monotonic()
     deadline = started + 30.0
     browser_env = os.environ.copy()
-    browser_env["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
+    if sandbox["mode"] == "setuid_helper":
+        if not isinstance(chrome_sandbox, dict):
+            raise SystemExit("the setuid sandbox receipt has no helper metadata")
+        browser_env["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
+    else:
+        browser_env.pop("CHROME_DEVEL_SANDBOX", None)
     process = subprocess.Popen(
         command,
         env=browser_env,
@@ -652,7 +769,8 @@ def browser_preflight() -> None:
         and not reap["live_children"]
         and reap["waitid_error"] is None
     )
-    success = not timed_out and process.returncode == 0 and closure_ok
+    native_page_status = "unresolved" if sandbox["mode"] == "user_namespace" else "not_applicable"
+    success = not timed_out and process.returncode == 0 and closure_ok and native_page_status != "unresolved"
     receipt = {
         "pid": process.pid,
         "returncode": process.returncode,
@@ -661,6 +779,10 @@ def browser_preflight() -> None:
         "stdout_path": "browser-preflight.stdout",
         "stderr_path": "browser-preflight.stderr",
         "chrome_sandbox": chrome_sandbox,
+        "sandbox": sandbox,
+        "sandbox_page_url": sandbox_page_url,
+        "sandbox_page_status": native_page_status,
+        "sandbox_page_output_sha256": sha_bytes(stdout) if sandbox["mode"] == "user_namespace" else None,
         "timed_out": timed_out,
         "subreaper_before_launch": context["enabled"],
         "subreaper_after_wait": after_subreaper,
@@ -679,6 +801,11 @@ def browser_preflight() -> None:
         raise SystemExit(f"owned Chromium preflight failed{stderr_detail}")
     if not closure_ok:
         raise SystemExit(f"owned Chromium preflight descendants did not reach ECHILD{stderr_detail}")
+    if sandbox["mode"] == "user_namespace":
+        raise SystemExit(
+            "Chromium chrome://sandbox readback was captured, but its native status "
+            "has no pinned receipt contract"
+        )
 
 
 def _subreaper_state() -> bool:
@@ -895,6 +1022,8 @@ def run_owned_child(command: list[str], deadline_seconds: float) -> int:
 
 def run_tests() -> None:
     root = repo_root()
+    resolved = _proof_json("resolved-tools.json")
+    sandbox = _verify_sealed_sandbox(resolved["sandbox"])
     receipt_context = _enable_subreaper()
     deadline_seconds = _runner_deadline_seconds()
     command = [
@@ -913,9 +1042,15 @@ def run_tests() -> None:
     output_path = proof_dir() / "cua-tests.stdout"
     runner_started = time.monotonic()
     runner_deadline = runner_started + deadline_seconds
+    test_environment = os.environ.copy()
+    if sandbox["mode"] == "user_namespace":
+        if "CHROME_DEVEL_SANDBOX" in test_environment:
+            raise SystemExit("user-namespace test environment contains CHROME_DEVEL_SANDBOX")
+        test_environment.pop("CHROME_DEVEL_SANDBOX", None)
     process = subprocess.Popen(
         command,
         cwd=root,
+        env=test_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -964,6 +1099,8 @@ def snapshot(label: str) -> None:
     tools_root = Path(os.environ.get("HERMES_RUNTIME_DIR", "")).resolve()
     if pm_root == base_root:
         raise SystemExit("snapshot requires the isolated PM test interpreter")
+    resolved = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
+    sandbox = _verify_sealed_sandbox(resolved["sandbox"])
     receipt = {
         "label": label,
         "source": git_inventory(root),
@@ -972,7 +1109,8 @@ def snapshot(label: str) -> None:
         "pm": {"root": str(pm_root), "files": tree_inventory(pm_root)},
         "base": {"root": str(base_root), "files": tree_inventory(base_root)},
         "tools": {"root": str(tools_root), "files": tree_inventory(tools_root)},
-        "chrome_sandbox": chrome_sandbox_receipt(),
+        "chrome_sandbox": sandbox.get("helper"),
+        "sandbox": sandbox,
         "interpreter": {"executable": sys.executable, "version": sys.version, "prefix": sys.prefix},
     }
     write_json(f"snapshot-{label}.json", receipt)
@@ -1020,7 +1158,16 @@ def _verify_snapshots() -> None:
     before_static = _proof_json("snapshot-before-static.json")
     before = _proof_json("snapshot-before-sut.json")
     after = _proof_json("snapshot-after-sut.json")
-    for key in ("source", "git", "system_packages", "pm", "base", "tools", "chrome_sandbox"):
+    for key in (
+        "source",
+        "git",
+        "system_packages",
+        "pm",
+        "base",
+        "tools",
+        "chrome_sandbox",
+        "sandbox",
+    ):
         if before_static[key] != before[key]:
             raise SystemExit(f"owned {key} changed during the static gate")
         if before[key] != after[key]:
@@ -1029,10 +1176,14 @@ def _verify_snapshots() -> None:
 
 def _verify_tool_receipt() -> None:
     resolved = _proof_json("resolved-tools.json")
-    chrome_sandbox = resolved.get("chrome_sandbox")
-    if not isinstance(chrome_sandbox, dict):
-        raise SystemExit("sealed Chrome sandbox helper is missing from the tool receipt")
-    _verify_sealed_chrome_sandbox(chrome_sandbox)
+    sandbox = resolved.get("sandbox")
+    if not isinstance(sandbox, dict):
+        raise SystemExit("sealed Chromium sandbox mode is missing from the tool receipt")
+    _verify_sealed_sandbox(sandbox)
+    if resolved.get("chrome_sandbox") != sandbox.get("helper"):
+        raise SystemExit("Chromium sandbox helper compatibility metadata changed")
+    if sandbox.get("mode") == "user_namespace":
+        raise SystemExit("Chromium user-namespace sandbox status was not natively attested")
     chromium = resolved.get("chromium") or {}
     path_entry = chromium.get("path_entry")
     path_target = chromium.get("path_entry_target")
