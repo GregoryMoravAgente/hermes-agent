@@ -242,6 +242,11 @@ async def initialize_gateway_runtime(runner):
     # registry or the OS profile locks.
     from gateway.runtime_custody import install_runtime_custody
     coordinator = install_runtime_custody(runner)
+    # I16 is a process-global source graph.  Register the actual producer entrypoints and
+    # profile factories only after every served authority has been constructed; an absent
+    # registration remains UNKNOWN and cannot be converted into an empty-map success.
+    from gateway.runtime_i16_source_registry import bootstrap_i16_source_registry
+    bootstrap_i16_source_registry(runner, coordinator)
     # Every managed authority now has the process coordinator. Each source reserves its I10/I11
     # owner before the existing compression write; the legacy initializer never enters this loop.
     from gateway.session_authorities import all_authorities, owner_scope
@@ -719,6 +724,30 @@ def _seal_i10_preservation_owner(runner, coordinator, receipt, descriptor):
             'I10_startup_recovery_handoff', getattr(refusal, 'code', 'read_failed'))
 
 
+def _seal_i16_preservation_owner(runner, coordinator, receipt, descriptor) -> None:
+    """Seal I16 from the exact retained service/physical source graph."""
+    from gateway.runtime_i16_source_registry import seal_source_owner
+
+    try:
+        evidence, refusal = seal_source_owner(
+            coordinator,
+            process_instance=receipt.process_instance,
+            authority_epoch=receipt.authority_epoch,
+            close_generation=receipt.close_generation,
+            owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:I16',
+        )
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        coordinator.mark_owner_unknown('I16_turn_sidecars', 'read_failed')
+        return
+    if evidence is None:
+        coordinator.mark_owner_unknown('I16_turn_sidecars', 'unmapped_writer')
+        return
+    if refusal is not None:
+        coordinator.mark_owner_unknown(
+            'I16_turn_sidecars', getattr(refusal, 'code', 'read_failed'),
+        )
+
+
 def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     """Seal source consumers whose durable terminal paths are wired here.
 
@@ -742,6 +771,10 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
             _seal_authorities_preservation_owner(
                 runner, coordinator, receipt, descriptor, authorities, owner_class,
             )
+
+    # I16 spans the process's ACP/Codex/shell/MCP/browser/CUA/environment routes, so it is
+    # sealed once from the coordinator-owned graph rather than once per profile authority.
+    _seal_i16_preservation_owner(runner, coordinator, receipt, descriptor)
 
     # Direct API runs have a separate adapter-owned source hook.  It may seal only after the
     # adapter registered its run lifecycle and every source-owned run/status/transport/finalizer
@@ -1585,12 +1618,17 @@ async def serve_profile_runtime(runner, name, home):
     authority = await _build_profile_authority(
         runner, name, home, register=False, defer_local_recovery=True)
     try:
+        # The I16 source graph is process-global but the served authority set is hot.  Register
+        # this exact successor before recovery/hosted services can reserve any sidecar child.
+        coordinator = getattr(runner, 'runtime_custody', None)
+        if coordinator is not None:
+            from gateway.runtime_i16_source_registry import refresh_i16_source_registry
+            refresh_i16_source_registry(runner, coordinator)
         # Hot-served profiles are added after the hosted runtime binding is published.  Reserve
         # the I17 root before recovery can publish a hosted service, room, or compute-host
         # producer; waiting for owner_evidence would be too late because preservation has already
         # entered closing.  Lightweight recovery callers without a live hosted control listener
         # do not claim an I17 owner merely by constructing an authority.
-        coordinator = getattr(runner, 'runtime_custody', None)
         if coordinator is not None and getattr(runner, 'session_control_server', None) is not None:
             from tui_gateway.hosted_tui_custody import bind_authority
             bind_authority(authority, runner=runner, coordinator=coordinator)

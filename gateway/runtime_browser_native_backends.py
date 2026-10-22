@@ -495,7 +495,8 @@ def reserve_lightpanda_backend(task_id: str, session_name: str) -> BrowserNative
         operation_id = f"browser-native:{task_id}:{session_name}"
         owner = reserve_profile_sidecar(
             runner, profile_home=Path(authority.profile_id), family="browser_native",
-            source_identity=f"browser-native:{session_name}", operation_id=operation_id,
+            source_identity=f"browser-native:{session_name}", producer_key="browser",
+            operation_id=operation_id,
         )
         parent = owner.parent
         receipt = BrowserNativeBackendReceipt(

@@ -779,7 +779,7 @@ def _resolve_codex_custody(agent):
     try:
         policy = (
             policy_without_spawn() if getattr(agent, "_codex_session", None) is not None
-            else ensure_agent_process_policy(agent)
+            else ensure_agent_process_policy(agent, producer_key="codex")
         )
     except ExternalProcessOperationError as exc:
         raise ServiceCustodyError(exc.code) from exc

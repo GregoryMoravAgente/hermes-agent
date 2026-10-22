@@ -71,7 +71,7 @@ async def test_managed_acp_response_requires_real_sessiondb_proof_before_deliver
     binding_token = None
     try:
         binding = await fixture.claim("managed-acp-proof")
-        service = reserve_service(binding, "service:managed-acp")
+        service = reserve_service(binding, "service:managed-acp", producer_key="acp")
         parent = parent_for_managed_service(binding, service, operation_id=binding.admission_id)
         request = service.begin_request(binding)
         fixture.authority._preservation_bind_sidecar(
@@ -164,7 +164,7 @@ async def _managed_acp_replay_case(tmp_path, monkeypatch, *, prime=True):
     client = None
     try:
         binding = await fixture.claim("managed-acp-replay-matrix")
-        service = reserve_service(binding, "service:managed-acp-replay")
+        service = reserve_service(binding, "service:managed-acp-replay", producer_key="acp")
         parent = parent_for_managed_service(binding, service, operation_id=binding.admission_id)
         request = service.begin_request(binding)
         fixture.authority._preservation_bind_sidecar(
@@ -240,7 +240,7 @@ async def _managed_acp_failure_recovery_case(tmp_path, monkeypatch):
     binding_token = None
     try:
         binding = await fixture.claim("managed-acp-recovery")
-        service = reserve_service(binding, "service:managed-acp-recovery")
+        service = reserve_service(binding, "service:managed-acp-recovery", producer_key="acp")
         parent = parent_for_managed_service(binding, service, operation_id=binding.admission_id)
         request = service.begin_request(binding)
         fixture.authority._preservation_bind_sidecar(

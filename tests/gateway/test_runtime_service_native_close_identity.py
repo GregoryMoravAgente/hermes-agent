@@ -17,7 +17,7 @@ async def test_managed_native_parent_requires_exact_retained_source_and_physical
     fixture = await real_runtime_binding(tmp_path, monkeypatch)
     try:
         binding = fixture.binding
-        service = reserve_service(binding, "native-retry-identity")
+        service = reserve_service(binding, "native-retry-identity", producer_key="provider")
         parent = parent_for_managed_service(binding, service)
         physical = reserve_physical(parent)
         assert _managed_parent_matches(physical) is True

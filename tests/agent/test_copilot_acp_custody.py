@@ -48,7 +48,7 @@ def test_real_acp_child_publishes_and_releases_two_sequential_completions(tmp_pa
     try:
         with reserve_standalone_external_process_parent(
             profile_home=tmp_path, profile_id=str(tmp_path), operation_id="acp-turn",
-            source_identity="copilot-acp", profile_db=db,
+            source_identity="copilot-acp", profile_db=db, producer_key="acp",
         ) as parent:
             policy = policy_for_parent(parent, mode="standalone_maintenance")
             client = CopilotACPClient(

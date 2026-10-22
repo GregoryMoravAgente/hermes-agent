@@ -29,7 +29,7 @@ _HOLD_CHILD = "import time; time.sleep(60)"
 async def _managed_client(tmp_path, monkeypatch, request_id):
     fixture = await real_runtime_binding(tmp_path, monkeypatch)
     binding = await fixture.claim(request_id)
-    service = reserve_service(binding, f"service:{request_id}")
+    service = reserve_service(binding, f"service:{request_id}", producer_key="acp")
     parent = parent_for_managed_service(binding, service, operation_id=binding.admission_id)
     request = service.begin_request(binding)
     fixture.authority._preservation_bind_sidecar(
@@ -254,7 +254,7 @@ def test_external_catalog_physical_close_unknown_retries_same_receipt(tmp_path, 
     try:
         with reserve_standalone_external_process_parent(
             profile_home=tmp_path, profile_id=str(tmp_path), operation_id="catalog-retry",
-            source_identity="copilot-acp", profile_db=db,
+            source_identity="copilot-acp", profile_db=db, producer_key="acp",
         ) as parent:
             policy = policy_for_parent(parent, mode="standalone_maintenance")
             client = CopilotACPClient(

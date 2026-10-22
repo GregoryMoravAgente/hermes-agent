@@ -57,7 +57,7 @@ async def test_service_request_unknown_retains_exact_lease(tmp_path, monkeypatch
     fixture = await real_runtime_binding(tmp_path, monkeypatch)
     try:
         binding = fixture.binding
-        service = reserve_service(binding, "service:session-1")
+        service = reserve_service(binding, "service:session-1", producer_key="codex")
         service.begin_request(binding)
         service.finish_request(binding, durable=False)
         status = fixture.binding.coordinator.status()

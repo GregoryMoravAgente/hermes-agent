@@ -25,6 +25,7 @@ async def test_stale_managed_binding_refuses_before_sidecar_root(tmp_path, monke
                 stale,
                 family="local_terminal",
                 source_identity="terminal:sidecar-stale-race",
+                producer_key="environment",
                 operation_id="stale-sidecar-race",
             )
         after = fixture.authority._preservation_coordinator().status()
@@ -58,6 +59,7 @@ async def test_mcp_stdio_capture_binds_sdk_process_and_restores_factory(
                 binding,
                 family="mcp_stdio",
                 source_identity="mcp:sidecar-mcp-stdio",
+                producer_key="mcp",
                 operation_id="mcp-stdio-sidecar",
             )
         finally:
@@ -169,6 +171,7 @@ async def test_invalid_required_streams_refuse_without_empty_reader_proof(tmp_pa
                 binding,
                 family="local_terminal",
                 source_identity="terminal:sidecar-invalid-streams",
+                producer_key="environment",
                 operation_id="invalid-streams-sidecar",
             )
         finally:

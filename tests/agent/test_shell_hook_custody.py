@@ -292,8 +292,8 @@ async def test_public_shell_reservation_refusal_reconciles_exact_owner_to_comple
     reserve_calls: list[tuple[str, Any]] = []
     original_reserve_service = runtime_service_custody.reserve_service
 
-    def capture_reserve(binding, owner_id):
-        service = original_reserve_service(binding, owner_id)
+    def capture_reserve(binding, owner_id, **kwargs):
+        service = original_reserve_service(binding, owner_id, **kwargs)
         reserve_calls.append((owner_id, service))
         return service
 

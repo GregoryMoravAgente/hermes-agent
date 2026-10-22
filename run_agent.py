@@ -297,7 +297,7 @@ class AIAgent(
                     owned_external_session_db = True
                 from gateway.runtime_service_operations import standalone_policy_for_session_db
                 external_process_policy = standalone_policy_for_session_db(
-                    provider or base_url, session_db, base_url=base_url,
+                    provider or base_url, session_db, base_url=base_url, producer_key="acp",
                 )
             except BaseException:
                 if owned_external_session_db:

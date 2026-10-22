@@ -168,6 +168,7 @@ def _prepare_i16_source_owner(server_name: str):
         profile_home=Path(home),
         family="mcp_stdio",
         source_identity=server_name,
+        producer_key="mcp",
     )
 
 

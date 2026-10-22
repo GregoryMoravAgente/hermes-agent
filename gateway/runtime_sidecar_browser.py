@@ -424,8 +424,13 @@ class BrowserSourceOwner:
 class BrowserServiceLease(ServiceLease):
     """A ServiceLease using the same coordinator handles with browser readback semantics."""
 
-    def __init__(self, coordinator: Any, handle: Any, binding: Any, owner_id: str, requests: dict):
-        super().__init__(coordinator, handle, binding, owner_id, requests)
+    def __init__(
+        self, coordinator: Any, handle: Any, binding: Any, owner_id: str, requests: dict,
+        *, producer_key: str = "browser",
+    ):
+        super().__init__(
+            coordinator, handle, binding, owner_id, requests, producer_key=producer_key,
+        )
         self.browser_owner: BrowserSourceOwner | None = None
 
     def complete_delivery(self, binding: Any, request: Any) -> None:
@@ -579,7 +584,17 @@ def _reserve_managed_browser(
     parent = None
     try:
         handle = _service_handle(binding.coordinator, binding, f"browser:{operation_id}")
-        service = BrowserServiceLease(binding.coordinator, handle, binding, f"browser:{operation_id}", {})
+        service = BrowserServiceLease(
+            binding.coordinator, handle, binding, f"browser:{operation_id}", {},
+            producer_key="browser",
+        )
+        registry = getattr(binding.coordinator, "_i16_source_registry", None)
+        if registry is not None:
+            try:
+                registry.register_service(service, "browser")
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                binding.coordinator.release_unaccepted(handle)
+                raise BrowserSourceError("browser_source_unregistered") from exc
         parent = parent_for_managed_service(
             binding, service, operation_id=operation_id, delivery_lifecycle="per_invocation",
         )
@@ -769,7 +784,7 @@ class BrowserSourceFactory:
             profile_home=Path(self.authority.profile_id),
             operation_id=operation_id,
             source_identity=f"browser:{session_name}",
-            mode="live_profile_discovery",
+            mode="live_profile_discovery", producer_key="browser",
         )
         try:
             reserve_request(parent)
@@ -798,7 +813,7 @@ class BrowserSourceFactory:
             profile_home=Path(self.authority.profile_id),
             operation_id=operation_id,
             source_identity=f"browser-cdp:{task_id}",
-            mode="live_profile_discovery",
+            mode="live_profile_discovery", producer_key="browser",
         )
         try:
             reserve_request(parent)

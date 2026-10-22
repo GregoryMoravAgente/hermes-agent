@@ -236,8 +236,10 @@ def _start_acp_pumps(client: Any, proc: Any, inbox: queue.Queue, stderr_tail: de
         if bind_reader is not None:
             for stream, reader in readers:
                 bind_reader(parent, stream, reader)
-        for _, reader in readers:
+        for stream, reader in readers:
             reader.start()
+            if receipt is not None and not receipt.reader_started(stream, reader):
+                raise RuntimeError(f"ACP {stream} reader start was not authenticated")
     except BaseException:
         # A wrapper or binder may fail before it reaches the receipt.  Retain each created
         # identity directly so reconciliation can see every reader, including an unstarted

@@ -274,7 +274,7 @@ def test_standalone_maintenance_keeps_fixed_epoch_without_session_authority(tmp_
     try:
         with reserve_standalone_external_process_parent(
             profile_home=home, profile_id=str(home), operation_id="standalone-epoch",
-            source_identity="standalone-test", profile_db=db,
+            source_identity="standalone-test", profile_db=db, producer_key="provider",
         ) as parent:
             assert parent.profile_authority is None
             assert parent.coordinator._profile_scope is None

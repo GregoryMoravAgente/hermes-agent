@@ -69,6 +69,7 @@ def prepare_managed_local_sidecar(
         active_binding,
         family="local_terminal",
         source_identity=source_identity,
+        producer_key="environment",
         operation_id=operation_id,
     )
 

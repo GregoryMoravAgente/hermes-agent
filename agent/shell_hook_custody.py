@@ -1220,7 +1220,7 @@ def _reserve_new_operation(
     reservation = _ShellHookReservation(binding=binding, owner_id=owner_id, operation_key=full_key)
     dispatch.reservations.append(reservation)
     try:
-        service = reserve_service(binding, owner_id)
+        service = reserve_service(binding, owner_id, producer_key="shell")
         reservation.service = service
         reservation.phase = "root_reserved"
         operation_parent = parent_for_managed_service(

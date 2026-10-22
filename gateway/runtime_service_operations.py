@@ -94,6 +94,8 @@ class ExternalProcessParent:
     authority_epoch: int
     coordinator: Any
     root_handle: Any
+    # The source graph class is carried with the same parent object that owns the service.
+    producer_key: str | None = None
     turn_binding: Any = None
     profile_authority: Any = None
     lock_owner: Any = None
@@ -155,7 +157,13 @@ def provider_process_kwargs(agent: Any, profile: Any, client_kwargs: dict) -> di
     )
     if not external:
         return client_kwargs
-    policy = getattr(agent, "_external_process_policy", None) or ensure_agent_process_policy(agent)
+    producer_key = (
+        "acp" if str(client_kwargs.get("base_url", "") or "").lower().startswith(("acp://", "acp+tcp://"))
+        else "provider"
+    )
+    policy = getattr(agent, "_external_process_policy", None) or ensure_agent_process_policy(
+        agent, producer_key=producer_key,
+    )
     parent = getattr(policy, "parent", None)
     if parent is not None:
         agent._external_process_parent = parent
@@ -242,6 +250,7 @@ def _managed_turn_policy(
     context: Any,
     binding: Any,
     *,
+    producer_key: str,
     cached_policy: ProducerPolicy | None = None,
 ) -> ProducerPolicy:
     current = getattr(context, "_external_process_policy", None)
@@ -283,7 +292,7 @@ def _managed_turn_policy(
         _clear_context_parent(context)
     from gateway.runtime_service_custody import reserve_service
     owner_id = f"external:{binding.admission_id}"
-    service = reserve_service(binding, owner_id)
+    service = reserve_service(binding, owner_id, producer_key=producer_key)
     parent = parent_for_managed_service(binding, service, operation_id=binding.admission_id)
     _register_authority_finalizer(binding.authority, parent)
     request = _begin_managed_request(binding, service, parent)
@@ -525,10 +534,16 @@ def producer_policy_for_turn(
     """Select the authenticated owner before an external provider/client is constructed."""
     if not _external_provider(provider, base_url):
         return None
+    producer_key = (
+        "acp" if str(base_url or "").lower().startswith(("acp://", "acp+tcp://"))
+        else "provider"
+    )
     from gateway.runtime_service_custody import current_turn_binding
     binding = current_turn_binding()
     if binding is not None:
-        return _managed_turn_policy(runner, context, binding, cached_policy=cached_policy)
+        return _managed_turn_policy(
+            runner, context, binding, producer_key=producer_key, cached_policy=cached_policy,
+        )
     current = getattr(context, "_external_process_policy", None)
     if current is not None:
         if getattr(current, "mode", None) == "managed_turn":
@@ -544,7 +559,7 @@ def producer_policy_for_turn(
     if authority is not None:
         parent = resolve_external_process_parent(
             runner, profile_home=home, operation_id=uuid.uuid4().hex,
-            source_identity=str(provider), mode="live_profile_discovery",
+            source_identity=str(provider), mode="live_profile_discovery", producer_key=producer_key,
         )
         policy = policy_for_parent(parent, mode="live_profile_discovery")
         context._external_process_parent = parent
@@ -552,7 +567,7 @@ def producer_policy_for_turn(
         return policy
     parent_context = reserve_standalone_external_process_parent(
         profile_home=home, profile_id=str(home), operation_id=uuid.uuid4().hex,
-        source_identity=str(provider), profile_db=db,
+        source_identity=str(provider), profile_db=db, producer_key=producer_key,
     )
     parent = parent_context.__enter__()
     policy = policy_for_parent(parent, mode="standalone_maintenance")
@@ -563,8 +578,8 @@ def producer_policy_for_turn(
 
 
 def standalone_policy_for_session_db(
-    provider: Any, profile_db: Any, *, operation_id: str | None = None,
-    base_url: Any = None,
+    provider: Any, profile_db: Any, *, producer_key: str,
+    operation_id: str | None = None, base_url: Any = None,
 ) -> ProducerPolicy:
     """Acquire the real standalone owner used by direct ACP/model-discovery callers."""
     if not _external_provider(provider, base_url):
@@ -572,7 +587,7 @@ def standalone_policy_for_session_db(
     home = _db_home(profile_db)
     parent_context = reserve_standalone_external_process_parent(
         profile_home=home, profile_id=str(home), operation_id=operation_id or uuid.uuid4().hex,
-        source_identity=str(provider), profile_db=profile_db,
+        source_identity=str(provider), profile_db=profile_db, producer_key=producer_key,
     )
     parent = parent_context.__enter__()
     parent._maintenance_context = parent_context
@@ -705,7 +720,7 @@ def external_catalog_model_ids(
             raise ExternalProcessOperationError("custody_unknown")
     try:
         if policy is None:
-            policy = standalone_policy_for_session_db(provider, profile_db)
+            policy = standalone_policy_for_session_db(provider, profile_db, producer_key="provider")
             profile_db._external_catalog_policy = policy
         else:
             validate_producer_policy(policy, spawning=True)
@@ -787,6 +802,7 @@ def _parent_service(parent: ExternalProcessParent):
         from gateway.runtime_service_custody import service_for_external_parent
         parent._service = service_for_external_parent(
             parent.coordinator, parent.root_handle, parent.operation_id,
+            producer_key=parent.producer_key,
         )
     return parent._service
 
@@ -818,6 +834,7 @@ def parent_for_managed_service(
         mode="managed_turn", profile_home=_canonical_home(binding.profile_id),
         profile_id=binding.profile_id, operation_id=operation_id or binding.admission_id,
         source_identity=binding.source_identity or binding.principal_id,
+        producer_key=getattr(service, "producer_key", None),
         principal_id=binding.principal_id or None,
         process_instance=binding.process_instance, authority_epoch=binding.authority_epoch,
         coordinator=binding.coordinator, root_handle=service.handle, turn_binding=binding,
@@ -831,7 +848,7 @@ def parent_for_managed_service(
 
 def resolve_external_process_parent(
     runner: Any, *, profile_home: Path, operation_id: str, source_identity: str,
-    mode: Literal["managed_turn", "live_profile_discovery"],
+    mode: Literal["managed_turn", "live_profile_discovery"], producer_key: str | None = None,
     principal_id: str | None = None, turn_binding: Any = None,
 ) -> ExternalProcessParent:
     """Resolve one explicitly selected live route before a discovery spawn.
@@ -855,6 +872,7 @@ def resolve_external_process_parent(
     source_identity = _require_text(source_identity, "invalid_source_identity")
     from gateway.session_authorities import authority_for_home, require_serving
     from gateway.runtime_ownership import process_ownership
+    from gateway.runtime_i16_source_registry import explicit_i16_producer_key
 
     authority = authority_for_home(runner, profile_home)
     if authority is None:
@@ -869,6 +887,15 @@ def resolve_external_process_parent(
     if type(process_instance) is not str or not process_instance or type(authority_epoch) is not int or authority_epoch < 1:
         raise ExternalProcessOperationError("stale_authority_epoch")
     _coordinator_identity(coordinator, process_instance=process_instance, authority_epoch=authority_epoch)
+    producer_key = explicit_i16_producer_key(producer_key)
+    registry = getattr(coordinator, "_i16_source_registry", None)
+    if registry is not None and producer_key is None:
+        raise ExternalProcessOperationError("i16_source_unregistered")
+    if registry is not None:
+        try:
+            registry.require_producer(producer_key)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ExternalProcessOperationError("i16_source_unregistered") from exc
     physical_owner_epoch = _current_physical_owner_epoch(profile_home)
     root = _reserve_root(
         coordinator, f"external:{operation_id}", profile_id=authority.profile_id,
@@ -877,7 +904,9 @@ def resolve_external_process_parent(
     parent = ExternalProcessParent(
         mode="live_profile_discovery", profile_home=profile_home,
         profile_id=authority.profile_id, operation_id=operation_id,
-        source_identity=source_identity, principal_id=principal_id,
+        source_identity=source_identity,
+        producer_key=producer_key,
+        principal_id=principal_id,
         process_instance=process_instance, authority_epoch=authority_epoch,
         coordinator=coordinator, root_handle=root, turn_binding=turn_binding,
         profile_authority=authority, lock_owner=process_ownership,
@@ -945,17 +974,22 @@ def _release_maintenance_hold(parent: ExternalProcessParent) -> bool:
 @contextmanager
 def reserve_standalone_external_process_parent(
     *, profile_home: Path, profile_id: str, operation_id: str, source_identity: str,
-    profile_db: Any, principal_id: str | None = None,
+    profile_db: Any, producer_key: str | None = None, principal_id: str | None = None,
 ) -> ContextManager[ExternalProcessParent]:
     """Hold the existing profile lock and real runtime epoch through finalization."""
     profile_home = _canonical_home(profile_home)
     profile_id = _require_text(profile_id, "invalid_profile_id")
     operation_id = _require_text(operation_id, "invalid_operation_id")
     source_identity = _require_text(source_identity, "invalid_source_identity")
+    from gateway.runtime_i16_source_registry import explicit_i16_producer_key
+    producer_key = explicit_i16_producer_key(producer_key)
+    if producer_key is None:
+        raise ExternalProcessOperationError("i16_source_unregistered")
     if profile_db is None or getattr(profile_db, "db_path", None) is None:
         raise ExternalProcessOperationError("owner_epoch_unavailable")
     profile_id = _canonical_db_identity(profile_home, profile_id, profile_db)
     from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.runtime_i16_source_registry import bootstrap_standalone_i16_source_registry
     from gateway.runtime_ownership import (
         _maintenance,
         exclusive_maintenance,
@@ -976,6 +1010,12 @@ def reserve_standalone_external_process_parent(
         if type(epoch) is not int or epoch < 1:
             raise ExternalProcessOperationError("owner_epoch_unavailable")
         coordinator = RuntimeCustodyCoordinator(process_instance=instance_id, authority_epoch=epoch)
+        bootstrap_standalone_i16_source_registry(
+            coordinator,
+            profile_id=profile_id,
+            process_instance=instance_id,
+            authority_epoch=epoch,
+        )
         root = _reserve_root(
             coordinator, f"external:{operation_id}", profile_id=profile_id, authority_epoch=epoch,
         )
@@ -990,7 +1030,8 @@ def reserve_standalone_external_process_parent(
             mode="standalone_maintenance", profile_home=profile_home, profile_id=profile_id,
             operation_id=operation_id, source_identity=source_identity, principal_id=principal_id,
             process_instance=instance_id, authority_epoch=epoch, coordinator=coordinator,
-            root_handle=root, turn_binding=None, profile_authority=None, lock_owner=lock_owner,
+            root_handle=root, producer_key=producer_key, turn_binding=None,
+            profile_authority=None, lock_owner=lock_owner,
             physical_owner_epoch=physical_owner_epoch,
             finalizer=None, state="parent_reserved", _service=None,
             _maintenance_context=maintenance_context, _profile_db=profile_db,
@@ -1062,6 +1103,16 @@ def validate_producer_policy(policy: Any, *, spawning: bool) -> ProducerPolicy:
         raise ExternalProcessOperationError("producer_policy_invalid")
     if policy.parent.state in {"unknown", "terminal"}:
         raise ExternalProcessOperationError("preservation_owner_unmapped")
+    registry = getattr(policy.parent.coordinator, "_i16_source_registry", None)
+    if registry is not None:
+        from gateway.runtime_i16_source_registry import explicit_i16_producer_key
+        producer_key = explicit_i16_producer_key(getattr(policy.parent, "producer_key", None))
+        if producer_key is None:
+            raise ExternalProcessOperationError("i16_source_unregistered")
+        try:
+            registry.require_producer(producer_key)
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            raise ExternalProcessOperationError("i16_source_unregistered") from exc
     try:
         from gateway.runtime_ownership import ProfileOwnership, process_ownership
         owner = getattr(policy.parent, "lock_owner", None)
@@ -1108,6 +1159,13 @@ def reserve_physical(parent: ExternalProcessParent):
         )
         receipt = ServiceProcessReceipt(service, handle, f"{parent.operation_id}:physical")
         service.physical = receipt
+        registry = getattr(parent.coordinator, "_i16_source_registry", None)
+        if registry is not None:
+            try:
+                registry.register_receipt(service, receipt)
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                receipt.mark_unknown("unmapped_writer")
+                raise ExternalProcessOperationError("i16_source_unregistered") from exc
     parent._physical = receipt
     parent.finalizer = receipt
     return receipt
@@ -1287,7 +1345,7 @@ def release_agent_process_parent(agent: Any) -> bool:
     return True
 
 
-def ensure_agent_process_policy(agent: Any) -> ProducerPolicy:
+def ensure_agent_process_policy(agent: Any, *, producer_key: str | None = None) -> ProducerPolicy:
     """Resolve the explicit producer policy at the actual direct/standalone route."""
     current = getattr(agent, "_external_process_policy", None)
     if current is not None:
@@ -1304,6 +1362,7 @@ def ensure_agent_process_policy(agent: Any) -> ProducerPolicy:
     context = reserve_standalone_external_process_parent(
         profile_home=home, profile_id=str(home), operation_id=uuid.uuid4().hex,
         source_identity=str(getattr(agent, "provider", "codex")), profile_db=db,
+        producer_key=producer_key,
     )
     parent = context.__enter__()
     agent._external_process_parent_context = context

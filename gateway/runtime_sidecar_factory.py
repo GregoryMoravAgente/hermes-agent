@@ -170,7 +170,7 @@ class MCPRemoteSourceFactory:
                     profile_home=Path(profile_id),
                     operation_id=operation_id,
                     source_identity=source_identity,
-                    mode="live_profile_discovery",
+                    mode="live_profile_discovery", producer_key="mcp",
                 )
                 reserve_request(parent)
                 generation = self._coordinator_generation(parent.coordinator)

@@ -112,7 +112,7 @@ class CodexAppServerCustody:
             self._check_next_admission_binding(binding, completed_request)
             reusing_completed = True
         if self.service is None:
-            self.service = reserve_service(binding, self.owner_id)
+            self.service = reserve_service(binding, self.owner_id, producer_key="codex")
         try:
             request = self.service.begin_request(binding)
         except Exception:

@@ -65,6 +65,7 @@ def reserve_managed_sidecar(
     *,
     family: str,
     source_identity: str,
+    producer_key: str | None = None,
     operation_id: str | None = None,
 ) -> SidecarOwner:
     """Reserve an I16 request under the live I04 admission before a producer effect."""
@@ -84,7 +85,9 @@ def reserve_managed_sidecar(
     parent = None
     request = None
     try:
-        service = reserve_service(binding, f"external:{operation_id}")
+        service = reserve_service(
+            binding, f"external:{operation_id}", producer_key=producer_key,
+        )
         parent = parent_for_managed_service(
             binding,
             service,
@@ -125,6 +128,7 @@ def reserve_profile_sidecar(
     profile_home: Path,
     family: str,
     source_identity: str,
+    producer_key: str,
     operation_id: str | None = None,
 ) -> SidecarOwner:
     """Reserve a live served-profile source through the canonical authority/lock path."""
@@ -145,7 +149,7 @@ def reserve_profile_sidecar(
         profile_home=Path(profile_home),
         operation_id=operation_id,
         source_identity=source_identity,
-        mode="live_profile_discovery",
+        mode="live_profile_discovery", producer_key=producer_key,
     )
     try:
         service = parent._service

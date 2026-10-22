@@ -674,7 +674,7 @@ async def _real_automation_delivery_case(tmp_path, monkeypatch, *, sidecar=False
             started, _first = await authority._claim_next(ref, live)
             assert isinstance(started, dict) and started["status"] == "started"
             binding = admission_binding(authority, ref, started)
-            service = reserve_service(binding, "automation-sidecar")
+            service = reserve_service(binding, "automation-sidecar", producer_key="provider")
             request = service.begin_request(binding)
             authority._preservation_bind_sidecar(admission_id, binding.parent_handle, service, request)
             authority._preservation_release_sidecar(admission_id, request, durable=True)

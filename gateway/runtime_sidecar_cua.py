@@ -491,6 +491,13 @@ class CuaStdioReceipt:
             self._propagate_unknown("cua_terminal_readback_unknown")
             return False
         self.state = "closed"
+        physical = self.physical
+        if physical is not None:
+            try:
+                physical.bind_source_receipt(self)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                self._propagate_unknown("cua_source_receipt_unknown")
+                return False
         return True
 
     def readback(self) -> dict[str, Any] | None:
@@ -516,30 +523,6 @@ class CuaStdioReceipt:
             "returncode": self.returncode,
             "identity_digest": self.owner.identity_digest,
         }
-
-
-class _ObservedCuaContext:
-    """Observe one SDK context while preserving its exact same-task exit."""
-
-    def __init__(self, context: Any, owner: CuaStdioOwner):
-        self._context, self._owner = context, owner
-        self._entered = False
-        self.value = None
-
-    async def __aenter__(self):
-        self.value = await self._context.__aenter__()
-        self._entered = True
-        self._owner.receipt.bind_session(self.value, asyncio.current_task())
-        return self.value
-
-    async def __aexit__(self, exc_type, exc, traceback):
-        try:
-            result = await self._context.__aexit__(exc_type, exc, traceback)
-        except BaseException as close_error:
-            self._owner.receipt.close_session(exc, close_error)
-            raise
-        self._owner.receipt.close_session(exc, None)
-        return result
 
 
 @dataclass
@@ -723,8 +706,9 @@ class CuaStdioOwner:
                 self.mark_unknown("cua_current_binding_mismatch")
             return False
 
-    def observe_session(self, context: Any) -> _ObservedCuaContext:
-        return _ObservedCuaContext(context, self)
+    def observe_session(self, context: Any) -> Any:
+        from gateway.runtime_sidecar_cua_context import ObservedCuaContext
+        return ObservedCuaContext(context, self)
 
     def mark_unknown(self, reason: str) -> None:
         self.receipt._mark_unknown(reason)
@@ -755,99 +739,12 @@ class CuaStdioOwner:
         if self.receipt.process is not None or self.receipt.transport_entered:
             self.mark_unknown("cua_partial_launch")
             return False
-        parent = self.parent
-        service = getattr(parent, "_service", None)
-        request = getattr(parent, "_request", None)
-        binding = getattr(parent, "turn_binding", None)
-        managed = getattr(parent, "mode", None) == "managed_turn"
-        result = None
-        if managed:
-            if (
-                service is None
-                or request is None
-                or binding is None
-                or getattr(parent, "_cua_receipt", None) is not self.receipt
-                or getattr(service, "external_parent", None) is not parent
-                or getattr(service, "binding", None) is not binding
-                or getattr(service, "requests", {}).get(getattr(binding, "admission_id", None)) is not request
-            ):
-                self.mark_unknown("cua_managed_owner_incomplete")
-                return False
-            physical = getattr(service, "physical", None)
-            if (
-                physical is None
-                or getattr(parent, "_physical", None) is not physical
-                or getattr(physical, "service", None) is not service
-                or (
-                    getattr(self.receipt, "physical", None) is not None
-                    and getattr(self.receipt, "physical", None) is not physical
-                )
-            ):
-                self.mark_unknown("cua_managed_owner_incomplete")
-                return False
-            try:
-                from gateway.runtime_service_operations import release_cua_request
-                release_cua_request(service, binding, request, self.parent)
-            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-                self.mark_unknown("cua_release_failed")
-                return False
-            if physical is not None:
-                if physical.state != "reserved" or physical.release_before_effect() is not True:
-                    self.mark_unknown("cua_physical_release_failed")
-                    return False
-                # `release_before_effect` may clear the service slot.  Keep the
-                # exact released receipt attached until the registry/root fences
-                # below have succeeded; a later failure must not lose custody.
-                service.physical = physical
-                parent._physical = physical
-            try:
-                _forget_cua_request(service, binding, request)
-            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-                return _retain_cua_late_fence(
-                    parent, service, physical, "cua_sidecar_retire_failed",
-                )
-        else:
-            result = parent.coordinator.release_unaccepted(parent.root_handle)
-        if result is not None:
-            self.mark_unknown("cua_release_failed")
-            return False
-        if managed:
-            parent.state = "terminal"
-            authority = getattr(parent, "profile_authority", None)
-            forget = getattr(authority, "forget_external_process_finalizer", None)
-            if not callable(forget):
-                return _retain_cua_late_fence(
-                    parent, service, physical, "cua_finalizer_retire_failed",
-                )
-            if not forget(parent.operation_id, parent):
-                _restore_cua_finalizer(parent)
-                return _retain_cua_late_fence(
-                    parent, service, physical, "cua_finalizer_retire_failed",
-                )
-            if not _mark_cua_root_terminal(parent):
-                parent.state = "unknown"
-                _restore_cua_finalizer(parent)
-                return _retain_cua_late_fence(
-                    parent, service, physical, "cua_release_failed",
-                )
-            parent._request = None
-            parent.turn_binding = None
-            if service is not None and getattr(service, "physical", None) is physical:
-                service.physical = None
-            parent._physical = None
-        else:
-            parent.state = "terminal"
-            if not _mark_cua_root_terminal(parent):
-                parent.state = "unknown"
-                return False
-            authority = getattr(parent, "profile_authority", None)
-            forget = getattr(authority, "forget_external_process_finalizer", None)
-            if callable(forget) and not forget(parent.operation_id, parent):
-                parent.state = "unknown"
-                return False
-        parent._cua_receipt = None
-        _finish_standalone_context(self.parent)
-        return True
+        mode = getattr(self.parent, "mode", None)
+        if mode == "managed_turn":
+            return _release_managed_cua_before_effect(self)
+        if mode == "standalone_maintenance":
+            return _release_standalone_cua_before_effect(self)
+        return _release_legacy_cua_before_effect(self)
 
     def finish(self) -> bool:
         if not self.receipt.close_after_shutdown():
@@ -856,6 +753,137 @@ class CuaStdioOwner:
             return False
         _finish_standalone_context(self.parent)
         return True
+
+
+def _managed_cua_release_parts(owner: CuaStdioOwner) -> tuple[Any, Any, Any, Any] | None:
+    parent = owner.parent
+    service = getattr(parent, "_service", None)
+    request = getattr(parent, "_request", None)
+    binding = getattr(parent, "turn_binding", None)
+    if (
+        service is None
+        or request is None
+        or binding is None
+        or getattr(parent, "_cua_receipt", None) is not owner.receipt
+        or getattr(service, "external_parent", None) is not parent
+        or getattr(service, "binding", None) is not binding
+        or getattr(service, "requests", {}).get(getattr(binding, "admission_id", None)) is not request
+    ):
+        return None
+    physical = getattr(service, "physical", None)
+    if (
+        physical is None
+        or getattr(parent, "_physical", None) is not physical
+        or getattr(physical, "service", None) is not service
+        or (
+            getattr(owner.receipt, "physical", None) is not None
+            and getattr(owner.receipt, "physical", None) is not physical
+        )
+    ):
+        return None
+    return service, binding, request, physical
+
+
+def _release_managed_cua_before_effect(owner: CuaStdioOwner) -> bool:
+    parts = _managed_cua_release_parts(owner)
+    if parts is None:
+        owner.mark_unknown("cua_managed_owner_incomplete")
+        return False
+    service, binding, request, physical = parts
+    try:
+        from gateway.runtime_service_operations import release_cua_request
+        release_cua_request(service, binding, request, owner.parent)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        owner.mark_unknown("cua_release_failed")
+        return False
+    if physical.state != "reserved" or physical.release_before_effect() is not True:
+        owner.mark_unknown("cua_physical_release_failed")
+        return False
+    # Keep the exact released receipt attached until every root fence succeeds.
+    service.physical = physical
+    owner.parent._physical = physical
+    try:
+        _forget_cua_request(service, binding, request)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return _retain_cua_late_fence(
+            owner.parent, service, physical, "cua_sidecar_retire_failed",
+        )
+    return _finish_managed_cua_release(owner, service, physical)
+
+
+def _finish_managed_cua_release(owner: CuaStdioOwner, service: Any, physical: Any) -> bool:
+    parent = owner.parent
+    parent.state = "terminal"
+    authority = getattr(parent, "profile_authority", None)
+    forget = getattr(authority, "forget_external_process_finalizer", None)
+    if not callable(forget):
+        return _retain_cua_late_fence(parent, service, physical, "cua_finalizer_retire_failed")
+    if not forget(parent.operation_id, parent):
+        _restore_cua_finalizer(parent)
+        return _retain_cua_late_fence(parent, service, physical, "cua_finalizer_retire_failed")
+    if not _mark_cua_root_terminal(parent):
+        parent.state = "unknown"
+        _restore_cua_finalizer(parent)
+        return _retain_cua_late_fence(parent, service, physical, "cua_release_failed")
+    parent._request = None
+    parent.turn_binding = None
+    if getattr(service, "physical", None) is physical:
+        service.physical = None
+    parent._physical = None
+    parent._cua_receipt = None
+    _finish_standalone_context(parent)
+    return True
+
+
+def _release_standalone_cua_before_effect(owner: CuaStdioOwner) -> bool:
+    parent = owner.parent
+    if not _standalone_cua_edges_exact(owner) or owner.receipt.state != "reserved":
+        owner.mark_unknown("cua_standalone_owner_incomplete")
+        return False
+    service = parent._service
+    physical = parent._physical
+    if physical.release_before_effect() is not True:
+        owner.mark_unknown("cua_physical_release_failed")
+        return False
+    service.physical = None
+    if parent.coordinator.release_unaccepted(parent._request) is not None:
+        owner.mark_unknown("cua_request_release_failed")
+        return False
+    service.requests.pop(parent.operation_id, None)
+    if parent.coordinator.release_unaccepted(parent.root_handle) is not None:
+        owner.mark_unknown("cua_release_failed")
+        return False
+    authority = getattr(parent, "profile_authority", None)
+    forget = getattr(authority, "forget_external_process_finalizer", None)
+    parent.state = "terminal"
+    if callable(forget) and not forget(parent.operation_id, parent):
+        parent.state = "unknown"
+        return False
+    parent._request = None
+    parent.turn_binding = None
+    parent._physical = None
+    parent._cua_receipt = None
+    _finish_standalone_context(parent)
+    return True
+
+
+def _release_legacy_cua_before_effect(owner: CuaStdioOwner) -> bool:
+    parent = owner.parent
+    if parent.coordinator.release_unaccepted(parent.root_handle) is not None:
+        owner.mark_unknown("cua_release_failed")
+        return False
+    parent.state = "terminal"
+    if not _mark_cua_root_terminal(parent):
+        parent.state = "unknown"
+        return False
+    authority = getattr(parent, "profile_authority", None)
+    forget = getattr(authority, "forget_external_process_finalizer", None)
+    if callable(forget) and not forget(parent.operation_id, parent):
+        parent.state = "unknown"
+        return False
+    parent._cua_receipt = None
+    _finish_standalone_context(parent)
+    return True
 
 
 def _finish_standalone_context(parent: Any) -> None:
@@ -1071,29 +1099,126 @@ def _prepare_cua_physical_retry(parent: Any) -> bool:
     return True
 
 
-def _bind_cua_physical(owner: CuaStdioOwner, process: Any, streams: Any) -> Any:
-    """Bind the actual CUA child to the existing managed ServiceProcessReceipt."""
+def _standalone_cua_edges_exact(owner: CuaStdioOwner) -> bool:
+    parent = owner.parent
+    service = getattr(parent, "_service", None)
+    request = getattr(parent, "_request", None)
+    physical = getattr(parent, "_physical", None)
+    return (
+        service is not None
+        and getattr(parent, "mode", None) == "standalone_maintenance"
+        and getattr(service, "binding", None) is None
+        and getattr(service, "external_parent", None) is parent
+        and getattr(service, "requests", {}).get(getattr(parent, "operation_id", None)) is request
+        and request is not None
+        and getattr(parent, "_request", None) is request
+        and getattr(service, "physical", None) is physical
+        and physical is not None
+        and getattr(physical, "service", None) is service
+        and (
+            getattr(owner.receipt, "physical", None) is None
+            or getattr(owner.receipt, "physical", None) is physical
+        )
+        and getattr(physical, "state", None) == "reserved"
+    )
+
+
+def _cua_physical_for_owner(owner: CuaStdioOwner) -> Any:
     parent = owner.parent
     service = getattr(parent, "_service", None)
     if service is None:
-        return None  # standalone maintenance keeps its legacy CUA-only receipt
-    if getattr(parent, "mode", None) != "managed_turn":
-        owner.mark_unknown("cua_managed_parent_mode_missing")
-        raise RuntimeError("cua_managed_parent_mode_missing")
+        return None
+    mode = getattr(parent, "mode", None)
+    if mode == "managed_turn":
+        return getattr(service, "physical", None)
+    if mode == "standalone_maintenance" and _standalone_cua_edges_exact(owner):
+        return getattr(service, "physical", None)
+    if mode == "standalone_maintenance":
+        owner.mark_unknown("cua_standalone_owner_incomplete")
+        raise RuntimeError("cua_standalone_owner_incomplete")
+    owner.mark_unknown("cua_managed_parent_mode_missing")
+    raise RuntimeError("cua_managed_parent_mode_missing")
+
+
+def _bind_cua_native_scope(
+    owner: CuaStdioOwner, physical: Any, process: Any, adapter: Any, pid: int,
+) -> None:
+    if os.name == "nt":
+        transaction = getattr(process, "windows_job", None) or getattr(process, "native_scope", None)
+        identity = getattr(transaction, "identity", None) if transaction is not None else None
+        started_at = getattr(transaction, "host_start_time", None) if transaction is not None else None
+        if (
+            transaction is None
+            or type(identity) is not str
+            or not identity.startswith("windows_job:")
+            or type(started_at) is not int
+            or started_at <= 0
+            or getattr(transaction, "custody", None) is not physical
+            or getattr(transaction, "process", None) is not process
+        ):
+            owner.mark_unknown("cua_windows_job_unavailable")
+            raise RuntimeError("cua_windows_job_unavailable")
+        if not physical.bind_process(pid, started_at, "windows_job", identity):
+            physical.mark_unknown("cua_physical_process_rejected")
+            raise RuntimeError("cua_physical_process_rejected")
+        physical.bind_launch(process, transaction)
+        physical.contained_scope_provider = transaction
+        return
+    if os.name != "posix":
+        owner.mark_unknown("cua_process_scope_unknown")
+        raise RuntimeError("cua_process_scope_unknown")
+    try:
+        pgid = os.getpgid(pid)
+    except (AttributeError, OSError, ProcessLookupError) as exc:
+        owner.mark_unknown("cua_process_scope_unknown")
+        raise RuntimeError("cua_process_scope_unknown") from exc
+    if type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp():
+        owner.mark_unknown("cua_process_scope_unknown")
+        raise RuntimeError("cua_process_scope_unknown")
+    if not physical.bind_process(
+        pid, None, "posix_process_group", f"posix_process_group:{pid}:{pgid}",
+        process_group_id=pgid,
+    ):
+        physical.mark_unknown("cua_physical_process_rejected")
+        raise RuntimeError("cua_physical_process_rejected")
+    physical.bind_launch(adapter)
+    from gateway.runtime_sidecar_browser import _BrowserPosixScope
+    physical.contained_scope_provider = _BrowserPosixScope(adapter, pgid)
+
+
+def _bind_cua_reader(owner: CuaStdioOwner, physical: Any, process: Any, streams: Any) -> Any:
+    from tools.mcp_tool_custody import MCPStdioReaderWitness
+    reader = getattr(owner.receipt, "physical_reader", None)
+    if reader is None:
+        reader = MCPStdioReaderWitness(streams[0], process)
+        physical.bind_reader("stdout", reader)
+        if not physical.reader_started("stdout", reader):
+            owner.mark_unknown("cua_reader_start_unknown")
+            raise RuntimeError("cua_reader_start_unknown")
+    elif getattr(reader, "stream", None) is not streams[0]:
+        owner.mark_unknown("cua_reader_identity_replaced")
+        raise RuntimeError("cua_reader_identity_replaced")
+    return reader
+
+
+def _bind_cua_physical(owner: CuaStdioOwner, process: Any, streams: Any) -> Any:
+    """Bind the actual CUA child to its source-owned physical receipt."""
+    parent = owner.parent
+    physical = _cua_physical_for_owner(owner)
+    if physical is None and getattr(parent, "_service", None) is None:
+        return None
     if not isinstance(streams, (tuple, list)) or not streams or streams[0] is None:
         owner.mark_unknown("cua_physical_reader_missing")
         raise RuntimeError("cua_physical_reader_missing")
     from gateway.runtime_service_operations import reserve_physical
     from gateway.runtime_sidecar_transport import configure_reader_streams
-    from tools.mcp_tool_custody import MCPProcessAdapter, MCPStdioReaderWitness
-
-    physical = getattr(service, "physical", None) or reserve_physical(parent)
+    from tools.mcp_tool_custody import MCPProcessAdapter
+    physical = physical or reserve_physical(parent)
     required = getattr(physical, "required_streams", None)
-    if required is None:
-        if not configure_reader_streams(physical, ("stdout",)):
-            owner.mark_unknown("cua_required_streams_invalid")
-            raise RuntimeError("cua_required_streams_invalid")
-    elif required != frozenset({"stdout"}):
+    if required is None and not configure_reader_streams(physical, ("stdout",)):
+        owner.mark_unknown("cua_required_streams_invalid")
+        raise RuntimeError("cua_required_streams_invalid")
+    if required is not None and required != frozenset({"stdout"}):
         owner.mark_unknown("cua_required_streams_replaced")
         raise RuntimeError("cua_required_streams_replaced")
     pid = getattr(process, "pid", None)
@@ -1105,57 +1230,8 @@ def _bind_cua_physical(owner: CuaStdioOwner, process: Any, streams: Any) -> Any:
         owner.mark_unknown("cua_physical_process_replaced")
         raise RuntimeError("cua_physical_process_replaced")
     if physical.process is None:
-        if os.name == "nt":
-            transaction = getattr(process, "windows_job", None) or getattr(process, "native_scope", None)
-            identity = getattr(transaction, "identity", None) if transaction is not None else None
-            started_at = getattr(transaction, "host_start_time", None) if transaction is not None else None
-            if (
-                transaction is None
-                or type(identity) is not str
-                or not identity.startswith("windows_job:")
-                or type(started_at) is not int
-                or started_at <= 0
-                or getattr(transaction, "custody", None) is not physical
-                or getattr(transaction, "process", None) is not process
-            ):
-                owner.mark_unknown("cua_windows_job_unavailable")
-                raise RuntimeError("cua_windows_job_unavailable")
-            if not physical.bind_process(pid, started_at, "windows_job", identity):
-                physical.mark_unknown("cua_physical_process_rejected")
-                raise RuntimeError("cua_physical_process_rejected")
-            physical.bind_launch(process, transaction)
-            physical.contained_scope_provider = transaction
-        elif os.name == "posix":
-            try:
-                pgid = os.getpgid(pid)
-            except (AttributeError, OSError, ProcessLookupError) as exc:
-                owner.mark_unknown("cua_process_scope_unknown")
-                raise RuntimeError("cua_process_scope_unknown") from exc
-            if type(pgid) is not int or pgid <= 0 or pgid == os.getpgrp():
-                owner.mark_unknown("cua_process_scope_unknown")
-                raise RuntimeError("cua_process_scope_unknown")
-            if not physical.bind_process(
-                pid, None, "posix_process_group", f"posix_process_group:{pid}:{pgid}",
-                process_group_id=pgid,
-            ):
-                physical.mark_unknown("cua_physical_process_rejected")
-                raise RuntimeError("cua_physical_process_rejected")
-            physical.bind_launch(adapter)
-            from gateway.runtime_sidecar_browser import _BrowserPosixScope
-            physical.contained_scope_provider = _BrowserPosixScope(adapter, pgid)
-        else:
-            owner.mark_unknown("cua_process_scope_unknown")
-            raise RuntimeError("cua_process_scope_unknown")
-    reader = getattr(owner.receipt, "physical_reader", None)
-    if reader is None:
-        reader = MCPStdioReaderWitness(streams[0], process)
-        physical.bind_reader("stdout", reader)
-        if not physical.reader_started("stdout", reader):
-            owner.mark_unknown("cua_reader_start_unknown")
-            raise RuntimeError("cua_reader_start_unknown")
-    elif getattr(reader, "stream", None) is not streams[0]:
-        owner.mark_unknown("cua_reader_identity_replaced")
-        raise RuntimeError("cua_reader_identity_replaced")
+        _bind_cua_native_scope(owner, physical, process, adapter, pid)
+    reader = _bind_cua_reader(owner, physical, process, streams)
     owner.receipt.physical = physical
     owner.receipt.physical_process = adapter
     owner.receipt.physical_reader = reader
@@ -1188,6 +1264,7 @@ def _reserve_managed_parent(binding: Any, operation_id: str, source_identity: st
         binding,
         family="cua_stdio",
         source_identity=source_identity,
+        producer_key="cua",
         operation_id=operation_id,
     )
     # CUA keeps the same source parent across cached backend turns.  Each later
@@ -1216,6 +1293,25 @@ def _forget_cua_request(service: Any, binding: Any, request: Any) -> None:
     service.forget_request(binding.admission_id)
 
 
+def _prepare_standalone_cua_route(parent: Any) -> Any:
+    """Attach the standalone CUA parent to its exact service/request/physical chain."""
+    from gateway.runtime_service_operations import _parent_service
+
+    try:
+        service = _parent_service(parent)
+        request = service.begin_standalone_request(parent, parent.operation_id)
+        physical = service.reserve_standalone_physical(parent, request)
+    except BaseException:
+        parent.state = "unknown"
+        parent.coordinator.mark_unknown(parent.root_handle, "cua_standalone_reservation_failed")
+        raise
+    parent._request = request
+    parent._physical = physical
+    parent.finalizer = physical
+    parent.state = "request_reserved"
+    return parent
+
+
 def _reserve_standalone_parent(operation_id: str, source_identity: str) -> Any:
     from hermes_constants import get_hermes_home
     from hermes_state_registry import acquire
@@ -1224,16 +1320,21 @@ def _reserve_standalone_parent(operation_id: str, source_identity: str) -> Any:
     context = reserve_standalone_external_process_parent(
         profile_home=Path(get_hermes_home()), profile_id=str(Path(get_hermes_home()).resolve()),
         operation_id=operation_id, source_identity=source_identity, profile_db=db,
+        producer_key="cua",
     )
+    parent = None
     try:
         parent = context.__enter__()
+        parent._maintenance_context = context
+        parent._cua_owned_profile_db = True
+        return _prepare_standalone_cua_route(parent)
     except BaseException:
-        from hermes_state_registry import release_or_close
-        release_or_close(db)
+        if parent is None:
+            from hermes_state_registry import release_or_close
+            release_or_close(db)
+        else:
+            _finish_standalone_context(parent)
         raise
-    parent._maintenance_context = context
-    parent._cua_owned_profile_db = True
-    return parent
 
 
 def reserve_cua_stdio(*, session_id: str, permission_mode: str, display_identity: str = "") -> CuaStdioOwner:
@@ -1277,7 +1378,7 @@ def reserve_cua_stdio(*, session_id: str, permission_mode: str, display_identity
                 from gateway.runtime_service_operations import resolve_external_process_parent
                 parent = resolve_external_process_parent(
                     runner, profile_home=Path(authority.profile_id), operation_id=operation_id,
-                    source_identity=source_identity, mode="live_profile_discovery",
+                    source_identity=source_identity, mode="live_profile_discovery", producer_key="cua",
                 )
         else:
             parent = _reserve_standalone_parent(operation_id, source_identity)
@@ -1686,6 +1787,81 @@ def _mark_cua_root_terminal(parent: Any) -> bool:
     return True
 
 
+def _standalone_cua_close_edges_exact(parent: Any, receipt: Any) -> bool:
+    service = getattr(parent, "_service", None)
+    request = getattr(parent, "_request", None)
+    physical = getattr(parent, "_physical", None)
+    return (
+        getattr(parent, "mode", None) == "standalone_maintenance"
+        and service is not None
+        and getattr(service, "binding", None) is None
+        and getattr(service, "external_parent", None) is parent
+        and getattr(service, "requests", {}).get(getattr(parent, "operation_id", None)) is request
+        and request is not None
+        and getattr(parent, "_request", None) is request
+        and getattr(service, "physical", None) is physical
+        and physical is not None
+        and getattr(physical, "service", None) is service
+        and getattr(parent, "_physical", None) is physical
+        and getattr(receipt, "physical", None) is physical
+        and getattr(physical, "source_receipt", None) is receipt
+        and getattr(receipt, "state", None) == "closed"
+        and callable(getattr(receipt, "readback", None))
+        and receipt.readback() is not None
+    )
+
+
+def _close_standalone_cua_route(parent: Any, receipt: Any) -> bool:
+    """Close standalone CUA's physical, request, and service handles in order."""
+    if not _standalone_cua_close_edges_exact(parent, receipt):
+        parent.state = "unknown"
+        return False
+    from gateway.runtime_service_operations import _cua_request_is_terminal, _cua_root_is_terminal
+    from gateway.runtime_sidecar_cua_standalone import native_close_ready, retry_close
+
+    service = parent._service
+    request = parent._request
+    physical = parent._physical
+    if physical.state != "closed":
+        if physical.state == "unknown":
+            if not retry_close(parent, physical):
+                parent.state = "unknown"
+                return False
+        elif physical.state == "released" or not native_close_ready(physical):
+            physical.mark_unknown("cua_physical_close_unknown")
+            parent.coordinator.mark_unknown(parent.root_handle, "cua_physical_close_unknown")
+            parent.state = "unknown"
+            return False
+        if physical.state != "closed":
+            result = parent.coordinator.mark_terminal(physical.handle)
+            if result is not None:
+                physical.mark_unknown("cua_physical_release_failed")
+                parent.coordinator.mark_unknown(parent.root_handle, "cua_physical_release_failed")
+                parent.state = "unknown"
+                return False
+            physical.state = "closed"
+    if not _cua_request_is_terminal(service, request):
+        result = parent.coordinator.mark_terminal(request)
+        if result is not None:
+            parent.coordinator.mark_unknown(parent.root_handle, "cua_request_finalize_failed")
+            parent.state = "unknown"
+            return False
+    if not _cua_root_is_terminal(parent):
+        result = parent.coordinator.mark_terminal(parent.root_handle)
+        if result is not None:
+            parent.coordinator.mark_unknown(parent.root_handle, "cua_root_retire_failed")
+            parent.state = "unknown"
+            return False
+    service.requests.pop(parent.operation_id, None)
+    service.durable_requests.discard(parent.operation_id)
+    parent.state = "terminal"
+    parent._request = None
+    parent.turn_binding = None
+    parent._physical = None
+    parent._cua_receipt = None
+    return True
+
+
 def close_cua_after_finalizers(parent: Any) -> bool:
     """Commit the exact CUA request and I16 root after the real context readback."""
     receipt = getattr(parent, "_cua_receipt", None)
@@ -1695,6 +1871,8 @@ def close_cua_after_finalizers(parent: Any) -> bool:
     if getattr(receipt, "state", None) != "closed" or receipt.readback() is None:
         parent.state = "unknown"
         return False
+    if getattr(parent, "mode", None) == "standalone_maintenance":
+        return _close_standalone_cua_route(parent, receipt)
     service = getattr(parent, "_service", None)
     request = getattr(parent, "_request", None)
     binding = getattr(parent, "turn_binding", None)

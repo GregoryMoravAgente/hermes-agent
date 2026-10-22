@@ -356,7 +356,15 @@ class CodexAppServerClient:
             self._physical_receipt.bind_reader("stdout", self._reader)
             self._physical_receipt.bind_reader("stderr", self._stderr_reader)
         self._reader.start()
+        if self._physical_receipt is not None and not self._physical_receipt.reader_started(
+            "stdout", self._reader,
+        ):
+            raise RuntimeError("Codex stdout reader start was not authenticated")
         self._stderr_reader.start()
+        if self._physical_receipt is not None and not self._physical_receipt.reader_started(
+            "stderr", self._stderr_reader,
+        ):
+            raise RuntimeError("Codex stderr reader start was not authenticated")
 
     def initialize(
         self, client_name: str = "hermes", client_title: str = "Hermes Agent",

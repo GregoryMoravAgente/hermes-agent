@@ -67,7 +67,7 @@ def standalone_external_policy(tmp_path):
             profile_id=str(tmp_path),
             operation_id="provider-client-seam",
             source_identity="provider-client-seam",
-            profile_db=db,
+            profile_db=db, producer_key="provider",
         ) as parent:
             policy = policy_for_parent(parent, mode="standalone_maintenance")
             yield policy
