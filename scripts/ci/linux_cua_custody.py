@@ -399,7 +399,15 @@ def _user_namespace_receipt() -> dict[str, Any]:
     unshare_path = Path(unshare).resolve()
     if not unshare_path.is_file() or not os.access(unshare_path, os.X_OK):
         raise SystemExit("the resolved unshare executable is not an owned executable")
-    command = [str(unshare_path), "--user", "--map-root-user", "--mount-proc", "/bin/true"]
+    command = [
+        str(unshare_path),
+        "--user",
+        "--map-root-user",
+        "--pid",
+        "--fork",
+        "--mount-proc",
+        "/bin/true",
+    ]
     try:
         probe = subprocess.run(
             command,
