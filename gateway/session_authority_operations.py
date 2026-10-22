@@ -965,6 +965,9 @@ class PreservationOperationsMixin:
         """Return the source-owned identity for one currently running control request."""
         if type(generation) is not int:
             raise RuntimeStoreError('stale_generation')
+        # A completed or superseded execution has no live parent to map. Preserve its public
+        # generation refusal before requiring custody for a control that could be accepted.
+        self.check_approval_generation(session_id, generation)
         live = self.sessions.get(session_id)
         execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
         admission_id = execution.get('admission_id')

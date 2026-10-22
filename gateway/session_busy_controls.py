@@ -188,6 +188,8 @@ async def correct(connection, ref, params, *, verb):
     authority = connection.authority
     generation = params['execution_generation']
     live = authority.sessions[ref.session_id]
+    with live.event_stream.lock:
+        row = authority._preservation_control_identity(ref.session_id, generation)
     async def call():
         with live.event_stream.lock:
             authority.check_approval_generation(ref.session_id, generation)
@@ -214,6 +216,7 @@ async def correct(connection, ref, params, *, verb):
                     'text': params['text'], 'execution_generation': generation,
                     'authority_epoch': authority.epoch}
     return await authority._preservation_control_call(
-        principal_id=connection.actor.subject, session_id=ref.session_id, operation=verb,
+        principal_id=row['principal_id'], session_id=ref.session_id, operation=verb,
         request_id=f'{verb}:{generation}:{hashlib.sha256(params["text"].encode()).hexdigest()}',
-        generation=generation, call=call)
+        admission_id=row['admission_id'], generation=generation,
+        source_identity='busy_control', call=call)
