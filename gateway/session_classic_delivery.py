@@ -1306,8 +1306,11 @@ def _nonclassic_callback_candidates(authority, row, admission_id):
     return _callback_nested_candidates_valid(authority, candidates, expected_owner)
 
 
-def classic_callback_requirement(authority, admission_id):
+def classic_callback_requirement(authority, admission_id, *, delivery_receipt=None):
     """Classify the exact admission's classic callback obligation.
+
+    ``delivery_receipt`` is supplied only by the real settled-delivery finalizer.  The legacy
+    lightweight exemption therefore cannot be reached by an untrusted direct classifier call.
 
     A required callback is proven by the authenticated classic bridge.  A nonclassic route is
     exempt only when its live opaque lease and terminal canonical row agree.  Missing rows,
@@ -1359,6 +1362,9 @@ def classic_callback_requirement(authority, admission_id):
         # I06 operation record has already been retired.  Empty nonclassic maps cannot prove its
         # absence, so retain the lease until the marker is settled or an exact bridge is recovered.
         return CLASSIC_CALLBACK_UNKNOWN
+    from gateway.session_classic_legacy_callback import legacy_lightweight_no_delivery_callback
+    if legacy_lightweight_no_delivery_callback(authority, row, admission_id, delivery_receipt):
+        return CLASSIC_CALLBACK_NOT_REQUIRED
     if _authenticated_local_operator_input(authority, row):
         return CLASSIC_CALLBACK_NOT_REQUIRED
     candidates = _nonclassic_callback_candidates(authority, row, admission_id)

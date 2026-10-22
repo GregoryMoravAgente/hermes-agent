@@ -1017,7 +1017,9 @@ async def _finish_preservation_delivery_impl(authority, admission_id, delivery_r
         if marker is not None and _callback_classic_marker_signal(authority, admission_id):
             return False
     elif not automation_binding:
-        callback_requirement = classic_callback_requirement(authority, admission_id)
+        callback_requirement = classic_callback_requirement(
+            authority, admission_id, delivery_receipt=delivery_receipt,
+        )
         if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
             return False
 
