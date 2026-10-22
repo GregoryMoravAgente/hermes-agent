@@ -214,6 +214,7 @@ class TestFirecrawlClientConfig:
         monkeypatch.setattr(firecrawl_provider.httpx, "post", _fake_post)
         monkeypatch.setattr(firecrawl_provider, "_get_firecrawl_client", firecrawl_provider._KeylessFirecrawlClient)
         monkeypatch.setattr(firecrawl_provider, "check_website_access", lambda url: None)
+        monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda url: True)
 
         entry = asyncio.run(firecrawl_provider._scrape_one("https://example.com", ["markdown"], None))
 

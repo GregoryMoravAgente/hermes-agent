@@ -283,6 +283,7 @@ class TestFirecrawlScrapeTimeout:
         monkeypatch.setattr(
             firecrawl_provider, "check_website_access", lambda url: None
         )
+        monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda url: True)
 
         p = firecrawl_provider.FirecrawlWebSearchProvider()
         results = asyncio.run(p.extract(["https://example.com"]))
