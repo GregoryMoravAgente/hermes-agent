@@ -5,7 +5,9 @@ name: Windows Native Custody
 on:
   pull_request:
   push:
-    branches: [codex/AGC-1722/windows-close-worker-root-20261021-01a120af]
+    branches:
+      - codex/AGC-1722/windows-close-worker-root-20261021-01a120af
+      - codex/AGC-1663/i12-managed-proof-root-01a120af-20261022
 
 permissions:
   contents: read
@@ -46,6 +48,7 @@ env:
     tests/gateway/test_codex_service_custody.py
     tests/agent/transports/test_codex_physical_custody.py
     tests/gateway/test_runtime_service_native_close_identity.py
+    tests/gateway/test_managed_scheduler_cron_custody.py
 
 jobs:
   native-custody:
