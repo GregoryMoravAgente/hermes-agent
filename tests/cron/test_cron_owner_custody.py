@@ -1090,6 +1090,42 @@ def test_i12_provider_claim_fire_refuses_during_retirement_close(custody_runtime
         assert coordinator.abort_before_handoff(close) is None
 
 
+def test_due_job_claim_preserves_exact_reserved_custody(custody_runtime, monkeypatch, tmp_path):
+    """The real durable CAS must not replace its already-reserved in-memory producer edge."""
+    from cron import jobs, scheduler
+    from cron.runtime_custody import reserve_execution
+
+    _coordinator, executions, _db = custody_runtime
+    with jobs.use_cron_store(tmp_path):
+        job = jobs.create_job(prompt="synthetic due job", schedule="every 1h", deliver="local")
+        binding = reserve_execution(
+            owner_class="I12_cron_fire", job_id=job["id"], source="builtin", required=True,
+        )
+        row = executions.create_execution(
+            job["id"], source="builtin", execution_id=binding.owner_id,
+        )
+        binding.bind_execution_record(row)
+        dispatched = dict(job, execution_id=binding.execution_id, _cron_custody=binding)
+        received = []
+
+        def consume(claimed, **_kwargs):
+            received.append(claimed)
+            assert claimed.get("_cron_custody") is binding
+            assert claimed["execution_id"] == binding.execution_id
+            assert jobs.get_job(job["id"])["fire_claim"]
+            return True
+
+        monkeypatch.setattr(scheduler, "run_one_job", consume)
+        try:
+            assert scheduler._process_due_job(dispatched, None, None, False) is True
+            assert len(received) == 1
+        finally:
+            assert executions.finish_execution(
+                binding.execution_id, success=True, delivery_outcome="suppressed",
+            ) is not None
+            assert binding.observe_terminal()
+
+
 @pytest.mark.platforms("windows")
 def test_i13_direct_popen_identity_probe():
     """Diagnostic only: compare real child identity with the parent Popen receipt."""
