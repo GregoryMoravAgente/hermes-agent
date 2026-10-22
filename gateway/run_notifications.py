@@ -30,6 +30,21 @@ from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixi
 logger = logging.getLogger("gateway.run")
 
 
+def initialize_i10_source_indexes(runner) -> None:
+    from gateway.run_notifications_recovery import initialize_i10_source_indexes as initialize
+    return initialize(runner)
+
+
+def i10_source_snapshot(authority):
+    from gateway.run_notifications_recovery import i10_source_snapshot as snapshot
+    return snapshot(authority)
+
+
+def register_i10_source(authority):
+    from gateway.run_notifications_recovery import register_i10_source as register
+    return register(authority)
+
+
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
 

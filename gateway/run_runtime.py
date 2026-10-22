@@ -75,6 +75,32 @@ def _store_open_failure(runner, home):
     return f'{path} is unavailable (its last open failed; retry pending)'
 
 
+def bootstrap_i10_consumer_sources(runner) -> None:
+    """Register each real recovery source before a preservation close can begin.
+
+    Registration is only a source hook installation.  The source modules perform their own
+    canonical queue/registry read at the close fence; no empty map or boot-time flag becomes an
+    absence receipt.
+    """
+    from gateway.platforms.webhook_ingress import register_i10_source as register_webhook
+    from gateway.run_notifications import register_i10_source as register_notifications
+    from gateway.run_startup import register_i10_source as register_startup
+    from gateway.session_bot_mailbox import register_i10_source as register_mailbox
+    from gateway.session_local_recovery import register_i10_source as register_local
+    from gateway.run_notifications import initialize_i10_source_indexes
+    from gateway.session_authorities import all_authorities, owner_scope
+
+    initialize_i10_source_indexes(runner)
+    for authority in all_authorities(runner):
+        with owner_scope(authority):
+            register_startup(authority)
+            register_local(authority)
+            register_webhook(authority)
+            runner.register_i10_source(authority)
+            register_notifications(authority)
+            register_mailbox(authority)
+
+
 async def initialize_session_authority(
         runner, *, profile_id, instance_id, db=None, register=True, defer_local_recovery=False):
     """Build and publish one profile authority after exclusive ownership is established."""
@@ -246,6 +272,7 @@ async def initialize_gateway_runtime(runner):
                 runner, name,
                 f'startup local recovery failed; profile parked: {exc}',
             )
+    bootstrap_i10_consumer_sources(runner)
     # Bind the process registry only after the authenticated process instance and authority epoch
     # exist. Pre-existing children are retained as unknown instead of being adopted after Popen.
     from tools.process_registry import process_registry
@@ -625,6 +652,73 @@ def _seal_authorities_preservation_owner(
         coordinator.mark_owner_unknown(owner_class, getattr(refusal, 'code', 'read_failed'))
 
 
+def _seal_i10_preservation_owner(runner, coordinator, receipt, descriptor):
+    """Aggregate each live profile's six I10 source proofs under one global close receipt."""
+    from gateway.runtime_custody import OWNER_SPECS
+    from gateway.session_authorities import owner_scope
+    from gateway.session_recovery_custody import owner_evidence, refresh_i10_source_evidence
+
+    authorities = _authorities(runner)
+    if not authorities:
+        coordinator.mark_owner_unknown('I10_startup_recovery_handoff', 'missing_source_hook')
+        return
+    profiles = []
+    for authority in authorities:
+        try:
+            with owner_scope(authority):
+                if not refresh_i10_source_evidence(authority, receipt.close_generation):
+                    coordinator.mark_owner_unknown(
+                        'I10_startup_recovery_handoff', 'enumeration_failed')
+                    return
+                proof = owner_evidence(
+                    authority,
+                    process_instance=authority.instance_id,
+                    authority_epoch=authority.epoch,
+                    close_generation=receipt.close_generation,
+                    owner_id=(
+                        f'{descriptor.get("instance_id", receipt.process_instance)}:I10:'
+                        f'{authority.profile_id}'
+                    ),
+                    require_close_witness=True,
+                )
+        except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError, ValueError):
+            coordinator.mark_owner_unknown('I10_startup_recovery_handoff', 'read_failed')
+            return
+        if proof is None:
+            coordinator.mark_owner_unknown('I10_startup_recovery_handoff', 'enumeration_failed')
+            return
+        profiles.append(proof)
+
+    evidence = {
+        'source': OWNER_SPECS['I10_startup_recovery_handoff'].source,
+        'process_instance': receipt.process_instance,
+        'authority_epoch': receipt.authority_epoch,
+        'close_generation': receipt.close_generation,
+        'owner_id': f'{descriptor.get("instance_id", receipt.process_instance)}:I10',
+        'observed': True,
+        # Keep every profile's own source evidence intact. A single mutable dict/last profile
+        # cannot overwrite the secondary epoch or consumer receipts.
+        'profiles': tuple(profiles),
+        'profile_ids': tuple(proof['profile_id'] for proof in profiles),
+        'profile_homes': tuple(proof['profile_home'] for proof in profiles),
+        'profile_epochs': tuple(
+            (proof['profile_id'], proof['authority_epoch']) for proof in profiles
+        ),
+        'consumers': tuple(
+            (proof['profile_id'], tuple(proof['consumers'])) for proof in profiles
+        ),
+        'cross_process_proof': all(proof.get('cross_process_proof') is True for proof in profiles),
+        'os_lock_owner': all(proof.get('os_lock_owner') is True for proof in profiles),
+        'native_handle_retained': all(
+            proof.get('native_handle_retained') is True for proof in profiles
+        ),
+    }
+    refusal = coordinator.seal_owner('I10_startup_recovery_handoff', evidence)
+    if refusal is not None:
+        coordinator.mark_owner_unknown(
+            'I10_startup_recovery_handoff', getattr(refusal, 'code', 'read_failed'))
+
+
 def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     """Seal source consumers whose durable terminal paths are wired here.
 
@@ -641,6 +735,7 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
         coordinator.mark_owner_unknown('I17_hosted_tui_services', 'read_failed')
     if authorities:
+        _seal_i10_preservation_owner(runner, coordinator, receipt, descriptor)
         for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
             if not all(_authority_owner_ready(authority, owner_class, coordinator) for authority in authorities):
                 continue
@@ -1506,6 +1601,9 @@ async def serve_profile_runtime(runner, name, home):
             recover_local_sessions(authority, schedule=True, allow_legacy=False)
             await recover_webhook_finalizations(authority)
             _recover_published_api_turns(runner, authority)
+            # Hot-served authorities join the same source-owned I10 close graph before they can
+            # publish a served profile or accept new ingress.
+            bootstrap_i10_consumer_sources(runner)
         if getattr(runner, 'session_control_server', None) is not None:
             await _ensure_hosted_service(runner, authority)
     except BaseException:

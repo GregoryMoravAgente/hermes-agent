@@ -1,6 +1,7 @@
 """Authority-local async serialization; file locks cover only short synchronous mailbox I/O."""
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from tools.bot_live_delivery import _locked, _read, _write
 
@@ -146,6 +147,46 @@ async def refuse_pin(home, key):
 async def scan_receipts(home, pins=None):
     """Bulk scan; an owner scan passes ``pins`` to collect pre-admission pins instead of warning."""
     return await _mailbox_io(_scan_receipts, home, pins)
+
+
+def i10_source_snapshot(authority):
+    """Read the canonical Bot Chat mailbox while holding its source lock."""
+    from gateway.session_bot import _is_pre_admission_pin, _record_admission_id, _record_shape_error
+    from tools.bot_live_delivery import _root, has_mailbox
+
+    home = Path(authority.db.db_path).parent.resolve()
+    if not has_mailbox(home):
+        return {"pending_ids": (), "registry": {"mailbox": "absent"}}
+    pending = set()
+    files = []
+    with _locked(home) as root:
+        for path in sorted(root.glob("*.json")):
+            files.append(path.name)
+            record = _read(path)
+            if record is None:
+                raise RuntimeError(f"mailbox receipt disappeared: {path.name}")
+            problem = _record_shape_error(path, record)
+            if problem is not None:
+                raise RuntimeError(f"malformed mailbox receipt: {path.name}: {problem}")
+            if record.get("profile_home") and record["profile_home"] != str(home):
+                raise RuntimeError("mailbox receipt belongs to another profile")
+            status = record.get("status")
+            if (
+                status in {"canonical", "queued", "claimed"}
+                or _is_pre_admission_pin(path, record)
+                or (status == "ambiguous" and _record_admission_id(record))
+            ):
+                pending.add(path.stem)
+    return {
+        "pending_ids": tuple(sorted(pending)),
+        "registry": {"mailbox": str(_root(home)), "files": tuple(files)},
+    }
+
+
+def register_i10_source(authority):
+    """Install Bot Chat mailbox's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "bot_mailbox", i10_source_snapshot)
 
 
 def remember_receipt(authority, home, record):

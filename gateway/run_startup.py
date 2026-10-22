@@ -37,6 +37,53 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 
 
+def i10_source_snapshot(authority):
+    """Read the startup recovery registries that can still publish work at close.
+
+    Startup recovery owns the session-store active-turn markers and the native/local durable
+    admissions it replays.  The snapshot is intentionally read-only; the close witness is the
+    only place that may turn an empty result into a typed absence.
+    """
+    store = getattr(authority.runner, "session_store", None)
+    if store is None or not hasattr(store, "_lock"):
+        raise RuntimeError("startup recovery registry unavailable")
+    markers = []
+    with store._lock:
+        store._ensure_loaded_locked()
+        for entry in store._entries.values():
+            if entry.active_turn_token and entry.active_turn_started_at and not entry.suspended:
+                markers.append(str(entry.active_turn_token))
+    from hermes_state_runtime import get_session_admission
+    admission_ids = authority.db._read_all(
+        "SELECT admission_id FROM session_admissions ORDER BY seq"
+    )
+    rows = [
+        row for candidate in admission_ids
+        if (row := get_session_admission(authority.db, admission_id=candidate["admission_id"])) is not None
+    ]
+    active_rows = tuple(
+        row for row in rows
+        if isinstance(row, dict)
+        and row.get("status") in {"queued", "started", "unknown"}
+        and isinstance(row.get("payload"), dict)
+        and ("native_text_v1" in row["payload"] or "local_automation_v1" in row["payload"])
+    )
+    pending = set(markers)
+    pending.update(str(row["admission_id"]) for row in active_rows if row.get("admission_id"))
+    return {
+        "pending_ids": tuple(sorted(pending)),
+        "rows": active_rows,
+        "registry": {"active_turn_markers": tuple(sorted(markers)),
+                      "admissions": tuple(sorted(row["admission_id"] for row in active_rows))},
+    }
+
+
+def register_i10_source(authority):
+    """Install startup's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "startup", i10_source_snapshot)
+
+
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> None:
     """Install the catalog plugin of every feature that left core (Home Assistant) *home* uses, in
     *home*'s runtime scope (its config, secrets and allow_lazy_installs); once per process per home.

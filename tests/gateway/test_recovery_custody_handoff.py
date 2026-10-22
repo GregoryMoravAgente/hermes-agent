@@ -151,12 +151,40 @@ async def _real_recovery_runtime(
     finally:
         release.set()
         if runner is not None:
+            # Public close tests intentionally stop at a refusal; release the process-wide
+            # reversible fence only during fixture teardown so the next isolated runtime can open.
+            coordinator = getattr(runner, "runtime_custody", None)
+            close = getattr(coordinator, "_close", None)
+            fence = getattr(coordinator, "_fence", None)
+            if close is not None and fence is not None:
+                fence.release_close(close)
             runner.session_store.close_all_db_handles()
             runner.close_all_session_db_handles()
         if reserved:
             process_ownership.release(home)
         peer.stop()
         reset_hermes_home_override(home_token)
+
+
+async def _begin_public_preservation_close(fixture):
+    """Start the authenticated public close route for the real managed fixture."""
+    from gateway import run_runtime
+
+    runner = fixture.authority.runner
+    runner._running = True
+    runner._restart_requested = False
+    runner._stop_task = None
+    descriptor = runner.session_runtime_descriptor
+    params = {
+        "instance_id": descriptor["instance_id"],
+        "authority_epoch": descriptor["authority_epoch"],
+        "owner_id": "i10-global-seal-test",
+        "scope": "profile",
+        "deadline_s": 30,
+    }
+    closing = await run_runtime.begin_preservation_drain(runner, params, "i10-test-peer")
+    assert closing["status"] == "closing", closing
+    return runner, params, closing
 
 
 def _fixture(tmp_path, *, started=False):
@@ -225,6 +253,93 @@ async def test_public_native_recovery_retains_one_current_i10_root(monkeypatch, 
         assert completed[handle.lease.lease_id] == "terminal"
         assert len(fixture.adapter.deliveries) == 1
         assert fixture.peer.requests
+
+
+@pytest.mark.asyncio
+async def test_public_global_seal_requires_six_source_owned_unused_receipts(monkeypatch, tmp_path):
+    async with _real_recovery_runtime(tmp_path, monkeypatch) as fixture:
+        from gateway import run_runtime
+        from gateway.session_recovery_custody import (
+            CONSUMERS, observe_consumer_rows, owner_evidence,
+        )
+
+        authority = fixture.authority
+        for consumer in CONSUMERS:
+            assert observe_consumer_rows(authority, consumer, rows=[], reason="no intake") is True
+        assert authority.preservation_owner_ready("I10_startup_recovery_handoff") is True
+
+        runner, params, closing = await _begin_public_preservation_close(fixture)
+        prepared = await run_runtime.prepare_preservation_handoff(
+            runner, {"receipt": closing}, "i10-test-peer",
+        )
+
+        assert prepared["status"] == "refused"
+        status = runner.runtime_custody.status()
+        assert status["owner_states"]["I10_startup_recovery_handoff"] == "sealed"
+        evidence = owner_evidence(
+            authority,
+            process_instance=params["instance_id"],
+            authority_epoch=params["authority_epoch"],
+            close_generation=closing["close_generation"],
+            owner_id=f'{params["instance_id"]}:I10_startup_recovery_handoff',
+        )
+        assert evidence is not None
+        assert tuple(item[0] for item in evidence["consumers"]) == CONSUMERS
+        assert all(item[1] == "unused" for item in evidence["consumers"])
+
+
+@pytest.mark.asyncio
+async def test_public_global_seal_keeps_i10_unknown_for_missing_or_malformed_consumer(
+        monkeypatch, tmp_path):
+    async with _real_recovery_runtime(tmp_path, monkeypatch) as fixture:
+        from gateway import run_runtime
+        from gateway.session_recovery_custody import CONSUMERS, observe_consumer, observe_consumer_rows
+
+        authority = fixture.authority
+        assert authority.preservation_owner_ready("I10_startup_recovery_handoff") is False
+        for consumer in CONSUMERS[1:]:
+            assert observe_consumer_rows(authority, consumer, rows=[], reason="no intake") is True
+        assert observe_consumer(authority, "startup", {"observed": True}) is False
+        runner, _params, closing = await _begin_public_preservation_close(fixture)
+
+        stale = dict(closing)
+        stale["close_generation"] += 1
+        refused = await run_runtime.prepare_preservation_handoff(
+            runner, {"receipt": stale}, "i10-test-peer",
+        )
+        assert refused == {"status": "refused", "reason": "stale_close_receipt"}
+
+        authority._i10_consumer_evidence["startup"] = {"observed": True}
+        prepared = await run_runtime.prepare_preservation_handoff(
+            runner, {"receipt": closing}, "i10-test-peer",
+        )
+        assert prepared["status"] == "refused"
+        assert runner.runtime_custody.status()["owner_states"][
+            "I10_startup_recovery_handoff"
+        ] != "sealed"
+
+
+@pytest.mark.asyncio
+async def test_public_global_seal_rejects_stale_current_epoch(monkeypatch, tmp_path):
+    async with _real_recovery_runtime(tmp_path, monkeypatch) as fixture:
+        from gateway import run_runtime
+        from gateway.session_recovery_custody import CONSUMERS, observe_consumer_rows
+
+        authority = fixture.authority
+        for consumer in CONSUMERS:
+            assert observe_consumer_rows(authority, consumer, rows=[], reason="no intake") is True
+        runner, _params, closing = await _begin_public_preservation_close(fixture)
+        authority.db._write_sql(
+            "UPDATE runtime_epoch SET epoch=? WHERE singleton=1", (authority.epoch + 1,)
+        )
+
+        prepared = await run_runtime.prepare_preservation_handoff(
+            runner, {"receipt": closing}, "i10-test-peer",
+        )
+        assert prepared["status"] == "refused"
+        assert runner.runtime_custody.status()["owner_states"][
+            "I10_startup_recovery_handoff"
+        ] != "sealed"
 
 
 @pytest.mark.asyncio

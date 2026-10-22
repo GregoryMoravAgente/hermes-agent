@@ -293,6 +293,35 @@ async def _webhook_retry(authority, event, payload, rows):
     return receipt
 
 
+def i10_source_snapshot(authority):
+    """Read the terminal webhook sessions still awaiting the canonical finalizer."""
+    from hermes_state_runtime import get_session_admission
+
+    candidates = authority.db._read_all("""
+        SELECT a.admission_id FROM sessions AS s
+        JOIN session_admissions AS a ON a.target_session_id=s.id
+        WHERE s.source='webhook' AND s.ended_at IS NULL
+          AND a.status='terminal' AND a.generation IS NOT NULL
+          AND json_extract(a.payload_json, '$.native_text_v1.source.platform')='webhook'
+          AND json_extract(a.payload_json, '$.native_text_v1.automation') IS NULL
+        """)
+    rows = tuple(
+        row for candidate in candidates
+        if (row := get_session_admission(authority.db, admission_id=candidate['admission_id'])) is not None
+    )
+    return {
+        "pending_ids": tuple(sorted(str(row['admission_id']) for row in rows if row.get('admission_id'))),
+        "rows": rows,
+        "registry": {"terminal_unended_admissions": tuple(sorted(row.get('admission_id', '') for row in rows))},
+    }
+
+
+def register_i10_source(authority):
+    """Install webhook replay's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "webhook_replay", i10_source_snapshot)
+
+
 def finalize_webhook(authority, receipt):
     """End only the settled admitted generation, atomically with the epoch fence."""
     import time

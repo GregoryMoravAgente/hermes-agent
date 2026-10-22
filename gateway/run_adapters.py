@@ -884,6 +884,16 @@ class GatewayAdapterLifecycleMixin:
         logger.warning("Reconnect %s: %s, removing from retry queue", platform.value, reason)
         del self._failed_platforms[platform]
 
+    def i10_source_snapshot(self, authority) -> dict:
+        """Read this profile's reconnect and adapter-owned inbound queues at close."""
+        from gateway.run_adapters_recovery import i10_source_snapshot
+        return i10_source_snapshot(self, authority)
+
+    def register_i10_source(self, authority):
+        """Install adapter reconnect's canonical close-time probe for the profile authority."""
+        from gateway.run_adapters_recovery import register_i10_source
+        return register_i10_source(self, authority)
+
     def _publish_primary_adapter(self, platform, adapter) -> None:
         """Register a connected primary adapter and wire voice mode/input (transcription without /voice join)."""
         self.adapters[platform] = adapter

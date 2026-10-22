@@ -320,7 +320,7 @@ def preservation_owner_ready(authority, owner_class):
         'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution',
         'I06_busy_followup_delivery', 'I07_automation_route_wakes',
         'I08_goals_loops_heartbeat', 'I05_controls_and_unknown',
-        'I11_session_mutations_finalizers',
+        'I11_session_mutations_finalizers', 'I10_startup_recovery_handoff',
     }
     if owner_class not in allowed:
         return False
@@ -328,6 +328,9 @@ def preservation_owner_ready(authority, owner_class):
     if coordinator is None:
         # Readiness is never proven by empty local maps while the authoritative ledger is absent.
         return False
+    if owner_class == 'I10_startup_recovery_handoff':
+        from gateway.session_recovery_custody import owner_ready
+        return owner_ready(authority)
     graph_owners = {'I05_controls_and_unknown', 'I11_session_mutations_finalizers'}
     if owner_class in graph_owners and _producer_graph(authority, coordinator) is None:
         return False

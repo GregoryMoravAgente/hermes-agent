@@ -369,6 +369,33 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
+def i10_source_snapshot(authority):
+    """Read LOCAL policy receipts, active admissions and the local adoption fences."""
+    pending = set()
+    rows = []
+    receipt_ids = tuple(local_receipt_ids(authority))
+    for sid in receipt_ids:
+        _latest, active, local, policy_source = _active_local_rows(authority, sid)
+        if any(_local_recovery_kind(row, policy_source) == 'unknown' for row in active):
+            pending.add(f"unknown:{sid}")
+        rows.extend(local)
+        for fence in _local_recovery_absence_fences(authority, sid, allow_legacy=False):
+            pending.add(f"{fence}:{sid}")
+    pending.update(str(row['admission_id']) for row in rows if row.get('admission_id'))
+    return {
+        "pending_ids": tuple(sorted(pending)),
+        "rows": tuple(rows),
+        "registry": {"local_receipts": tuple(sorted(receipt_ids)),
+                     "active_admissions": tuple(sorted(row.get('admission_id', '') for row in rows))},
+    }
+
+
+def register_i10_source(authority):
+    """Install LOCAL recovery's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "local_recovery", i10_source_snapshot)
+
+
 _LOCAL_POLICY_SOURCES = frozenset({'cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'})
 _FOREIGN_POLICY_SOURCES = frozenset({'a2a', 'kanban', 'cron', 'bot_room'})
 
@@ -581,11 +608,21 @@ def _managed_local_recovery_handles(authority, local, terminal_local):
     for row in local:
         admission_id = row['admission_id']
         handle = handles.get(admission_id)
-        if row.get('status') == 'queued' and handle is None:
+        if row.get('status') == 'queued' and (
+                handle is None or getattr(handle, 'owner_class', None) == 'I02_api_session_turn'):
             handles[admission_id] = ensure_recovery_root(
                 authority, row, consumer='local_recovery',
             )
-        elif handle is None or _validate_handle(authority, handle) is None:
+            handle = handles[admission_id]
+        bindings = getattr(authority, '_i10_recovery_bindings', None)
+        binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+        if (
+            handle is None
+            or _validate_handle(authority, handle) is None
+            or getattr(handle, 'owner_class', None) != 'I10_startup_recovery_handoff'
+            or not isinstance(binding, dict)
+            or binding.get('handle') is not handle
+        ):
             blocked = True
     terminal_handles = _local_recovery_handles(authority, terminal_local)
     bound_terminal = {key: value for key, value in terminal_handles.items() if value is not None}

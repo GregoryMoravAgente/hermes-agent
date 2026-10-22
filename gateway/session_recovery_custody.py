@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 import sqlite3
 from itertools import pairwise
-from typing import Any
+from typing import Any, Callable
 
 from hermes_state_runtime import RuntimeStoreError, get_session_admission
 
@@ -75,6 +75,31 @@ class RecoveryConsumerAbsence:
     authority_epoch: int
     profile_home: str
     reason: str
+    close_witness: RecoveryConsumerCloseWitness | None = None
+
+
+@dataclass(frozen=True)
+class RecoveryConsumerCloseWitness:
+    """Typed source snapshot attached at the reversible close boundary.
+
+    A source absence is admissible only after its own canonical registry/queue has been read while
+    the process ingress fence is closed.  The witness retains the exact profile, process, authority
+    epoch and close generation that produced that readback; a later generic empty-map check cannot
+    manufacture one.
+    """
+
+    schema: str
+    consumer: str
+    source: str
+    profile_id: str
+    profile_home: str
+    process_instance: str
+    authority_epoch: int
+    close_generation: int
+    source_generation: int
+    ingress_state: str
+    registry_digest: str
+    pending_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -95,6 +120,7 @@ class RecoveryConsumerReceipt:
     source_receipts: tuple[object, ...]
     finalizer_digest: str | None = None
     reason: str | None = None
+    close_witness: RecoveryConsumerCloseWitness | None = None
 
 
 @dataclass(frozen=True)
@@ -159,6 +185,7 @@ _RECEIPT_SCHEMA = "hermes.gateway.i10-consumer-receipt.v1"
 _ABSENCE_SCHEMA = "hermes.gateway.i10-consumer-absence.v1"
 _LOCAL_POLICY_SCHEMA = "hermes.gateway.local-policy-lineage.v1"
 _LOCAL_SOURCE_SCHEMA = "hermes.gateway.local-recovery-source.v1"
+_CLOSE_WITNESS_SCHEMA = "hermes.gateway.i10-consumer-close-witness.v1"
 _LOCAL_POLICY_SOURCES = frozenset({'cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'})
 _ACTIVE_STATES = {"accepted", "active", "unknown", "finalizing"}
 _TERMINAL_STATES = {"terminal", "failed", "cancelled"}
@@ -609,6 +636,7 @@ def record_source_delivery_receipt(authority, admission_id, receipt):
             updated.append(RecoveryConsumerReceipt(
                 item.schema, item.consumer, item.source, item.state, item.identity,
                 item.handle, source_receipts, item.finalizer_digest, item.reason,
+                item.close_witness,
             ))
             changed = True
         if changed:
@@ -1193,6 +1221,7 @@ def commit_binding_retirement(authority, proof):
                 receipt = RecoveryConsumerReceipt(
                     receipt.schema, receipt.consumer, receipt.source, "terminal", receipt.identity,
                     receipt.handle, source_receipts, proof.receipt_digest, receipt.reason,
+                    receipt.close_witness,
                 )
             updated.append(receipt)
         if updated:
@@ -1321,7 +1350,6 @@ def _adopt_native_inbound_root(authority, row, existing, *, consumer):
     authority._i10_recovery_seen = True
     return replacement
 
-
 def _reserve_recovery_root(authority, row, *, consumer):
     identity = _identity(row, authority)
     if identity is None:
@@ -1331,9 +1359,17 @@ def _reserve_recovery_root(authority, row, *, consumer):
     if existing is not None:
         binding = _binding_for_row(authority, row, consumer=consumer)
         if binding is None:
+            if (
+                consumer == "local_recovery"
+                and getattr(existing, "owner_class", None) == "I02_api_session_turn"
+            ):
+                from gateway.session_recovery_custody_roots import adopt_local_api_root
+                return adopt_local_api_root(authority, row, existing)
             return _adopt_native_inbound_root(
                 authority, row, existing, consumer=consumer,
             )
+        if getattr(existing, "owner_class", None) != OWNER_CLASS:
+            raise RuntimeStoreError("preservation_owner_unmapped")
         binding.setdefault("consumers", set()).add(consumer)
         binding["consumer"] = consumer
         return existing
@@ -1467,7 +1503,7 @@ def refresh_binding(authority, row):
 
 def consumer_receipt(
     authority, consumer, *, row=None, handle=None, source_receipts=(), state="active",
-    finalizer_digest=None, reason=None,
+    finalizer_digest=None, reason=None, close_witness=None,
 ):
     """Build a receipt only from an existing typed source result and exact bound handle."""
     if consumer not in CONSUMERS or state not in _ACTIVE_STATES | _TERMINAL_STATES:
@@ -1486,21 +1522,60 @@ def consumer_receipt(
         raise RuntimeStoreError("preservation_owner_unmapped")
     if state in _TERMINAL_STATES and not finalizer_digest:
         raise RuntimeStoreError("preservation_receipt_unmapped")
+    if close_witness is not None and not _valid_close_witness(authority, consumer, close_witness):
+        raise RuntimeStoreError("preservation_receipt_unmapped")
     return RecoveryConsumerReceipt(
         _RECEIPT_SCHEMA, consumer, _SOURCE_BY_CONSUMER[consumer], state, identity, handle,
-        source_receipts, finalizer_digest, reason,
+        source_receipts, finalizer_digest, reason, close_witness,
     )
 
 
-def unused_consumer(authority, consumer, *, reason):
+def unused_consumer(authority, consumer, *, reason, close_witness=None):
     """Record source-owned absence, never inferred from a generic empty map."""
     if consumer not in CONSUMERS or not isinstance(reason, str) or not reason:
         raise RuntimeStoreError("preservation_owner_mismatch")
     return RecoveryConsumerAbsence(
         _ABSENCE_SCHEMA, consumer, _SOURCE_BY_CONSUMER[consumer], authority.instance_id,
-        authority.epoch, str(_home(authority)), reason,
+        authority.epoch, str(_home(authority)), reason, close_witness,
     )
 
+
+
+def _valid_close_witness(authority, consumer, witness, *, close_generation=None):
+    from gateway.session_recovery_custody_sources import valid_close_witness
+    return valid_close_witness(
+        authority, consumer, witness, close_generation=close_generation,
+    )
+
+
+def _i10_close_fence_current(authority, close_generation):
+    from gateway.session_recovery_custody_sources import close_fence_current
+    return close_fence_current(authority, close_generation)
+
+
+def register_i10_consumer_source(authority, consumer, probe: Callable):
+    from gateway.session_recovery_custody_sources import register_consumer_source
+    return register_consumer_source(authority, consumer, probe)
+
+
+def _i10_source_registry(authority):
+    from gateway.session_recovery_custody_sources import source_registry
+    return source_registry(authority)
+
+
+def _close_witness(authority, consumer, close_generation, source_generation, snapshot):
+    from gateway.session_recovery_custody_sources import close_witness
+    return close_witness(authority, consumer, close_generation, source_generation, snapshot)
+
+
+def _attach_close_witness(authority, consumer, witness):
+    from gateway.session_recovery_custody_sources import attach_close_witness
+    return attach_close_witness(authority, consumer, witness)
+
+
+def refresh_i10_source_evidence(authority, close_generation):
+    from gateway.session_recovery_custody_sources import refresh_source_evidence
+    return refresh_source_evidence(authority, close_generation)
 
 def ensure_native_recovery_root(authority, row):
     """Retain one current I10 root for a queued ordinary native admission.
@@ -1769,6 +1844,9 @@ def observe_consumer(authority, consumer, receipt):
             or receipt.profile_home != str(_home(authority))
         ):
             return False
+        if receipt.close_witness is not None and not _valid_close_witness(
+                authority, consumer, receipt.close_witness):
+            return False
     elif isinstance(receipt, RecoveryConsumerReceipt):
         if (
             receipt.schema != _RECEIPT_SCHEMA
@@ -1780,6 +1858,9 @@ def observe_consumer(authority, consumer, receipt):
             or receipt.identity.process_instance != authority.instance_id
             or not _validate_source_receipts(receipt.source_receipts, consumer=receipt.consumer)
         ):
+            return False
+        if receipt.close_witness is not None and not _valid_close_witness(
+                authority, consumer, receipt.close_witness):
             return False
         binding = _bindings(authority).get(receipt.identity.admission_id)
         if (
@@ -1820,7 +1901,7 @@ def observe_consumer(authority, consumer, receipt):
 
 
 def owner_ready(authority):
-    """Return true after source-owned I10 receipts settle, or before I10 intake starts."""
+    """Return true only after every source-owned I10 consumer has settled or recorded absence."""
     coordinator = getattr(authority.runner, "runtime_custody", None)
     if coordinator is None:
         return False
@@ -1839,22 +1920,63 @@ def owner_ready(authority):
         return False
     if pending is not None or _bindings(authority):
         return False
-    observations = getattr(authority, "_i10_consumer_evidence", {})
-    if not getattr(authority, "_i10_recovery_seen", False):
-        # This is an unused profile only when the canonical queue and coordinator have both been
-        # checked and no I10 source has ever accepted work in this authority instance.
-        return True
+    observations = getattr(authority, "_i10_consumer_evidence", None)
+    if not isinstance(observations, dict):
+        return False
     for consumer in CONSUMERS:
-        stored = observations.get(consumer)
+        if consumer not in observations:
+            # A missing source observation is unknown.  An empty map or a never-set seen flag is
+            # not an absence receipt: every registered consumer must report its own intake scan.
+            return False
+        stored = observations[consumer]
         receipts = stored if isinstance(stored, tuple) else (stored,)
         if not receipts or any(receipt is None for receipt in receipts):
             return False
         for receipt in receipts:
             if isinstance(receipt, RecoveryConsumerAbsence):
-                if receipt.authority_epoch != authority.epoch or receipt.process_instance != authority.instance_id:
+                if (
+                    receipt.schema != _ABSENCE_SCHEMA
+                    or receipt.consumer != consumer
+                    or receipt.source != _SOURCE_BY_CONSUMER[consumer]
+                    or receipt.process_instance != authority.instance_id
+                    or receipt.authority_epoch != authority.epoch
+                    or receipt.profile_home != str(_home(authority))
+                    or not isinstance(receipt.reason, str)
+                    or not receipt.reason
+                ):
+                    return False
+                if receipt.close_witness is not None and not _valid_close_witness(
+                        authority, consumer, receipt.close_witness):
                     return False
                 continue
-            if not isinstance(receipt, RecoveryConsumerReceipt) or receipt.state not in _TERMINAL_STATES:
+            if (
+                not isinstance(receipt, RecoveryConsumerReceipt)
+                or receipt.schema != _RECEIPT_SCHEMA
+                or receipt.consumer != consumer
+                or receipt.source != _SOURCE_BY_CONSUMER[consumer]
+                or not isinstance(receipt.identity, RecoveryBindingIdentity)
+                or receipt.identity.profile_id != authority.profile_id
+                or receipt.identity.authority_epoch != authority.epoch
+                or receipt.identity.process_instance != authority.instance_id
+                or receipt.state not in _TERMINAL_STATES
+            ):
+                return False
+            if receipt.close_witness is not None and not _valid_close_witness(
+                    authority, consumer, receipt.close_witness):
+                return False
+            terminal_check = getattr(coordinator, "is_terminal_handle", None)
+            if receipt.handle is None or not callable(terminal_check):
+                return False
+            try:
+                same_handle = terminal_check(
+                    receipt.handle,
+                    owner_class=OWNER_CLASS,
+                    profile_id=authority.profile_id,
+                    authority_epoch=authority.epoch,
+                )
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                return False
+            if same_handle is not True:
                 return False
             if not receipt.finalizer_digest or not _validate_source_receipts(
                     receipt.source_receipts, consumer=receipt.consumer):
@@ -1862,41 +1984,17 @@ def owner_ready(authority):
     return True
 
 
-def owner_evidence(authority, *, process_instance, authority_epoch, close_generation, owner_id):
-    if not owner_ready(authority):
-        return None
-    try:
-        physical = _physical_owner(authority)
-        current_epoch = _current_epoch(authority)
-    except (RuntimeStoreError, AttributeError, TypeError, ValueError):
-        return None
-    if process_instance != authority.instance_id or authority_epoch != authority.epoch:
-        return None
-    observations = getattr(authority, "_i10_consumer_evidence", {})
-    consumer_proofs = []
-    for consumer in CONSUMERS:
-        stored = observations.get(consumer)
-        receipts = stored if isinstance(stored, tuple) else (stored,)
-        for receipt in receipts:
-            if isinstance(receipt, RecoveryConsumerReceipt):
-                consumer_proofs.append((consumer, receipt.identity.admission_id, receipt.finalizer_digest))
-            elif isinstance(receipt, RecoveryConsumerAbsence):
-                consumer_proofs.append((consumer, "unused", receipt.reason))
-        if not receipts or all(receipt is None for receipt in receipts):
-            consumer_proofs.append((consumer, "unused", "no_i10_intake_in_authority_epoch"))
-    return {
-        "source": "gateway/run_startup.py;gateway/session_local_recovery.py;"
-                  "gateway/platforms/webhook_ingress.py;gateway/run_adapters.py;"
-                  "gateway/run_notifications.py;gateway/session_bot_mailbox.py",
-        "process_instance": authority.instance_id,
-        "authority_epoch": current_epoch[0],
-        "close_generation": close_generation,
-        "owner_id": owner_id,
-        "profile_home": str(_home(authority)),
-        "consumers": tuple(consumer_proofs),
-        "observed": True,
-        "cross_process_proof": physical.get("cross_process_proof") is True,
-        "os_lock_owner": physical.get("os_lock_owner") is True,
-        "native_handle_retained": physical.get("native_handle_retained") is True,
-        "record_binding": physical.get("record_binding"),
-    }
+
+def owner_evidence(
+        authority, *, process_instance, authority_epoch, close_generation, owner_id,
+        require_close_witness=False,
+):
+    from gateway.session_recovery_custody_sources import owner_evidence as build_owner_evidence
+    return build_owner_evidence(
+        authority,
+        process_instance=process_instance,
+        authority_epoch=authority_epoch,
+        close_generation=close_generation,
+        owner_id=owner_id,
+        require_close_witness=require_close_witness,
+    )
