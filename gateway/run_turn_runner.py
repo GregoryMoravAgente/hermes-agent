@@ -251,19 +251,22 @@ def _classic_writer_proof_request_context(
     event = getattr(ctx, "classic_writer_event", None)
     if getattr(ctx, "classic_writer_binding", None) is not None:
         return event, True, ctx.classic_writer_binding
-    # A native API authority turn already has its I02 admission/terminal receipt.  Its
-    # ContextVar carries a managed child binding for the canonical turn, but no classic
-    # writer event owns that binding.  Treating that child as a direct I04 writer here
-    # requests the classic handoff on every checkpoint; the terminal proof then rejects
-    # the assistant/tool prefix as an invalid prefix repair and turns a valid run into
-    # ``session_persistence_failed``.  Only a source-owned classic event may opt this
-    # route into the legacy writer proof.
+    # A native API authority turn targeting the binding's logical session already has
+    # its I02 admission/terminal receipt.  Its ContextVar carries a managed child binding
+    # for the canonical turn, but no classic writer event owns that binding.  A compressed
+    # I04/I03 execution uses a distinct physical agent session and still needs the
+    # authenticated writer handoff.
     try:
         from gateway.session_api_turn import api_execution
         from gateway.session_classic_custody import ClassicExecutionEventBridge
         bridge = getattr(event, "_classic_execution_bridge", None)
+        agent_session_id = getattr(agent, "session_id", None)
+        binding_session_id = getattr(current_binding, "session_id", None)
         if (
             api_execution.get() is not None
+            and isinstance(agent_session_id, str) and agent_session_id
+            and isinstance(binding_session_id, str) and binding_session_id
+            and agent_session_id == binding_session_id
             and getattr(ctx, "classic_writer_binding", None) is None
             and not isinstance(bridge, ClassicExecutionEventBridge)
         ):
