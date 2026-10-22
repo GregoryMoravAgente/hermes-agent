@@ -55,6 +55,39 @@ async def _prepare_compressed_api_admission(api, owner, *, session_id, request_i
     return ref, row, child, home, store_path, original_owner_epoch
 
 
+async def _run_compressed_bound_api_admission(
+    api, owner, monkeypatch, *, run_id, session_id, request_id, child,
+):
+    """Admit, compress, and run one fixture turn through the source-owned I03 path."""
+    from gateway.platforms.api_server_run_custody import reserve_legacy, run_legacy_authority_turn
+    import gateway.session_api_turn as api_turn_module
+
+    original_admit = api_turn_module.admit_api_turn_async
+
+    async def admit_and_compress(adapter, *, custody=None, **kwargs):
+        admitted = await original_admit(adapter, custody=custody, **kwargs)
+        _authority, ref, _row = admitted
+        _publish_real_compression(owner, ref.session_id, child, "summary")
+        route = owner.sessions[ref.session_id].route
+        assert owner.runner.session_store.advance_compression_session(
+            route, ref.session_id, child,
+        )
+        return admitted
+
+    monkeypatch.setattr(api_turn_module, "admit_api_turn_async", admit_and_compress)
+    custody = reserve_legacy(api, owner.profile_id, run_id)
+    result = await run_legacy_authority_turn(
+        api, custody, active_run_id=None, run_kwargs={
+            "user_message": "physical child",
+            "conversation_history": [],
+            "session_id": session_id,
+            "request_id": request_id,
+            "notification_category": "result",
+        },
+    )
+    return custody, result
+
+
 @pytest.mark.asyncio
 async def test_real_openai_api_writer_handoff_binds_current_tip_before_i04_release(
     runtime_owned_api_owner, monkeypatch,
@@ -124,32 +157,60 @@ async def test_real_openai_api_writer_refuses_reacquired_owner_and_retains_unkno
 ):
     api, owner = runtime_owned_api_owner
     observed = {}
-    foreign_owner = None
     home = Path(owner.db.db_path).expanduser().resolve().parent
-    from gateway.runtime_ownership import ProfileOwnership, process_ownership
+    from gateway.runtime_ownership import process_ownership
 
     import agent.session_persistence_proof as proof_module
 
     original_publish = proof_module.publish_gateway_writer_proof
 
+    stale_evidence_active = False
+    owner_evidence = process_ownership.reservation_evidence(home)
+    assert isinstance(owner_evidence, dict)
+    original_owner_epoch = owner_evidence["owner_epoch"]
+    stale_owner_epoch = f"reacquired:{original_owner_epoch}"
+    original_reservation_evidence = process_ownership.reservation_evidence
+
+    # A real release/reacquire would correctly make the live I03 custody unrecoverable, so it
+    # cannot also prove clean fixture teardown.  Inject the replacement epoch only at the
+    # source-owned evidence read used by writer handoff, then restore the live evidence before
+    # the genuine I03 finalizer runs.
+    def reservation_evidence_with_reacquired_epoch(profile_home):
+        evidence = original_reservation_evidence(profile_home)
+        if not stale_evidence_active or Path(profile_home).expanduser().resolve() != home:
+            return evidence
+        assert isinstance(evidence, dict)
+        tampered = dict(evidence)
+        tampered["owner_epoch"] = stale_owner_epoch
+        tampered["physical_binding"] = (
+            str(home), stale_owner_epoch, evidence["native_descriptor"],
+        )
+        return tampered
+
+    monkeypatch.setattr(
+        process_ownership, "reservation_evidence", reservation_evidence_with_reacquired_epoch,
+    )
+
     def refuse_publish(agent, messages, proof, turn_id):
-        nonlocal foreign_owner
+        nonlocal stale_evidence_active
         binding = current_turn_binding()
-        assert resolve_physical_tip_witness(binding, ref.session_id, store_path) is None
+        assert binding is not None
+        assert resolve_physical_tip_witness(binding, binding.session_id, store_path) is None
         assert resolve_physical_tip_witness(binding, "missing-physical-tip", store_path) is None
-        assert process_ownership.release(home) is True
-        foreign_owner = ProfileOwnership()
-        foreign_owner.reserve([home])
-        assert foreign_owner.owns(home)
-        assert resolve_physical_tip_witness(binding, child, store_path) is None
-        assert foreign_owner.release(home) is True
-        process_ownership.reserve([home])
+        assert resolve_physical_tip_witness(binding, child, store_path) is not None
+        stale_evidence_active = True
         reacquired = process_ownership.reservation_evidence(home)
         assert isinstance(reacquired, dict)
-        assert reacquired["owner_epoch"] != original_owner_epoch
-        assert resolve_physical_tip_witness(binding, child, store_path) is None
-        refused = original_publish(agent, messages, proof, turn_id)
-        assert refused is None
+        assert reacquired["owner_epoch"] == stale_owner_epoch
+        try:
+            assert resolve_physical_tip_witness(binding, child, store_path) is None
+            refused = original_publish(agent, messages, proof, turn_id)
+            assert refused is None
+        finally:
+            stale_evidence_active = False
+            restored = process_ownership.reservation_evidence(home)
+            assert isinstance(restored, dict)
+            assert restored["owner_epoch"] == original_owner_epoch
         observed["agent"] = agent
         observed["refused"] = refused
         return refused
@@ -157,11 +218,21 @@ async def test_real_openai_api_writer_refuses_reacquired_owner_and_retains_unkno
     monkeypatch.setattr(proof_module, "publish_gateway_writer_proof", refuse_publish)
 
     try:
-        ref, row, child, home, store_path, original_owner_epoch = await _prepare_compressed_api_admission(
-            api, owner, session_id="compression-root-negative", request_id="tip-turn-negative",
-            child="compression-root-negative-child",
+        child = "compression-root-negative-child"
+        store_path = str(Path(owner.db.db_path).expanduser().resolve())
+        custody, result = await _run_compressed_bound_api_admission(
+            api, owner, monkeypatch, run_id="compression-negative-run",
+            session_id="compression-root-negative", request_id="tip-turn-negative",
+            child=child,
         )
-        await execute_admission(owner, ref, row)
+        assert result[0]["final_response"] == "runtime-custody-fixture-ok"
+        assert custody.released is True
+        completion = custody.finalizer_completion
+        assert completion is not None
+        assert completion.receipt is not None
+        assert completion.receipt.state == "complete"
+        assert completion.receipt.finalizer_ok is True
+        assert completion.receipt.release_ok is True
         assert observed["refused"] is None
         retained_agent = observed["agent"]
         assert getattr(retained_agent, "_classic_writer_proof_unknown", False) is True
@@ -169,8 +240,6 @@ async def test_real_openai_api_writer_refuses_reacquired_owner_and_retains_unkno
     finally:
         from gateway.run_runtime import _retire_profile_authority
 
-        if foreign_owner is not None and foreign_owner.owns(home):
-            assert foreign_owner.release(home) is True
         retired = await _retire_profile_authority(owner, timeout=5)
         assert retired is True
         if process_ownership.owns(home):
