@@ -219,8 +219,6 @@ async def _run_public_browser_turn(
     """Component-level custody control; public producer coverage is below."""
     from gateway.platforms.event import MessageEvent
     from gateway.runtime_service_custody import current_turn_binding
-    from gateway.session_ingress_context import native_callback
-    from hermes_constants import get_hermes_home
     from hermes_state_runtime import get_session_admission
     from tools.browser_tool import browser_navigate, browser_snapshot
 
@@ -231,8 +229,7 @@ async def _run_public_browser_turn(
     event = MessageEvent(
         text=f"browser-public-turn:{message_id}", source=source, message_id=message_id,
     )
-    with native_callback(fixture.runner, event, get_hermes_home()):
-        accepted = await fixture.authority.admit_native(event)
+    accepted = await fixture.admit_native_with_source_handoff(event)
     assert accepted.status == "queued"
     fixture.authority.native_waiters.add(accepted.admission_id)
     fixture.authority.waiters[accepted.admission_id] = asyncio.get_running_loop().create_future()

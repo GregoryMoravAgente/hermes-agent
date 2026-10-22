@@ -166,6 +166,9 @@ async def test_real_claim_existing_operation_rejects_a_copied_parent(tmp_path, m
 @pytest.mark.asyncio
 async def test_classic_commit_refusal_retains_accepted_row_before_publication(tmp_path, monkeypatch):
     from gateway.platforms.event import MessageEvent
+    from gateway.preservation_source_close import source_handoff_context
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import get_hermes_home
     from hermes_state_runtime import RuntimeStoreError, get_session_admission
     from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
 
@@ -179,6 +182,32 @@ async def test_classic_commit_refusal_retains_accepted_row_before_publication(tm
         session_key = store._generate_session_key(source)
         store.get_or_create_session(source, touch_activity=False)
         event = MessageEvent(text='retained commit', source=source, message_id='commit-refusal')
+
+        async def admit_native_with_source_handoff(native_event):
+            owner = fixture.runner._transport_owner(native_event.source)
+            assert owner is not None and owner[0] is fixture.adapter
+            source_adapter, source_profile = owner
+            source_close = fixture.runner._preservation_source_close
+            token = source_close.admit_source(
+                source_adapter, native_event, profile=source_profile, event=native_event,
+                phase='native-fixture',
+            )
+            completed = False
+            try:
+                with source_handoff_context((token,)):
+                    with native_callback(
+                        fixture.runner, native_event, get_hermes_home(), source_profile,
+                        source_token=token,
+                    ):
+                        receipt = await authority.admit_native(native_event)
+                        source_close.mark_producer_done(token)
+                        completed = True
+                        return receipt
+            except BaseException:
+                if not completed:
+                    source_close.mark_unknown(token, 'native_fixture_admission_failed')
+                raise
+
         assert authority._classic_begin(event, session_key, 'fifo')
         key = event._classic_custody_key
         record = authority._preservation_operations[key]
@@ -192,7 +221,7 @@ async def test_classic_commit_refusal_retains_accepted_row_before_publication(tm
         monkeypatch.setattr(authority, '_publish_pending', publications.append)
         monkeypatch.setattr(authority, '_schedule', schedules.append)
         with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
-            await authority.admit_native(event)
+            await admit_native_with_source_handoff(event)
         row = get_session_admission(authority.db, admission_id=record['admission_id'])
         assert row is not None and row['status'] == 'queued'
         assert row['request_id'] == event.message_id

@@ -247,6 +247,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
         fixture = SimpleNamespace(
             runner=runner, authority=authority, adapter=adapter, live=None, ref=None, claim=claim,
             run_real_admission=run_real_admission, cleanup=close_resources, binding=probe_binding,
+            admit_native_with_source_handoff=admit_native_with_source_handoff,
             finalizer_calls=0,
         )
         handed_off = True
