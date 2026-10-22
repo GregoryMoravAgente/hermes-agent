@@ -791,6 +791,8 @@ def browser_preflight() -> None:
         "--no-default-browser-check",
         f"--user-data-dir={profile}",
         "--dump-dom",
+        "--timeout=5000",
+        "--allow-chrome-scheme-url",
         sandbox_page_url,
     ]
     context = _enable_subreaper()
