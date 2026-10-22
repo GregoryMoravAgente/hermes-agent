@@ -39,6 +39,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.preservation_source_close import source_handoff_context
     from gateway.runtime_ownership import process_ownership
     from gateway.session_ingress_context import native_callback
     from hermes_constants import (
@@ -94,6 +95,31 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
         # Keep the source-owned scheduler fence for every caller; the unrelated probe is
         # optional because the I02 readiness helper must inspect its own current row.
         authority._schedule = lambda _ref: None
+
+        async def admit_native_with_source_handoff(native_event):
+            owner = runner._transport_owner(native_event.source)
+            assert owner is not None and owner[0] is adapter
+            source_adapter, source_profile = owner
+            source_close = runner._preservation_source_close
+            token = source_close.admit_source(
+                source_adapter, native_event, profile=source_profile, event=native_event,
+                phase="native-fixture",
+            )
+            completed = False
+            try:
+                with source_handoff_context((token,)):
+                    with native_callback(
+                        runner, native_event, get_hermes_home(), source_profile,
+                        source_token=token,
+                    ):
+                        receipt = await authority.admit_native(native_event)
+                        source_close.mark_producer_done(token)
+                        completed = True
+                        return receipt
+            except BaseException:  # health: allow BLE001 -- cancellation retains the real source lease
+                if not completed:
+                    source_close.mark_unknown(token, "native_fixture_admission_failed")
+                raise
         probe_binding = None
         if include_probe:
             # Keep one independently claimed producer edge for the legacy custody
@@ -111,8 +137,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             # Use the real native producer: it reserves/binds the I01 parent around the durable
             # admission before the FIFO claim can reserve its exact I04 child.
             native_event = MessageEvent(text=request_id, source=source, message_id=request_id)
-            with native_callback(runner, native_event, get_hermes_home()):
-                receipt = await authority.admit_native(native_event)
+            receipt = await admit_native_with_source_handoff(native_event)
             assert receipt.status == "queued"
             ref = receipt.ref
             live = authority.sessions[ref.session_id]
@@ -137,8 +162,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             probe_event = MessageEvent(
                 text="fixture-probe", source=probe_source, message_id="fixture-probe",
             )
-            with native_callback(runner, probe_event, get_hermes_home()):
-                probe_receipt = await authority.admit_native(probe_event)
+            probe_receipt = await admit_native_with_source_handoff(probe_event)
             assert probe_receipt.status == "queued"
             probe_ref = probe_receipt.ref
             probe_live = authority.sessions[probe_ref.session_id]
@@ -157,8 +181,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             from gateway.session_results import execution_result
 
             native_event = MessageEvent(text=text, source=source, message_id=text)
-            with native_callback(runner, native_event, get_hermes_home()):
-                receipt = await authority.admit_native(native_event)
+            receipt = await admit_native_with_source_handoff(native_event)
             assert receipt.status == "queued"
             # The native waiter is optional: finalizer-only controls use it to avoid a
             # platform send, while the pre-effect retry control reaches deliver_settled.

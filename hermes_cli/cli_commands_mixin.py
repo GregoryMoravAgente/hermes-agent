@@ -416,7 +416,9 @@ def _browser_connect(cli, cdp_url: str) -> None:
         return
     cdp_url, port = normalized
     # Clear any existing browser sessions so the next tool call uses the new backend
-    _probe("tools.browser_tool_lifecycle", "cleanup_all_browsers", None)
+    cleanup_result = _probe("tools.browser_tool_lifecycle", "cleanup_all_browsers", _FAILED)
+    if cleanup_result is False or cleanup_result is _FAILED:
+        return _say_block(_t("browser.not_connected"))
     print()
     # Already serving CDP? For the default-local URL probe both loopbacks: a squatter
     # on 127.0.0.1:<port> (e.g. an IDE debugger) can push the browser to bind [::1] only.
@@ -438,33 +440,23 @@ def _browser_connect(cli, cdp_url: str) -> None:
     _probe("tools.browser_tool_cdp", "_ensure_cdp_supervisor", None, "default")
     _say_block(_t("browser.connected"), f"   {_t('browser.endpoint', url=found)}")
     # Tell the model the CDP browser was made available on purpose.
-    if hasattr(cli, '_pending_input'):
-        cli._pending_input.put(
-            "[System note: The user invoked /browser connect and connected your browser tools to "
-            "a Chromium-family dev/debug browser via Chrome DevTools Protocol. "
-            "Your browser_navigate, browser_snapshot, browser_click, and other browser tools now "
-            "control that CDP browser. The command itself is a signal that using browser tools for "
-            "their current browser-related request is expected; do not wait for separate permission "
-            "just because CDP is connected. This is typically a Hermes-managed isolated debug "
-            "profile, not the user's main everyday browser. It is still user-visible and may contain "
-            "pages, logged-in sessions, or cookies in that debug profile, so avoid destructive actions, "
-            "closing tabs, or navigating away unless the user's task calls for it.]")
+    from tools.browser_tool_lifecycle import notify_cdp_connect
+    notify_cdp_connect(cli)
 
 
 def _browser_disconnect(cli) -> None:
     if not os.environ.get("BROWSER_CDP_URL", "").strip():
         return _say_block(_t("browser.already_default"))
-    os.environ.pop("BROWSER_CDP_URL", None)
-    with suppress(Exception):
-        from tools.browser_tool_lifecycle import cleanup_all_browsers
-        from tools.browser_tool_cdp import _stop_cdp_supervisor
-        _stop_cdp_supervisor("default")
-        cleanup_all_browsers()
+    from tools.browser_tool_lifecycle import disconnect_cdp_browser, notify_cdp_disconnect
+    status = disconnect_cdp_browser(
+        lambda: _probe("tools.browser_tool_lifecycle", "cleanup_all_browsers", _FAILED), _FAILED
+    )
+    if status == "already_default":
+        return _say_block(_t("browser.already_default"))
+    if status == "not_connected":
+        return _say_block(_t("browser.not_connected"))
     _say_block(_t("browser.disconnected"), f"   {_t('browser.reverted')}")
-    if hasattr(cli, '_pending_input'):
-        cli._pending_input.put(
-            "[System note: The user has disconnected the browser tools from their live Chromium-family browser. "
-            "Browser tools are back to default mode (headless local browser or cloud provider).]")
+    notify_cdp_disconnect(cli)
 
 
 # /browser status headline per local browser.engine value: (headline key, *detail keys) under

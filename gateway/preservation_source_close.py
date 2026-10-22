@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import inspect
 import hashlib
 import json
@@ -107,6 +107,94 @@ class SourcePendingSnapshot:
 
 
 @dataclass(frozen=True)
+class SourceTransportReceipt:
+    """Typed source-owned handoff for a non-bridge producer.
+
+    The opaque marker and handoff are retained by object identity.  They are not
+    serialized into the receipt digest, so a caller cannot replace them with a
+    copied public dictionary.  ``native_occurrence_id`` is optional at admission:
+    ``enter_native`` assigns the real occurrence later and the finalizer receipt
+    records that value.
+    """
+
+    protocol: str
+    producer_kind: str
+    source_marker: object = field(repr=False, compare=False)
+    registration_generation: int
+    invocation_id: int
+    close_generation: int | None
+    producer_generation: str
+    source_event_digest: str
+    wire_identity_digest: str
+    handoff_digest: str
+    ack_required: bool
+    ack_sent: bool
+    ack_digest: str
+    native_occurrence_id: str | None = None
+    handoff: object | None = field(default=None, repr=False, compare=False)
+    custody_ref: str | None = None
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "protocol": self.protocol,
+            "producer_kind": self.producer_kind,
+            "registration_generation": self.registration_generation,
+            "invocation_id": self.invocation_id,
+            "close_generation": self.close_generation,
+            "producer_generation": self.producer_generation,
+            "source_event_digest": self.source_event_digest,
+            "wire_identity_digest": self.wire_identity_digest,
+            "handoff_digest": self.handoff_digest,
+            "ack_required": self.ack_required,
+            "ack_sent": self.ack_sent,
+            "ack_digest": self.ack_digest,
+            "native_occurrence_id": self.native_occurrence_id,
+            "custody_ref": self.custody_ref,
+        }
+
+    @property
+    def receipt_digest(self) -> str:
+        encoded = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def matches_token(self, token: SourceAdmissionToken) -> bool:
+        return bool(
+            isinstance(self.protocol, str)
+            and self.protocol.startswith("hermes.")
+            and isinstance(self.producer_kind, str)
+            and bool(self.producer_kind)
+            and self.source_marker is token.marker
+            and self.registration_generation == token.registration_generation
+            and self.invocation_id == token.invocation_id
+            and self.close_generation == token.close_generation
+            and isinstance(self.producer_generation, str)
+            and bool(self.producer_generation)
+            and (
+                token.producer_generation is None
+                or token.producer_generation == self.producer_generation
+            )
+            and isinstance(self.source_event_digest, str)
+            and bool(self.source_event_digest)
+            and isinstance(self.wire_identity_digest, str)
+            and bool(self.wire_identity_digest)
+            and isinstance(self.handoff_digest, str)
+            and bool(self.handoff_digest)
+            and isinstance(self.ack_digest, str)
+            and bool(self.ack_digest)
+            and self.handoff is not None
+            and (
+                self.custody_ref is None
+                or (isinstance(self.custody_ref, str) and bool(self.custody_ref))
+            )
+            and (not self.ack_required or self.ack_sent)
+            and (
+                self.native_occurrence_id is None
+                or self.native_occurrence_id == token.native_occurrence_id
+            )
+        )
+
+
+@dataclass(frozen=True)
 class SourceFinalizerReceipt:
     """Immutable observation emitted by the actual source/background finalizer."""
 
@@ -126,10 +214,23 @@ class SourceFinalizerReceipt:
     sequence: int | None
     custody_ref: str | None
     finalizer_digest: str
+    producer_kind: str | None = None
+    source_event_digest: str | None = None
+    wire_identity_digest: str | None = None
+    handoff_digest: str | None = None
+    ack_required: bool | None = None
+    ack_sent: bool | None = None
+    ack_digest: str | None = None
 
     @classmethod
     def build(cls, token: SourceAdmissionToken, *, status: str, reason: str = ""):
         delivery = token.transport_receipt if isinstance(token.transport_receipt, dict) else {}
+        typed = token.transport_receipt if isinstance(token.transport_receipt, SourceTransportReceipt) else None
+        close_generation = (
+            typed.close_generation
+            if typed is not None
+            else delivery.get("close_generation")
+        )
         identity = {
             "registration_generation": token.registration_generation,
             "native_occurrence_id": token.native_occurrence_id,
@@ -139,16 +240,27 @@ class SourceFinalizerReceipt:
             "queue_epoch": delivery.get("queue_epoch"),
             "bridge_instance": delivery.get("bridge_instance"),
             "owner_epoch": delivery.get("owner_epoch"),
-            "close_generation": delivery.get("close_generation"),
+            "close_generation": close_generation,
             "item_id": delivery.get("item_id"),
             "sequence": delivery.get("sequence"),
             "custody_ref": token.custody_ref or delivery.get("custody_ref"),
             "status": status,
             "reason": reason,
         }
+        if typed is not None:
+            identity.update({
+                "protocol": typed.protocol,
+                "producer_kind": typed.producer_kind,
+                "source_event_digest": typed.source_event_digest,
+                "wire_identity_digest": typed.wire_identity_digest,
+                "handoff_digest": typed.handoff_digest,
+                "ack_required": typed.ack_required,
+                "ack_sent": typed.ack_sent,
+                "ack_digest": typed.ack_digest,
+            })
         encoded = json.dumps(identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
         return cls(
-            protocol="hermes.whatsapp.source-finalizer.v1",
+            protocol=typed.protocol if typed is not None else "hermes.whatsapp.source-finalizer.v1",
             status=status,
             reason=reason,
             registration_generation=token.registration_generation,
@@ -159,15 +271,22 @@ class SourceFinalizerReceipt:
             queue_epoch=delivery.get("queue_epoch"),
             bridge_instance=delivery.get("bridge_instance"),
             owner_epoch=delivery.get("owner_epoch"),
-            close_generation=delivery.get("close_generation"),
+            close_generation=close_generation,
             item_id=delivery.get("item_id"),
             sequence=delivery.get("sequence"),
             custody_ref=token.custody_ref or delivery.get("custody_ref"),
             finalizer_digest=hashlib.sha256(encoded.encode("utf-8")).hexdigest(),
+            producer_kind=typed.producer_kind if typed is not None else None,
+            source_event_digest=typed.source_event_digest if typed is not None else token.source_event_digest,
+            wire_identity_digest=typed.wire_identity_digest if typed is not None else token.wire_descriptor_digest,
+            handoff_digest=typed.handoff_digest if typed is not None else None,
+            ack_required=typed.ack_required if typed is not None else None,
+            ack_sent=typed.ack_sent if typed is not None else None,
+            ack_digest=typed.ack_digest if typed is not None else None,
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "protocol": self.protocol,
             "status": self.status,
             "reason": self.reason,
@@ -185,6 +304,17 @@ class SourceFinalizerReceipt:
             "custody_ref": self.custody_ref,
             "finalizer_digest": self.finalizer_digest,
         }
+        if self.producer_kind is not None:
+            result.update({
+                "producer_kind": self.producer_kind,
+                "source_event_digest": self.source_event_digest,
+                "wire_identity_digest": self.wire_identity_digest,
+                "handoff_digest": self.handoff_digest,
+                "ack_required": self.ack_required,
+                "ack_sent": self.ack_sent,
+                "ack_digest": self.ack_digest,
+            })
+        return result
 
 
 @dataclass(frozen=True)
@@ -827,14 +957,38 @@ class PreservationSourceClose:
         if not callable(settlement):
             self.mark_unknown(token, "transport_settlement_missing")
             return None
+        requested_custody = custody_ref
+        if isinstance(receipt, SourceTransportReceipt):
+            if not receipt.matches_token(token):
+                self.mark_unknown(token, "typed_transport_identity_mismatch")
+                return None
+            if receipt.custody_ref is not None and custody_ref not in {None, receipt.custody_ref}:
+                self.mark_unknown(token, "typed_transport_custody_mismatch")
+                return None
+            requested_custody = receipt.custody_ref or custody_ref
+        elif not isinstance(receipt, dict):
+            self.mark_unknown(token, "transport_receipt_type_unknown")
+            return None
+        token.custody_ref = (
+            requested_custody
+            if isinstance(requested_custody, str) and requested_custody
+            else secrets.token_urlsafe(32)
+        )
+        if isinstance(receipt, SourceTransportReceipt):
+            receipt = replace(receipt, custody_ref=token.custody_ref)
         token.transport_receipt = receipt
-        token.custody_ref = custody_ref if isinstance(custody_ref, str) and custody_ref else secrets.token_urlsafe(32)
         token.transport_settled = False
         token.transport_settlement = settlement
         token.transport_settlement_started = False
         token.settlement_witness = None
         token.settlement_receipt = None
-        if isinstance(receipt, dict) and ("queue_epoch" in receipt or "wire_identity" in receipt):
+        if isinstance(receipt, SourceTransportReceipt):
+            token.producer_generation = receipt.producer_generation
+            token.wire_descriptor_digest = receipt.wire_identity_digest
+            token.source_event_digest = receipt.source_event_digest
+            token.transport_receipt_digest = receipt.receipt_digest
+            token.transport_status = "pending"
+        elif isinstance(receipt, dict) and ("queue_epoch" in receipt or "wire_identity" in receipt):
             try:
                 token.capture_bridge_delivery(receipt)
             except (AttributeError, TypeError, ValueError):
@@ -864,6 +1018,12 @@ class PreservationSourceClose:
                profile: str | None = None) -> SourceAdmissionToken | None:
         """Transfer an accepted held item to a newly registered adapter instance atomically."""
         if not isinstance(token, SourceAdmissionToken) or token not in self._leases:
+            return None
+        if isinstance(token.transport_receipt, SourceTransportReceipt):
+            # A typed receipt is bound to its registration and physical producer
+            # generation; handing it to a successor would make the old occurrence
+            # appear settled under a new owner.
+            self.mark_unknown(token, "typed_transport_rehome_unsupported")
             return None
         registration = self._registration_for_adapter(adapter, profile)
         if registration is None:
@@ -967,6 +1127,7 @@ class PreservationSourceClose:
             token.native_entered = True
             if token.native_occurrence_id is None:
                 token.native_occurrence_id = f"{token.registration.generation}:{token.invocation_id}"
+            self._bind_typed_native_occurrence(token)
             token.state = "native"
             self.bind_event(token, event)
         active = tuple(token for token in tokens if token in self._leases)
@@ -980,6 +1141,7 @@ class PreservationSourceClose:
         token = self.admit_source(registration.adapter, event, profile=profile, event=event, phase="native-callback")
         token.native_entered = True
         token.native_occurrence_id = token.native_occurrence_id or f"{token.registration.generation}:{token.invocation_id}"
+        self._bind_typed_native_occurrence(token)
         token.state = "native"
         token.producer_done = True
         return token
@@ -1178,6 +1340,24 @@ class PreservationSourceClose:
             self._signal()
             return
 
+    @staticmethod
+    def _bind_typed_transport_generation(token: SourceAdmissionToken, close_generation: int | None) -> None:
+        receipt = token.transport_receipt
+        if not isinstance(receipt, SourceTransportReceipt):
+            return
+        bound = replace(receipt, close_generation=close_generation)
+        token.transport_receipt = bound
+        token.transport_receipt_digest = bound.receipt_digest
+
+    @staticmethod
+    def _bind_typed_native_occurrence(token: SourceAdmissionToken) -> None:
+        receipt = token.transport_receipt
+        if not isinstance(receipt, SourceTransportReceipt):
+            return
+        bound = replace(receipt, native_occurrence_id=token.native_occurrence_id)
+        token.transport_receipt = bound
+        token.transport_receipt_digest = bound.receipt_digest
+
     def begin_close(self, close_generation: int) -> bool:
         """Close each registered producer at one exact coordinator generation."""
         if type(close_generation) is not int or close_generation < 1:
@@ -1208,6 +1388,7 @@ class PreservationSourceClose:
                 self._unknown_sources[("contract", registration.generation)] = "source_close_hook_missing"
         for token in tuple(self._leases):
             token.close_generation = close_generation
+            self._bind_typed_transport_generation(token, close_generation)
             token.identity = (token.registration.adapter, token.registration.profile,
                               token.registration.transport_owner, token.registration.generation,
                               close_generation)
@@ -1248,6 +1429,7 @@ class PreservationSourceClose:
                     self._unknown_sources[("reclose", registration.generation)] = "source_reclose_failed"
             for token in tuple(self._leases):
                 token.close_generation = close_generation
+                self._bind_typed_transport_generation(token, close_generation)
                 token.identity = (token.registration.adapter, token.registration.profile,
                                   token.registration.transport_owner, token.registration.generation,
                                   close_generation)
@@ -1261,6 +1443,7 @@ class PreservationSourceClose:
         self._close_generation = None
         for token in tuple(self._leases):
             token.close_generation = None
+            self._bind_typed_transport_generation(token, None)
             token.identity = (token.registration.adapter, token.registration.profile,
                               token.registration.transport_owner, token.registration.generation, None)
         self._signal()

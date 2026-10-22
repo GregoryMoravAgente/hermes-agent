@@ -873,6 +873,11 @@ def started_mux(tmp_path, monkeypatch, unused_tcp_port):
     finally:
         if runner is not None:
             if started:
+                yuanbao = getattr(runner, "adapters", {}).get(Platform.YUANBAO)
+                if yuanbao is not None and getattr(
+                    getattr(yuanbao, "_connection", None), "ws", None
+                ) is not None:
+                    call(yuanbao.disconnect())
                 call(runner.stop())
             else:
                 if getattr(runner, "session_runtime_descriptor", None) is not None:
@@ -889,6 +894,231 @@ def started_mux(tmp_path, monkeypatch, unused_tcp_port):
         loop.call_soon_threadsafe(loop.stop)
         thread.join(30)
         assert not thread.is_alive(), "started gateway loop did not stop"
+        loop.close()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.fixture
+def started_yuanbao(tmp_path, monkeypatch, unused_tcp_port):
+    """Start the real Gateway/I04 path with Yuanbao configured before READY.
+
+    The only test seam is a loopback websocket and sign-token response installed
+    before ``GatewayRunner.start``.  The adapter constructor, AUTH_BIND decoder,
+    registration, handler wiring, source handoff and READY lifecycle remain the
+    production path; no adapter is inserted after startup.
+    """
+    import asyncio
+    import json
+    import threading
+
+    from gateway.control_socket import GatewayControlServer
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    from gateway.run_runtime import (
+        drain_gateway_runtime,
+        initialize_gateway_runtime,
+        publish_gateway_runtime_ready,
+        start_gateway_runtime_api,
+    )
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import _IMPORT_DEFAULT_DB_PATH
+    import hermes_state
+    from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+    from tui_gateway.hosted_tui_custody import close_profile
+
+    class _LoopbackWebSocket:
+        def __init__(self, auth_frame):
+            self.sent = []
+            self.open = True
+            self._auth_frame = auth_frame
+            self._auth_sent = False
+            self._closed = asyncio.Event()
+            self._frames = asyncio.Queue()
+            self._close_sent = False
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            self._auth_sent = True
+            try:
+                decoded = yuanbao_module.decode_conn_msg(payload)
+            except (KeyError, TypeError, ValueError):
+                return
+            head = decoded.get('head', {})
+            if head.get('cmd_type') != yuanbao_module.CMD_TYPE['Request']:
+                return
+            if head.get('cmd') == 'auth-bind':
+                return
+            await self._frames.put(yuanbao_proto.encode_conn_msg_full(
+                cmd_type=yuanbao_module.CMD_TYPE['Response'],
+                cmd=head['cmd'], seq_no=head['seq_no'], msg_id=head['msg_id'],
+                module=head['module'], data=b'',
+            ))
+
+        async def recv(self):
+            if self._auth_sent and self._auth_frame is not None:
+                frame, self._auth_frame = self._auth_frame, None
+                return frame
+            if self._closed.is_set() and self._frames.empty():
+                raise StopAsyncIteration
+            frame = await self._frames.get()
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._closed.is_set() and self._frames.empty():
+                raise StopAsyncIteration
+            frame = await self._frames.get()
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+        async def close(self):
+            self.open = False
+            if not self._close_sent:
+                self._close_sent = True
+                self._closed.set()
+                await self._frames.put(None)
+
+        async def wait_closed(self):
+            if not self._close_sent:
+                self._close_sent = True
+                self._closed.set()
+                await self._frames.put(None)
+
+    from plugins.platforms.yuanbao import adapter as yuanbao_module
+    from plugins.platforms.yuanbao.adapter import ConnectionManager, YuanbaoAdapter
+    from plugins.platforms.yuanbao import yuanbao_proto
+
+    def _auth_frame():
+        auth_data = yuanbao_proto._encode_parts([(1, 'n', 0), (3, 's', 'loopback-connect')])
+        return yuanbao_proto.encode_conn_msg_full(
+            cmd_type=yuanbao_module.CMD_TYPE['Response'], cmd='auth-bind', seq_no=1,
+            msg_id='loopback-auth', module='conn_access', data=auth_data,
+        )
+
+    async def _loopback_token(self):
+        return {
+            'token': 'loopback-token', 'bot_id': 'synthetic-yuanbao-bot',
+            'source': 'bot', 'duration': 3600, 'product': 'fixture',
+        }
+
+    async def _loopback_dial(self, token_data):
+        self._ws = _LoopbackWebSocket(_auth_frame())
+        if not await self._authenticate(token_data):
+            await self._cleanup_ws()
+            return False
+        return True
+
+    monkeypatch.setattr(yuanbao_module.YuanbaoAdapter, '_get_cached_token', _loopback_token)
+    monkeypatch.setattr(ConnectionManager, '_dial', _loopback_dial)
+
+    root = (tmp_path / '.hermes').resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', _IMPORT_DEFAULT_DB_PATH)
+    (root / 'config.yaml').write_text(json.dumps({
+        'model': {'default': 'fixture-model'}, 'platform_toolsets': {'cli': []},
+    }))
+    api_key = 'started-yuanbao-api-key-0123456789'
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(
+                enabled=True, extra={'key': api_key, 'port': unused_tcp_port},
+            ),
+            Platform.YUANBAO: PlatformConfig(
+                enabled=True,
+                extra={
+                    'app_id': 'synthetic-yuanbao-app',
+                    'app_secret': 'synthetic-yuanbao-secret',
+                    'ws_url': 'wss://loopback.invalid/ws',
+                    'api_domain': 'https://loopback.invalid',
+                    'dm_policy': 'allowlist',
+                    'dm_allow_from': 'synthetic-yuanbao-user',
+                    'group_policy': 'allowlist',
+                    'group_allow_from': 'synthetic-group',
+                    'bot_id': 'synthetic-yuanbao-bot',
+                },
+            ),
+        },
+        sessions_dir=root / 'sessions',
+    )
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name='started-yuanbao-loop')
+    thread.start()
+    runner = None
+    adapter = None
+    control_server = None
+    home_token = set_hermes_home_override(root)
+    previous_active_adapter = YuanbaoAdapter.get_active()
+    reserved = False
+    started = False
+
+    def call(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(30)
+
+    def call_sync(function, *args):
+        async def invoke():
+            return function(*args)
+        return call(invoke())
+
+    def close_replaced_active_adapter():
+        active_adapter = YuanbaoAdapter.get_active()
+        if active_adapter is None or active_adapter is adapter or active_adapter is previous_active_adapter:
+            return
+        try:
+            call(active_adapter.disconnect())
+        finally:
+            YuanbaoAdapter.set_active(previous_active_adapter)
+
+    try:
+        with FakeLLMServer(default_text='started-yuanbao-fixture-ok') as provider:
+            write_hermes_home(root, provider.base_url)
+            process_ownership.reserve([root])
+            reserved = True
+            runner = GatewayRunner(config)
+            call(initialize_gateway_runtime(runner))
+            control_server = runner.session_control_server = GatewayControlServer(
+                root, verb_handlers={'identify': lambda: runner.session_runtime_descriptor}
+            )
+            call(control_server.start())
+            call(start_gateway_runtime_api(runner))
+            assert call(runner.start()) is True
+            started = True
+            call_sync(publish_gateway_runtime_ready, runner)
+            assert runner._running is True
+            assert runner.session_runtime_descriptor['state'] == 'ready'
+            adapter = runner.adapters[Platform.YUANBAO]
+            yield runner, adapter, loop, call, adapter._connection
+    finally:
+        if runner is not None:
+            if started:
+                close_replaced_active_adapter()
+                try:
+                    call(runner.stop())
+                finally:
+                    YuanbaoAdapter.set_active(previous_active_adapter)
+            else:
+                if getattr(runner, 'session_runtime_descriptor', None) is not None:
+                    call(drain_gateway_runtime(runner))
+                YuanbaoAdapter.set_active(previous_active_adapter)
+            if control_server is not None:
+                call(control_server.stop())
+            for authority in tuple(getattr(runner, 'session_authorities', []) or ()):
+                assert close_profile(authority), 'Yuanbao fixture profile did not close'
+                authority.db.close()
+            runner.session_store.close_all_db_handles()
+            runner.close_all_session_db_handles()
+        if reserved:
+            process_ownership.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(30)
+        assert not thread.is_alive(), 'started Yuanbao loop did not stop'
         loop.close()
         reset_hermes_home_override(home_token)
 

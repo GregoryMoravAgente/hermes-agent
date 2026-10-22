@@ -6,7 +6,7 @@ dedicated persistent Firefox profile on the server side.
 """
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -23,10 +23,13 @@ from tools.browser_camofox_state import get_camofox_identity
 
 
 def _mock_response(status=200, json_data=None):
-    resp = MagicMock()
+    import requests
+
+    resp = requests.Response()
     resp.status_code = status
-    resp.json.return_value = json_data or {}
-    resp.raise_for_status = MagicMock()
+    resp.url = "http://localhost:9377/test"
+    resp.headers["Content-Type"] = "application/json"
+    resp._content = json.dumps(json_data or {}).encode("utf-8")
     return resp
 
 
@@ -105,7 +108,7 @@ class TestManagedPersistenceMode:
         with (
             _enable_persistence(),
             patch("tools.browser_camofox.requests.post", side_effect=_capture_post),
-            patch("tools.browser_camofox.requests.delete", return_value=_mock_response()),
+            patch("tools.browser_camofox.requests.delete", return_value=_mock_response(json_data={"ok": True})),
         ):
             first = json.loads(camofox_navigate("https://example.com", task_id="task-1"))
             camofox_close("task-1")

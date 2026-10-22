@@ -148,9 +148,16 @@ def _browser_connect(rid, params: dict) -> dict:
                       else parsed._replace(path="", params="", query="", fragment="").geturl())
         # Reap BEFORE publishing the new env (an in-flight tool call sees the old supervisor closed)
         # and AFTER (the default task's cached supervisor drains against the new URL).
-        cleanup_all_browsers()
+        if cleanup_all_browsers() is False:
+            return _err(rid, 5032, "browser session cleanup is unresolved")
+        previous_cdp_url = os.environ.get("BROWSER_CDP_URL")
         os.environ["BROWSER_CDP_URL"] = normalized
-        cleanup_all_browsers()
+        if cleanup_all_browsers() is False:
+            if previous_cdp_url is None:
+                os.environ.pop("BROWSER_CDP_URL", None)
+            else:
+                os.environ["BROWSER_CDP_URL"] = previous_cdp_url
+            return _err(rid, 5032, "browser session cleanup is unresolved")
     except Exception as e:
         return _err(rid, 5031, str(e))
     return _ok(rid, {"connected": True, "url": normalized,
@@ -159,14 +166,20 @@ def _browser_connect(rid, params: dict) -> dict:
 
 def _browser_disconnect(rid) -> dict:
     # Reap, drop the override, reap again — same swap window as ``_browser_connect``.
-    def reap() -> None:
+    def reap() -> bool:
         with contextlib.suppress(Exception):
             from tools.browser_tool_lifecycle import cleanup_all_browsers
-            cleanup_all_browsers()
+            return cleanup_all_browsers() is not False
+        return False
 
-    reap()
+    previous_cdp_url = os.environ.get("BROWSER_CDP_URL")
+    if not reap():
+        return _err(rid, 5032, "browser session cleanup is unresolved")
     os.environ.pop("BROWSER_CDP_URL", None)
-    reap()
+    if not reap():
+        if previous_cdp_url is not None:
+            os.environ["BROWSER_CDP_URL"] = previous_cdp_url
+        return _err(rid, 5032, "browser session cleanup is unresolved")
     return _ok(rid, {"connected": False})
 
 

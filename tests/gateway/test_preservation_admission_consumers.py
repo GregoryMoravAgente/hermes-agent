@@ -72,8 +72,11 @@ def _reserved_profile_owner(authority, monkeypatch):
 async def test_native_entrypoint_binds_real_durable_admission(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
+    from gateway.preservation_source_close import source_handoff_context
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
 
     from plugins.platforms.whatsapp.adapter import WhatsAppAdapter
@@ -96,7 +99,27 @@ async def test_native_entrypoint_binds_real_durable_admission(tmp_path, monkeypa
         message_id='native-preservation-r2',
     )
     try:
-        receipt = await authority.admit_native(event)
+        owner = runner._transport_owner(event.source)
+        assert owner is not None and owner[0] is adapter
+        source_adapter, source_profile = owner
+        source_close = runner._preservation_source_close
+        token = source_close.admit_source(
+            source_adapter, event, profile=source_profile, event=event,
+            phase='native-fixture',
+        )
+        completed = False
+        try:
+            with source_handoff_context((token,)):
+                with native_callback(
+                    runner, event, get_hermes_home(), source_profile, source_token=token,
+                ):
+                    receipt = await authority.admit_native(event)
+                    source_close.mark_producer_done(token)
+                    completed = True
+        except BaseException:  # health: allow BLE001 -- cancellation retains the real source lease
+            if not completed:
+                source_close.mark_unknown(token, 'native_fixture_admission_failed')
+            raise
         rows = list_session_admissions(authority.db, session_id=receipt.ref.session_id)
         assert len(rows) == 1 and rows[0]['status'] == 'queued'
         handle = authority._preservation_handles[rows[0]['admission_id']]

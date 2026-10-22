@@ -4,6 +4,7 @@
 (owner-thread close vs stranger-thread abort), credential rotation and route-derived headers.
 """
 import logging
+import os
 import threading
 import time
 from contextlib import suppress
@@ -100,6 +101,40 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         agent._replace_primary_openai_client(reason="fallback_timeout_apply")
 
 
+def cleanup_task_resources(agent, task_id: str, *, persistent_env_checker=None, runtime_getter=None) -> None:
+    """Release per-turn VM/browser resources through the client lifecycle owner."""
+    if runtime_getter is None:
+        def runtime_getter():
+            import run_agent
+            return run_agent
+
+    if persistent_env_checker is None:
+        from tools.terminal_tool_lifecycle import is_persistent_env as persistent_env_checker
+
+    def _headed() -> bool:
+        try:
+            from tools.browser_tool_cloud import _is_headed_mode
+            return _is_headed_mode()
+        except Exception:
+            logger.exception("Unable to determine headed browser mode; using environment fallback")
+            return bool(os.environ.get("AGENT_BROWSER_HEADED"))
+
+    for label, skip, skip_what, cleanup in (
+        ("VM", persistent_env_checker, "cleanup_vm for persistent env", lambda: runtime_getter().cleanup_vm(task_id)),
+        ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: runtime_getter().cleanup_browser(task_id)),
+    ):
+        try:
+            if skip(task_id):
+                if agent.verbose_logging:
+                    logging.debug(f"Skipping per-turn {skip_what} {task_id}; idle reaper will handle it.")
+            else:
+                if cleanup() is False:
+                    logger.warning("Retaining unresolved %s for task %s", label, task_id)
+        except Exception as exc:
+            if agent.verbose_logging:
+                logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, exc, exc_info=True)
+
+
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -134,7 +169,11 @@ class ClientLifecycleMixin:
                 if owner and owner != task_id:
                     clear_file_ops_cache(owner)
 
-        for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
+        def cleanup_browser_checked() -> None:
+            if cleanup_browser(task_id) is False:
+                logger.warning("Retaining unresolved browser session for task %s", task_id)
+
+        for step in (kill_processes, lambda: cleanup_vm(task_id), cleanup_browser_checked,
                      release_computer_use, forget_file_state):
             _quietly(step)
 

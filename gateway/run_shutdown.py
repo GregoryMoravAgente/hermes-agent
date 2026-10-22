@@ -1793,12 +1793,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             from tools.terminal_tool_lifecycle import cleanup_all_environments
             cleanup_all_environments()
 
-        def _cleanup_browsers() -> None:
-            from tools.browser_tool_lifecycle import cleanup_all_browsers
-            cleanup_all_browsers()
-
+        from tools.browser_tool_lifecycle import cleanup_browsers_for_shutdown
         _step("cleanup_all_environments", _cleanup_environments)
-        _step("cleanup_all_browsers", _cleanup_browsers)
+        _step("cleanup_all_browsers", lambda: cleanup_browsers_for_shutdown(phase, logger))
         return _marked_cron_jobs
 
     @staticmethod

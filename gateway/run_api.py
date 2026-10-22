@@ -153,8 +153,12 @@ async def start_gateway_api(runner, *, host: str = "127.0.0.1", port: int = 0) -
         session_authority=getattr(runner, "session_authority", None))
     mount = GatewayDashboardMount(runner, state)
     # Lifespan off: the dashboard's own lifespan runs when it is mounted (GatewayDashboardMount).
+    # This listener is embedded after gateway bootstrap installed Hermes' QueueListener. Uvicorn's
+    # default dictConfig clears those handlers and can invert the logging module/handler lock order
+    # while a profile router creates its first file handler. Standalone listeners retain the default.
     config, server = build_listener_server(mount, host, port, auth_required=state.auth_required,
-                                           timeout_graceful_shutdown=5, lifespan="off")
+                                           timeout_graceful_shutdown=5, lifespan="off",
+                                           inherit_logging=True)
     family, kind, proto, _, address = socket.getaddrinfo(
         host, port, type=socket.SOCK_STREAM,
     )[0]

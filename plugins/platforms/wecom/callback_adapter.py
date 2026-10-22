@@ -251,9 +251,28 @@ class WecomCallbackAdapter(BasePlatformAdapter):
                     if event.message_id and self._dedup.is_duplicate(event.message_id):
                         logger.debug("[WecomCallback] Duplicate MsgId %s, skipping", event.message_id)
                         return _ack()
-                    if event.source and event.source.user_id:
-                        self._user_app_map[self._user_app_key(str(app.get("corp_id") or ""), event.source.user_id)] = app["name"]
-                    await self._message_queue.put(event)
+                    # Admission is the source-owned proof that this authenticated callback
+                    # may enter the local queue.  It must precede both routing-map mutation
+                    # and the immediate provider acknowledgement.
+                    from hermes_state_runtime import RuntimeStoreError
+                    try:
+                        source_token = self._preservation_source_admit(
+                            event, event=event, phase="wecom-callback",
+                        )
+                    except RuntimeStoreError as exc:
+                        logger.debug("[WecomCallback] Source-close refused callback: %s", exc)
+                        return web.Response(status=503, text="retry later")
+                    try:
+                        if event.source and event.source.user_id:
+                            self._user_app_map[self._user_app_key(str(app.get("corp_id") or ""), event.source.user_id)] = app["name"]
+                        await self._message_queue.put(event)
+                    except asyncio.CancelledError:
+                        self._preservation_source_unknown(source_token or event, "wecom_queue_cancelled")
+                        raise
+                    except Exception:
+                        self._preservation_source_unknown(source_token or event, "wecom_queue_failed")
+                        raise
+                    self._preservation_source_producer_done(source_token or event)
                 return _ack()  # ack immediately — the reply arrives later via proactive message/send
             except WeComCryptoError:
                 continue
@@ -268,13 +287,34 @@ class WecomCallbackAdapter(BasePlatformAdapter):
 
     async def _poll_loop(self) -> None:
         while True:
-            event = await self._message_queue.get()
+            event = None
             try:
+                event = await self._message_queue.get()
                 task = asyncio.create_task(self.handle_message(event))
                 self._background_tasks.add(task)
                 task.add_done_callback(self._background_tasks.discard)
+                task.add_done_callback(lambda done, item=event: self._source_dispatch_done(item, done))
+            except asyncio.CancelledError:
+                if event is not None:
+                    self._preservation_source_unknown(event, "wecom_dispatch_cancelled")
+                raise
             except Exception:
+                if event is not None:
+                    self._preservation_source_unknown(event, "wecom_dispatch_failed")
                 logger.exception("[WecomCallback] Failed to enqueue event")
+
+    def _source_dispatch_done(self, event: MessageEvent, task: asyncio.Task) -> None:
+        """Retain the exact callback lease when the real poll task never completes."""
+        try:
+            if task.cancelled():
+                self._preservation_source_unknown(event, "wecom_dispatch_task_cancelled")
+                return
+            if task.exception() is not None:
+                self._preservation_source_unknown(event, "wecom_dispatch_task_failed")
+                return
+            self._preservation_source_producer_done(event)
+        except asyncio.CancelledError:
+            self._preservation_source_unknown(event, "wecom_dispatch_task_cancelled")
 
     def _decrypt_request(self, app: dict[str, Any], body: str, msg_signature: str, timestamp: str, nonce: str) -> str:
         encrypt = ET.fromstring(body).findtext("Encrypt", default="")

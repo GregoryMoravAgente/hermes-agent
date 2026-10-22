@@ -44,11 +44,13 @@ def _config_with_camofox(**camofox_config):
 
 
 def _mock_response(status=200, json_data=None):
-    resp = MagicMock()
+    import requests
+
+    resp = requests.Response()
     resp.status_code = status
-    resp.json.return_value = json_data or {}
-    resp.content = b"\x89PNG\r\n\x1a\nfake"
-    resp.raise_for_status = MagicMock()
+    resp.url = "http://localhost:9377/test"
+    resp.headers["Content-Type"] = "application/json"
+    resp._content = json.dumps(json_data or {}).encode("utf-8")
     return resp
 
 
