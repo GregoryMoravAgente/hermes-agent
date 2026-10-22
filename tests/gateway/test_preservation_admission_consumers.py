@@ -268,6 +268,7 @@ async def test_real_api_waiter_settles_under_close_and_aborts_with_active_custod
     assert stale == {'status': 'refused', 'reason': 'stale_close_receipt'}
 
 
+@pytest.mark.platforms("windows")
 @pytest.mark.asyncio
 async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path, owner, monkeypatch):
     """A native adapter owns marker adoption and releases it through the real delivery ledger.
