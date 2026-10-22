@@ -899,6 +899,28 @@ def close_profile(authority):
     return True
 
 
+def release_profile_source(authority):
+    """Revoke a terminal profile's source binding before its authority is removed.
+
+    ``close_profile`` intentionally keeps the binding available for an authenticated reversible
+    abort.  Permanent profile retirement has a separate boundary: once the exact terminal root is
+    settled and the authority is about to leave the registry, the coordinator must revoke that
+    source capability so a successor with the same profile name can bind cleanly.
+    """
+    root = getattr(authority, "_i17_service_handle", None)
+    coordinator = getattr(authority, "_i17_runtime_custody", None)
+    binding = getattr(authority, "_i17_rebind_source", None)
+    if root is None and coordinator is None and binding is None:
+        return True
+    if root is None or coordinator is None or binding is None:
+        return False
+    refusal = coordinator._unregister_source_rebind_binding(
+        _OWNER_CLASS, str(getattr(authority, "profile_id", "")), binding,
+        terminal_handle=root,
+    )
+    return refusal is None
+
+
 def owner_evidence(runner, receipt):
     """Close all real profile roots and return one cross-process owner receipt."""
     coordinator = getattr(runner, "runtime_custody", None)

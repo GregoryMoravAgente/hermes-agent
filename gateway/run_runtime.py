@@ -1378,9 +1378,16 @@ async def _retire_profile_authority(authority, timeout=None):
         logger.error('Profile %s external process finalizers did not settle; ownership retained',
                      authority.profile_id)
         return False
-    from tui_gateway.hosted_tui_custody import close_profile
+    from tui_gateway.hosted_tui_custody import close_profile, release_profile_source
     if not close_profile(authority):
         logger.error('Profile %s hosted TUI custody did not settle; ownership retained',
+                     authority.profile_id)
+        return False
+    # ``close_profile`` keeps the exact source binding available for a reversible preservation
+    # abort.  This profile is leaving the authority registry permanently, so revoke that exact
+    # terminal binding before the successor can reuse the profile name.
+    if not release_profile_source(authority):
+        logger.error('Profile %s hosted TUI source binding did not revoke; ownership retained',
                      authority.profile_id)
         return False
     # Keep the source owner bound while the exact I17 root is read/terminalized. A failed close

@@ -422,6 +422,59 @@ class RuntimeCustodyCoordinator:
         with self._lock:
             return self._source_rebind_bindings.get((owner_class, profile_id)) is binding
 
+    def _unregister_source_rebind_binding(
+        self, owner_class: str, profile_id: str, binding, *, terminal_handle: CustodyHandle,
+    ):
+        """Release one exact source binding after its profile root is terminal.
+
+        A weak registry value can remain alive while the retired authority is still referenced by
+        a drained client or task.  The lifecycle owner therefore has to revoke that exact source
+        capability before removing the authority slot.  The revocation is deliberately narrow:
+        it requires the canonical binding object, its still-registered authority, the closed
+        source graph, and the exact terminal handle.  A copied binding, an active/UNKNOWN root,
+        or a binding that was already replaced is refused and remains fail-closed.
+        """
+        if (
+            not isinstance(owner_class, str)
+            or not isinstance(profile_id, str)
+            or not profile_id
+            or not isinstance(terminal_handle, CustodyHandle)
+        ):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        try:
+            from tui_gateway.hosted_tui_custody import _I17RebindSource
+            from gateway.session_authorities import all_authorities
+        except (ImportError, AttributeError):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        if type(binding) is not _I17RebindSource:
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        authority = getattr(binding, "authority", None)
+        runner = getattr(binding, "runner", None)
+        if (
+            authority is None
+            or runner is None
+            or getattr(binding, "coordinator", None) is not self
+            or getattr(authority, "_i17_rebind_source", None) is not binding
+            or getattr(authority, "_i17_producer_registry", None) is not getattr(binding, "registry", None)
+            or getattr(authority, "profile_id", None) != profile_id
+            or getattr(authority, "_i17_service_closed", False) is not True
+            or not any(item is authority for item in all_authorities(runner))
+        ):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        if not self.is_terminal_handle(
+            terminal_handle,
+            owner_class=owner_class,
+            profile_id=profile_id,
+            authority_epoch=getattr(terminal_handle, "authority_epoch", None),
+        ):
+            return CustodyRefusal("owner_proof_mismatch", owner_class)
+        with self._lock:
+            key = (owner_class, profile_id)
+            if self._source_rebind_bindings.get(key) is not binding:
+                return CustodyRefusal("owner_proof_mismatch", owner_class)
+            self._source_rebind_bindings.pop(key, None)
+            return None
+
     def authority_epoch_for_profile(
         self, profile_id: str, *, require_serving: bool = True,
     ) -> int | None:
