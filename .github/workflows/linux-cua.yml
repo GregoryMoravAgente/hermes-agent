@@ -48,13 +48,9 @@ env:
   CUA_DRIVER_RS_TELEMETRY_ENABLED: '0'
   HERMES_TEST_WORKERS: '1'
   HERMES_TEST_FILE_RETRIES: '0'
-  TMPDIR: ${{ runner.temp }}/linux-cua/tmp
-  XDG_RUNTIME_DIR: ${{ runner.temp }}/linux-cua/xdg
-  HERMES_HOME: ${{ runner.temp }}/linux-cua/hermes
-  HERMES_RUNTIME_DIR: ${{ runner.temp }}/linux-cua/hermes/tools
-  HERMES_CUA_PROOF_DIR: ${{ runner.temp }}/linux-cua/proof
   HERMES_CUA_EXPECTED_HEAD: ${{ inputs.commit || github.sha }}
-  HERMES_CUA_BASE: ${{ inputs.base || github.event.before }}
+  # Keep the full CUA family in the static gate across workflow-only corrections.
+  HERMES_CUA_BASE: ${{ inputs.base || '11cbcc9a79c24837b699671eb1f5205944f71a0a' }}
 
 jobs:
   hosted-cua:
@@ -76,6 +72,18 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          export TMPDIR="$RUNNER_TEMP/linux-cua/tmp"
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/linux-cua/xdg"
+          export HERMES_HOME="$RUNNER_TEMP/linux-cua/hermes"
+          export HERMES_RUNTIME_DIR="$RUNNER_TEMP/linux-cua/hermes/tools"
+          export HERMES_CUA_PROOF_DIR="$RUNNER_TEMP/linux-cua/proof"
+          {
+            printf 'TMPDIR=%s\n' "$TMPDIR"
+            printf 'XDG_RUNTIME_DIR=%s\n' "$XDG_RUNTIME_DIR"
+            printf 'HERMES_HOME=%s\n' "$HERMES_HOME"
+            printf 'HERMES_RUNTIME_DIR=%s\n' "$HERMES_RUNTIME_DIR"
+            printf 'HERMES_CUA_PROOF_DIR=%s\n' "$HERMES_CUA_PROOF_DIR"
+          } >> "$GITHUB_ENV"
           mkdir -p "$TMPDIR" "$XDG_RUNTIME_DIR" "$HERMES_HOME" "$HERMES_RUNTIME_DIR" "$HERMES_CUA_PROOF_DIR"
           chmod 700 "$TMPDIR" "$XDG_RUNTIME_DIR" "$HERMES_HOME" "$HERMES_CUA_PROOF_DIR"
 
@@ -83,7 +91,7 @@ jobs:
         shell: bash
         env:
           CUA_COMMIT: ${{ inputs.commit || github.sha }}
-          CUA_BASE: ${{ inputs.base || github.event.before }}
+          CUA_BASE: ${{ env.HERMES_CUA_BASE }}
         run: |
           set -euo pipefail
           sha_pattern='^[0-9a-f]{40}$'
@@ -129,25 +137,32 @@ jobs:
           save-tools-cache: 'false'
 
       - name: Capacity gate after PM provisioning
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-pm --source-floor
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-pm --source-floor
 
       - name: Resolve and seal PM CUA and Chromium binaries
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py resolve-tools
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py resolve-tools
 
       - name: Snapshot source and owned inputs before static checks
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-static
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-static
 
       - name: Run the configured static gate before native consumers
-        run: "$HERMES_PYTHON" scripts/check --base "$HERMES_CUA_BASE"
+        run: >-
+          "$HERMES_PYTHON" scripts/check --base "$HERMES_CUA_BASE"
 
       - name: Snapshot source and owned inputs before SUT
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-sut
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label before-sut
 
       - name: Initialize and seal the PM Chromium process
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py browser-preflight
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py browser-preflight
 
       - name: Capacity gate after browser initialization
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-browser --source-floor
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py capacity --stage after-browser --source-floor
 
       - name: Run both complete CUA modules
         id: cua-tests
@@ -176,7 +191,8 @@ jobs:
       - name: Snapshot source and owned inputs after SUT
         if: always()
         continue-on-error: true
-        run: "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label after-sut
+        run: >-
+          "$HERMES_PYTHON" scripts/ci/linux_cua_custody.py snapshot --label after-sut
 
       - name: Verify CUA receipt and owned descendant closure
         if: always()
