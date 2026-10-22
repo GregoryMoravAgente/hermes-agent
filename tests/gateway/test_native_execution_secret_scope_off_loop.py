@@ -37,6 +37,8 @@ async def test_native_execution_and_settled_delivery_hydrate_secrets_off_loop(tm
         'text_batch_delay_seconds': 0, 'session_path': str(tmp_path / 'wa')}))
     adapter.gateway_runner, runner.adapters = runner, {Platform.WHATSAPP: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='secrets')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     sent = []
 
