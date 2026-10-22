@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from types import SimpleNamespace
 from typing import Any
 
@@ -68,6 +69,79 @@ def record_cleanup_error(event: dict[str, Any], step: str, exc: BaseException) -
     event.setdefault("cleanup_errors", []).append(
         {"step": step, "type": type(exc).__name__}
     )
+
+
+def _native_handle_identity(handle: Any) -> dict[str, Any]:
+    """Record the exact retained native handle; invalid handles fail closed."""
+    native_value = int(handle)
+    if native_value <= 0:
+        raise RuntimeError("retained-native-handle-invalid")
+    return {
+        "python_type": type(handle).__name__,
+        "python_object_id": id(handle),
+        "native_value": native_value,
+    }
+
+
+def observe_owned_job_empty(
+    job: Any,
+    process_ref: Any,
+    deadline: float,
+    event: dict[str, Any],
+) -> None:
+    """Observe the same owned Job until it is empty, without reopening or census."""
+    started = time.monotonic()
+    samples: list[dict[str, Any]] = []
+    event["native_job_observation_started_monotonic"] = started
+    event["native_job_observation_deadline_monotonic"] = deadline
+    event["native_job_observation_budget_seconds"] = max(0.0, deadline - started)
+    event["native_job_observation_samples_after_exit"] = samples
+    event["native_job_observation_retained_python_objects"] = {
+        "job": id(job), "process_ref": id(process_ref)
+    }
+    event["native_job_observation"] = "pending"
+    while True:
+        sampled_at = time.monotonic()
+        sample: dict[str, Any] = {
+            "monotonic_seconds": sampled_at - started,
+            "active_processes": None,
+            "exact_process_handle_member": None,
+        }
+        samples.append(sample)
+        try:
+            sample["exact_process_handle_member"] = job.contains_process_handle(process_ref)
+            sample["active_processes"] = job.active_processes()
+        except BaseException as exc:
+            sample["error"] = type(exc).__name__
+            event["native_runner_tree_empty_after_exit"] = False
+            event["native_job_observation"] = "native-query-failed"
+            logger.exception("retained Windows Job observation failed")
+            raise
+        membership = sample["exact_process_handle_member"]
+        active = sample["active_processes"]
+        if len(samples) == 1:
+            event["exact_process_handle_member_after_exit"] = membership
+            event["native_job_active_processes_after_exit"] = active
+        if membership is not True:
+            event["native_runner_tree_empty_after_exit"] = False
+            event["native_job_observation"] = "membership_unproven"
+            raise RuntimeError("exact-membership-after-exit-unproven")
+        if type(active) is not int or active < 0:
+            event["native_runner_tree_empty_after_exit"] = False
+            event["native_job_observation"] = "active-count-unavailable"
+            raise RuntimeError("owned-job-active-count-unavailable")
+        if active == 0:
+            event["native_runner_tree_empty_after_exit"] = True
+            event["native_job_observation"] = "empty"
+            event["native_job_active_processes_after_exit_settled"] = active
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            event["native_runner_tree_empty_after_exit"] = False
+            event["native_job_observation"] = "persistent-nonzero"
+            event["native_job_active_processes_after_exit_settled"] = active
+            raise RuntimeError("owned-job-has-active-descendants")
+        time.sleep(min(0.05, remaining))
 
 
 def close_owned_job(job: Any, event: dict[str, Any]) -> bool:
@@ -189,13 +263,20 @@ def run(
             if job is None or proc is None or raw_handle is None:
                 raise RuntimeError("owned-job-launch-proof-missing")
             process_ref = SimpleNamespace(raw_handle=raw_handle)
+            event["native_job_handle_identity"] = _native_handle_identity(
+                getattr(job, "_handle", None)
+            )
+            event["native_root_process_handle_identity"] = _native_handle_identity(raw_handle)
             event["exact_process_handle_member_after_resume"] = (
                 job.contains_process_handle(process_ref) is True
             )
             if not event["exact_process_handle_member_after_resume"]:
                 raise RuntimeError("exact-membership-after-resume-unproven")
+            wait_deadline = time.monotonic() + max(0.0, timeout)
             try:
-                event["exit_code"] = proc.wait(timeout=timeout)
+                event["exit_code"] = proc.wait(
+                    timeout=max(0.0, wait_deadline - time.monotonic())
+                )
             except subprocess.TimeoutExpired as exc:
                 event["outcome"] = "timeout"
                 event["outer_timeout_seconds"] = timeout
@@ -203,16 +284,7 @@ def run(
                 result = 124
             else:
                 event["outcome"] = "completed" if event["exit_code"] == 0 else "failed"
-                event["exact_process_handle_member_after_exit"] = (
-                    job.contains_process_handle(process_ref) is True
-                )
-                active = job.active_processes()
-                event["native_job_active_processes_after_exit"] = active
-                event["native_runner_tree_empty_after_exit"] = active == 0
-                if not event["exact_process_handle_member_after_exit"]:
-                    raise RuntimeError("exact-membership-after-exit-unproven")
-                if active != 0:
-                    raise RuntimeError("owned-job-has-active-descendants")
+                observe_owned_job_empty(job, process_ref, wait_deadline, event)
                 if event["exit_code"] != 0:
                     record_exit_failure(event, event["exit_code"])
                     result = 1
