@@ -42,13 +42,12 @@ async def test_edit_policy_is_a_durable_session_setting_every_viewer_reads(tmp_p
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import policy_for_source
+    from tests.gateway.conftest import bind_authority_runtime_custody
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
     first = await initialize_session_authority(_runner(store), profile_id='owned', instance_id='first')
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
-    first.runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=first.instance_id, authority_epoch=first.epoch)
+    bind_authority_runtime_custody(first.runner, first)
     editor = AuthorityConnection(first, object(), {'user_id': 'human'})
     other = AuthorityConnection(first, object(), {'user_id': 'human'})
     try:
@@ -82,8 +81,7 @@ async def test_edit_policy_is_a_durable_session_setting_every_viewer_reads(tmp_p
 
     # An owner restart restores the session's policy from its stored receipt.
     cold = await initialize_session_authority(_runner(store), profile_id='owned', instance_id='restarted')
-    cold.runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=cold.instance_id, authority_epoch=cold.epoch)
+    bind_authority_runtime_custody(cold.runner, cold)
     viewer = AuthorityConnection(cold, object(), {'user_id': 'human'})
     try:
         resumed = await viewer.dispatch({'id': 3, 'method': 'session.resume', 'params': {'session_id': sid}})
@@ -105,13 +103,12 @@ async def test_a_branch_of_a_dont_ask_session_starts_at_ask(tmp_path, monkeypatc
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     db = store._db
     owner = await initialize_session_authority(_runner(store), profile_id='owned', instance_id='fork')
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
-    owner.runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=owner.instance_id, authority_epoch=owner.epoch)
+    bind_authority_runtime_custody(owner.runner, owner)
     editor = AuthorityConnection(owner, object(), {'user_id': 'human'})
     try:
         created = await editor.dispatch({'id': 1, 'method': 'session.create', 'params': {
