@@ -87,9 +87,22 @@ def _windows_base_environment():
     """
     environment = dict(os.environ)
     if sys.platform == "win32":
+        import sysconfig
+
         from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
 
-        pin_hermes_tree_on_pythonpath(environment, Path(__file__).resolve().parents[2])
+        root = Path(__file__).resolve().parents[2]
+        pin_hermes_tree_on_pythonpath(environment, root)
+        # CI's PM test environment is intentionally not the installed runtime selection.
+        # Bind the dependencies of this exact test interpreter as well: per-file isolation
+        # changes HERMES_HOME, so a committed runtime lookup alone may legitimately find none.
+        dependencies = Path(sysconfig.get_path("purelib")).resolve()
+        if not dependencies.is_dir():
+            raise RuntimeError("native fixture test dependencies unavailable")
+        paths = environment.get("PYTHONPATH", "").split(os.pathsep)
+        environment["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(
+            [str(root), str(dependencies), *(path for path in paths if path)],
+        ))
     return environment
 
 
