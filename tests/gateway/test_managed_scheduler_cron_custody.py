@@ -32,6 +32,29 @@ def _install_i12_observer(monkeypatch):
     return captured
 
 
+def _i13_failure_snapshot(binding):
+    """Show exact retained worker facts if a positive native handoff stays UNKNOWN."""
+    child = binding.child
+    if child is None:
+        return {"child": None, "parent_unknown": binding._unknown}
+    process = child._process
+    return {
+        "parent_unknown": binding._unknown,
+        "child_unknown": child._unknown,
+        "child_settled": child.settled,
+        "dispatch_mode": child._dispatch_mode,
+        "native_job_bound": child._native_job is not None,
+        "native_job_proven": child._native_job_proven,
+        "process_pid": process.pid if process is not None else None,
+        "process_returncode": process.poll() if process is not None else None,
+        "bound_pid": child._bound_process_pid,
+        "bound_started_at": child._bound_process_started_at,
+        "worker_pid": child._worker_pid,
+        "worker_started_at": child._worker_started_at,
+        "reaper_alive": child._reaper.is_alive() if child._reaper is not None else None,
+    }
+
+
 def _assert_terminal_i12(binding, job, executions, coordinator, owner_classes_before):
     from cron.runtime_custody import CronOwnerBinding
 
@@ -39,7 +62,7 @@ def _assert_terminal_i12(binding, job, executions, coordinator, owner_classes_be
     assert binding.owner_class == "I12_cron_fire"
     assert binding.execution_id == binding.owner_id
     assert binding.job_id == job["id"]
-    assert binding.settled is True
+    assert binding.settled is True, _i13_failure_snapshot(binding)
     record = executions.get_execution(binding.owner_id)
     assert record is not None
     assert record["id"] == binding.owner_id

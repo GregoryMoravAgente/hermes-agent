@@ -4491,6 +4491,8 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     claimed_job = dict(claimed) if isinstance(claimed, dict) else dict(job)
     claimed_job["execution_id"] = job["execution_id"]
     claimed_job["_scheduled_instant"] = job.get("_scheduled_instant")
+    if job.get("_cron_custody") is not None:
+        claimed_job["_cron_custody"] = job["_cron_custody"]
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
