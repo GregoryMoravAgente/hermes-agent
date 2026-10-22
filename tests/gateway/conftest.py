@@ -694,12 +694,109 @@ def _api_runtime_cleanup_readback(adapter, runner):
     return True
 
 
-def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, cleanup_readback=False):
+def _runtime_owned_identify(runner):
+    """Return the production-shaped discovery payload for the live fixture runner."""
+    from gateway.control_socket import build_identify_payload
+
+    descriptor = runner.session_runtime_descriptor
+    payload = build_identify_payload()
+    payload.update({key: descriptor[key] for key in (
+        'instance_id', 'runtime_protocol', 'authority_epoch', 'state',
+        'api_origin', 'served_profiles', 'parked_profiles', 'capabilities'
+    ) if key in descriptor})
+    # Manual/desktop launch context is not a supervisor in the discovery protocol.
+    payload['supervisor'] = {'manual': 'none', 'desktop': 'none'}.get(
+        payload.get('supervisor'), payload.get('supervisor', 'none'))
+    return payload
+
+
+async def _runtime_owned_start_public(runner, home, handles):
+    """Start the real control/API listeners and publish the production READY state."""
+    import asyncio
+    from functools import partial
+
+    from gateway.control_socket import GatewayControlServer
+    from gateway.run_runtime import publish_gateway_runtime_ready, start_gateway_runtime_api
+
+    control_server = runner.session_control_server = GatewayControlServer(
+        home, verb_handlers={'identify': partial(_runtime_owned_identify, runner)}
+    )
+    handles['control_server'] = control_server
+    # Production startup wires the initialized ticket store before the control listener starts.
+    control_server.ticket_store = runner.session_ticket_store
+    if not await asyncio.wait_for(control_server.start(), timeout=30):
+        raise RuntimeError('runtime_owned_api control server did not start')
+    if os.name == 'nt':
+        native_control_server = getattr(control_server, '_pipe_server', None)
+        native_control_threads = tuple(getattr(native_control_server, '_threads', ()) or ())
+        handles['native_control_server'] = native_control_server
+        handles['native_control_threads'] = native_control_threads
+        if native_control_server is None or not native_control_threads:
+            raise RuntimeError('runtime_owned_api native control handle unavailable')
+    else:
+        socket_control_server = getattr(control_server, '_server', None)
+        handles['socket_control_server'] = socket_control_server
+        if socket_control_server is None:
+            raise RuntimeError('runtime_owned_api control socket handle unavailable')
+    await asyncio.wait_for(start_gateway_runtime_api(runner), timeout=30)
+    if not await asyncio.wait_for(runner.start(), timeout=30):
+        raise RuntimeError('runtime_owned_api gateway runner did not start')
+    publish_gateway_runtime_ready(runner)
+    if not runner._running or runner.session_runtime_descriptor.get('state') != 'ready':
+        raise RuntimeError('runtime_owned_api gateway runner did not publish READY')
+
+
+async def _runtime_owned_stop_public(runner, handles):
+    """Stop public listeners with bounded, fail-closed proof of native teardown."""
+    import asyncio
+
+    runtime_stop_proven = False
+    try:
+        if not getattr(runner, '_running', False):
+            runner._startup_cleanup_only = True
+        await asyncio.wait_for(runner.stop(), timeout=30)
+        handle = getattr(runner, 'session_api', None)
+        task = getattr(handle, 'task', None)
+        if task is not None and not task.done():
+            raise RuntimeError('runtime_owned_api API listener remained live')
+        runtime_stop_proven = True
+    except BaseException:
+        runtime_stop_proven = False
+
+    control_server = handles.get('control_server')
+    if control_server is not None:
+        try:
+            await asyncio.wait_for(control_server.stop(), timeout=30)
+            native_control_server = handles.get('native_control_server')
+            native_control_threads = handles.get('native_control_threads', ())
+            socket_control_server = handles.get('socket_control_server')
+            if os.name == 'nt':
+                stop_event = getattr(native_control_server, '_stop', None)
+                if (native_control_server is None or not native_control_threads or
+                        stop_event is None or not stop_event.is_set() or
+                        any(thread.is_alive() for thread in native_control_threads)):
+                    raise RuntimeError('runtime_owned_api native control listener remained live')
+            else:
+                is_serving = getattr(socket_control_server, 'is_serving', None)
+                if not callable(is_serving) or is_serving():
+                    raise RuntimeError('runtime_owned_api control socket remained live')
+            if (getattr(control_server, '_server', None) is not None or
+                    getattr(control_server, '_pipe_server', None) is not None):
+                raise RuntimeError('runtime_owned_api control listener remained live')
+        except BaseException:
+            runtime_stop_proven = False
+    return runtime_stop_proven
+
+
+def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, cleanup_readback=False,
+                      start_public_runtime=False):
     """Yield an API adapter after the real single-profile runtime bootstrap has completed.
 
     This is an explicit context manager for tests that intentionally construct their own adapter;
     it is never autouse. The adapter receives the production descriptor, authority registry,
     process ownership, and coordinator before the test patches only its model boundary.
+    ``start_public_runtime`` is opt-in: the owner-facing fixture uses the real control listener,
+    API listener, runner start, and READY transition required by an external worker.
     """
     from contextlib import asynccontextmanager
 
@@ -723,6 +820,14 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
         reserved = False
         runner = None
         adapter = None
+        stdio_before = (sys.stdout, sys.stderr)
+        public_handles = {
+            'control_server': None,
+            'native_control_server': None,
+            'native_control_threads': (),
+            'socket_control_server': None,
+        }
+        runtime_stop_proven = not start_public_runtime
         try:
             with FakeLLMServer(default_text='runtime-custody-fixture-ok') as provider:
                 extra_config = requested_config or ''
@@ -744,10 +849,24 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
                     # installed process ownership, descriptor, database, and coordinator.
                     runner.session_authority = None
                     runner.session_authorities = None
+                if start_public_runtime:
+                    await _runtime_owned_start_public(runner, home, public_handles)
                 yield adapter
         finally:
-            cleanup_proven = True
-            if runner is not None:
+            # Stop the real public listeners before profile/database teardown. The helper keeps
+            # the exact native server/thread handles because GatewayControlServer.stop() clears
+            # its wrapper handle even when native close raises.
+            if start_public_runtime:
+                try:
+                    if runner is not None:
+                        runtime_stop_proven = await _runtime_owned_stop_public(runner, public_handles)
+                finally:
+                    # `tui_gateway.server` reserves stdout for JSON-RPC at import time.
+                    # Restore the fixture caller's exact streams after the public runtime stops
+                    # so pytest's terminal reporter retains its original output contract.
+                    sys.stdout, sys.stderr = stdio_before
+            cleanup_proven = runtime_stop_proven
+            if runner is not None and cleanup_proven:
                 from tui_gateway.hosted_tui_custody import close_profile
                 authorities = tuple(locals().get('authorities', ()) or ())
                 for authority in authorities:
@@ -758,16 +877,16 @@ def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, clea
                     _api_runtime_cleanup_readback(adapter, runner)
                     and cleanup_proven
                 )
-            if adapter is not None:
+            if adapter is not None and (not start_public_runtime or cleanup_proven):
                 adapter._response_store.close()
                 adapter._run_idempotency_store.close()
-            if runner is not None:
+            if runner is not None and (not start_public_runtime or cleanup_proven):
                 runner.session_store.close_all_db_handles()
                 runner.close_all_session_db_handles()
             try:
                 if reserved and cleanup_proven:
                     process_ownership.close()
-                if cleanup_readback and not cleanup_proven:
+                if (cleanup_readback or start_public_runtime) and not cleanup_proven:
                     raise RuntimeError('api_runtime_cleanup_unproven')
             finally:
                 reset_hermes_home_override(home_token)
@@ -1140,7 +1259,7 @@ async def runtime_owned_api_owner(tmp_path, monkeypatch):
     Tests may replace only the model/turn callback; descriptor, process ownership,
     profile DB, coordinator, and admission parent remain production-created.
     """
-    async with runtime_owned_api(tmp_path, monkeypatch) as adapter:
+    async with runtime_owned_api(tmp_path, monkeypatch, start_public_runtime=True) as adapter:
         yield adapter, adapter.gateway_runner.session_authority
 
 
