@@ -580,16 +580,22 @@ class SessionSchemaMixin:
     def _recover_stale_fts(self, cursor: sqlite3.Cursor, *, legacy: bool, timeout_seconds=None) -> bool:
         """Atomically rebuild stale base/trigram indexes and resume syncing. *timeout_seconds*
         bounds the admission wait (None = full startup budget, ``0`` = non-blocking retry).
-        Fails closed: holders or a lost admission race leave the breadcrumb set."""
-        foreign_holders = self._foreign_state_db_holders()
-        if foreign_holders and self._defer_stale_fts_for_holders(cursor, foreign_holders):
-            return False
+        Fails closed: holders or a lost admission race leave the breadcrumb set.
+
+        Acquire the rebuild authority before the foreign-holder diagnostic. On macOS that
+        diagnostic asks launchd/psutil for every process's open files and can be slow when
+        many test or gateway processes are active. A non-blocking in-process retry must
+        observe the rebuild lock first; otherwise a live holder can release while the scan
+        runs and the retry may rebuild after the authority has changed."""
         with fts_rebuild_admission(self.db_path, timeout_seconds=timeout_seconds) as admitted:
             if not admitted:
                 logger.warning(
                     "Deferred stale state.db FTS rebuild: another process holds the rebuild authority; "
                     "canonical writes and LIKE search remain available."
                 )
+                return False
+            foreign_holders = self._foreign_state_db_holders()
+            if foreign_holders and self._defer_stale_fts_for_holders(cursor, foreign_holders):
                 return False
             return self._recover_stale_fts_locked(cursor, legacy=legacy)
 

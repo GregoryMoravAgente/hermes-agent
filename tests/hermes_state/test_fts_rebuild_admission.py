@@ -152,6 +152,45 @@ class TestRebuildFtsAdmission:
 
 
 class TestSchemaPathAdmission:
+    def test_stale_recovery_admits_before_foreign_holder_scan(
+        self, tmp_path, fast_timeout, monkeypatch
+    ):
+        """A live rebuild holder blocks before the foreign-holder diagnostic runs."""
+        db_path = tmp_path / "state.db"
+        d = SessionDB(db_path=db_path)
+        if not d._fts_enabled:
+            d.close()
+            pytest.skip("FTS5 unavailable in this build")
+        d.create_session("s1", source="test")
+        d.append_message("s1", "user", "hello admission ordering")
+        d.close()
+
+        raw = sqlite3.connect(str(db_path))
+        raw.execute(
+            "INSERT INTO state_meta (key, value) VALUES (?, '1') "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (FTS_STALE_KEY,),
+        )
+        for trig in _FTS_TRIGGERS:
+            raw.execute(f"DROP TRIGGER IF EXISTS {trig}")
+        raw.commit()
+        raw.close()
+
+        monkeypatch.setattr(
+            SessionDB,
+            "_foreign_state_db_holders",
+            lambda _self: pytest.fail(
+                "foreign-holder diagnostic ran before rebuild admission"
+            ),
+        )
+        with _rebuild_lock_held_by_other_process(db_path):
+            d2 = SessionDB(db_path=db_path)
+            try:
+                assert d2._fts_enabled is False
+                assert d2._fts_stale is True
+            finally:
+                d2.close()
+
     def test_startup_trigger_repair_defers_and_fails_closed(
         self, tmp_path, fast_timeout
     ):
