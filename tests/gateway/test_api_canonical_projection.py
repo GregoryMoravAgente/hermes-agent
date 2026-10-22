@@ -192,9 +192,10 @@ async def _session_stream_tool_frames(api, owner, produce):
 
 
 @pytest.mark.asyncio
-async def test_session_chat_stream_carries_the_producers_tool_verdict_and_preview(api, owner):
+async def test_session_chat_stream_carries_the_producers_tool_verdict_and_preview(runtime_owned_api_owner):
     """A Codex command that exits 1 with no output is tool.failed (its result text is only "[exit 1]"),
     and the start frame keeps Codex's own 120-character preview, as the direct progress path does."""
+    api, owner = runtime_owned_api_owner
     from agent.codex_runtime import make_codex_app_server_event_bridge
 
     def produce(turn):
@@ -210,9 +211,10 @@ async def test_session_chat_stream_carries_the_producers_tool_verdict_and_previe
 
 
 @pytest.mark.asyncio
-async def test_session_chat_stream_keeps_a_bounded_worker_failure(api, owner):
+async def test_session_chat_stream_keeps_a_bounded_worker_failure(runtime_owned_api_owner):
     """A managed worker bounds a large failing terminal result into an envelope with no exit_code;
     the stream reports the frame's own verdict, tool.failed."""
+    api, owner = runtime_owned_api_owner
     import json
     from agent.managed_worker import tool_frame
     from gateway.run_turn_progress import publish_worker_tool_event
