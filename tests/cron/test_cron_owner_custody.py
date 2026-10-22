@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import textwrap
@@ -74,6 +75,24 @@ def _windows_base_executable():
     return sys.executable
 
 
+def _windows_base_environment():
+    """Overlay the real PM dependency generation on the direct base interpreter.
+
+    The Windows PM launcher can expose a ``Scripts/python.exe`` shim whose
+    ``sys._base_executable`` is the store interpreter.  Launching that base
+    executable directly keeps the same-PID/native-Job contract, but it drops the
+    managed ``site-packages`` path unless the child receives the production cron
+    overlay.  Use the source-owned helper so this fixture selects the committed
+    generation rather than an ambient or stale in-tree environment.
+    """
+    environment = dict(os.environ)
+    if sys.platform == "win32":
+        from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
+
+        pin_hermes_tree_on_pythonpath(environment, Path(__file__).resolve().parents[2])
+    return environment
+
+
 def test_i12_holds_real_future_until_terminal_delivery_and_teardown(custody_runtime):
     coordinator, executions, _db = custody_runtime
     from cron.runtime_custody import reserve_execution
@@ -138,7 +157,7 @@ def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(cust
     )
     process = subprocess.Popen(
         [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True)
+        text=True, env=_windows_base_environment())
     worker.bind_process(process)
     assert process.stdout is not None
     acknowledgement = json.loads(process.stdout.readline())
@@ -190,7 +209,7 @@ def test_i13_terminal_row_before_ready_ack_keeps_exact_worker_identity(custody_r
     )
     process = subprocess.Popen(
         [_windows_base_executable(), "-c", script], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-        text=True)
+        text=True, env=_windows_base_environment())
     worker.bind_process(process)
     try:
         assert process.stdout is not None
@@ -240,7 +259,7 @@ def test_i13_reconcile_terminal_child_uses_parent_captured_identity(custody_runt
     )
     process = subprocess.Popen(
         [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=_windows_base_environment())
     worker.bind_process(process)
     try:
         assert process.stdout is not None
@@ -305,6 +324,7 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
     process, native_job = spawn_server(
         [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        env=_windows_base_environment(),
         owner_job_name=new_windows_job_name())
     worker.bind_process(process, native_job=native_job)
     try:
@@ -333,7 +353,7 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
             native_job.close()
 
 
-def _windows_split_fixture(custody_runtime, tmp_path, *, with_job):
+def _windows_split_fixture(custody_runtime, tmp_path, *, with_job, hold_after_terminal=False):
     """Start a real root/worker split; the root waits while the worker owns the ledger."""
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
@@ -363,9 +383,14 @@ def _windows_split_fixture(custody_runtime, tmp_path, *, with_job):
             "dispatch_mode": "degraded",
             "scope_unit": None,
         }}), encoding="utf-8")
-        while not Path({str(release_path)!r}).exists():
-            time.sleep(0.01)
-        assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
+        if {hold_after_terminal!r}:
+            assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
+            while not Path({str(release_path)!r}).exists():
+                time.sleep(0.01)
+        else:
+            while not Path({str(release_path)!r}).exists():
+                time.sleep(0.01)
+            assert e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
         """
     )
     launcher_code = textwrap.dedent(
@@ -468,6 +493,7 @@ def _windows_direct_fixture(custody_runtime):
         process, native_job = spawn_server(
             [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            env=_windows_base_environment(),
             owner_job_name=new_windows_job_name(),
         )
         worker.bind_process(process, native_job=native_job)
@@ -765,14 +791,21 @@ def test_i13_windows_degraded_terminal_tuple_mismatch_refuses_without_readoption
 ):
     """An activated split with a stale terminal tuple stays UNKNOWN while both processes live."""
     _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
-        custody_runtime, tmp_path, with_job=True)
+        custody_runtime, tmp_path, with_job=True, hold_after_terminal=True)
     from cron import executions
+    from tests.waiting import wait_until
     try:
         child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
         active_handle = child.handle
         active_job = child._native_job
-        assert executions.finish_execution(
-            child.execution_id, success=True, delivery_outcome="delivered") is not None
+        wait_until(
+            lambda: (
+                (record := executions.get_execution(child.execution_id)) is not None
+                and record["status"] == "completed"
+            ),
+            timeout=15,
+            what="the child-owned terminal execution row",
+        )
         child._worker_started_at += 1
         reactivation_calls = []
 
@@ -867,7 +900,7 @@ def test_i13_birth_fingerprint_mismatch_refuses_worker_adoption(custody_runtime,
     )
     process = subprocess.Popen(
         [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-        text=True)
+        text=True, env=_windows_base_environment())
     # Capture a deliberately stale parent fingerprint before bind_process. The child adopts the
     # real durable row and publishes its real fingerprint, so activation must refuse the mismatch
     # against the Popen identity already captured by the parent.
@@ -1051,7 +1084,7 @@ def test_i13_direct_popen_identity_probe():
     )
     process = subprocess.Popen(
         [_windows_base_executable(), "-c", script], stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, env=_windows_base_environment())
     try:
         from gateway.status import get_process_start_time
 
