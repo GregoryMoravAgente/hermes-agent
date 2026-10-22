@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - codex/AGC-1721/controlled-candidate-r2-root-01a120af-20261020
+      - codex/AGC-1723/linux-cua-sandbox-root-01a120af-20261022
   workflow_dispatch:
     inputs:
       commit:

@@ -19,6 +19,7 @@ import platform
 import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -36,7 +37,18 @@ TEST_FILES = (
     "tests/tools/test_computer_use_cua_custody.py",
 )
 RUNNER_FILE = "scripts/run_tests_parallel.py"
-SOURCE_CONTRACT_FILES = TEST_FILES + (RUNNER_FILE,)
+SOURCE_CONTRACT_FILES = TEST_FILES + (
+    RUNNER_FILE,
+    "scripts/ci/linux_cua_custody.py",
+    "scripts/run_tests.sh",
+    "tools/browser_tool_session.py",
+    "tests/tools/test_browser_open_timeout.py",
+    "tests/tools/test_bot_desktop_browser.py",
+    ".github/workflows/linux-cua.yml",
+)
+CHROME_PACKAGE = "google-chrome-stable"
+CHROME_SANDBOX_PATH = Path("/opt/google/chrome/chrome-sandbox")
+CHROME_SANDBOX_MODE = 0o4755
 SKIP_DIRS = {".git", "__pycache__", ".pytest_cache"}
 SKIP_SUFFIXES = {".pyc", ".pyo"}
 SYSTEM_PACKAGES = (
@@ -256,6 +268,87 @@ def system_packages() -> dict[str, str]:
     return {line.split("\t", 1)[0]: line.split("\t", 1)[1] for line in lines}
 
 
+def _dpkg_query(*args: str) -> list[str]:
+    if not shutil.which("dpkg-query"):
+        raise SystemExit("dpkg-query is required for the Chrome sandbox receipt")
+    try:
+        output = subprocess.check_output(
+            ["dpkg-query", *args],
+            text=True,
+            timeout=METADATA_SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit("the Chrome package receipt could not be read") from exc
+    return [line for line in output.splitlines() if line]
+
+
+def chrome_sandbox_receipt() -> dict[str, Any]:
+    """Attest the existing package-owned setuid helper without modifying it."""
+    if platform.system() != "Linux" or os.name != "posix":
+        raise SystemExit("the hosted CUA lane requires the Linux Chrome sandbox helper")
+    path = CHROME_SANDBOX_PATH
+    try:
+        file_stat = path.lstat()
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise SystemExit(f"the required Chrome sandbox helper is unavailable: {path}") from exc
+    if resolved != path:
+        raise SystemExit("the Chrome sandbox helper must not be a symlink or redirected path")
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise SystemExit("the Chrome sandbox helper is not a regular file")
+    if file_stat.st_uid != 0 or stat.S_IMODE(file_stat.st_mode) != CHROME_SANDBOX_MODE:
+        raise SystemExit("the Chrome sandbox helper is not root-owned setuid 04755")
+    status_rows = _dpkg_query(
+        "-W",
+        "-f=${Status}\t${Version}\t${Architecture}\n",
+        CHROME_PACKAGE,
+    )
+    if len(status_rows) != 1:
+        raise SystemExit("the exact google-chrome-stable package receipt is incomplete")
+    status_parts = status_rows[0].split("\t")
+    if len(status_parts) != 3:
+        raise SystemExit("google-chrome-stable returned malformed package metadata")
+    status, version, architecture = status_parts
+    if status != "install ok installed" or not version or not architecture:
+        raise SystemExit("google-chrome-stable is not installed with a complete package receipt")
+    package_files = _dpkg_query("-L", CHROME_PACKAGE)
+    if str(path) not in package_files:
+        raise SystemExit("google-chrome-stable does not own the canonical Chrome sandbox path")
+    ownership_rows = _dpkg_query("-S", str(path))
+    package_owner = any(
+        owner_path == str(path)
+        and (owner == CHROME_PACKAGE or owner.startswith(f"{CHROME_PACKAGE}:"))
+        for row in ownership_rows
+        for owner, separator, owner_path in [row.partition(": ")]
+        if separator
+    )
+    if not package_owner:
+        raise SystemExit("dpkg ownership does not bind the Chrome sandbox to google-chrome-stable")
+    return {
+        "path": str(path),
+        "resolved_path": str(resolved),
+        "sha256": sha_file(path),
+        "uid": file_stat.st_uid,
+        "gid": file_stat.st_gid,
+        "mode": oct(stat.S_IMODE(file_stat.st_mode)),
+        "regular_file": True,
+        "non_symlink": True,
+        "package": CHROME_PACKAGE,
+        "package_status": status,
+        "package_version": version,
+        "package_architecture": architecture,
+        "package_manifest_path": True,
+        "package_owner": True,
+    }
+
+
+def _verify_sealed_chrome_sandbox(expected: dict[str, Any]) -> dict[str, Any]:
+    actual = chrome_sandbox_receipt()
+    if actual != expected:
+        raise SystemExit("the package-owned Chrome sandbox helper changed after resolution")
+    return actual
+
+
 def read_meminfo() -> dict[str, int]:
     result: dict[str, int] = {}
     for line in Path("/proc/meminfo").read_text(encoding="utf-8-sig").splitlines():
@@ -407,6 +500,7 @@ def resolve_tools() -> None:
     chromium_link.symlink_to(chromium_path)
     if chromium_link.resolve() != Path(chromium_path).resolve():
         raise SystemExit("owned Chromium PATH entry does not resolve to the sealed PM binary")
+    chrome_sandbox = chrome_sandbox_receipt()
     receipt = {
         "architecture": platform.machine(),
         "cua_driver": {"path": driver_path, "sha256": DRIVER_SHA256},
@@ -416,6 +510,7 @@ def resolve_tools() -> None:
             "path_entry": str(chromium_link),
             "path_entry_target": str(chromium_link.resolve()),
         },
+        "chrome_sandbox": chrome_sandbox,
     }
     write_json("resolved-tools.json", receipt)
     existing_path = os.environ.get("PATH", "")
@@ -423,6 +518,7 @@ def resolve_tools() -> None:
         "HERMES_CUA_DRIVER_CMD": driver_path,
         "AGC_CUA_PUBLIC_DRIVER": driver_path,
         "AGENT_BROWSER_EXECUTABLE_PATH": chromium_path,
+        "CHROME_DEVEL_SANDBOX": chrome_sandbox["path"],
         "PATH": f"{path_bin}:{existing_path}",
     })
 
@@ -503,6 +599,7 @@ def _browser_preflight_stderr_detail(value: bytes) -> str:
 def browser_preflight() -> None:
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
+    chrome_sandbox = _verify_sealed_chrome_sandbox(tools["chrome_sandbox"])
     profile = proof_dir() / "browser-preflight-profile"
     profile.mkdir(mode=0o700)
     command = [
@@ -518,7 +615,15 @@ def browser_preflight() -> None:
     context = _enable_subreaper()
     started = time.monotonic()
     deadline = started + 30.0
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    browser_env = os.environ.copy()
+    browser_env["CHROME_DEVEL_SANDBOX"] = chrome_sandbox["path"]
+    process = subprocess.Popen(
+        command,
+        env=browser_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
     timed_out = False
     stdout: bytes = b""
     stderr: bytes = b""
@@ -555,6 +660,7 @@ def browser_preflight() -> None:
         "stderr_sha256": sha_bytes(stderr),
         "stdout_path": "browser-preflight.stdout",
         "stderr_path": "browser-preflight.stderr",
+        "chrome_sandbox": chrome_sandbox,
         "timed_out": timed_out,
         "subreaper_before_launch": context["enabled"],
         "subreaper_after_wait": after_subreaper,
@@ -866,6 +972,7 @@ def snapshot(label: str) -> None:
         "pm": {"root": str(pm_root), "files": tree_inventory(pm_root)},
         "base": {"root": str(base_root), "files": tree_inventory(base_root)},
         "tools": {"root": str(tools_root), "files": tree_inventory(tools_root)},
+        "chrome_sandbox": chrome_sandbox_receipt(),
         "interpreter": {"executable": sys.executable, "version": sys.version, "prefix": sys.prefix},
     }
     write_json(f"snapshot-{label}.json", receipt)
@@ -913,7 +1020,7 @@ def _verify_snapshots() -> None:
     before_static = _proof_json("snapshot-before-static.json")
     before = _proof_json("snapshot-before-sut.json")
     after = _proof_json("snapshot-after-sut.json")
-    for key in ("source", "git", "system_packages", "pm", "base", "tools"):
+    for key in ("source", "git", "system_packages", "pm", "base", "tools", "chrome_sandbox"):
         if before_static[key] != before[key]:
             raise SystemExit(f"owned {key} changed during the static gate")
         if before[key] != after[key]:
@@ -922,6 +1029,10 @@ def _verify_snapshots() -> None:
 
 def _verify_tool_receipt() -> None:
     resolved = _proof_json("resolved-tools.json")
+    chrome_sandbox = resolved.get("chrome_sandbox")
+    if not isinstance(chrome_sandbox, dict):
+        raise SystemExit("sealed Chrome sandbox helper is missing from the tool receipt")
+    _verify_sealed_chrome_sandbox(chrome_sandbox)
     chromium = resolved.get("chromium") or {}
     path_entry = chromium.get("path_entry")
     path_target = chromium.get("path_entry_target")

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import socket
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -170,6 +171,31 @@ def test_unprivileged_user_under_apparmor_userns_restriction_gets_the_system_bro
     agent_flags = set(agent_env.get("AGENT_BROWSER_ARGS", "").split(",")) - {""}
     assert agent_flags <= set(browser.dock_argv(exe, "/p/dir"))
     assert ("--no-sandbox" in browser.dock_argv(exe, "/p/dir")) == ("--no-sandbox" in agent_flags)
+
+
+def test_attested_helper_keeps_dock_and_agent_on_the_sandboxed_policy(tmp_path, monkeypatch):
+    from tools import browser_tool_session as session
+
+    helper = tmp_path / "chrome-sandbox"
+    helper.write_bytes(b"synthetic helper")
+    monkeypatch.setattr(session, "_CHROMIUM_SANDBOX_PATH", str(helper))
+    monkeypatch.setattr(session, "_CHROMIUM_SANDBOX_MODE", 0o4755)
+    monkeypatch.setenv("CHROME_DEVEL_SANDBOX", str(helper))
+    monkeypatch.setattr(session.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(browser.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(session._install, "_running_in_docker", lambda: False)
+    monkeypatch.setattr(session, "apparmor_restricts_unprivileged_userns", lambda: True)
+    monkeypatch.setattr(
+        session.os,
+        "lstat",
+        lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o4755, st_uid=0),
+    )
+    monkeypatch.setattr(session.os.path, "realpath", lambda path: str(path))
+
+    agent_env = {"CHROME_DEVEL_SANDBOX": str(helper)}
+    session._apply_chromium_sandbox_args(agent_env)
+    assert "AGENT_BROWSER_ARGS" not in agent_env
+    assert "--no-sandbox" not in browser.dock_argv("/opt/chrome", "/p/dir")
 
 
 def test_root_dock_browser_starts_with_the_same_sandbox_args_as_the_agents_browser(monkeypatch):

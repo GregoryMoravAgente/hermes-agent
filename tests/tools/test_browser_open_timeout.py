@@ -1,6 +1,8 @@
 """Tests for browser first-open timeout and timeout diagnostics."""
 
+import stat
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -58,6 +60,27 @@ class TestSandboxBypass:
 
         monkeypatch.setattr(builtins, "open", _open)
         assert bt_session._needs_chromium_sandbox_bypass() is True
+
+    def test_attested_setuid_helper_keeps_sandbox_enabled_under_apparmor(self, monkeypatch, tmp_path):
+        helper = tmp_path / "chrome-sandbox"
+        helper.write_bytes(b"synthetic helper")
+        monkeypatch.setattr(bt_session, "_CHROMIUM_SANDBOX_PATH", str(helper))
+        monkeypatch.setattr(bt_session, "_CHROMIUM_SANDBOX_MODE", 0o4755)
+        monkeypatch.setenv("CHROME_DEVEL_SANDBOX", str(helper))
+        monkeypatch.setattr(bt_session.os, "geteuid", lambda: 1000)
+        monkeypatch.setattr(bt_session._install, "_running_in_docker", lambda: False)
+        monkeypatch.setattr(bt_session, "apparmor_restricts_unprivileged_userns", lambda: True)
+        monkeypatch.setattr(
+            bt_session.os,
+            "lstat",
+            lambda _path: SimpleNamespace(st_mode=stat.S_IFREG | 0o4755, st_uid=0),
+        )
+        monkeypatch.setattr(bt_session.os.path, "realpath", lambda path: str(path))
+
+        browser_env = {"CHROME_DEVEL_SANDBOX": str(helper)}
+        assert bt_session._needs_chromium_sandbox_bypass(browser_env) is False
+        bt_session._apply_chromium_sandbox_args(browser_env)
+        assert "AGENT_BROWSER_ARGS" not in browser_env
 
 
 class TestTimeoutErrorFormatting:
