@@ -13,13 +13,28 @@ def _authority(runner, event=None):
         return bound
     if runner is None:
         return None
+    # A shared primary adapter can route an event into a secondary profile before the
+    # profile-scoped message handler runs.  Resolve the classic custody owner from the
+    # source's pinned runtime identity at this producer boundary; ambient scope is still
+    # the fallback for legacy/unpinned events.
+    if event is not None:
+        try:
+            from gateway.session_identity import identity_of
+            from gateway.session_authorities import authority_for_home
+            identity = identity_of(getattr(event, 'source', None))
+            if identity is not None:
+                scoped = authority_for_home(runner, identity.runtime_home)
+                if scoped is not None:
+                    return scoped
+        except (AttributeError, KeyError, TypeError, ValueError):
+            pass
     from gateway.session_authorities import active_authority
     return active_authority(runner)
 
 
 def begin_classic_event(runner, event, session_key, producer, *, state='queued', parent=None):
     bound = getattr(event, '_classic_custody_authority', None)
-    active = _authority(runner)
+    active = _authority(runner, event)
     if bound is not None and getattr(bound, 'runner', None) is not runner:
         return False
     if bound is not None and active is None and runner is not None and (
