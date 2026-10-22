@@ -1319,7 +1319,10 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
         raise SystemExit("the direct-file diagnostic requires the user-namespace sandbox mode")
     if sandbox["mode"] == "user_namespace":
         variant_specs = (
-            (("about-blank-direct-file", "about:blank"),)
+            (
+                ("about-blank-direct-file", "about:blank"),
+                ("chrome-sandbox-direct-file", "chrome://sandbox"),
+            )
             if diagnostic_direct_file
             else (("about-blank", "about:blank"), ("chrome-sandbox", "chrome://sandbox"))
         )
@@ -1339,7 +1342,14 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
         variants.append(variant)
         if not variant["closure_ok"]:
             break
-    primary = next((item for item in variants if item["name"] == "chrome-sandbox"), variants[-1])
+    primary = next(
+        (
+            item
+            for item in variants
+            if item["name"] in {"chrome-sandbox", "chrome-sandbox-direct-file"}
+        ),
+        variants[-1],
+    )
     _write_browser_preflight_output("browser-preflight.stdout", primary["_stdout"])
     _write_browser_preflight_output("browser-preflight.stderr", primary["_stderr"])
     after_subreaper = _subreaper_state()
@@ -1351,7 +1361,7 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
     )
     if sandbox["mode"] != "user_namespace":
         native_page_status = "not_applicable"
-    elif primary["name"] == "chrome-sandbox":
+    elif primary["name"] in {"chrome-sandbox", "chrome-sandbox-direct-file"}:
         native_page_status = "unresolved"
     else:
         native_page_status = "not_executed"
@@ -1380,7 +1390,7 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
         "sandbox_page_status": native_page_status,
         "sandbox_page_output_sha256": (
             sha_bytes(primary_stdout)
-            if primary["name"] == "chrome-sandbox"
+            if primary["name"] in {"chrome-sandbox", "chrome-sandbox-direct-file"}
             else None
         ),
         "timed_out": timed_out,
@@ -1398,7 +1408,7 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
             for item in variants
         ],
         "experiment_complete": (
-            (diagnostic_direct_file and len(variants) == 1)
+            (diagnostic_direct_file and len(variants) == 2)
             or (requires_causal_pair and len(variants) == 2)
             or (not requires_causal_pair and len(variants) == 1)
         ),
