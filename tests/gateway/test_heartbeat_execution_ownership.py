@@ -175,6 +175,7 @@ async def _real_goal_owner(tmp_path, monkeypatch, *, enable_drain=False, seed_na
 @pytest.mark.asyncio
 async def test_unbound_goal_tick_delivery_callback_releases_real_reservation(tmp_path, monkeypatch):
     """A no-child goal decision settles its source-owned tick at the real adapter boundary."""
+    from gateway.platforms.base_delivery_callbacks import finish_post_delivery_callback
     from gateway.session_goal_tick_custody import (
         attach_tick_handle, reserve_tick, view_for_handle,
     )
@@ -198,7 +199,30 @@ async def test_unbound_goal_tick_delivery_callback_releases_real_reservation(tmp
         assert register_tick_delivery_finalizer(runner, event.source, event) is True
         assert key in adapter._post_delivery_callbacks
 
-        await adapter._fire_post_delivery_callback(key, asyncio.Event())
+        channel = SimpleNamespace(
+            id=42,
+            send=AsyncMock(return_value=SimpleNamespace(id="goal-delivery")),
+        )
+        adapter._client = SimpleNamespace(
+            get_channel=lambda _channel_id: channel,
+            fetch_channel=AsyncMock(return_value=channel),
+        )
+        result = await adapter.send(
+            chat_id=event.source.chat_id,
+            content="heartbeat delivery",
+            metadata={},
+        )
+        assert result.success is True
+        assert result.message_id == "goal-delivery"
+        await finish_post_delivery_callback(
+            adapter,
+            event,
+            key,
+            asyncio.Event(),
+            processing_ok=result.success,
+            classic_receipt=None,
+            thread_metadata=None,
+        )
 
         assert view_for_handle(authority, tick.handle) is None
     finally:
@@ -473,3 +497,67 @@ async def test_goal_fallback_slash_keeps_command_route_and_retains_same_handle_u
         assert handoff.state == "unknown"
     finally:
         runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_goal_tick_exact_callback_cancel_marks_same_handle_unknown_before_reraise(
+    tmp_path, monkeypatch,
+):
+    """Exact cancellation still consumes the generic I08 finalizer outside its outcome scope."""
+    from gateway.platforms.base_delivery_callbacks import finish_post_delivery_callback
+    from gateway.session_goal_tick_custody import (
+        attach_tick_handle, reserve_tick, view_for_handle,
+    )
+    from gateway.session_goal_tick_runtime import register_tick_delivery_finalizer
+    from gateway.session_automation_custody import automation_source_identity
+
+    runner, adapter, authority, key, entry, event, _handoff = await _real_goal_owner(
+        tmp_path, monkeypatch,
+    )
+    try:
+        tick = reserve_tick(
+            authority,
+            request_id="goal-exact-cancel",
+            principal_id="automation:" + key,
+            session_id=authority.logical_owner(entry.session_id),
+            source_identity=automation_source_identity(event, key),
+            kind="goal",
+        )
+        assert tick is not None
+        attach_tick_handle(event, tick, "goal")
+        assert register_tick_delivery_finalizer(runner, event.source, event) is True
+
+        async def cancelled_exact_callback():
+            raise asyncio.CancelledError()
+
+        exact_handle = adapter.register_post_delivery_callback_occurrence(
+            key,
+            cancelled_exact_callback,
+            generation=getattr(event, "_hermes_run_generation", None),
+            owner_event=event,
+        )
+        assert exact_handle is not None
+        event._classic_execution_bridge = SimpleNamespace(
+            post_delivery_callback_handle=exact_handle,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await finish_post_delivery_callback(
+                adapter,
+                event,
+                key,
+                asyncio.Event(),
+                processing_ok=True,
+                classic_receipt=None,
+                thread_metadata=None,
+            )
+
+        record = authority._preservation_coordinator()._records[tick.handle.lease.lease_id]
+        assert record.handle is tick.handle
+        assert record.state == "unknown"
+        assert record.reason == "join_failed"
+        assert view_for_handle(authority, tick.handle) is not None
+        assert key not in adapter._post_delivery_callbacks
+    finally:
+        runner.session_store.close_all_db_handles()
+

@@ -34,6 +34,134 @@ def _event_tick_handles(event):
     return tuple(handles)
 
 
+_I04_PARENT = "I04_fifo_turn_execution"
+_I08_CHILD = "I08_goals_loops_heartbeat"
+_MISSING_ORIGIN = object()
+_INVALID_ORIGIN = object()
+
+
+def _authenticated_goal_parent(
+    authority, session_id, admission_id, generation, principal_id, handle,
+):
+    """Return the exact active I04 parent for one newly reserved I08 handle."""
+    values = (session_id, admission_id, principal_id)
+    if (any(type(value) is not str or not value for value in values)
+            or type(generation) is not int or generation < 1
+            or getattr(handle, "owner_class", None) != _I08_CHILD):
+        return None
+    child_lease = getattr(handle, "lease", None)
+    parent_lease_id = getattr(child_lease, "parent_lease_id", None)
+    if type(parent_lease_id) is not str or not parent_lease_id:
+        return None
+    getter = getattr(authority, "_preservation_operation_parent", None)
+    coordinator_getter = getattr(authority, "_preservation_coordinator", None)
+    if not callable(getter) or not callable(coordinator_getter):
+        return None
+    try:
+        parent = getter(
+            session_id, admission_id, generation=generation, principal_id=principal_id,
+        )
+        coordinator = coordinator_getter()
+        validator = getattr(authority, "_preservation_operation_validate_parent_handle", None)
+        instance_id = getattr(authority, "instance_id", None)
+        if (parent is None or getattr(parent, "owner_class", None) != _I04_PARENT
+                or coordinator is None or not callable(validator)
+                or type(instance_id) is not str or not instance_id):
+            return None
+        if validator(
+            parent, coordinator, getattr(authority, "profile_id", None),
+            getattr(authority, "epoch", None), instance_id,
+        ) is not parent:
+            return None
+        parent_lease = getattr(parent, "lease", None)
+        if getattr(parent_lease, "lease_id", None) != parent_lease_id:
+            return None
+        for candidate in (parent, handle):
+            if (getattr(candidate, "profile_id", None) != getattr(authority, "profile_id", None)
+                    or getattr(candidate, "authority_epoch", None) != getattr(authority, "epoch", None)
+                    or getattr(candidate, "process_instance", None) != instance_id
+                    or getattr(candidate, "coordinator_id", None)
+                    != getattr(coordinator, "_coordinator_id", None)):
+                return None
+        records = getattr(coordinator, "_records", None)
+        record = records.get(parent_lease_id) if isinstance(records, dict) else None
+        if (record is None or getattr(record, "handle", None) is not parent
+                or getattr(record, "state", None) not in {"accepted", "finalizing"}):
+            return None
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError,
+            sqlite3.Error, TypeError, ValueError):
+        return None
+    return parent
+
+
+def _capture_goal_delivery_origin(
+    authority, session_id, admission_id, generation, principal_id, handle,
+):
+    """Capture the source-owned ingress event before the waiter cleanup removes its map entry."""
+    parent = _authenticated_goal_parent(
+        authority, session_id, admission_id, generation, principal_id, handle,
+    )
+    if parent is None:
+        parent_lease_id = getattr(getattr(handle, "lease", None), "parent_lease_id", None)
+        return _INVALID_ORIGIN if isinstance(parent_lease_id, str) and parent_lease_id else None
+    adopters = getattr(authority, "marker_adopters", None)
+    origin = adopters.get(admission_id) if isinstance(adopters, dict) else None
+    # A parent without the exact already-installed marker is a real provenance failure.  Keep the
+    # authenticated parent in the capture with origin=None so the later callback cannot fall back
+    # to the restored event or treat an empty current map as proof.
+    return (admission_id, generation, session_id, principal_id, parent, origin)
+
+
+def _captured_goal_delivery_origin(authority, ticks, captured, registered_generation):
+    """Validate the registration snapshot and every I08->I04 edge before delivery release."""
+    if captured is _MISSING_ORIGIN:
+        return _MISSING_ORIGIN
+    capture = captured
+    if not isinstance(capture, tuple) or len(capture) != 6:
+        return None
+    admission_id, generation, session_id, principal_id, parent, origin = capture
+    if (type(admission_id) is not str or not admission_id
+            or type(generation) is not int or generation < 1
+            or type(session_id) is not str or not session_id
+            or type(principal_id) is not str or not principal_id
+            or origin is None or parent is None
+            or registered_generation != generation):
+        return None
+    try:
+        coordinator = getattr(authority, "_preservation_coordinator", lambda: None)()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    instance_id = getattr(authority, "instance_id", None)
+    if (coordinator is None or type(instance_id) is not str or not instance_id
+            or getattr(parent, "owner_class", None) != _I04_PARENT
+            or getattr(parent, "profile_id", None) != getattr(authority, "profile_id", None)
+            or getattr(parent, "authority_epoch", None) != getattr(authority, "epoch", None)
+            or getattr(parent, "process_instance", None) != instance_id
+            or getattr(parent, "coordinator_id", None)
+            != getattr(coordinator, "_coordinator_id", None)):
+        return None
+    parent_lease_id = getattr(getattr(parent, "lease", None), "lease_id", None)
+    if type(parent_lease_id) is not str or not parent_lease_id:
+        return None
+    adopters = getattr(authority, "marker_adopters", None)
+    if not isinstance(adopters, dict):
+        return None
+    if admission_id in adopters and adopters[admission_id] is not origin:
+        return None
+    for tick in ticks:
+        handle = getattr(tick, "handle", None)
+        lease = getattr(handle, "lease", None)
+        if (getattr(handle, "owner_class", None) != _I08_CHILD
+                or getattr(lease, "parent_lease_id", None) != parent_lease_id
+                or getattr(handle, "profile_id", None) != getattr(authority, "profile_id", None)
+                or getattr(handle, "authority_epoch", None) != getattr(authority, "epoch", None)
+                or getattr(handle, "process_instance", None) != instance_id
+                or getattr(handle, "coordinator_id", None)
+                != getattr(coordinator, "_coordinator_id", None)):
+            return None
+    return origin
+
+
 def reserve_goal_tick(runner, session_entry, source, event):
     """Reserve a goal decision beneath the live I04 admission, or refuse it closed."""
     if event is None:
@@ -70,6 +198,15 @@ def reserve_goal_tick(runner, session_entry, source, event):
             turn_lease=turn_lease,
         )
         if tick is not None:
+            origin = _capture_goal_delivery_origin(
+                authority, session_entry.session_id, admission_id, generation,
+                principal_id, tick.handle,
+            )
+            if origin is None:
+                if hasattr(event, "_i08_delivery_origin"):
+                    delattr(event, "_i08_delivery_origin")
+            else:
+                event._i08_delivery_origin = origin
             attach_tick_handle(event, tick, "goal")
     except (AttributeError, KeyError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
         logger.debug("goal continuation custody reservation failed: %s", exc)
@@ -135,22 +272,47 @@ def register_tick_delivery_finalizer(runner, source, event) -> bool:
             mark_unknown(tick, "delivery_callback_missing")
         return False
 
+    origin_snapshot = getattr(event, "_i08_delivery_origin", _MISSING_ORIGIN)
+    registration_generation = getattr(event, "_hermes_run_generation", None)
+    captured_ticks = tuple(ticks)
+
     async def _settle_after_delivery() -> None:
         try:
-            for _kind, handle in _event_tick_handles(event):
+            from gateway.platforms.base_delivery_callbacks import _post_delivery_outcome
+            outcome = _post_delivery_outcome()
+            if outcome is None:
+                for tick in ticks:
+                    mark_unknown(tick, "join_failed")
+                return
+            origin = _captured_goal_delivery_origin(
+                authority, captured_ticks, origin_snapshot, registration_generation,
+            )
+            event_matches = (
+                outcome.event is event if origin is _MISSING_ORIGIN
+                else origin is not None and outcome.event is origin
+            )
+            if not event_matches or outcome.session_key != session_key:
+                for tick in ticks:
+                    mark_unknown(tick, "join_failed")
+                return
+            if outcome.processing_ok is not True:
+                for tick in ticks:
+                    mark_unknown(tick, "join_failed")
+                return
+            for captured_tick in captured_ticks:
+                handle = getattr(captured_tick, "handle", None)
                 tick = view_for_handle(authority, handle)
                 if tick is None or _bound_admission(authority, handle) is not None:
                     continue
                 if not finish_unbound(tick, success=True):
-                    mark_unknown(tick, "delivery_finalizer_refused")
+                    mark_unknown(tick, "join_failed")
         except BaseException:
             for tick in ticks:
-                mark_unknown(tick, "delivery_finalizer_failed")
+                mark_unknown(tick, "join_failed")
             raise
 
-    generation = getattr(event, "_hermes_run_generation", None)
     try:
-        register(session_key, _settle_after_delivery, generation=generation)
+        register(session_key, _settle_after_delivery, generation=registration_generation)
         entry = getattr(adapter, "_post_delivery_callbacks", {}).get(session_key)
         callback = entry[1] if isinstance(entry, tuple) and len(entry) == 2 else entry
         if not _generic_callback_contains(callback, _settle_after_delivery):

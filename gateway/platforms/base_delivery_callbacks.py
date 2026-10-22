@@ -7,12 +7,46 @@ same-key recursive turns never share a mutable dispatch owner or overwrite one a
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 import inspect
 import logging
 from typing import Any, Awaitable, Callable
 
 
 logger = logging.getLogger("gateway.platforms.base")
+
+
+@dataclass(frozen=True)
+class _PostDeliveryOutcome:
+    """Source-owned outcome visible only while Base consumes one callback occurrence."""
+
+    event: Any
+    session_key: str
+    processing_ok: bool
+
+
+_POST_DELIVERY_OUTCOME: ContextVar[_PostDeliveryOutcome | None] = ContextVar(
+    "gateway_post_delivery_outcome", default=None,
+)
+
+
+def _post_delivery_outcome() -> _PostDeliveryOutcome | None:
+    return _POST_DELIVERY_OUTCOME.get()
+
+
+@contextmanager
+def _post_delivery_outcome_scope(event: Any, session_key: str, processing_ok: bool):
+    token = _POST_DELIVERY_OUTCOME.set(
+        _PostDeliveryOutcome(
+            event=event, session_key=session_key, processing_ok=processing_ok,
+        ),
+    )
+    try:
+        yield
+    finally:
+        _POST_DELIVERY_OUTCOME.reset(token)
 
 
 def _legacy_occurrence_marker() -> None:
@@ -221,20 +255,33 @@ async def finish_post_delivery_callback(
 
     callback_completed = False
     first_error = None
+    post_delivery_handle = None
+    generic_callback_attempted = False
 
     try:
-        post_delivery_handle = callback_handle_for_event(event)
-        if post_delivery_handle is None:
-            await adapter._fire_post_delivery_callback(session_key, interrupt_event)
-        else:
-            await adapter._fire_post_delivery_callback_occurrence(
-                session_key, interrupt_event, post_delivery_handle,
-            )
-            # Generic callbacks retain their legacy same-key lane after the exact occurrence.
-            await adapter._fire_post_delivery_callback(session_key, interrupt_event)
-        callback_completed = True
+        with _post_delivery_outcome_scope(event, session_key, processing_ok):
+            post_delivery_handle = callback_handle_for_event(event)
+            if post_delivery_handle is None:
+                generic_callback_attempted = True
+                await adapter._fire_post_delivery_callback(session_key, interrupt_event)
+            else:
+                await adapter._fire_post_delivery_callback_occurrence(
+                    session_key, interrupt_event, post_delivery_handle,
+                )
+                # Generic callbacks retain their legacy same-key lane after the exact occurrence.
+                generic_callback_attempted = True
+                await adapter._fire_post_delivery_callback(session_key, interrupt_event)
+            callback_completed = True
     except BaseException as exc:  # health: allow BLE001 -- opaque callback cancellation is re-raised after all ownership cleanup phases
         first_error = exc
+        if post_delivery_handle is not None and not generic_callback_attempted:
+            # The outcome scope has reset before this retry, so a retained I08 callback can only
+            # observe the failed exact occurrence and mark its original handle UNKNOWN.
+            generic_callback_attempted = True
+            try:
+                await adapter._fire_post_delivery_callback(session_key, interrupt_event)
+            except BaseException:
+                logger.exception("post-delivery generic callback cleanup failed")
 
     try:
         finish_adapter_event(
