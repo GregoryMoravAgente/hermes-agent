@@ -41,6 +41,7 @@ SOURCE_CONTRACT_FILES = TEST_FILES + (
     RUNNER_FILE,
     "scripts/ci/linux_cua_custody.py",
     "scripts/ci/linux_cua_process_state.py",
+    "scripts/ci/linux_cua_single_process_probe.py",
     "scripts/run_tests.sh",
     "tools/browser_tool_session.py",
     "tests/tools/test_browser_open_timeout.py",
@@ -1285,10 +1286,12 @@ def _run_browser_preflight_pipe_variant(
     }
 
 
-def browser_preflight(*, output_transport: str = "pipes") -> None:
+def browser_preflight(*, output_transport: str = "pipes", single_process: bool = False) -> None:
     if output_transport not in {"pipes", "direct_files"}:
         raise ValueError(f"unsupported browser preflight output transport: {output_transport}")
     diagnostic_direct_file = output_transport == "direct_files"
+    if single_process and not diagnostic_direct_file:
+        raise SystemExit("the single-process diagnostic requires direct-file output")
     tools = json.loads((proof_dir() / "resolved-tools.json").read_text(encoding="utf-8-sig"))
     browser = tools["chromium"]["path"]
     sandbox = _verify_sealed_sandbox(tools["sandbox"])
@@ -1305,6 +1308,8 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
         "--timeout=5000",
         "--allow-chrome-scheme-url",
     ]
+    if single_process:
+        base_command.insert(1, "--single-process")
     context = _enable_subreaper()
     started = time.monotonic()
     deadline = started + 30.0
@@ -1317,7 +1322,9 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
         browser_env.pop("CHROME_DEVEL_SANDBOX", None)
     if diagnostic_direct_file and sandbox["mode"] != "user_namespace":
         raise SystemExit("the direct-file diagnostic requires the user-namespace sandbox mode")
-    if sandbox["mode"] == "user_namespace":
+    if single_process:
+        variant_specs = (("about-blank-single-process-direct-file", "about:blank"),)
+    elif sandbox["mode"] == "user_namespace":
         variant_specs = (
             (
                 ("about-blank-direct-file", "about:blank"),
@@ -1358,6 +1365,15 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
     all_variants_ok = (
         all(item["result_ok"] for item in variants)
         and (not requires_causal_pair or len(variants) == 2)
+    )
+    from linux_cua_single_process_probe import diagnostic_fields
+
+    experiment_complete, experiment_result = diagnostic_fields(
+        diagnostic_direct_file,
+        single_process,
+        len(variants),
+        requires_causal_pair,
+        all_variants_ok,
     )
     if sandbox["mode"] != "user_namespace":
         native_page_status = "not_applicable"
@@ -1407,22 +1423,8 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
             {key: value for key, value in item.items() if not key.startswith("_")}
             for item in variants
         ],
-        "experiment_complete": (
-            (diagnostic_direct_file and len(variants) == 2)
-            or (requires_causal_pair and len(variants) == 2)
-            or (not requires_causal_pair and len(variants) == 1)
-        ),
-        "experiment_result": (
-            "direct_file_variant_closed"
-            if diagnostic_direct_file and all_variants_ok
-            else "direct_file_variant_failed"
-            if diagnostic_direct_file
-            else "both_variants_closed"
-            if requires_causal_pair and all_variants_ok
-            else "setuid_default_closed"
-            if not requires_causal_pair and all_variants_ok
-            else "causal_variant_failed"
-        ),
+        "experiment_complete": experiment_complete,
+        "experiment_result": experiment_result,
         "success": success,
     }
     if diagnostic_direct_file:
@@ -1430,7 +1432,13 @@ def browser_preflight(*, output_transport: str = "pipes") -> None:
             {
                 "output_transport": output_transport,
                 "diagnostic_only": True,
-                "comparison_control": "d2_about_blank_pipe",
+                "comparison_control": (
+                    "existing_about_blank_direct_file"
+                    if single_process
+                    else "d2_about_blank_pipe"
+                ),
+                "single_process": single_process,
+                "next_stage": "stop_before_cua_sut" if single_process else None,
             }
         )
     write_json("browser-preflight.json", receipt)
