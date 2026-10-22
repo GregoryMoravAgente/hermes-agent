@@ -494,8 +494,14 @@ def _windows_direct_fixture(custody_runtime):
             "dispatch_mode": "direct",
             "scope_unit": None,
         }}), flush=True)
+        # The adopted row belongs to this child PID.  Let the parent alter the native Job
+        # binding first, then perform the terminal write here and remain alive for the
+        # parent's durable readback/reconciliation check.
+        assert sys.stdin.read(1) == "f"
+        assert e.finish_execution(
+            {binding.execution_id!r}, success=True, delivery_outcome="delivered") is not None
+        print("terminal", flush=True)
         assert sys.stdin.read(1) == "x"
-        e.finish_execution({binding.execution_id!r}, success=True, delivery_outcome="delivered")
         """
     )
     native_job = None
@@ -785,8 +791,15 @@ def test_i13_windows_direct_terminal_replaced_or_query_job_refuses(
         if replacement_kind != "dropped":
             child._native_job = replacement
             child._native_job_proven = True
-        assert executions.finish_execution(
-            child.execution_id, success=True, delivery_outcome="delivered") is not None
+        assert process.stdin is not None
+        process.stdin.write("f")
+        process.stdin.flush()
+        assert process.stdout is not None
+        assert process.stdout.readline().strip() == "terminal"
+        terminal_record = executions.get_execution(child.execution_id)
+        assert terminal_record is not None
+        assert terminal_record["status"] == "completed"
+        assert process.poll() is None
         assert child.reconcile_unacknowledged(process, dispatch_mode="direct") == "unknown"
         assert child._unknown is True
         assert child.settled is False
