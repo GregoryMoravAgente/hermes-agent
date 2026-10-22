@@ -155,15 +155,21 @@ def test_stamp_claim_publishes_the_card_and_an_ordinary_claim_stays_empty():
     published = []
     stream = SessionEvents()
     stream.publish = lambda sid, payload, *, event_type: published.append((event_type, payload))
-    authority = SimpleNamespace(epoch=3, executing={}, _publish_pending=lambda ref: None)
+    authority = SimpleNamespace(
+        epoch=3, executing={}, _publish_pending=lambda ref: None,
+        _preservation_activate_claim=lambda *_args: None,
+        _preservation_bind_claim=lambda *_args: None,
+    )
     live = SimpleNamespace(event_stream=stream)
     ref = SessionRef("p", SID)
     automation = {"text": MODEL_TEXT, "local_automation_v1": {
         "identity": "i", "owner": SID, "route": "r", "target": SID,
         "display_kind": "process_complete", "display_text": DISPLAY}}
-    SessionAuthority._stamp_claim(authority, ref, live, {"generation": 9, "admission_id": "adm-9", "payload": automation})
-    SessionAuthority._stamp_claim(authority, ref, live, {"generation": 10, "admission_id": "adm-10",
-                                                         "payload": {"text": "typed"}})
+    SessionAuthority._stamp_claim(
+        authority, ref, live, row={"generation": 9, "admission_id": "adm-9", "payload": automation})
+    SessionAuthority._stamp_claim(
+        authority, ref, live, row={"generation": 10, "admission_id": "adm-10",
+                                   "payload": {"text": "typed"}})
     assert published == [("message.start", {"display_kind": "process_complete", "display_text": DISPLAY,
                                             "text": MODEL_TEXT}), ("message.start", {})]
 
