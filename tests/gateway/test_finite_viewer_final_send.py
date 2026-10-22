@@ -39,6 +39,7 @@ def _turn_ctx():
         stream_consumer_holder=[_consumer()],
         source=SimpleNamespace(platform="local"),
         session_key="agent:main:local:dm:local-139666",
+        run_generation=1,
     )
 
 
