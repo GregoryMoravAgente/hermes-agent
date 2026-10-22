@@ -80,76 +80,133 @@ async def run_task(connection, params):
     from hermes_state_local import local_receipt
     from gateway.session_policy import restore_policy
     authority = connection.authority
-    # Resolved off-loop up front: no await separates the saved-claim check from session
-    # creation. The Kanban claim check and its marker share one off-loop transaction; a
-    # concurrent retry of the same attempt meets that marker (same session) or a stale claim.
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
+    # Resolve the database path up front.  The durable admission lookup below is read-only and
+    # precedes the first local policy/session effect; the Kanban claim check and marker still share
+    # one off-loop transaction after that source-owned root is reserved.
     owner_db = str(await asyncio.to_thread(Path(authority.db.db_path).resolve))
     # The dispatcher attempt is the durable request identity, including after the
     # task closes. Retry checks the saved claim, never reinterprets updated cards.
     request_id = 'kanban:' + json.dumps([params.get('board'), params.get('task_id'), params.get('run_id')], separators=(',', ':'))
     sid = local_identity(authority.profile_id, connection.actor.subject, request_id)
-    saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
-    if saved:
-        policy = restore_policy(saved['policy'])
-        context = json.loads(policy.kanban_json or '{}')
-        if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
-                or any(params[k] != context.get(k) for k in params)):
-            raise RuntimeStoreError('permission_denied')
-        from gateway.session_local_recovery import restore_local_session
-        ref = restore_local_session(authority, sid)
-    else:
-        policy, private = build_kanban_policy(connection, params, _load_gateway_config())
-        ref = create_local_session(authority, connection.actor, {'request_id': request_id},
-                                   trusted_policy=policy, trusted_secrets=private)
-    from hermes_cli.kanban_db_connect import connect_closing
-    from hermes_cli import kanban_db as kb
-    import os
-    import psutil
-    from hermes_cli.process_identity import process_birth
-    context = json.loads(policy.kanban_json)
+    root = getattr(authority, '_preservation_automation_root', None)
+    if coordinator is not None and not callable(root):
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    handle = None
+    descriptor = None
+    try:
+        # Existing rows are read-only recovery.  New attempts reserve the exact target sid before
+        # policy construction, local-session creation, or the Kanban owner marker.
+        from hermes_state_runtime import find_session_admission
+        # A real authority always exposes the transactional read context.  A small legacy
+        # adapter used by the headless policy unit path does not, and it has no preservation
+        # coordinator to own a durable I09 admission; keep that adapter's pre-existing
+        # non-durable test path.  An authority-shaped object that claims a coordinator but lacks
+        # the read API must fail closed rather than silently treating an admission as absent.
+        read_ctx = getattr(authority.db, '_read_ctx', None)
+        legacy_adapter = (not callable(read_ctx) and coordinator is None
+                          and not callable(require_coordinator))
+        if not callable(read_ctx):
+            if coordinator is not None or callable(require_coordinator):
+                raise RuntimeStoreError('runtime_custody_unavailable')
+            committed = None
+        else:
+            committed = await asyncio.to_thread(find_session_admission, authority.db,
+                principal_id=connection.actor.subject, session_id=sid, request_id=request_id)
+        if committed is not None:
+            descriptor = authority._preservation_i09_descriptor_for_row(
+                committed, source_identity='kanban:' + request_id)
+            handle = authority._preservation_recover_automation(committed)
+            if handle is None and committed.get('status') != 'terminal':
+                raise RuntimeStoreError('preservation_owner_unmapped')
+        elif coordinator is not None:
+            handle = root(request_id=request_id, principal_id=connection.actor.subject,
+                          session_id=sid, source_identity='kanban:' + request_id,
+                          owner_class='I09_a2a_hosted_kanban')
+            if handle is None:
+                raise RuntimeStoreError('runtime_custody_unavailable')
+            pending_root = getattr(authority, '_preservation_pending_root', None)
+            if callable(pending_root):
+                pending_root(request_id, handle, principal_id=connection.actor.subject,
+                             session_id=sid, source_identity='kanban:' + request_id)
+        saved = local_receipt(authority.db, sid) if authority.db.get_session(sid) is not None else None
+        if saved:
+            policy = restore_policy(saved['policy'])
+            context = json.loads(policy.kanban_json or '{}')
+            if (not connection.native_owner or set(params) not in ({'board', 'task_id', 'run_id', 'claim_lock'}, {'board', 'task_id', 'run_id', 'claim_lock', 'db'})
+                    or any(params[k] != context.get(k) for k in params)):
+                raise RuntimeStoreError('permission_denied')
+            from gateway.session_local_recovery import restore_local_session
+            ref = restore_local_session(authority, sid)
+        else:
+            policy, private = build_kanban_policy(connection, params, _load_gateway_config())
+            ref = create_local_session(authority, connection.actor, {'request_id': request_id},
+                                       trusted_policy=policy, trusted_secrets=private)
+        if ref.session_id != sid and not legacy_adapter:
+            raise RuntimeStoreError('admission_conflict')
+        if committed is None and coordinator is not None and handle is None:
+            raise RuntimeStoreError('runtime_custody_unavailable')
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli import kanban_db as kb
+        import os
+        import psutil
+        from hermes_cli.process_identity import process_birth
+        context = json.loads(policy.kanban_json)
 
-    def admit_claim():
-        # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
-        # check and its marker share one write transaction, off the owner loop.
-        with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
-            # Either this exact attempt was already admitted to this session (retry after a
-            # crash between session creation and admission), or the claim is still current
-            # now; a reclaimed/closed task never reaches resume/submit.
-            marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
-                                  (params['task_id'], params['run_id'])).fetchone()
-            if marker:
-                if json.loads(marker[0])['session_id'] != ref.session_id:
-                    raise RuntimeStoreError('stale_kanban_claim')
-            else:
-                task = kb.get_task(conn, params['task_id'])
-                if not (task and task.status == 'running' and task.current_run_id == params['run_id'] and task.claim_lock == params['claim_lock']):
-                    raise RuntimeStoreError('stale_kanban_claim')
-                kb._append_event(conn, task.id, 'owner_admitted',
-                    {'db': owner_db, 'session_id': ref.session_id,
-                     'request_id': request_id, 'pid': os.getpid(), 'birth': process_birth(psutil.Process())},
-                    run_id=task.current_run_id)
-    from gateway.session_runtime_workers import tracked_write
-    await tracked_write(authority, admit_claim)
-    await connection.resume(ref, {})
-    # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
-    # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
-    # A retry of an attempt admitted before cards were finite resubmits its committed payload,
-    # so the store returns the original receipt instead of admission_conflict.
-    from hermes_state_runtime import find_session_admission
-    committed = None if not saved else await asyncio.to_thread(find_session_admission, authority.db,
-        principal_id=connection.actor.subject, session_id=ref.session_id, request_id=request_id)
-    payload: dict = {'text': f'work kanban task {params["task_id"]}'}
-    if committed is None or 'finite' in committed['payload']:
-        payload['finite'] = True
-    # The dispatcher's trusted producer marker (#134889 KB-8): nobody waits on a card attempt, so one
-    # lost across an owner restart settles interrupted instead of pausing the card session. An
-    # attempt main committed without it resubmits unmarked (same digest, original receipt).
-    card = None
-    if committed is None or 'kanban_card_v1' in committed['payload']:
-        card = {'board': context.get('board'), 'task_id': params['task_id'], 'run_id': params['run_id']}
-    receipt = await authority.submit(connection.actor, Submission(request_id, ref, payload, 'queue'),
-                                     _kanban_card=card)
-    return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
+        def admit_claim():
+            # The Kanban DB is the cross-profile dispatch bus (busy_timeout up to 120 s): the claim
+            # check and its marker share one write transaction, off the owner loop.
+            with connect_closing(Path(context['db'])) as conn, kb.write_txn(conn):
+                # Either this exact attempt was already admitted to this session (retry after a
+                # crash between session creation and admission), or the claim is still current
+                # now; a reclaimed/closed task never reaches resume/submit.
+                marker = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
+                                      (params['task_id'], params['run_id'])).fetchone()
+                if marker:
+                    if json.loads(marker[0])['session_id'] != ref.session_id:
+                        raise RuntimeStoreError('stale_kanban_claim')
+                else:
+                    task = kb.get_task(conn, params['task_id'])
+                    if not (task and task.status == 'running' and task.current_run_id == params['run_id'] and task.claim_lock == params['claim_lock']):
+                        raise RuntimeStoreError('stale_kanban_claim')
+                    kb._append_event(conn, task.id, 'owner_admitted',
+                        {'db': owner_db, 'session_id': ref.session_id,
+                         'request_id': request_id, 'pid': os.getpid(), 'birth': process_birth(psutil.Process())},
+                        run_id=task.current_run_id)
+        from gateway.session_runtime_workers import tracked_write
+        await tracked_write(authority, admit_claim)
+        await connection.resume(ref, {})
+        # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
+        # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
+        # A retry of an attempt admitted before cards were finite resubmits its committed payload,
+        # so the store returns the original receipt instead of admission_conflict.
+        payload: dict = {'text': f'work kanban task {params["task_id"]}'}
+        if committed is None or 'finite' in committed['payload']:
+            payload['finite'] = True
+        # The trusted card producer has no interactive owner waiting after restart. A
+        # committed legacy retry keeps its original absence for exact replay.
+        card = None
+        if committed is None or 'kanban_card_v1' in committed['payload']:
+            card = {'board': context.get('board'), 'task_id': params['task_id'], 'run_id': params['run_id']}
+        if handle is not None or descriptor is not None:
+            receipt = await authority._submit_i09_automation(
+                connection.actor, ref, request_id, payload, handle,
+                source_identity='kanban:' + request_id, descriptor=descriptor,
+                kanban_card=card)
+        else:
+            receipt = await authority.submit(
+                connection.actor, Submission(request_id, ref, payload, 'queue'), _kanban_card=card)
+        finish = getattr(authority, '_preservation_finish_automation', None)
+        if getattr(receipt, 'status', None) == 'terminal' and callable(finish):
+            finish(receipt.admission_id, finalizer_id=f'kanban:{receipt.admission_id}')
+        return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
+    except BaseException:
+        coordinator_for_failure = getattr(authority, '_preservation_coordinator', None)
+        coordinator = coordinator_for_failure() if callable(coordinator_for_failure) else None
+        if coordinator is not None and handle is not None:
+            coordinator.mark_unknown(handle, 'join_failed')
+        raise
 
 
 def bind_worker_context(frame):

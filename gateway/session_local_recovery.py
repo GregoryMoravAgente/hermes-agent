@@ -9,7 +9,18 @@ from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
 from hermes_state_keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
-from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+from hermes_state_runtime import RuntimeStoreError, get_session_admission, list_session_admissions
+
+
+def _registry(authority):
+    """Presence marks managed bootstrap; a present-but-None registry is never legacy."""
+    runner = authority.runner
+    if not hasattr(runner, 'session_authorities'):
+        return None
+    registry = runner.session_authorities
+    if registry is None:
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    return registry
 
 
 def local_adapter_map(authority):
@@ -17,7 +28,7 @@ def local_adapter_map(authority):
     profile, ``runner._profile_adapters[name]`` for a served secondary (its routed home, so
     ``_adapter_for_source`` / ``_adapters_for_profile`` resolve the right transport)."""
     runner = authority.runner
-    registry = getattr(runner, 'session_authorities', None)
+    registry = _registry(authority)
     name = registry.profile_name(authority) if registry is not None else None
     if name is None:
         return runner.adapters
@@ -32,7 +43,7 @@ def local_source(authority, chat_id, user_id):
     carry its profile so ``build_session_key`` namespaces them (``agent:<name>:local:...``) and the
     SessionStore writes their rows to that profile's ``state.db``, not the launch store."""
     source = SessionSource(platform=Platform.LOCAL, chat_id=chat_id, user_id=user_id, chat_type='dm')
-    registry = getattr(authority.runner, 'session_authorities', None)
+    registry = _registry(authority)
     name = registry.profile_name(authority) if registry is not None else None
     if name is not None:
         source.profile = name
@@ -135,6 +146,7 @@ def _stray_route_target(authority, receipt, session_id):
 
 
 def restore_local_session(authority, sid):
+    _registry(authority)
     from gateway.session_authority import LiveSession
     from gateway.session_local import LocalSessionAdapter
     from gateway.session_policy import restore_policy
@@ -357,17 +369,364 @@ def local_receipt_ids(authority):
             'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
 
 
-def recover_local_sessions(authority, *, schedule=False):
+_LOCAL_POLICY_SOURCES = frozenset({'cli', 'tui', 'gui', 'acp', 'tool', 'oneshot'})
+_FOREIGN_POLICY_SOURCES = frozenset({'a2a', 'kanban', 'cron', 'bot_room'})
+
+
+def _local_policy_source(authority, sid):
+    try:
+        policy = local_receipt(authority.db, sid).get('policy')
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    source = policy.get('source') if isinstance(policy, dict) else None
+    return source if isinstance(source, str) else None
+
+
+def _local_recovery_kind(row, policy_source=None):
+    """Classify canonical local work without claiming another source's admission."""
+    payload = row.get('payload') if isinstance(row, dict) else None
+    if not isinstance(payload, dict):
+        return 'unknown'
+    if ('native_text_v1' in payload or 'api_turn_v1' in payload
+            or 'local_automation_v1' in payload or '_automation_custody_v1' in payload):
+        return 'foreign'
+    if policy_source in _FOREIGN_POLICY_SOURCES:
+        return 'foreign'
+    if policy_source not in _LOCAL_POLICY_SOURCES:
+        return 'unknown'
+    return 'local' if isinstance(payload.get('text'), str) else 'unknown'
+
+
+def _active_local_rows(authority, sid):
+    rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+    active = [row for row in rows if row.get('status') in {'queued', 'started', 'unknown'}]
+    policy_source = _local_policy_source(authority, sid)
+    return rows, active, [
+        row for row in active if _local_recovery_kind(row, policy_source) == 'local'
+    ], policy_source
+
+
+def _local_adoption_fences(authority, sid):
+    from gateway.session_viewer_close import CLOSE_PREFIX
+
+    pending_closes = getattr(authority, 'pending_closes', None)
+    if isinstance(pending_closes, dict) and sid in pending_closes:
+        return ('viewer_close_pending',)
+    if authority.db.get_meta(CLOSE_PREFIX + sid) is not None:
+        return ('viewer_close_persisted',)
+    physical = authority.db.get_compression_tip(sid) or sid
+    with authority.db._read_ctx() as conn:
+        pending = conn.execute(
+            "SELECT 1 FROM worker_executions WHERE session_id IN (?,?) "
+            "AND status IN ('registered','running','unknown') LIMIT 1",
+            (sid, physical),
+        ).fetchone()
+    return ('worker_pending',) if pending is not None else ()
+
+
+def _reconcile_local_parents(authority, handles):
+    """Reopen every exact I10 parent only after the tuple is validated atomically."""
+    from gateway.session_recovery_custody import _validate_handle
+
+    if not isinstance(handles, tuple) or not handles:
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    coordinator = authority._preservation_coordinator()
+    if coordinator is None:
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    unknown = []
+    for handle in handles:
+        record = _validate_handle(authority, handle, allow_unknown=True)
+        if record is None or getattr(handle, 'owner_class', None) != 'I10_startup_recovery_handoff':
+            raise RuntimeStoreError('unknown_execution')
+        if record.state == 'unknown':
+            unknown.append(handle)
+    if unknown:
+        refusal = coordinator.reconcile_unknown_parents(
+            tuple(unknown), profile_id=authority.profile_id,
+            authority_epoch=authority.epoch, process_instance=authority.instance_id,
+        )
+        if refusal is not None:
+            raise RuntimeStoreError('unknown_execution')
+    for handle in handles:
+        if _validate_handle(authority, handle) is None:
+            raise RuntimeStoreError('unknown_execution')
+    return handles
+
+
+def _reconcile_local_parent(authority, handle):
+    """Compatibility wrapper for callers that have exactly one I10 parent."""
+    return _reconcile_local_parents(authority, (handle,))[0]
+
+
+def _local_adoption_handle(authority, row):
+    admission_id = row.get('admission_id')
+    handle = getattr(authority, '_preservation_handles', {}).get(admission_id)
+    if row.get('status') == 'queued' and handle is None:
+        from gateway.session_recovery_custody import ensure_recovery_root
+        handle = ensure_recovery_root(authority, row, consumer='local_recovery')
+    if handle is None:
+        raise RuntimeStoreError('unknown_execution')
+    from gateway.session_recovery_custody import refresh_binding
+    current = get_session_admission(authority.db, admission_id=admission_id)
+    if not isinstance(current, dict) or not refresh_binding(authority, current):
+        raise RuntimeStoreError('unknown_execution')
+    return handle
+
+
+def local_adoption_parents(authority, sid):
+    """Return every exact active local I10 parent in durable FIFO order."""
+    _registry(authority)
+    _rows, active, local, policy_source = _active_local_rows(authority, sid)
+    if any(_local_recovery_kind(row, policy_source) != 'local' for row in active):
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    if _local_adoption_fences(authority, sid):
+        raise RuntimeStoreError('storage_unavailable')
+    handles = []
+    try:
+        for row in local:
+            handles.append(_local_adoption_handle(authority, row))
+    except Exception:
+        if handles:
+            _mark_local_recovery_handles_unknown(
+                authority, {handle.lease.lease_id: handle for handle in handles}, 'read_failed',
+            )
+        raise
+    return _reconcile_local_parents(authority, tuple(handles)) if handles else ()
+
+
+def local_adoption_parent(authority, sid):
+    """Compatibility wrapper returning one handle or the exact parent tuple."""
+    parents = local_adoption_parents(authority, sid)
+    if len(parents) <= 1:
+        return parents[0] if parents else None
+    return parents
+
+
+def _local_recovery_handles(authority, rows):
+    return {
+        row['admission_id']: getattr(authority, '_preservation_handles', {}).get(row['admission_id'])
+        for row in rows if isinstance(row.get('admission_id'), str)
+    }
+
+
+def _local_recovery_absence_fences(authority, sid, *, allow_legacy):
+    """Read every local source fence before recording a source-owned absence."""
+    if allow_legacy:
+        return ()
+    from gateway.session_local_adoption import _due
+    from gateway.session_viewer_close import CLOSE_PREFIX
+
+    fences = []
+    if _due(authority, sid, strict=True) is not None:
+        fences.append('compression_pending')
+    pending = getattr(authority, '_local_adoptions', None)
+    adoption = pending.get(sid) if isinstance(pending, dict) else None
+    if adoption is not None:
+        try:
+            current_task = asyncio.current_task()
+        except RuntimeError:
+            current_task = None
+        done = getattr(adoption, 'done', None)
+        if not callable(done) or (not done() and adoption is not current_task):
+            fences.append('compression_adoption_pending')
+    pending_closes = getattr(authority, 'pending_closes', None)
+    if isinstance(pending_closes, dict) and sid in pending_closes:
+        fences.append('viewer_close_pending')
+    if authority.db.get_meta(CLOSE_PREFIX + sid) is not None:
+        fences.append('viewer_close_persisted')
+    physical = authority.db.get_compression_tip(sid) or sid
+    with authority.db._read_ctx() as conn:
+        pending_worker = conn.execute(
+            "SELECT 1 FROM worker_executions WHERE session_id IN (?,?) "
+            "AND status IN ('registered','running','unknown') LIMIT 1",
+            (sid, physical),
+        ).fetchone()
+    if pending_worker is not None:
+        fences.append('worker_pending')
+    return tuple(dict.fromkeys(fences))
+
+
+def _mark_local_recovery_handles_unknown(authority, handles, reason):
+    """Mark exact retained roots unknown; a missing handle is itself an uncertainty."""
+    if not handles:
+        raise RuntimeStoreError('preservation_owner_unmapped')
+    coordinator = getattr(authority.runner, 'runtime_custody', None)
+    if coordinator is None:
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    for handle in handles.values():
+        if handle is None:
+            raise RuntimeStoreError('preservation_owner_unmapped')
+        coordinator.mark_unknown(handle, reason)
+        lease_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+        record = getattr(coordinator, '_records', {}).get(lease_id)
+        if record is None or record.handle is not handle or record.state != 'unknown':
+            raise RuntimeStoreError('preservation_owner_unmapped')
+
+
+def mark_local_recovery_unknown(authority, sid, reason):
+    policy_source = _local_policy_source(authority, sid)
+    rows = [
+        row for row in list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        if row.get('status') in {'queued', 'started', 'unknown'}
+        and _local_recovery_kind(row, policy_source) == 'local'
+    ]
+    _mark_local_recovery_handles_unknown(authority, _local_recovery_handles(authority, rows), reason)
+
+
+def _managed_local_recovery_handles(authority, local, terminal_local):
+    from gateway.session_recovery_custody import ensure_recovery_root, _validate_handle
+
+    handles = _local_recovery_handles(authority, local)
+    blocked = False
+    for row in local:
+        admission_id = row['admission_id']
+        handle = handles.get(admission_id)
+        if row.get('status') == 'queued' and handle is None:
+            handles[admission_id] = ensure_recovery_root(
+                authority, row, consumer='local_recovery',
+            )
+        elif handle is None or _validate_handle(authority, handle) is None:
+            blocked = True
+    terminal_handles = _local_recovery_handles(authority, terminal_local)
+    bound_terminal = {key: value for key, value in terminal_handles.items() if value is not None}
+    if bound_terminal:
+        _mark_local_recovery_handles_unknown(authority, bound_terminal, 'terminal_proof_missing')
+    return handles, blocked
+
+
+def _local_recovery_intake(authority, sid, *, allow_legacy):
+    if not allow_legacy:
+        _registry(authority)
+    rows, active, local, policy_source = _active_local_rows(authority, sid)
+    foreign = [row for row in active if _local_recovery_kind(row, policy_source) == 'foreign']
+    unknown = [row for row in active if _local_recovery_kind(row, policy_source) == 'unknown']
+    terminal_local = [
+        row for row in rows
+        if row.get('status') == 'terminal'
+        and _local_recovery_kind(row, policy_source) == 'local'
+    ]
+    if not allow_legacy and getattr(authority.runner, 'runtime_custody', None) is None:
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    absence_fences = _local_recovery_absence_fences(authority, sid, allow_legacy=allow_legacy)
+    handles = _local_recovery_handles(authority, local)
+    blocked = bool(foreign or unknown or terminal_local or absence_fences)
+    if not allow_legacy:
+        handles, handles_blocked = _managed_local_recovery_handles(
+            authority, local, terminal_local,
+        )
+        blocked = blocked or handles_blocked
+        if blocked:
+            bound = {key: value for key, value in handles.items() if value is not None}
+            if bound and (foreign or unknown or terminal_local):
+                _mark_local_recovery_handles_unknown(authority, bound, 'recovery_intake_uncertain')
+    return {
+        'rows': rows, 'local': local, 'foreign': foreign, 'unknown': unknown,
+        'terminal_local': terminal_local, 'handles': handles,
+        'absence_fences': absence_fences, 'blocked': blocked,
+        'policy_source': policy_source,
+    }
+
+
+def _observe_local_recovery(authority, sid, intake, policy_receipt, *, worker_status):
+    from gateway.session_recovery_custody import (
+        consumer_receipt, local_recovery_source_receipt, observe_consumer, refresh_binding,
+    )
+    observed = []
+    for row in intake['local']:
+        admission_id = row['admission_id']
+        handle = intake['handles'].get(admission_id)
+        if handle is None:
+            continue
+        current = get_session_admission(authority.db, admission_id=admission_id)
+        if not isinstance(current, dict):
+            raise RuntimeStoreError('preservation_receipt_unmapped')
+        refresh_binding(authority, current)
+        source_receipt = local_recovery_source_receipt(
+            authority, current, policy_receipt, worker_status=worker_status,
+        )
+        admission_receipt = authority._receipt(current)
+        state = 'unknown' if current.get('status') == 'unknown' else 'active'
+        receipt = consumer_receipt(
+            authority, 'local_recovery', row=current, handle=handle,
+            source_receipts=(source_receipt, admission_receipt), state=state,
+        )
+        if not observe_consumer(authority, 'local_recovery', receipt):
+            raise RuntimeStoreError('preservation_receipt_unmapped')
+        observed.append(admission_id)
+    return observed
+
+
+def _recover_one_local_session(authority, sid, *, schedule, allow_legacy, worker_status='mounted'):
+    if allow_legacy:
+        ref = restore_local_session(authority, sid)
+        pending = list_session_admissions(authority.db, session_id=sid)
+        from gateway.session_recovery_custody import observe_consumer_rows
+        observe_consumer_rows(
+            authority, 'local_recovery', rows=pending,
+            reason='local receipt had no accepted admission',
+        )
+        if schedule and pending and not any(row.get('status') == 'unknown' for row in pending):
+            authority._schedule(ref)
+        return ref
+    intake = _local_recovery_intake(authority, sid, allow_legacy=False)
+    if intake['blocked']:
+        return None
+    ref = restore_local_session(authority, sid)
+    if intake['local']:
+        policy_receipt = local_receipt(authority.db, sid)
+        observed = _observe_local_recovery(
+            authority, sid, intake, policy_receipt, worker_status=worker_status,
+        )
+        ready = (
+            len(observed) == len(intake['local'])
+            and not any(row.get('status') == 'unknown' for row in intake['local'])
+        )
+    else:
+        latest = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        policy_source = intake['policy_source']
+        if any(row.get('status') in {'queued', 'started', 'unknown'} for row in latest):
+            return None
+        if any(row.get('status') == 'terminal'
+               and _local_recovery_kind(row, policy_source) == 'local'
+               for row in latest):
+            return None
+        if _local_recovery_absence_fences(authority, sid, allow_legacy=False):
+            return None
+        from gateway.session_recovery_custody import observe_consumer, unused_consumer
+        absence = unused_consumer(
+            authority, 'local_recovery',
+            reason='local policy inventory contained no local active admission',
+        )
+        if not observe_consumer(authority, 'local_recovery', absence):
+            raise RuntimeStoreError('preservation_receipt_unmapped')
+        ready = False
+    if schedule and ready:
+        authority._schedule(ref)
+    return ref
+
+
+def complete_local_recovery(authority, sid, *, schedule=True, allow_legacy=False):
+    """Finish one compression worker through the same managed source path as startup recovery."""
+    return _recover_one_local_session(
+        authority, sid, schedule=schedule, allow_legacy=allow_legacy,
+        worker_status='compression_catchup',
+    )
+
+
+def recover_local_sessions(authority, *, schedule=False, allow_legacy=None):
+    if allow_legacy is None:
+        allow_legacy = not hasattr(authority.runner, 'session_authorities')
     for sid in local_receipt_ids(authority):
         try:
-            ref = restore_local_session(authority, sid)
-            pending = list_session_admissions(authority.db, session_id=sid)
-            if schedule and pending and not any(row['status'] == 'unknown' for row in pending):
-                authority._schedule(ref)
+            _recover_one_local_session(
+                authority, sid, schedule=schedule, allow_legacy=allow_legacy,
+            )
         except (_ReceiptRefused, _CatchUpPending):
-            continue  # logged: the check that refused it, or the catch-up handed to a worker
+            continue  # the refusal/worker keeps its source handle for a later owner step
         except RuntimeStoreError as exc:
-            logging.getLogger(__name__).warning('Local session %s paused: %s', sid, exc.reason)
+            logging.getLogger(__name__).warning(
+                'Local session %s paused: %s', sid, _refused_check(exc),
+            )
     if schedule:
         # A last-viewer close the previous owner stopped before completing (#134889 LC-6b).
         from gateway.session_viewer_close import rearm_persisted_closes, settle_viewer_close
@@ -377,3 +736,41 @@ def recover_local_sessions(authority, *, schedule=False):
             if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
                 # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
                 track_mutation(authority, settle_viewer_close(authority, sid))
+
+
+def restore_pending_local_automation(authority, session_ids):
+    """Rebuild only routes named by a pending, persisted local automation admission.
+
+    Managed startup normally restores LOCAL policy receipts before native recovery.  A hard-killed
+    owner can leave the automation admission's durable row behind while the session-store route is
+    absent, though.  The row's own payload selects this narrow repair; ``restore_local_session``
+    still authenticates the receipt's profile, source, stored entry and lineage before publishing
+    the route.  A refusal leaves the admission queued for the existing fail-closed recovery path.
+    """
+    for sid in session_ids:
+        rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        if not any(
+            row.get('status') in {'queued', 'started', 'unknown'}
+            and isinstance(row.get('principal_id'), str)
+            and row['principal_id'].startswith('automation:')
+            and isinstance(row.get('payload'), dict)
+            and isinstance(row['payload'].get('local_automation_v1'), dict)
+            for row in rows
+        ):
+            continue
+        try:
+            from gateway.session_recovery_custody import validate_local_automation_recovery
+            for row in rows:
+                if (
+                    row.get('status') in {'queued', 'started', 'unknown'}
+                    and isinstance(row.get('principal_id'), str)
+                    and row['principal_id'].startswith('automation:')
+                    and isinstance(row.get('payload'), dict)
+                    and isinstance(row['payload'].get('local_automation_v1'), dict)
+                ):
+                    validate_local_automation_recovery(authority, row)
+            restore_local_session(authority, sid)
+        except (_ReceiptRefused, _CatchUpPending, RuntimeStoreError) as exc:
+            logging.getLogger(__name__).warning(
+                'Local automation route %s paused: %s', sid, _refused_check(exc),
+            )

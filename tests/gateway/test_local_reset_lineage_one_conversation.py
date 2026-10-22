@@ -25,6 +25,8 @@ async def reset_lineage(tmp_path, monkeypatch):
                              _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='fixture')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     authority._schedule = lambda ref: None
     owner = Principal('uid:1000', 'default', frozenset({'session:create', 'session:read', 'session:submit',
                                                         'session:control'}), 'native')

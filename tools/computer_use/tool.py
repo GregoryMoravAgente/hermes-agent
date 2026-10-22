@@ -160,6 +160,40 @@ def _new_backend(permission_mode: str) -> ComputerUseBackend:
     from plugins.computer_use import get_active_provider
     return get_active_provider().create_backend(permission_mode=permission_mode)
 
+
+_AUTO_CUA_OWNER = object()
+
+
+def _prepare_cua_owner(
+    backend: ComputerUseBackend, session_id: str, permission_mode: str,
+    requested: Any = _AUTO_CUA_OWNER,
+) -> Any:
+    """Resolve the source-owned CUA owner before a backend can spawn its child."""
+    setter = getattr(backend, "set_cua_owner", None)
+    if not callable(setter):
+        # ACP/Codex/shell-compatible backends keep their existing standalone path.
+        return None
+    existing = getattr(backend, "_cua_owner", None)
+    if requested is _AUTO_CUA_OWNER:
+        if existing is not None:
+            from gateway.runtime_service_custody import current_turn_binding
+            binding = current_turn_binding()
+            if binding is not None and not existing.prepare_current_binding(binding):
+                raise RuntimeError("cua_current_binding_mismatch")
+            if binding is None and getattr(existing.parent, "mode", None) == "managed_turn":
+                raise RuntimeError("cua_managed_binding_missing")
+            return existing
+        from gateway.runtime_sidecar_cua import prepare_cua_session
+        return prepare_cua_session(
+            session_id=session_id,
+            permission_mode=permission_mode,
+        )
+    if requested is None:
+        return None
+    if existing is not None and existing is not requested:
+        raise RuntimeError("cua_managed_owner_replaced")
+    return requested
+
 def _install_backend(sid: str, backend: ComputerUseBackend, permission_mode: str) -> ComputerUseBackend:
     """Record a backend in the session caches (the empty session also mirrors it onto the ``_backend`` hook).
     Caller holds ``_backend_lock``."""
@@ -200,7 +234,9 @@ def _scoped_sid(session_id: str) -> str:
     sid = str(session_id or "")
     return sid if get_hermes_home_override() is None else f"{sid}@{hermes_home_key()}"
 
-def _get_backend(session_id: str = "") -> ComputerUseBackend:
+def _get_backend(
+    session_id: str = "", *, cua_owner: Any = _AUTO_CUA_OWNER,
+) -> ComputerUseBackend:
     bare_sid, sid = str(session_id or ""), _scoped_sid(session_id)
     while True:
         with _backend_lock:
@@ -210,8 +246,22 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                 _install_backend(sid, _backend, permission_mode)  # fold the injection hook into the cache
             if (cached := _backends.get(sid)) is None:
                 backend = _new_backend(permission_mode)
-                backend.start()  # under the cache lock: one backend per session; a concurrent toggle releases it
+                owner = _prepare_cua_owner(backend, bare_sid, permission_mode, cua_owner)
+                try:
+                    if owner is not None:
+                        backend.set_cua_owner(owner)
+                    backend.start()  # under the cache lock: one backend per session; a concurrent toggle releases it
+                except BaseException:
+                    if owner is not None:
+                        try:
+                            owner.mark_unknown("cua_backend_start_failed")
+                        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                            logger.debug("failed retaining CUA owner after backend startup failure", exc_info=True)
+                    raise
                 return _install_backend(sid, backend, permission_mode)
+            resolved_owner = _prepare_cua_owner(cached, bare_sid, permission_mode, cua_owner)
+            if resolved_owner is not None and getattr(cached, "_cua_owner", None) is not resolved_owner:
+                raise RuntimeError("cua_owner_missing_before_backend_start")
             from tools.computer_use.cua_backend import backend_display_stale, desktop_identity
             if (_backend_permission_modes.get(sid, "standard") == permission_mode
                     and not backend_display_stale(_backend_displays.get(sid, ""), desktop_identity())):
@@ -222,7 +272,9 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
         _stop_backend(cached, stale_lock, lambda e: None)
 
 @contextlib.contextmanager
-def _backend_for_call(session_id: str = "") -> Iterator[ComputerUseBackend]:
+def _backend_for_call(
+    session_id: str = "", *, cua_owner: Any = _AUTO_CUA_OWNER,
+) -> Iterator[ComputerUseBackend]:
     """Hold a live backend through dispatch, retrying admission but never an action.
 
     A display/mode change or release can retire a backend before lock lookup or
@@ -233,7 +285,7 @@ def _backend_for_call(session_id: str = "") -> Iterator[ComputerUseBackend]:
 
     sid = _scoped_sid(session_id)
     while True:
-        backend = _get_backend(session_id=session_id)
+        backend = _get_backend(session_id=session_id, cua_owner=cua_owner)
         with _backend_lock:
             if _backends.get(sid) is not backend:
                 continue
@@ -259,12 +311,35 @@ def release_computer_use_session(session_id: str) -> bool:
     sid = _scoped_sid(session_id)
     _reset_screenshot_dedup(sid)  # the next capture of a re-created session must deliver pixels
     with _backend_lock:
+        retained_mode = _backend_permission_modes.get(sid, "standard")
+        retained_display = _backend_displays.get(sid, "")
         backend, call_lock = _detach_locked(sid)
     if backend is None:
         return False
     _stop_backend(backend, call_lock,
                   lambda e: logger.debug("computer_use backend release failed for session %s", sid, exc_info=True))
-    return True
+    owner = getattr(backend, "_cua_owner", None)
+    if owner is None:
+        return True
+    try:
+        finished = owner.finish()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        finished = False
+        logger.debug("computer_use CUA owner release failed for session %s", sid, exc_info=True)
+    if finished is True:
+        return True
+    # A failed finalizer is an ownership result, not a reason to discard the
+    # backend/parent tuple.  Restore the same backend and lock so the next call
+    # retries the exact source-owned fence.
+    with _backend_lock:
+        _backends[sid] = backend
+        _backend_call_locks[sid] = call_lock or threading.RLock()
+        _backend_permission_modes[sid] = retained_mode
+        _backend_displays[sid] = retained_display
+        if sid == "":
+            global _backend
+            _backend = backend
+    return False
 
 @atexit.register
 def _shutdown_backend_atexit() -> None:

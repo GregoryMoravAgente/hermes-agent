@@ -40,6 +40,7 @@ async def _served_authority(tmp_path, monkeypatch, instance_id, db=None):
     builds them; returns (served authority, its state db, the secondary home path)."""
     from gateway.session_authority import initialize_session_authority
     from hermes_state import SessionDB
+    from gateway.runtime_custody import install_runtime_custody
     runner, registry, root, secondary = _build_runtime(tmp_path, monkeypatch)
     launch = await initialize_session_authority(runner, profile_id=str(root), instance_id=instance_id)
     registry.add(root, launch, name='default')
@@ -48,6 +49,16 @@ async def _served_authority(tmp_path, monkeypatch, instance_id, db=None):
     # Reserve-then-replace, as the multiplex bring-up does: recovery inside initialize must
     # already see the served slot (and thus the profile name) to rebuild a profiled source.
     registry.add(secondary, None, name='secondary')
+    runner.session_runtime_descriptor = {
+        'instance_id': instance_id,
+        'authority_epoch': launch.epoch,
+        'profile_id': str(root),
+        'served_profiles': [
+            {'profile_id': str(root), 'home': str(root)},
+            {'profile_id': str(secondary), 'home': str(secondary)},
+        ],
+    }
+    install_runtime_custody(runner)
     served = await initialize_session_authority(runner, profile_id=str(secondary),
                                                 instance_id=instance_id, register=False, db=db)
     registry.replace(secondary, served)

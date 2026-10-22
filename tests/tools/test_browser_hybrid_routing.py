@@ -187,3 +187,25 @@ class TestCleanupHybridSessions:
         # The cleaned sidecar must not remain the recorded owner; otherwise a
         # later click/snapshot could resurrect it instead of using the primary.
         assert "default" not in browser_tool._last_active_session_key
+
+    def test_local_sidecar_failure_does_not_retarget_primary(self, monkeypatch):
+        """An unresolved local custody lease cannot silently become the cloud session."""
+        monkeypatch.setattr(
+            browser_tool,
+            "_active_sessions",
+            {
+                "default": {"session_name": "cloud_sess"},
+                "default::local": {"session_name": "local_sess"},
+            },
+        )
+        monkeypatch.setattr(
+            browser_tool, "_last_active_session_key", {"default": "default::local"},
+        )
+        def _retain_local(key):
+            assert key == "default::local"
+            return False
+
+        monkeypatch.setattr(bt_lifecycle, "_cleanup_single_browser_session", _retain_local)
+        bt_lifecycle.cleanup_browser("default::local")
+        assert browser_tool._last_active_session_key["default"] == "default::local"
+        assert "default::local" in browser_tool._active_sessions

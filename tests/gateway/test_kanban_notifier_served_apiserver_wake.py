@@ -278,3 +278,170 @@ def test_internal_session_turn_targets_the_live_session_under_the_owner_profile(
         with pytest.raises(ValueError):  # the proof is the caller's; never derived here
             asyncio.run(adapter.run_internal_session_turn(session_id=tip, text="wake", profile=""))
     assert seen == {}
+
+
+@pytest.mark.asyncio
+async def test_persisted_nonpush_wake_carries_occurrence_into_the_api_authority(served, monkeypatch):
+    """A real claimed Kanban row must carry its occurrence through the stateless wake seam.
+
+    The API adapter is the real non-push adapter and the subscription/event rows are real SQLite
+    rows.  The final provider turn is deliberately stopped at the existing API-server wake seam:
+    this test is the consuming contract for the source-owned occurrence/request identity that the
+    next SessionAuthority admission must receive.  A test double is used only for the external
+    HTTP/provider boundary, never for the persisted notifier or adapter route.
+    """
+    from gateway.kanban_watchers_notifier import _KanbanNotification, _kanban_wake_occurrence
+    from gateway.platforms.api_server import APIServerAdapter
+    from gateway.session_automation_custody import kanban_occurrence_metadata, route_wake_identity
+    import gateway.wake as wake_mod
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(served.root / "board.db"))
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="persisted api wake", assignee="builder", session_id=WORKER_SESSION,
+            initial_status="running",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform="api_server", chat_id=SESSION,
+            chat_type="dm", delivery_mode="wake",
+        )
+        assert kb.complete_task(conn, task_id, summary="persisted handoff")
+        sub = kbn.list_notify_subs(conn, task_id=task_id)[0]
+        old_cursor, cursor, events = kbn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="api_server", chat_id=SESSION,
+            thread_id="", kinds=["completed"],
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None and events
+    delivery = {
+        "sub": sub, "old_cursor": old_cursor, "cursor": cursor,
+        "events": events, "task": task, "board": "default",
+    }
+    raw_occurrence = _kanban_wake_occurrence(delivery, events)
+    occurrence = kanban_occurrence_metadata(
+        {"kanban_occurrence": raw_occurrence}
+    )["kanban_occurrence"]
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    calls = []
+
+    async def capture_self_post(adapter, *, text, session_id, wake_metadata=None, **kwargs):
+        calls.append({
+            "session_id": session_id, "text": text,
+            "wake_metadata": wake_metadata, "extra": kwargs,
+        })
+
+    monkeypatch.setattr(wake_mod, "_self_post_chat_completion", capture_self_post)
+    notification = _KanbanNotification(
+        _make_runner(adapter=adapter), delivery, platform_cls=Platform, sub_fail_counts={},
+    )
+    notification.adapter = adapter
+    notification.is_push_adapter = False
+    notification.build_wake_text()
+    notification.session_key = SESSION
+    notification.synth = "same rendered persisted wake"
+    notification.wake_occurrence = occurrence
+    try:
+        await notification.wake()
+    finally:
+        adapter._response_store.close()
+        adapter._run_idempotency_store.close()
+
+    assert len(calls) == 1
+    assert calls[0]["session_id"] == SESSION
+    assert calls[0]["wake_metadata"] == {"kanban_occurrence": occurrence}
+
+    first = route_wake_identity(
+        "kanban-wake", SESSION, "same rendered persisted wake",
+        {"kanban_occurrence": occurrence},
+    )
+    retry = route_wake_identity(
+        "kanban-wake", SESSION, "same rendered persisted wake",
+        {"kanban_occurrence": occurrence},
+    )
+    distinct = route_wake_identity(
+        "kanban-wake", SESSION, "same rendered persisted wake",
+        {"kanban_occurrence": {**raw_occurrence, "event_ids": [events[0].id + 1]}},
+    )
+    assert first == retry
+    assert first != distinct
+
+
+def test_persisted_claimed_event_backlog_keeps_all_occurrence_ids_over_256(tmp_path, monkeypatch):
+    """The source DB claim is one durable occurrence; identity must not truncate it at 256."""
+    from gateway.kanban_watchers_notifier import _kanban_wake_occurrence
+    from gateway.session_automation_custody import route_wake_identity
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "backlog.db"))
+    kb.init_db()
+    with kbc.connect() as conn:
+        task_id = kb.create_task(
+            conn, title="large persisted backlog", assignee="builder", initial_status="running",
+        )
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform="api_server", chat_id=SESSION,
+            chat_type="dm", delivery_mode="wake",
+        )
+        for index in range(257):
+            kb.add_comment(conn, task_id, "fixture", f"event {index}")
+        old_cursor, cursor, events = kbn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="api_server", chat_id=SESSION,
+            thread_id="", kinds=["commented"],
+        )
+
+    assert len(events) == 257
+    delivery = {
+        "sub": {"task_id": task_id}, "old_cursor": old_cursor,
+        "cursor": cursor, "board": "default",
+    }
+    occurrence = _kanban_wake_occurrence(delivery, events)
+    assert occurrence["event_ids"] == [event.id for event in events]
+    # This is deliberately the current RED boundary: the durable claim is complete, but the
+    # current identity normalizer rejects the source-owned 257-event occurrence at 256.
+    identity = route_wake_identity(
+        "kanban-wake", SESSION, "large persisted backlog",
+        {"kanban_occurrence": occurrence},
+    )
+    assert identity
+
+
+def test_persisted_automation_recovery_refuses_missing_generation_witness(owner):
+    """A started persisted automation row cannot mint a successor from an incomplete descriptor."""
+    from pathlib import Path
+
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.runtime_ownership import process_ownership
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state_runtime import admit_session_input, claim_session_input, RuntimeStoreError
+
+    coordinator = RuntimeCustodyCoordinator(
+        process_instance=owner.instance_id, authority_epoch=owner.epoch, fence=RetirementFence(),
+    )
+    owner.runner.runtime_custody = coordinator
+    session_id, request_id = "automation-session", "persisted-wake"
+    owner.db.create_session(session_id, source="api_server")
+    root = owner._preservation_automation_root(
+        request_id=request_id, principal_id="automation:kanban", session_id=session_id,
+        source_identity="kanban-source", delivery_id="delivery-1",
+    )
+    descriptor = owner._preservation_automation_descriptor(
+        root, request_id=request_id, principal_id="automation:kanban", session_id=session_id,
+        source_identity="kanban-source", delivery_id="delivery-1",
+    )
+    descriptor.pop("close_generation")
+    queued = admit_session_input(
+        owner.db, epoch=owner.epoch, principal_id="automation:kanban", session_id=session_id,
+        request_id=request_id,
+        payload={"native_text_v1": {"automation": {"custody": descriptor}}},
+    )
+    row = claim_session_input(owner.db, epoch=owner.epoch, session_id=session_id, head=queued["admission_id"])
+    assert isinstance(row, dict) and row["status"] == "started" and isinstance(row["generation"], int)
+    home = Path(owner.db.db_path).parent.resolve()
+    process_ownership.reserve([home])
+    try:
+        with pytest.raises(RuntimeStoreError, match="preservation_owner_unmapped"):
+            owner._preservation_recover_automation(row)
+    finally:
+        process_ownership.release(home)
+        owner._preservation_release_automation_unaccepted(None, root)

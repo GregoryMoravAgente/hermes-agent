@@ -49,12 +49,15 @@ async def test_gateway_startup_restores_pending_delegation_completions(tmp_path,
     monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
     monkeypatch.setattr("agent.shell_hooks.register_from_config", lambda *a, **k: None)
     monkeypatch.setattr(process_registry, "recover_from_checkpoint", lambda: 0)
+    from tests.gateway.test_completion_admission import prepared_execution
+
     event = {"type": "async_delegation", "delegation_id": "d-owner", "session_key": "OLD", "origin_ui_session_id": "",
              "goal": "g", "status": "success", "summary": "S", "api_calls": 1, "duration_seconds": 1.0,
              "dispatched_at": time.time() - 2, "completed_at": time.time() - 1}
     ad._persist_dispatch({"delegation_id": "d-owner", "goal": "g", "context": None, "toolsets": None, "role": "leaf",
                           "model": "m", "session_key": "OLD", "origin_ui_session_id": "", "parent_session_id": "OLD",
-                          "status": "running", "dispatched_at": time.time() - 2, "completed_at": None, "interrupt_fn": None})
+                          "status": "running", "dispatched_at": time.time() - 2, "completed_at": None, "interrupt_fn": None,
+                          "execution": prepared_execution("d-owner")})
     ad._persist_completion(event, {"summary": "S"})
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()

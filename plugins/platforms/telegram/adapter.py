@@ -555,6 +555,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
 
+    def _preservation_source_contract(self):
+        # The PTB-facing override below still delegates to BasePlatformAdapter, but the
+        # subclass method identity would otherwise make the inherited contract report
+        # this real source as unsupported.
+        from gateway.preservation_source_close import SourceCloseContract
+
+        return SourceCloseContract.for_adapter(self, name="telegram-source", supported=True)
+
     @staticmethod
     def _env_float_clamped(name: str, default: float, *, min_value: Optional[float] = None, max_value: Optional[float] = None) -> float:
         """Read a float env var; non-finite → default; clamp to bounds (safe for asyncio.sleep)."""
@@ -2885,10 +2893,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         if claim is not None:
             claim.failed = True
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(
+        self, event: MessageEvent, *, source_token=None, source_tokens=None,
+    ) -> None:
+        explicit_tokens = source_tokens if source_tokens is not None else source_token
+        tokens = tuple(explicit_tokens or self._preservation_source_tokens(event))
+        if not tokens:
+            admitted = self._preservation_source_admit(
+                event, event=event, phase="telegram-handler",
+            )
+            tokens = tuple(admitted) if isinstance(admitted, (tuple, list)) else ((admitted,) if admitted is not None else ())
         self._accept_update()
         await apply_root_dm_topic_transfer(self, event)  # opt-in dm_topic_auto_transfer (#139136)
-        await super().handle_message(event)
+        await super().handle_message(event, source_tokens=tokens or None)
 
     def set_topic_transfer_fn(self, fn: Optional[TopicTransferFn]) -> None:
         """Install the runner's root-DM topic-transfer hook (``dm_topic_auto_transfer``); None clears."""
@@ -6557,6 +6574,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text chunk, or hold it while delayed delivery must be dropped."""
+        self._admit_media_source_event(event, "telegram-text-batch")
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="text-enqueue")
             return
@@ -6593,10 +6611,19 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             if log_fn is not None:
                 log_fn(event)
             await self.handle_message(event)
+            self._preservation_source_producer_done(event)
             event = None
         except asyncio.CancelledError:
             if event is not None:
                 self._hold_inbound_event(event, where=f"{where}-flush-cancelled")
+            raise
+        except Exception:
+            # The event was admitted before it entered the debounce map.  If the
+            # real handler fails after the timer pops it, retain that exact
+            # source lease as UNKNOWN rather than leaving a stranded accepted
+            # item behind the provider's failed callback.
+            if event is not None:
+                self._preservation_source_unknown(event, f"telegram_{where}_failed")
             raise
         finally:
             if committed.get((where, key)) is current_task:
@@ -6640,6 +6667,14 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
             self._pending_photo_batches, self._pending_photo_batch_tasks, batch_key, self._media_batch_delay_seconds, "photo",
             lambda ev: logger.info("[Telegram] Flushing photo batch %s with %d image(s)", batch_key, len(ev.media_urls)))
 
+    def _admit_media_source_event(self, event: MessageEvent, phase: str) -> tuple:
+        """Admit a provider event before any local debounce/hold side effect."""
+        bound = tuple(self._preservation_source_tokens(event))
+        self._preservation_source_admit(
+            event, event=event, phase=phase, source_token=bound or None,
+        )
+        return tuple(self._preservation_source_tokens(event))
+
     def _merge_into_pending(self, pending: dict, key: str, event: MessageEvent) -> None:
         """Merge ``event`` into ``pending[key]`` (media + caption) or seed it."""
         existing = pending.get(key)
@@ -6650,9 +6685,13 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
         existing.media_types.extend(event.media_types)
         if event.text:
             existing.text = self._merge_caption(existing.text, event.text)
+        registry = self._preservation_source_registry()
+        if registry is not None:
+            registry.merge_events(existing, event)
 
     def _enqueue_photo_event(self, batch_key: str, event: MessageEvent) -> None:
         """Merge photo events into a pending batch and schedule flush."""
+        self._admit_media_source_event(event, "telegram-photo-batch")
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="photo-enqueue")
             return
@@ -6866,6 +6905,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BaseP
     async def _queue_media_group_event(self, media_group_id: str, event: MessageEvent) -> None:
         """Debounce album items (shared media_group_id) into one MessageEvent so the second image isn't
         treated as a new message interrupting the first."""
+        self._admit_media_source_event(event, "telegram-media-group")
         if self._should_drop_delayed_delivery():
             self._hold_inbound_event(event, where="media-group-enqueue")
             return

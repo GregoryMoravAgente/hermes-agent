@@ -52,6 +52,7 @@ async def owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_cli import model_cost_guard, model_switch
@@ -74,6 +75,7 @@ async def owner(tmp_path, monkeypatch):
                              _resolve_session_agent_runtime=lambda **kwargs: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     wire = Wire(asyncio.get_running_loop())
     wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': 'p'})
     sid = create_local_session(authority, wire.viewer.actor, {'request_id': 'editor', 'source': 'acp',

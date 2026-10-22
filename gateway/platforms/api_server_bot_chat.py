@@ -125,7 +125,75 @@ def bot_chat_tip(authority, session_id):
     return db.get_session(tip)
 
 
-async def admit_peer_turn(runner, session_id, message, author):
+def _reject_nonlocal_peer_turn(authority, tip, custody, home, key):
+    if str(tip.get('chat_id') or '').startswith('local-'):
+        return None
+    from hermes_state_local_migration import validate_legacy_row
+    try:
+        validate_legacy_row(authority.db, tip)
+    except RuntimeStoreError as exc:
+        reason, error = _refusal(authority, tip, exc)
+    else:
+        reason, error = _refusal(authority, tip, RuntimeStoreError('not_found'))
+    if custody is not None:
+        custody.mark_admission_closed()
+        custody.mark_unknown(reason)
+    return home, {
+        'status': 'failed', 'delivery_id': key, 'reason': reason, 'error': error,
+    }
+
+
+def _peer_actor(authority, user_id):
+    return Principal(user_id, authority.profile_id,
+                     frozenset({'session:read', 'session:submit'}), 'api-peer-dm')
+
+
+def _peer_create_actor(authority):
+    return Principal(_PEER_SUBJECT, authority.profile_id,
+                     frozenset({'session:create', 'session:read', 'session:submit'}), 'api-peer-dm')
+
+
+def _peer_displacement_failure(custody, home, reason):
+    if custody is not None:
+        custody.mark_admission_closed()
+        custody.mark_unknown(reason)
+    return home, {
+        'status': 'failed', 'delivery_id': uuid.uuid4().hex,
+        'reason': reason,
+    }
+
+
+async def _prepare_peer_bot_chat(authority, tip, custody, home):
+    """Return the actor and current LOCAL Bot Chat tip, moving aside a displaceable API row."""
+    from gateway.session_bot import displaceable_bot_chat
+    holder = authority.db.get_session_by_title('Bot Chat') or tip
+    displaced = displaceable_bot_chat(authority, holder)
+    if displaced is None:
+        return _peer_actor(authority, tip['user_id']), tip, None
+
+    from gateway.session_bot import _create_bot_chat
+    from gateway.session_runtime_workers import track_mutation
+    actor = _peer_create_actor(authority)
+    try:
+        authority._require_admission_open()
+        await asyncio.shield(track_mutation(
+            authority, _create_bot_chat(authority, actor, displace=displaced)))
+    except RuntimeStoreError as exc:
+        return actor, tip, _peer_displacement_failure(custody, home, exc.reason)
+
+    # Read the title and its physical tip again after the serialized move. The API row is retained
+    # under its visible name; only this newly minted LOCAL target receives the peer admission.
+    holder = authority.db.get_session_by_title('Bot Chat')
+    if holder is None:
+        return actor, tip, _peer_displacement_failure(custody, home, 'peer_parent_unmapped')
+    tip_id = authority.db.get_compression_tip(holder['id']) or holder['id']
+    tip = authority.db.get_session(tip_id)
+    if tip is None:
+        return actor, tip, _peer_displacement_failure(custody, home, 'peer_parent_unmapped')
+    return actor, tip, None
+
+
+async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     """``(profile home, receipt)`` when *session_id* is the Bot Chat and the turn was admitted to its
     FIFO; None when the target is any other session (the caller runs it as an API turn)."""
     from gateway.session_authorities import served_profile_name
@@ -137,33 +205,120 @@ async def admit_peer_turn(runner, session_id, message, author):
     if tip is None:
         return None
     home = Path(authority.db.db_path).parent.resolve()
-    from gateway.session_bot import displaceable_bot_chat
-    if displaceable_bot_chat(authority, authority.db.get_session_by_title('Bot Chat') or tip) is not None:
-        # The title is held by an API conversation no FIFO can own (#140769, MSG-21): the owner
-        # moves it aside and mints the local Bot Chat for the peer, as ``create_peer_bot_chat`` does.
-        actor = Principal(_PEER_SUBJECT, authority.profile_id,
-                          frozenset({'session:create', 'session:read', 'session:submit'}), 'api-peer-dm')
-    else:
-        # The API key already authenticated the peer; the turn enters the chat as its owner's own
-        # input, the way owner recovery re-admits queued deliveries (``recover_bot_deliveries``).
-        actor = Principal(tip['user_id'], authority.profile_id,
-                          frozenset({'session:submit', 'session:read'}), 'api-peer-dm')
+    actor, tip, displacement_failure = await _prepare_peer_bot_chat(authority, tip, custody, home)
+    if displacement_failure is not None:
+        return displacement_failure
     key = uuid.uuid4().hex
+    nonlocal_refusal = _reject_nonlocal_peer_turn(authority, tip, custody, home, key)
+    if nonlocal_refusal is not None:
+        return nonlocal_refusal
     params = dict(id=key, profile=served_profile_name(home), message=message)
     if author is not None:
         params['author'] = dict(author)
+    # Pin the target selected above.  This lets the existing deliver() target gate detect a
+    # concurrent title rotation instead of silently sending the peer turn to another session.
+    target_id = authority.logical_owner(tip['id'])
+    params['session_id'] = target_id
+
+    parent_handle = None
+    if custody is not None:
+        parent_handle = authority._preservation_root('I02_api_session_turn', f'api-peer:{key}')
+        live_target = authority.sessions.get(target_id)
+        target_entry = (
+            runner.session_store.lookup_by_session_key(live_target.route)
+            if live_target is not None and getattr(live_target, 'route', None) else None)
+        if parent_handle is None or target_entry is None or target_entry.session_id != target_id:
+            if parent_handle is not None:
+                authority._preservation_release_unaccepted(parent_handle)
+            custody.mark_unknown('peer_parent_unmapped')
+            return home, {
+                'status': 'failed', 'delivery_id': key,
+                'reason': 'peer_parent_unmapped',
+            }
+        authority._preservation_pending_root(
+            'bot:' + key, parent_handle,
+            principal_id='automation:' + target_entry.session_key, session_id=target_id)
+
+    if custody is not None:
+        refusal = custody.mark_admission_started()
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, 'code', 'peer_admission_pending'))
+            return home, {
+                'status': 'failed', 'delivery_id': key,
+                'reason': getattr(refusal, 'code', 'peer_admission_pending'),
+            }
+
+    def _bind_admitted(record):
+        if custody is None or not isinstance(record, dict):
+            return
+        if custody.parent_bound and custody.initial_admission_id == record.get('admission_id'):
+            return
+        record.update({
+            "_api_producer_phase": "bot_i02",
+            "_api_producer_source": "bot_chat",
+        })
+        refusal = custody.bind_peer_record(record, authority, expected_parent=parent_handle)
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, 'code', 'peer_parent_unmapped'))
+            return
+        authority._preservation_forget_pending_root(parent_handle)
+        refusal = custody.mark_worker_submitted()
+        if refusal is not None:
+            custody.mark_unknown(getattr(refusal, 'code', 'peer_worker_submission_unknown'))
+
     try:
-        record = await deliver(SimpleNamespace(authority=authority, actor=actor), params)
+        record = await deliver(
+            SimpleNamespace(authority=authority, actor=actor), params,
+            on_admitted=_bind_admitted if custody is not None else None,
+            _peer_custody=custody if custody is not None else None,
+            _peer_parent=parent_handle if custody is not None else None,
+        )
+    except asyncio.CancelledError:
+        if custody is not None:
+            # ``deliver`` shields the tracked mutation.  Keep this handle unknown while the
+            # late callback binds any admission that commits after the caller disappeared.
+            custody.request_no_worker()
+            custody.mark_unknown('peer_admission_cancelled')
+        raise
     except RuntimeStoreError as exc:
+        if custody is not None:
+            custody.mark_admission_closed()
         reason, error = _refusal(authority, tip, exc)
         record = {'status': 'failed', 'delivery_id': key, 'reason': reason, 'error': error}
+    except (OSError, TypeError, ValueError, LookupError, RuntimeError):
+        if custody is not None:
+            custody.mark_admission_closed()
+            custody.mark_unknown('peer_admission_interrupted')
+        raise
+    if (parent_handle is not None and custody is not None and not custody.parent_bound
+            and not any(handle is parent_handle for handle in authority._preservation_handles.values())):
+        authority._preservation_release_unaccepted(parent_handle)
+    _bind_admitted(record)
+    # The exact authority that admitted this FIFO row is an internal custody input.  Do not
+    # rediscover it from the launch profile: multiplexed profiles can share one process while
+    # only this authority owns the admission generation.
+    if isinstance(record, dict):
+        record = {
+            **record,
+            '_api_admitting_authority': authority,
+            '_api_producer_phase': 'bot_i02',
+            '_api_producer_source': 'bot_chat',
+        }
     return home, record
 
 
 async def await_live_delivery(adapter, home, record, timeout, *, should_stop=None):
     """Wait for a live Bot Chat receipt through whichever door admitted it: the authority FIFO
     (in-process waiter) or the legacy owner mailbox (``await_delivery_async``)."""
-    authority = _authority(adapter.gateway_runner)
+    candidate = record.get('_api_admitting_authority')
+    authority = (
+        candidate
+        if (
+            getattr(candidate, 'db', None) is not None
+            and getattr(candidate, 'profile_id', None) == record.get('profile_id')
+        )
+        else _authority(adapter.gateway_runner)
+    )
     if authority is not None and record.get('admission_id'):
         return await await_peer_receipt(authority, record, timeout, should_stop=should_stop)
     from tools.bot_live_delivery import await_delivery_async

@@ -6,7 +6,8 @@
  * and exposes HTTP endpoints for the Python gateway adapter.
  *
  * Endpoints (matches gateway/platforms/whatsapp.py expectations):
- *   GET  /messages       - Long-poll for new incoming messages
+ *   GET  /messages       - Durable inbound queue snapshot
+ *   POST /messages/claim - Claim one FIFO inbound message
  *   POST /send           - Send a message { chatId, message, replyTo?, mentions? }
  *   POST /edit           - Edit a sent message { chatId, messageId, message }
  *   POST /send-media     - Send media natively { chatId, filePath, mediaType?, caption?, fileName?, mentions? }
@@ -51,8 +52,12 @@ import {
   normalizeWhatsAppId,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  bindInboundProducerLifecycle,
+  enqueueInboundWireEvent,
   writeJsonLine,
 } from './bridge_helpers.js';
+import { BOOTSTRAP_PROTOCOL, SOURCE_FIXTURE_PROTOCOL, parseJsonFrame } from './bridge_protocol.js';
+import { InboundQueue, mountInboundQueueRoutes } from './inbound_queue.js';
 
 // First statement: helpers capture console.log as a default at call time below.
 installConsoleStamps();
@@ -111,11 +116,12 @@ const AUDIO_CACHE_DIR = process.env.HERMES_AUDIO_CACHE_DIR
 // `hermes update` updates bridge.js on disk but a long-lived bridge process
 // keeps serving the old behavior forever).
 let SCRIPT_HASH = '';
+let SCRIPT_SHA256_FULL = '';
 try {
-  SCRIPT_HASH = createHash('sha256')
+  SCRIPT_SHA256_FULL = createHash('sha256')
     .update(readFileSync(fileURLToPath(import.meta.url)))
-    .digest('hex')
-    .slice(0, 16);
+    .digest('hex');
+  SCRIPT_HASH = SCRIPT_SHA256_FULL.slice(0, 16);
 } catch {}
 const PAIR_ONLY = args.includes('--pair-only');
 const PAIR_JSON = args.includes('--pair-json');
@@ -235,6 +241,131 @@ function emitDebugEvent(payload) {
 
 mkdirSync(SESSION_DIR, { recursive: true });
 
+function readManagedBootstrap() {
+  if (!args.includes('--managed')) return null;
+  try {
+    const input = readFileSync(0);
+    if (!input.length) throw new Error('managed bridge bootstrap frame is missing');
+    if (input.length < 4) throw new Error('bridge bootstrap frame is truncated');
+    const length = input.readUInt32BE(0);
+    if (length < 1 || length > 16384 || input.length < length + 4) {
+      throw new Error('bridge bootstrap frame length is invalid');
+    }
+    const frame = parseJsonFrame(input.subarray(4, 4 + length), 16384);
+    if (frame.protocol !== BOOTSTRAP_PROTOCOL || Object.keys(frame).some((key) => ![
+      'protocol', 'session_digest', 'profile_digest', 'canonical_port', 'script_sha256',
+      'startup_mode', 'predecessor_digest', 'adoption_nonce', 'key_id',
+      'attach_key_b64url', 'source_witness_key_id', 'source_witness_key_b64url', 'process_start',
+    ].includes(key))) throw new Error('bridge bootstrap protocol is invalid');
+    const hex64 = (value) => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+    const b64url = (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{24,}$/.test(value)
+      && Buffer.from(value, 'base64url').length >= 16;
+    const expectedSessionDigest = createHash('sha256').update(path.resolve(SESSION_DIR)).digest('hex');
+    if (!hex64(frame.session_digest) || frame.session_digest !== expectedSessionDigest
+      || !hex64(frame.profile_digest) || frame.canonical_port !== PORT
+      || !hex64(frame.script_sha256) || frame.script_sha256 !== SCRIPT_SHA256_FULL
+      || !['fresh', 'adopt'].includes(frame.startup_mode) || !hex64(frame.key_id)
+      || !b64url(frame.attach_key_b64url) || !hex64(frame.source_witness_key_id)
+      || !b64url(frame.source_witness_key_b64url) || !Number.isInteger(frame.process_start)
+      || frame.process_start < 1
+      || frame.key_id !== createHash('sha256').update(frame.attach_key_b64url).digest('hex')
+      || frame.source_witness_key_id !== createHash('sha256').update(frame.source_witness_key_b64url).digest('hex')
+      || (frame.startup_mode === 'fresh' && (frame.predecessor_digest || frame.adoption_nonce))
+      || (frame.startup_mode === 'adopt' && (!hex64(frame.predecessor_digest) || !b64url(frame.adoption_nonce)))) {
+      throw new Error('bridge bootstrap owner proof is invalid');
+    }
+    const frameEnd = length + 4;
+    let fixture = null;
+    if (input.length !== frameEnd) {
+      if (!args.includes('--source-fixture')) throw new Error('unexpected managed bridge frame');
+      if (input.length < frameEnd + 4) throw new Error('source fixture frame is truncated');
+      const fixtureLength = input.readUInt32BE(frameEnd);
+      if (fixtureLength < 1 || fixtureLength > 16384 || input.length !== frameEnd + fixtureLength + 4) {
+        throw new Error('source fixture frame length is invalid');
+      }
+      const fixtureFrame = parseJsonFrame(input.subarray(frameEnd + 4), 16384);
+      if (fixtureFrame.protocol !== SOURCE_FIXTURE_PROTOCOL
+        || Object.keys(fixtureFrame).some((key) => !['protocol', 'payload'].includes(key))
+        || !fixtureFrame.payload || typeof fixtureFrame.payload !== 'object'
+        || Array.isArray(fixtureFrame.payload)
+        || !Array.isArray(fixtureFrame.payload.messages)
+        || !['notify', 'append'].includes(fixtureFrame.payload.type)) {
+        throw new Error('source fixture protocol is invalid');
+      }
+      fixture = fixtureFrame.payload;
+    } else if (args.includes('--source-fixture')) {
+      throw new Error('source fixture frame is missing');
+    }
+    return { bootstrap: frame, fixture };
+  } catch (error) {
+    if (args.includes('--managed')) throw error;
+    return null;
+  }
+}
+
+const MANAGED_INPUT = readManagedBootstrap();
+const MANAGED_BOOTSTRAP = MANAGED_INPUT?.bootstrap ?? null;
+const SOURCE_FIXTURE = MANAGED_INPUT?.fixture ?? null;
+
+let inboundQueue = null;
+
+function createInboundQueue() {
+  inboundQueue = new InboundQueue({
+    sessionDir: SESSION_DIR,
+    owner: {
+      pid: process.pid,
+      startedAt: MANAGED_BOOTSTRAP?.process_start ?? new Date().toISOString(),
+      canonicalPort: PORT,
+      sessionPath: path.resolve(SESSION_DIR),
+      scriptHash: SCRIPT_SHA256_FULL || SCRIPT_HASH,
+      processStart: MANAGED_BOOTSTRAP?.process_start ?? null,
+      sessionDigest: MANAGED_BOOTSTRAP?.session_digest ?? null,
+      profileDigest: MANAGED_BOOTSTRAP?.profile_digest ?? null,
+      attachKeyId: MANAGED_BOOTSTRAP?.key_id ?? null,
+      sourceWitnessKeyId: MANAGED_BOOTSTRAP?.source_witness_key_id ?? null,
+      startupMode: MANAGED_BOOTSTRAP?.startup_mode ?? 'fresh',
+      predecessorDigest: MANAGED_BOOTSTRAP?.predecessor_digest ?? null,
+      adoptionNonce: MANAGED_BOOTSTRAP?.adoption_nonce ?? null,
+      capability: MANAGED_BOOTSTRAP?.attach_key_b64url ?? undefined,
+      witnessKey: MANAGED_BOOTSTRAP?.source_witness_key_b64url ?? undefined,
+      capabilityRequired: Boolean(MANAGED_BOOTSTRAP),
+      holdOwnerLock: true,
+      listenerReady: PAIR_ONLY,
+      ownerReady: PAIR_ONLY,
+    },
+  });
+  return inboundQueue;
+}
+
+function queueBinding() {
+  if (!inboundQueue) {
+    return {
+      session_path: path.resolve(SESSION_DIR),
+      listener_ready: false,
+      owner_ready: false,
+    };
+  }
+  const health = inboundQueue.health();
+  return {
+    session_path: path.resolve(SESSION_DIR),
+    queue_epoch: inboundQueue.queueEpoch,
+    bridge_instance: inboundQueue.bridgeInstance,
+    owner_epoch: inboundQueue.ownerEpoch,
+    capability_required: inboundQueue.capabilityRequired,
+    owner_pid: process.pid,
+    owner_start: MANAGED_BOOTSTRAP?.process_start ?? null,
+    process_start: MANAGED_BOOTSTRAP?.process_start ?? null,
+    canonical_port: PORT,
+    session_digest: MANAGED_BOOTSTRAP?.session_digest ?? null,
+    profile_digest: MANAGED_BOOTSTRAP?.profile_digest ?? null,
+    script_sha256: SCRIPT_SHA256_FULL || SCRIPT_HASH,
+    attach_key_id: health.attach_key_id,
+    source_witness_key_id: health.source_witness_key_id,
+    listener_ready: health.listener_ready,
+    owner_ready: health.owner_ready,
+  };
+}
+
 // Build LID → phone reverse map from session files (lid-mapping-{phone}.json)
 function buildLidMap() {
   const map = {};
@@ -252,10 +383,6 @@ function buildLidMap() {
 let lidToPhone = buildLidMap();
 
 const logger = pino({ level: 'warn' });
-
-// Message queue for polling
-const messageQueue = [];
-const MAX_QUEUE_SIZE = 100;
 
 // Track recently sent message IDs.  Two purposes:
 //   1. Prevent echo-back loops with media in self-chat mode.
@@ -311,7 +438,7 @@ function logPollUpdateDiagnostic({ sourcePath, pollId, pollCreation, pollUpdates
   } catch {}
 }
 
-function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
+async function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
   const chatId = normalizeWhatsAppId(key?.remoteJid || update?.pollUpdates?.[0]?.pollUpdateMessageKey?.remoteJid || '');
   const senderId = normalizeWhatsAppId(
     key?.participant
@@ -365,10 +492,11 @@ function enqueuePollUpdateEvent({ key, update, selectedOptions, aggregation }) {
     botIds: [],
     timestamp: Math.floor(Date.now() / 1000),
   };
-  messageQueue.push(event);
-  if (messageQueue.length > MAX_QUEUE_SIZE) {
-    messageQueue.shift();
-  }
+  await enqueueInboundWireEvent(
+    inboundQueue,
+    event,
+    { chatId, messageId: event.messageId, pollId, source: 'messages.update' },
+  );
 }
 
 function rememberSentId(id) {
@@ -408,6 +536,10 @@ async function startSocket() {
       return { conversation: '' };
     },
   });
+
+  // The queue's producer receipt is driven by the real Baileys lifecycle, not
+  // by listener/owner readiness or the adapter's /health polling.
+  bindInboundProducerLifecycle(inboundQueue, sock.ev);
 
   sock.ev.on('creds.update', () => { saveCreds(); lidToPhone = buildLidMap(); });
 
@@ -516,11 +648,11 @@ async function startSocket() {
         selectedOptions,
         aggregation,
       });
-      enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
+      await enqueuePollUpdateEvent({ key, update: { ...update, pollUpdates }, selectedOptions, aggregation });
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+  async function handleMessagesUpsert({ messages, type }) {
     // In self-chat mode, your own messages commonly arrive as 'append' rather
     // than 'notify'. Accept both and filter agent echo-backs below.
     if (type !== 'notify' && type !== 'append') return;
@@ -717,7 +849,7 @@ async function startSocket() {
           selectedOptions,
           aggregation,
         });
-        enqueuePollUpdateEvent({
+        await enqueuePollUpdateEvent({
           key: { ...pollKey, remoteJid: pollKey.remoteJid || chatId, participant: pollKey.participant || senderId },
           update: { pollUpdates },
           selectedOptions,
@@ -778,7 +910,17 @@ async function startSocket() {
         mediaType: event.mediaType,
         mediaUrls: event.mediaUrls,
       });
-      messageQueue.push(event);
+      await enqueueInboundWireEvent(
+        inboundQueue,
+        event,
+        {
+          chatId,
+          messageId: msg.key.id,
+          senderId: resolvedSenderId,
+          source: 'messages.upsert',
+        },
+      );
+      const queueSnapshot = inboundQueue.snapshot();
       emitDebugEvent({
         stage: 'queued',
         chatId: redactWhatsAppId(chatId),
@@ -787,13 +929,13 @@ async function startSocket() {
         bodyLength: event.body.length,
         hasMedia: event.hasMedia,
         mediaType: event.mediaType,
-        queueLength: messageQueue.length,
+        queueLength: queueSnapshot.pending,
       });
-      if (messageQueue.length > MAX_QUEUE_SIZE) {
-        messageQueue.shift();
-      }
     }
-  });
+  }
+
+  sock.ev.on('messages.upsert', handleMessagesUpsert);
+  if (SOURCE_FIXTURE) await handleMessagesUpsert(SOURCE_FIXTURE);
 }
 
 // HTTP server
@@ -831,11 +973,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Poll for new messages (long-poll style)
-app.get('/messages', (req, res) => {
-  const msgs = messageQueue.splice(0, messageQueue.length);
-  res.json(msgs);
-});
+// The durable inbound queue owns claim/transition/close semantics. GET /messages is a
+// read-only snapshot; the adapter claims through POST /messages/claim with an idempotent
+// request_id, so a lost response never loses the cursor identity.
+mountInboundQueueRoutes(app, () => inboundQueue, { binding: () => queueBinding() });
 
 // Send a message
 app.post('/send', async (req, res) => {
@@ -1126,9 +1267,18 @@ app.get('/chat/:id', async (req, res) => {
 
 // Health check
 app.get('/health', (req, res) => {
+  let queue = { status: 'startup_pending', listener_ready: false, owner_ready: false };
+  if (inboundQueue) {
+    try {
+      queue = inboundQueue.health();
+    } catch (error) {
+      queue = { status: 'storage_fault', storage_fault: error?.code || 'storage_fault' };
+    }
+  }
   res.json({
     status: connectionState,
-    queueLength: messageQueue.length,
+    queueLength: queue.pending || 0,
+    queue,
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
@@ -1141,6 +1291,7 @@ app.get('/health', (req, res) => {
 // Start
 if (PAIR_ONLY) {
   // Pair-only mode: just connect, show QR, save creds, exit. No HTTP server.
+  createInboundQueue();
   if (PAIR_JSON) {
     emitPairEvent({ event: 'started', session: SESSION_DIR });
   } else {
@@ -1156,7 +1307,22 @@ if (PAIR_ONLY) {
     process.exit(1);
   });
 } else {
+  try {
+    // Create and fence the durable queue before exposing the HTTP listener.
+    // The real listen callback below is the only source of listener readiness.
+    createInboundQueue();
+  } catch (error) {
+    console.error(`[bridge] durable queue initialization failed before listener bind: ${error.message}`);
+    process.exitCode = 1;
+  }
   app.listen(PORT, '127.0.0.1', () => {
+    try {
+      inboundQueue.markListenerReady({ binding: queueBinding(), listener_ready: true, owner_ready: true });
+    } catch (error) {
+      console.error(`[bridge] durable queue readiness failed after listener bind: ${error.message}`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {

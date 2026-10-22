@@ -19,6 +19,7 @@ import re
 import sqlite3
 import threading
 import time
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 from gateway.dead_targets import classify_dead_error
@@ -80,6 +81,20 @@ FLOOD_RETRY_SLACK_SECONDS = 2.0
 # Matching requires the "flood control" wording as well as the delay, so an unrelated error that
 # merely suggests retrying is never mistaken for a flood.
 _RAW_FLOOD_RE = re.compile(r"flood control exceeded.*?retry in\s+(\d+(?:\.\d+)?)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DeliveryObligationProof:
+    """Exact readback of an existing delivery-obligation row after its state transition."""
+
+    obligation_id: str
+    session_key: str
+    platform: str
+    chat_id: str
+    thread_id: Optional[str]
+    content_digest: str
+    state: str
+    adapter_profile: str
 
 
 def _raw_flood_wait(text: str) -> Optional[float]:
@@ -265,6 +280,49 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
     """Stable id: same turn + same content re-records idempotently, while distinct threads/topics on one
     chat never collide (session_key carries platform/chat/thread; ``message_ref`` = inbound message id)."""
     return hashlib.sha256(f"{session_key}|{message_ref}|{content}".encode("utf-8", "replace")).hexdigest()[:24]
+
+
+def read_obligation(
+    obligation_id: str, *, session_key: str, platform: str, chat_id: Any,
+    thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+    expected_state: Optional[str] = None,
+) -> Optional[DeliveryObligationProof]:
+    """Read back one exact obligation after a real ledger transition.
+
+    The caller supplies the turn identity again so a stale or foreign row cannot be treated as this
+    delivery.  The content itself is never returned in the proof; only its digest crosses the custody
+    boundary.
+    """
+    profile = str(adapter_profile).strip() if adapter_profile else "default"
+    expected_chat = str(chat_id)
+    expected_thread = str(thread_id) if thread_id is not None else None
+    expected_digest = hashlib.sha256(str(content).encode("utf-8", "replace")).hexdigest()
+    with _DB_LOCK, _transaction() as conn:
+        row = conn.execute(
+            """SELECT obligation_id, session_key, platform, chat_id, thread_id, content,
+                      state, adapter_profile
+               FROM delivery_obligations WHERE obligation_id = ?""",
+            (str(obligation_id),),
+        ).fetchone()
+    if row is None:
+        return None
+    row_profile = str(row[7] or "default")
+    if (
+        str(row[0]) != str(obligation_id)
+        or str(row[1]) != str(session_key)
+        or str(row[2]) != str(platform)
+        or str(row[3]) != expected_chat
+        or (str(row[4]) if row[4] is not None else None) != expected_thread
+        or hashlib.sha256(str(row[5]).encode("utf-8", "replace")).hexdigest() != expected_digest
+        or row_profile != profile
+        or (expected_state is not None and str(row[6]) != expected_state)
+    ):
+        return None
+    return DeliveryObligationProof(
+        obligation_id=str(row[0]), session_key=str(row[1]), platform=str(row[2]),
+        chat_id=str(row[3]), thread_id=(str(row[4]) if row[4] is not None else None),
+        content_digest=expected_digest, state=str(row[6]), adapter_profile=row_profile,
+    )
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,

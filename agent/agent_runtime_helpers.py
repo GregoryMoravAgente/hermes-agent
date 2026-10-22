@@ -22,7 +22,11 @@ from agent.message_sanitization import (
 from agent.message_metadata import (
     TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
-from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
+from agent.tool_dispatch_helpers import (
+    _trajectory_normalize_msg,
+    build_tool_dispatch_kwargs,
+    make_tool_result_message,
+)
 from agent.think_scrubber import THINK_TAG_NAMES
 from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import (
@@ -1878,11 +1882,8 @@ def anthropic_prompt_cache_policy(
         return True, True
     # Qwen/Alibaba on OpenCode and DashScope accept envelope cache_control on the OpenAI wire
     # (pi-mono's "alibaba" cacheControlFormat). DeepSeek on OpenCode is excluded: its relay 400s on
-    # block-array content. Family set/predicate shared with the effective_cache_ttl clamp.
     # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire transport that accepts
     # Anthropic-style cache_control markers and rewards them with real cache hits. Without this branch
-    # qwen3.6-plus on opencode-go reports 0% cached tokens and burns through the subscription on every turn.
-    # OpenCode Zen's relay rejects the Anthropic-style content block format that cache markers produce
     # (content becomes a block array instead of a plain string), causing HTTP 400 (#77217).
     from agent.prompt_caching import ALIBABA_FAMILY_PROVIDERS, is_qwen_model
     if provider_lower in ALIBABA_FAMILY_PROVIDERS and is_qwen_model(model_lower):
@@ -1891,10 +1892,7 @@ def anthropic_prompt_cache_policy(
 
 
 def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
-    """Ask the registered ProviderProfile for a custom client, if any. Resolves by provider name,
-    then by ``base_url`` prefix so a URL-only runtime (``acp://…``) still reaches its profile.
-    A profile that raises is logged and skipped: a third-party plugin must not be able to take
-    the turn down, it can only fail to provide a client."""
+    """Ask the registered ProviderProfile for a custom client, if any."""
     try:
         from providers import get_provider_profile
     except Exception:
@@ -1912,9 +1910,15 @@ def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
             profile = _profile_for_base_url(base_url)
     if profile is None:
         return None
+    from gateway.runtime_service_operations import ExternalProcessOperationError, provider_process_kwargs
     try:
+        client_kwargs = provider_process_kwargs(agent, profile, client_kwargs)
         return profile.create_client(**client_kwargs)
-    except Exception:
+    except ExternalProcessOperationError:
+        raise
+    except Exception as exc:
+        if getattr(exc, "code", None) and "producer_policy" in client_kwargs:
+            raise
         _ra().logger.warning(
             "Provider profile %r failed to create a client; falling back to the standard client path",
             getattr(profile, "name", provider_name) or "?", exc_info=True,
@@ -2491,23 +2495,7 @@ def switch_model(
     _persist_switch_billing_route(agent)
 
 
-def _pre_tool_block_message(agent, function_name, function_args, effective_task_id, tool_call_id, middleware_trace):
-    """Plugin pre-tool-call hook verdict: ``(block_message, function_args)``; failures never block."""
-    try:
-        from hermes_cli.plugins import _dispatch_pre_tool_call_hooks
-        block_message, modified_args = _dispatch_pre_tool_call_hooks(
-            function_name, function_args, task_id=effective_task_id or "",
-            session_id=getattr(agent, "session_id", "") or "", tool_call_id=tool_call_id or "",
-            turn_id=getattr(agent, "_current_turn_id", "") or "",
-            api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-            middleware_trace=list(middleware_trace),
-        )
-        return block_message, (modified_args if modified_args is not None else function_args)
-    except Exception:
-        return None, function_args
-
-
-def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
+def _invoke_tool_unbound(agent, function_name: str, function_args: dict, effective_task_id: str,
                  tool_call_id: Optional[str] = None, messages: list | None = None,
                  pre_tool_block_checked: bool = False,
                  skip_tool_request_middleware: bool = False,
@@ -2520,6 +2508,7 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         InlineToolContext, apply_transform_tool_result, emit_terminal_post_tool_call,
         resolve_invoke_tool_executor, tool_hook_ids
     )
+    from agent.shell_hook_custody import pre_tool_block_message
     if not isinstance(function_args, dict):
         function_args = {}
     hook_ids = tool_hook_ids(agent, effective_task_id, tool_call_id)
@@ -2530,11 +2519,11 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             _tool_request_mw = apply_tool_request_middleware(function_name, function_args, **hook_ids)
             function_args = _tool_request_mw.payload
             _tool_middleware_trace = _tool_request_mw.trace
-    except Exception as _mw_err:
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as _mw_err:
         logger.debug("tool_request middleware error: %s", _mw_err)
     block_message: Optional[str] = None
     if not pre_tool_block_checked:
-        block_message, function_args = _pre_tool_block_message(
+        block_message, function_args = pre_tool_block_message(
             agent, function_name, function_args, effective_task_id, tool_call_id, _tool_middleware_trace
         )
     if block_message is not None:
@@ -2568,18 +2557,12 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
             )
     else:
         def _execute(next_args: dict) -> Any:
-            dispatch_kwargs = dict(
-                tool_call_id=tool_call_id, session_id=agent.session_id or "",
-                turn_id=getattr(agent, "_current_turn_id", "") or "",
-                api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
-                skip_pre_tool_call_hook=True, skip_tool_request_middleware=True,
-                enabled_toolsets=getattr(agent, "enabled_toolsets", None),
-                disabled_toolsets=getattr(agent, "disabled_toolsets", None),
-                tool_request_middleware_trace=list(_tool_middleware_trace),
+            dispatch_kwargs = build_tool_dispatch_kwargs(
+                agent,
+                tool_call_id=tool_call_id,
+                middleware_trace=_tool_middleware_trace,
+                skip_tool_execution_middleware=skip_tool_execution_middleware,
             )
-            if skip_tool_execution_middleware:
-                dispatch_kwargs["skip_tool_execution_middleware"] = True
             import model_tools
             return model_tools.handle_function_call(function_name, next_args, effective_task_id, **dispatch_kwargs)
     if skip_tool_execution_middleware:
@@ -2590,6 +2573,22 @@ def invoke_tool(agent, function_name: str, function_args: dict, effective_task_i
         lambda next_args: _execute(next_args if isinstance(next_args, dict) else function_args),
         original_args=function_args, **hook_ids,
     )
+
+
+def invoke_tool(agent, function_name: str, function_args: dict, effective_task_id: str,
+                tool_call_id: Optional[str] = None, messages: list | None = None,
+                pre_tool_block_checked: bool = False,
+                skip_tool_request_middleware: bool = False,
+                tool_request_middleware_trace: Optional[list[dict[str, Any]]] = None,
+                skip_tool_execution_middleware: bool = False) -> str:
+    """Invoke one tool inside the exact live shell-hook dispatch context."""
+    from agent.shell_hook_custody import tool_dispatch
+    with tool_dispatch(agent, effective_task_id, tool_call_id):
+        return _invoke_tool_unbound(
+            agent, function_name, function_args, effective_task_id, tool_call_id,
+            messages, pre_tool_block_checked, skip_tool_request_middleware,
+            tool_request_middleware_trace, skip_tool_execution_middleware,
+        )
 
 
 def repair_tool_call(agent, tool_name: str) -> str | None:

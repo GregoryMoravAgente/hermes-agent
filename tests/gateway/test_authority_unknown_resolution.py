@@ -12,6 +12,7 @@ from gateway.session_contract import SessionRef, Submission
 from gateway.session_controls import AuthorityConnection
 from hermes_state_runtime import RuntimeStoreError, claim_session_input, list_session_admissions
 from tests.waiting import async_wait_until
+from tests.gateway.test_preservation_admission_consumers import _install_custody
 
 
 class Peer:
@@ -40,6 +41,7 @@ async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed):
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='unknown-head')
     db.create_session('s', source='telegram')
     first = await initialize_session_authority(runner, profile_id='p', instance_id='owner-1')
+    _install_custody(first)
     first.sessions['s'] = LiveSession(source, 's')
     ref = SessionRef('p', 's')
     actor = AuthorityConnection(first, Peer(), {'user_id': 'human'}).actor
@@ -50,6 +52,7 @@ async def _restarted_owner_with_unknown_head(tmp_path, monkeypatch, executed):
     claimed = claim_session_input(db, epoch=first.epoch, session_id='s')
     assert claimed['admission_id'] == head.admission_id
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner-2')
+    _install_custody(authority)
     authority.sessions['s'] = LiveSession(source, 's')
     rows = {r['admission_id']: r for r in list_session_admissions(db, session_id='s')}
     assert rows[head.admission_id]['status'] == 'unknown' and rows[follower.admission_id]['status'] == 'queued'

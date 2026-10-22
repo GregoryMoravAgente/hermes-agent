@@ -52,6 +52,11 @@ class TurnContext:
     session_id: Optional[str] = None
     session_key: Optional[str] = None
     run_generation: Optional[int] = None
+    # Direct I06 roots carry their exact source-owned custody handle; managed I04 turns leave it None.
+    classic_writer_binding: Any = None
+    # The inbound event is the private owner of a typed writer handoff. It must never travel through
+    # the run result, captured settlement result, or JSON/public projection.
+    classic_writer_event: Any = None
     process_task_id: str = ""
     process_baseline: frozenset[str] = field(default_factory=frozenset)
     _interrupt_depth: int = 0

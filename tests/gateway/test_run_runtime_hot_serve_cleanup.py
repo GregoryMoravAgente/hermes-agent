@@ -83,8 +83,9 @@ async def test_failed_hot_serve_retires_session_and_bot_recovery_tasks(monkeypat
     async def build(*args, **kwargs):
         return authority
 
-    def recover_local(_authority, schedule):
+    def recover_local(_authority, schedule, *, allow_legacy):
         assert schedule is True
+        assert allow_legacy is False
 
         async def background():
             pump_started.set()
@@ -197,11 +198,12 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
 
     runner._start_one_profile_adapters, runner._after_profiles_added = start_adapters, after_added
 
-    async def build(runner_, name, home, *, register):
+    async def build(runner_, name, home, *, register, defer_local_recovery=False):
         live = SimpleNamespace(task=writer if name == "beta" else None, route=name,
                                event_stream=SimpleNamespace(execution={"execution_generation": 1}))
         authority = SimpleNamespace(runner=runner_, profile_id=str(home), sessions={"s": live},
-                                    pending_stops={}, adopted={}, retiring=False, hosted_room_service=None)
+                                    pending_stops={}, adopted={}, retiring=False, hosted_room_service=None,
+                                    native_waiters=set(), waiters={})
         registry.add(home, authority, name=name)
         return authority
 
@@ -216,7 +218,10 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
     monkeypatch.setattr(run_runtime, "TURN_SETTLE_SECONDS", 0.05)
     monkeypatch.setattr(run_runtime, "_record_parked_profiles", lambda value: parked.update(value))
     monkeypatch.setattr("gateway.session_bot.recover_bot_deliveries", recover_bot)
-    monkeypatch.setattr("gateway.session_local_recovery.recover_local_sessions", lambda a, schedule: None)
+    monkeypatch.setattr("gateway.session_local_adoption.adopt_local_compressions",
+                        lambda authority: asyncio.sleep(0))
+    monkeypatch.setattr("gateway.session_local_recovery.recover_local_sessions",
+                        lambda a, schedule, *, allow_legacy: None)
     monkeypatch.setattr("gateway.platforms.webhook_ingress.recover_webhook_finalizations", no_webhooks)
     monkeypatch.setattr("gateway.session_cron.unbind_owner", lambda authority: None)
     monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda **kw: list(homes.items()))

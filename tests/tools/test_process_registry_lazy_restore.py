@@ -48,3 +48,48 @@ def test_first_drain_under_secondary_scope_replays_the_launch_ledger(monkeypatch
     finally:
         reset_hermes_home_override(token)
     assert ledgers == [tmp_path / "launch" / "state.db"]
+
+
+def test_completed_result_restore_keeps_legacy_receipts_and_redacted_metadata(monkeypatch, tmp_path):
+    import json
+
+    from tools import process_registry_results as receipts
+
+    parent = "sess-cold"
+    path = tmp_path / "proc_cold"
+    record = {
+        "id": "proc_cold",
+        "command": "printf legacy",
+        "cwd": None,
+        "task_id": "task",
+        "owner_task_id": "task",
+        "session_key": "key",
+        "parent_session_id": parent,
+        "started_at": 1.0,
+        "exit_code": 0,
+        "completion_reason": "exited",
+        "termination_source": "",
+        "notify_on_complete": True,
+        "output": "legacy output",
+    }
+    path.write_text(json.dumps(record), encoding="utf-8")
+    monkeypatch.setattr(receipts, "get_hermes_home", lambda: tmp_path)
+    monkeypatch.setattr(receipts, "_result_paths", lambda: [path])
+    monkeypatch.setattr(receipts, "_owns_result", lambda *_args: True)
+    monkeypatch.setattr("gateway.session_context.get_session_env", lambda *_args: parent)
+
+    restored = receipts.load_completed_results()
+    legacy = restored["proc_cold"]
+    assert legacy.output_log == ""
+    assert legacy.total_output_chars == len(record["output"])
+    assert legacy._completion_event.is_set()
+
+    record.update(
+        output_log="<HERMES_HOME>/logs/process-output/proc_cold.log",
+        total_output_chars=987,
+    )
+    path.write_text(json.dumps(record), encoding="utf-8")
+    restored = receipts.load_completed_results()
+    current = restored["proc_cold"]
+    assert current.output_log == str(tmp_path / "logs/process-output/proc_cold.log")
+    assert current.total_output_chars == 987

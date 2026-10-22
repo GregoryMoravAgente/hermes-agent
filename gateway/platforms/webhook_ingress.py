@@ -1,5 +1,6 @@
 """Receipt-only adapter ingress: the authority, not an HTTP/WS task, owns execution."""
 import asyncio
+import uuid
 from contextlib import asynccontextmanager
 
 from hermes_state_runtime import RuntimeStoreError
@@ -133,33 +134,48 @@ async def admit_producer(adapter, event):
         from hermes_cli.lifecycle import has_hook
         webhook = adapter.platform == Platform.WEBHOOK
         hooks = [name for name in ('pre_gateway_dispatch', POST_ADMISSION_HOOK) if has_hook(name)]
-        if not (webhook or hooks):
-            return await authority.admit_native(event)
-        from gateway.session_authority import native_write_started
-        payload, principal = await _prepared(authority, event)
-        writing = native_write_started.set(False)
+        reservation_id = str(getattr(event, 'message_id', None) or uuid.uuid4().hex)
+        # Producer ingress has its own preparation await.  Carry one exact I01 root lease across
+        # that await and transfer it to the authority only at the durable admission call; a
+        # provider retry, hook skip, or preparation failure releases this exact unaccepted lease.
+        preservation_handle = [authority._preservation_root(
+            'I01_native_inbound', f'native:{reservation_id}')]
         try:
-            # An identical delivery (provider retry, relay re-send) overlapping this one waits here, then
-            # rechecks the ledger: the retry check, the hooks and the commit run once per delivery.
-            async with _delivery_turn((authority.profile_id, principal, event.message_id)):
-                committed = payload, _committed(authority, principal, event.message_id)
-                return await _admit_once(authority, event, webhook, hooks, committed)
-        except (Exception, asyncio.CancelledError) as exc:
-            # Refused after preparing (a command-shaped rewrite, a drain during the hooks, a conflict),
-            # or cancelled (relay disconnect, shutdown) before the admission write began. A cancelled
-            # write still commits (it is shielded): the bytes it commits are never released here.
-            if not (isinstance(exc, asyncio.CancelledError) and native_write_started.get()):
-                await asyncio.shield(_release_preparation(authority, payload))
-            raise
+            if not (webhook or hooks):
+                # ``admit_native`` owns this handle from the call boundary onward, including its
+                # fresh-admission refusal and durable-write reconciliation paths.
+                handle = preservation_handle.pop()
+                return await authority.admit_native(event, _preservation_handle=handle)
+            from gateway.session_authority import native_write_started
+            payload, principal = await _prepared(authority, event)
+            writing = native_write_started.set(False)
+            try:
+                # An identical delivery (provider retry, relay re-send) overlapping this one waits here, then
+                # rechecks the ledger: the retry check, the hooks and the commit run once per delivery.
+                async with _delivery_turn((authority.profile_id, principal, event.message_id)):
+                    committed = payload, _committed(authority, principal, event.message_id)
+                    return await _admit_once(authority, event, webhook, hooks, committed,
+                                             preservation_handle)
+            except (Exception, asyncio.CancelledError) as exc:
+                # Refused after preparing (a command-shaped rewrite, a drain during the hooks, a conflict),
+                # or cancelled (relay disconnect, shutdown) before the admission write began. A cancelled
+                # write still commits (it is shielded): the bytes it commits are never released here.
+                if not (isinstance(exc, asyncio.CancelledError) and native_write_started.get()):
+                    await asyncio.shield(_release_preparation(authority, payload))
+                raise
+            finally:
+                native_write_started.reset(writing)
         finally:
-            native_write_started.reset(writing)
+            if preservation_handle:
+                authority._preservation_bind_or_release(None, preservation_handle.pop())
 
 
-async def _admit_once(authority, event, webhook, hooks, committed):
+async def _admit_once(authority, event, webhook, hooks, committed, preservation_handle):
     from gateway.run_inbound_consumer import POST_ADMISSION_HOOK
     if webhook:
         prior = await _webhook_retry(authority, event, *committed)
         if prior is not None:
+            authority._preservation_bind_or_release(None, preservation_handle.pop())
             return prior
     admitted = event
     if hooks and (webhook or not committed[1]):
@@ -168,6 +184,7 @@ async def _admit_once(authority, event, webhook, hooks, committed):
             admitted = await runner._hm_pre_gateway_dispatch_hook(event, event.source)
             if admitted is None:
                 await _release_preparation(authority, committed[0])
+                authority._preservation_bind_or_release(None, preservation_handle.pop())
                 return None
             if admitted is not event:
                 # The rewrite is committed with the fingerprint of the delivery as received:
@@ -180,8 +197,12 @@ async def _admit_once(authority, event, webhook, hooks, committed):
                 runner, admitted, admitted.source, runner._session_key_for_source(admitted.source))
             if consumed:
                 await _release_preparation(authority, committed[0])
+                authority._preservation_bind_or_release(None, preservation_handle.pop())
                 return None
-    return await authority.admit_native(admitted)
+    # The authority now owns the exact root and reconciles it against the durable row on every
+    # write/refusal path.  Remove it from the producer's finally block before crossing that call.
+    handle = preservation_handle.pop()
+    return await authority.admit_native(admitted, _preservation_handle=handle)
 
 
 # Producer deliveries in flight by (profile, principal, provider id) -> [lock, holder + waiters]. This
@@ -251,7 +272,19 @@ async def _webhook_retry(authority, event, payload, rows):
             payload['native_text_v1'].pop('webhook_route')
             if 'provenance' not in retained:
                 payload['native_text_v1'].pop('provenance', None)
-        same = row['payload'] == payload
+        # ``producer_process_mode`` is stamped by the authority after this producer-side
+        # comparison. It is server-owned custody metadata, so a provider retry cannot carry it
+        # back in its prepared payload and must not be rejected solely because the first receipt
+        # persisted the marker.
+        retained_for_compare = dict(row['payload'])
+        candidate_for_compare = dict(payload)
+        retained_native = dict(retained_for_compare.get('native_text_v1') or {})
+        candidate_native = dict(candidate_for_compare.get('native_text_v1') or {})
+        retained_native.pop('producer_process_mode', None)
+        candidate_native.pop('producer_process_mode', None)
+        retained_for_compare['native_text_v1'] = retained_native
+        candidate_for_compare['native_text_v1'] = candidate_native
+        same = retained_for_compare == candidate_for_compare
     if len(rows) != 1 or not same:
         raise RuntimeStoreError('admission_conflict')
     event._webhook_duplicate = True
@@ -295,10 +328,12 @@ async def recover_webhook_finalizations(authority):
           AND json_extract(a.payload_json, '$.native_text_v1.automation') IS NULL
         """)
     results = {}
+    observed_rows = []
     for candidate in rows:
         row = get_session_admission(authority.db, admission_id=candidate['admission_id'])
         if row is None:
             continue
+        observed_rows.append(row)
         sid = row['target_session_id']
         try:
             envelope = row['payload']['native_text_v1']
@@ -312,4 +347,9 @@ async def recover_webhook_finalizations(authority):
                 authority, authority._receipt(row)) else 'unchanged'
         except (KeyError, RuntimeStoreError):
             results[sid] = 'unavailable'
+    from gateway.session_recovery_custody import observe_consumer_rows
+    observe_consumer_rows(
+        authority, 'webhook_replay', rows=observed_rows,
+        reason='webhook replay found no accepted admission',
+    )
     return results

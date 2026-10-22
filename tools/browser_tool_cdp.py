@@ -176,11 +176,54 @@ def _ensure_cdp_supervisor(task_id: str) -> None:
             cdp_url = _resolve_cdp_override(maybe)
     if not cdp_url:
         return
+    source_receipt = None
+    source_enabled = False
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
         policy, timeout_s = _get_dialog_policy_config()
-        SUPERVISOR_REGISTRY.get_or_start(task_id=task_id, cdp_url=cdp_url, dialog_policy=policy, dialog_timeout_s=timeout_s)
+        existing = SUPERVISOR_REGISTRY.get(task_id)
+        existing_receipt = getattr(existing, "_i16_browser_receipt", None) if existing is not None else None
+        if existing is not None and existing.cdp_url == cdp_url:
+            healthy = (
+                getattr(existing, "_thread", None) is not None
+                and existing._thread.is_alive()
+                and getattr(existing, "_loop", None) is not None
+                and existing._loop.is_running()
+            )
+            if healthy:
+                if existing_receipt is not None:
+                    if getattr(existing_receipt, "state", None) == "accepted":
+                        return
+                    raise RuntimeError("browser_supervisor_receipt_unknown")
+                from gateway.runtime_sidecar_browser import begin_browser_supervisor
+                existing_receipt = begin_browser_supervisor(task_id, cdp_url)
+                if existing_receipt is None:
+                    return
+                existing_receipt.bind(existing)
+                return
+        from gateway.runtime_sidecar_browser import _active_factory
+        source_enabled = existing_receipt is not None or _active_factory() is not None
+        if existing is not None:
+            # Registry replacement stops the old object internally, but the source-owned receipt
+            # must be closed and read back before a new endpoint can be accepted.
+            SUPERVISOR_REGISTRY.stop(task_id)
+            if existing_receipt is not None:
+                from gateway.runtime_sidecar_browser import finish_browser_supervisor
+                if not finish_browser_supervisor(existing):
+                    raise RuntimeError("browser_supervisor_replacement_unknown")
+        from gateway.runtime_sidecar_browser import begin_browser_supervisor
+        source_receipt = begin_browser_supervisor(task_id, cdp_url)
+        source_enabled = source_receipt is not None
+        supervisor = SUPERVISOR_REGISTRY.get_or_start(
+            task_id=task_id, cdp_url=cdp_url, dialog_policy=policy, dialog_timeout_s=timeout_s,
+        )
+        if source_receipt is not None:
+            source_receipt.bind(supervisor)
     except Exception as exc:
+        if source_receipt is not None and getattr(source_receipt, "state", None) == "reserved":
+            source_receipt.mark_unknown("browser_supervisor_start_failed")
+        if source_enabled:
+            raise
         _bt.logger.debug("CDP supervisor attach for task=%s failed (non-fatal): %s", task_id, exc)
 
 
@@ -188,6 +231,11 @@ def _stop_cdp_supervisor(task_id: str) -> None:
     """Stop the CDP supervisor for ``task_id`` if one exists. No-op otherwise."""
     try:
         from tools.browser_supervisor import SUPERVISOR_REGISTRY  # type: ignore[import-not-found]
+        supervisor = SUPERVISOR_REGISTRY.get(task_id)
         SUPERVISOR_REGISTRY.stop(task_id)
+        if supervisor is not None and getattr(supervisor, "_i16_browser_receipt", None) is not None:
+            from gateway.runtime_sidecar_browser import finish_browser_supervisor
+            if not finish_browser_supervisor(supervisor):
+                raise RuntimeError("browser_supervisor_close_unknown")
     except Exception as exc:
         _origin().logger.debug("CDP supervisor stop for task=%s failed (non-fatal): %s", task_id, exc)

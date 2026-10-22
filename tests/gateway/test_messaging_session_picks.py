@@ -23,8 +23,10 @@ async def _compressed_chat(tmp_path):
     from gateway.session import SessionSource
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     runner = GatewayRunner(GatewayConfig())
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id='4242', user_id='u-4242', chat_type='dm')
     root = authority.register(source).session_id
     route = runner.session_store._generate_session_key(source)

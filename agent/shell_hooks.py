@@ -476,7 +476,7 @@ def _windows_script_argv(argv: list[str]) -> list[str]:
     return [_find_bash(), *argv]
 
 
-def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
+def _spawn(spec: ShellHookSpec, stdin_json: str, *, custody: Any = None) -> dict[str, Any]:
     """The single subprocess site: run ``spec.command`` with ``stdin_json`` on stdin. Same result keys for every outcome."""
     result: dict[str, Any] = {"returncode": None, "stdout": "", "stderr": "", "timed_out": False, "elapsed_seconds": 0.0, "error": None}
 
@@ -487,8 +487,14 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     try:
         argv = split_command_line(os.path.expanduser(spec.command))
     except ValueError as exc:
+        if custody is not None:
+            from agent.shell_hook_custody import record_spawn_error
+            record_spawn_error(custody, f"command cannot be parsed: {exc}")
         return failed(f"command {spec.command!r} cannot be parsed: {exc}")
     if not argv:
+        if custody is not None:
+            from agent.shell_hook_custody import record_spawn_error
+            record_spawn_error(custody, "empty command")
         return failed("empty command")
     t0 = time.monotonic()
     # Own process group on POSIX so a timed-out hook's descendants are reaped with it (Windows: kill_process_tree
@@ -502,10 +508,24 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
     try:
         if IS_WINDOWS:
             argv = _windows_script_argv(argv)
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, encoding='utf-8', errors='replace', shell=False,
-                                env=build_subprocess_env(scrub_secrets=is_multiplex_active()), **popen_kwargs)
-    except Exception as exc:
+        env = build_subprocess_env(scrub_secrets=is_multiplex_active())
+        if custody is not None and IS_WINDOWS:
+            proc = custody.launch_windows(
+                argv, subprocess.PIPE, subprocess.PIPE, subprocess.PIPE, env,
+            )
+        else:
+            proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding='utf-8', errors='replace', shell=False,
+                                    env=env, **popen_kwargs)
+    except BaseException as exc:
+        if custody is not None:
+            from agent.shell_hook_custody import record_spawn_error
+            retained_process = getattr(getattr(custody.receipt, "transaction", None), "process", None)
+            record_spawn_error(
+                custody, str(exc), ambiguous=not isinstance(exc, Exception), process=retained_process,
+            )
+        if not isinstance(exc, Exception):
+            raise
         for cls, msg in _POPEN_ERRORS:
             if isinstance(exc, cls):
                 return failed(msg)
@@ -514,6 +534,14 @@ def _spawn(spec: ShellHookSpec, stdin_json: str) -> dict[str, Any]:
             # operator on a non-English Windows could not act on it at all.
             return failed(f"{argv[0]!r} {_NOT_DIRECTLY_EXECUTABLE}")
         return failed(str(exc))
+    if custody is not None:
+        if IS_WINDOWS:
+            from agent.shell_hook_custody import process_result
+            result.update(process_result(custody, proc, stdin_json, spec.timeout, kill_process_tree))
+            return result
+        from agent.shell_hook_custody import process_result
+        result.update(process_result(custody, proc, stdin_json, spec.timeout, kill_process_tree))
+        return result
     try:
         stdout, stderr = proc.communicate(input=stdin_json, timeout=spec.timeout)
     except BaseException as exc:
@@ -541,7 +569,35 @@ def _make_callback(spec: ShellHookSpec) -> Callable[..., Optional[dict[str, Any]
             return None
         if spec.event in _TOOL_EVENTS and not spec.matches_tool(kwargs.get("tool_name")):
             return None
-        return _evaluate_result(spec, _spawn(spec, _serialize_payload(spec.event, kwargs)))
+        custody = None
+        try:
+            from agent.shell_hook_custody import current_dispatch_operation
+            custody = current_dispatch_operation(spec, spec.event, kwargs)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            # A managed admission must never run an unowned child after custody setup failed.
+            # The historical fail-open/fail-closed decision is preserved below.
+            from agent.shell_hook_scope import mark_current_hook_unknown
+            mark_current_hook_unknown("hook_custody_unmapped")
+            logger.warning("shell hook custody reservation failed: %s", type(exc).__name__)
+            return _evaluate_result(spec, {
+                "returncode": None, "stdout": "", "stderr": "", "timed_out": False,
+                "elapsed_seconds": 0.0, "error": f"custody reservation failed: {exc}",
+            })
+        try:
+            stdin_json = _serialize_payload(spec.event, kwargs)
+        except BaseException as exc:
+            if custody is not None:
+                from agent.shell_hook_custody import record_spawn_error
+                record_spawn_error(custody, str(exc), ambiguous=not isinstance(exc, Exception))
+            if not isinstance(exc, Exception):
+                raise
+            return _evaluate_result(spec, {
+                "returncode": None, "stdout": "", "stderr": "", "timed_out": False,
+                "elapsed_seconds": 0.0, "error": f"hook payload serialization failed: {exc}",
+            })
+        result = (_spawn(spec, stdin_json, custody=custody)
+                  if custody is not None else _spawn(spec, stdin_json))
+        return _evaluate_result(spec, result)
 
     _callback.__name__ = _callback.__qualname__ = f"shell_hook[{spec.event}:{spec.command}]"
     return _callback

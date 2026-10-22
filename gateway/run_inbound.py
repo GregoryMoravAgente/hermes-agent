@@ -574,7 +574,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         from gateway.platforms.base import merge_pending_message_event
         adapter = self._delivery_adapter_for(source)
         if adapter:
+            from gateway.platforms.base_busy_custody import attach_adapter_event, begin_adapter_event
+            if not begin_adapter_event(adapter, event, _quick_key, "fifo", state="queued"):
+                return
+            existing = adapter._pending_messages.get(_quick_key)
             merge_pending_message_event(adapter._pending_messages, _quick_key, event, merge_text=merge_text)
+            if existing is not None:
+                attach_adapter_event(adapter, existing, event)
 
     async def _hm_busy_slash_or_photo(
         self, event: MessageEvent, source: SessionSource, _quick_key: str
@@ -1210,6 +1216,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
+        preserved = getattr(event, "_preservation_handoff", None)
+        if preserved is not None:
+            from gateway.session_ingress import admit_preserved_route
+            return await admit_preserved_route(self, authority, event, source, preserved)
         if authority is not None and not event.get_command() and not is_internal:
             from gateway.session_ingress import admit_message, executing_admission
             if not executing_admission.get():

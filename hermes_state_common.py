@@ -14,7 +14,7 @@ from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
 from hermes_state_keys import CRON_PRINCIPAL_ID
 from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
-from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
+from agent.compression_marker import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
 
 
@@ -744,7 +744,11 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     -- async_delegations shapes depending on whether the delegation tool had
     -- ever run, breaking rebuild/replay pipelines that reconstruct state.db
     -- from the canonical schema (#94691).
-    origin_session_id TEXT NOT NULL DEFAULT ''
+    origin_session_id TEXT NOT NULL DEFAULT '',
+    -- Typed executor handoff/worker-exit claim; distinct from UI result/delivery state.
+    -- Keep this append-only at the end of the fresh-install shape so the v32
+    -- policy matches both the v31 wire order and ALTER TABLE backfills.
+    execution_json TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);

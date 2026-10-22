@@ -47,7 +47,10 @@ async def _compressed(tmp_path, monkeypatch):
     from gateway.session_local import create_local_session
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    authority = await initialize_session_authority(_runner(tmp_path), profile_id='fixture', instance_id='first')
+    runner = _runner(tmp_path)
+    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read'}), 'socket')
     ref = create_local_session(authority, actor, dict(request_id='lc12', source='gui', cwd=str(tmp_path),
                                                       model='frozen', toolsets=[]))
@@ -66,8 +69,11 @@ async def _compressed(tmp_path, monkeypatch):
 
 async def _cold(compressed):
     from gateway.session_authority import initialize_session_authority
-    return await initialize_session_authority(_runner(compressed.tmp_path), profile_id='fixture',
-                                              instance_id='second')
+    runner = _runner(compressed.tmp_path)
+    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='second')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
+    return authority
 
 
 @pytest.mark.asyncio

@@ -181,6 +181,8 @@ def test_release_seam_stops_exact_backend_and_clears_session_state():
 
     first = MagicMock()
     second = MagicMock()
+    first._cua_owner = None
+    second._cua_owner = None
     computer_use._backends.update({
         "conversation-a": first,
         "conversation-b": second,
@@ -204,6 +206,7 @@ def test_release_seam_evicts_state_even_when_backend_stop_fails():
     from tools.computer_use import tool as computer_use
 
     backend = MagicMock()
+    backend._cua_owner = None
     backend.stop.side_effect = RuntimeError("driver teardown failed")
     computer_use._backends["failed-run"] = backend
     computer_use._backend_call_locks["failed-run"] = computer_use.threading.RLock()
@@ -217,6 +220,7 @@ def test_release_seam_waits_for_in_flight_action_before_stopping_backend():
     from tools.computer_use import tool as computer_use
 
     backend = MagicMock()
+    backend._cua_owner = None
     call_lock = computer_use.threading.RLock()
     computer_use._backends["cancelled-run"] = backend
     computer_use._backend_call_locks["cancelled-run"] = call_lock

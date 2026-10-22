@@ -8110,6 +8110,30 @@
             "title": "Profile Home",
             "type": "string"
           },
+          "profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Profile Id"
+          },
+          "authority_epoch": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Authority Epoch"
+          },
           "session_id": {
             "title": "Session Id",
             "type": "string"
@@ -8166,6 +8190,30 @@
             ],
             "default": null,
             "title": "Retry Admission Id"
+          },
+          "execution_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Execution Generation"
+          },
+          "retry_execution_generation": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Retry Execution Generation"
           },
           "error": {
             "anyOf": [

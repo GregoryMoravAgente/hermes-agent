@@ -203,6 +203,7 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 
 def _persist_pending_completion(event):
     from tools import async_delegation
+    from tests.gateway.test_completion_admission import prepared_execution
 
     async_delegation._persist_dispatch({
         "delegation_id": event["delegation_id"],
@@ -210,6 +211,7 @@ def _persist_pending_completion(event):
         "origin_ui_session_id": "",
         "parent_session_id": event.get("parent_session_id"),
         "dispatched_at": event["dispatched_at"],
+        "execution": prepared_execution(event["delegation_id"]),
     })
     async_delegation._persist_completion(event, {
         "status": "completed",

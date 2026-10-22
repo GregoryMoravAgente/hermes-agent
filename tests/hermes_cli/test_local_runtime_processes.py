@@ -6,6 +6,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 
 import psutil
 import pytest
@@ -152,9 +153,9 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
     real_init = processes._WindowsJob.__init__
     real_assign = processes._WindowsJob.assign
 
-    def track_job(job):
+    def track_job(job, name=None):
         jobs.append(job)
-        real_init(job)
+        real_init(job, name=name)
         handles.append(job._handle)
 
     if failure == 'configure':
@@ -233,3 +234,75 @@ def test_failed_setup_never_runs_child_and_releases_handles(tmp_path, monkeypatc
             proc._handle.Close()
         for job in jobs:
             job.close()
+
+
+@pytest.mark.platforms("windows")
+def test_owned_job_terminate_uses_same_handle_and_preserves_external_process(tmp_path):
+    """Use the returned Job for recovery while retaining external ownership."""
+    from hermes_cli.local_runtime.processes import spawn_server
+
+    script = tmp_path / 'disposable server.py'
+    script.write_text(_SCRIPT)
+    env = dict(os.environ, HERMES_HOME=str(tmp_path / "home"),
+               PYTHONPATH=str(Path(__file__).resolve().parents[2]))
+    launcher = control = job = None
+    launchers = []
+    log_path = tmp_path / "terminate.log"
+    with log_path.open("w") as log:
+        try:
+            control = subprocess.Popen(
+                [sys.executable, str(script), str(tmp_path), "control"],
+                env=env, stdout=log, stderr=log,
+            )
+            launchers.append(control)
+            launcher, job = spawn_server(
+                [sys.executable, str(script), str(tmp_path), "router"],
+                env=env, stdout=log, stderr=log,
+            )
+            launchers.append(launcher)
+            router = _read(tmp_path / "router.json")
+            grandchild = _read(tmp_path / "grandchild.json")
+            assert job.contains_process_handle(
+                SimpleNamespace(raw_handle=launcher._handle),
+            ) is True
+            assert job.empty() is False
+
+            job.terminate()
+            assert _wait(lambda: not _alive(router) and not _alive(grandchild))
+            control_identity = _read(tmp_path / "control.json")
+            assert _alive(control_identity)
+            assert _wait(lambda: launcher.poll() is not None)
+            assert job.empty() is True
+        finally:
+            descendants = []
+            for owner in launchers:
+                try:
+                    descendants.extend(psutil.Process(owner.pid).children(recursive=True))
+                except psutil.NoSuchProcess:
+                    pass
+            for proc in reversed(descendants):
+                _kill({"pid": proc.pid, "created": proc.create_time()})
+
+            def close_exact_process(process):
+                if process is None:
+                    return
+                handle = getattr(process, "_handle", None)
+                try:
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=10)
+                    assert handle is not None
+                    assert not handle.closed
+                finally:
+                    if handle is not None and not handle.closed:
+                        handle.Close()
+                    assert handle is not None and handle.closed
+
+            try:
+                if job is not None:
+                    job.close()
+            finally:
+                try:
+                    close_exact_process(launcher)
+                finally:
+                    close_exact_process(control)

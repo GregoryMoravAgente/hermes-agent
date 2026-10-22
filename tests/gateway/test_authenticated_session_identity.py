@@ -73,6 +73,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_local import create_local_session
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_contract import Principal
     from hermes_cli.web_server_sessions import _session_mutation_context
     from hermes_state_runtime import RuntimeStoreError
@@ -82,6 +83,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    bind_authority_runtime_custody(runner, authority)
 
     async def actor(session):
         request, endpoint, auth, factory, ws_type = connection(authority, session, monkeypatch)
@@ -120,6 +122,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
         {'provider': oauth.provider, 'issuer': oauth.issuer + '/other', 'user_id': oauth.user_id})
     runner.adapters = {}
     cold = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='second')
+    bind_authority_runtime_custody(runner, cold)
     reconnect = await actor(oidc('user-a'))
     assert create_local_session(cold, reconnect, params) == ref
     assert await mutate_session(cold, reconnect, ref, edit) == receipt
@@ -139,6 +142,7 @@ async def test_private_native_subject_preserves_existing_creation_and_mutation_r
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_mutations import mutate_session
@@ -148,6 +152,7 @@ async def test_private_native_subject_preserves_existing_creation_and_mutation_r
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    bind_authority_runtime_custody(runner, authority)
     caps = frozenset({'session:create', 'session:read', 'session:control'})
     old = Principal('uid:1000', 'fixture', caps, 'old')
     params = {'request_id': 'original', 'source': 'cli', 'cwd': str(tmp_path), 'model': 'fixture', 'toolsets': []}

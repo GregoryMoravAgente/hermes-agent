@@ -95,6 +95,29 @@ async def test_push_receipt_requires_real_admission_without_displacing_user(raft
 
 
 @pytest.mark.asyncio
+async def test_push_wake_preserves_the_trusted_kanban_occurrence_metadata():
+    _runner, adapter, source, _key = setup_route()
+    received = []
+
+    async def handler(event):
+        received.append(event)
+
+    adapter.set_message_handler(handler)
+    occurrence = {
+        'schema': 'kanban_task_events.v1', 'board': 'ops', 'task_id': 'task-42',
+        'old_cursor': 4, 'claimed_cursor': 5, 'event_ids': [5],
+    }
+    await adapter.connect()
+    try:
+        await deliver_wake(adapter, text='same rendered wake', source=source,
+                           wake_metadata={'kanban_occurrence': occurrence})
+        await drain(adapter)
+        assert received[0].metadata['kanban_occurrence'] == occurrence
+    finally:
+        await adapter.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_notifier_retries_unaccepted_wake_without_repeating_pings(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "board.db"))
     runner, adapter, _source, key = setup_route()

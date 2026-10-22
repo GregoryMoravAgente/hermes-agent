@@ -14,6 +14,7 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from agent.turn_context import _bind_interrupt_scope
 from tools import async_delegation
+from tools.daemon_pool import OwnedSubmission
 from tools.delegate_tool_dispatch import _Batch, _dispatch_background
 from tools.interrupt import is_interrupted, set_interrupt
 from tools.process_registry import process_registry
@@ -166,8 +167,10 @@ def test_rejected_background_child_stops_with_parent(
         assert occupied.wait(5)
     elif rejection == "schedule_failure":
         class RejectingExecutor:
-            def submit(self, *_args, **_kwargs):
-                raise RuntimeError("executor shut down")
+            def submit_owned(self, handoff_id, *_args, **_kwargs):
+                return OwnedSubmission(
+                    handoff_id, None, "no", RuntimeError("executor shut down"),
+                )
 
         monkeypatch.setattr(async_delegation, "_get_executor", lambda _n: RejectingExecutor())
     else:
@@ -176,11 +179,13 @@ def test_rejected_background_child_stops_with_parent(
         class PartiallyRejectingExecutor:
             submitted = 0
 
-            def submit(self, *args, **kwargs):
+            def submit_owned(self, handoff_id, fn, /, *args, **kwargs):
                 self.submitted += 1
                 if self.submitted == 2:
-                    raise RuntimeError("unit submission failed")
-                return executor.submit(*args, **kwargs)
+                    return OwnedSubmission(
+                        handoff_id, None, "no", RuntimeError("unit submission failed"),
+                    )
+                return executor.submit_owned(handoff_id, fn, *args, **kwargs)
 
         partial_executor = PartiallyRejectingExecutor()
         monkeypatch.setattr(async_delegation, "_get_executor", lambda _n: partial_executor)

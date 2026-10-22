@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import logging
 import subprocess
 import threading
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 def _close_late_session_db_result(future: concurrent.futures.Future) -> None:
@@ -53,18 +57,57 @@ def defer_teardown_to_running_worker(
     return True
 
 
-def reap_terminal_worker_in_background(process: subprocess.Popen) -> None:
-    """Keep the reap contract when the waiter returns before the worker exits.
+def reap_terminal_worker_in_background(process: subprocess.Popen, on_done=None):
+    """Keep the reap contract and report its physical completion to custody.
 
-    The ledger turning terminal lets ``_wait_for_external_cron_worker_body``
-    return while the worker is still in final teardown. The gateway remains the
-    worker's parent, so if nobody calls ``wait()`` afterwards the worker lingers
-    as a zombie (STAT=Z) under the gateway until it is restarted (#114509). A
-    short-lived daemon thread holds that single responsibility and ends with
-    the process exit it waits for.
+    The ledger turning terminal lets ``_wait_for_external_cron_worker_body`` return while the
+    worker is still in final teardown.  The callback is only a wakeup for the exact binding; it
+    cannot release a lease without the ledger, process, reaper, and delivery checks agreeing.
     """
-    threading.Thread(
-        target=process.wait,
+    reaped = threading.Event()
+
+    def _reap() -> None:
+        try:
+            # This thread is the detached reaper: a blocking wait is the native
+            # Popen contract and performs the actual child reap.  Polling with a
+            # short timeout here made unchanged fake/process adapters that raise
+            # TimeoutExpired forever spin at full speed and starve the owning
+            # test/process.  A live child still leaves custody pending until this
+            # wait returns; the gateway caller never joins this daemon thread.
+            # health: allow HX006 -- the detached daemon must block for native child exit; the caller never joins, and custody settles only after this wait returns.
+            process.wait()
+        except (OSError, ValueError, subprocess.SubprocessError):
+            thread._cron_reap_succeeded = False
+            reaped.set()
+            logger.warning("Cron external worker could not be reaped; custody remains pending")
+        else:
+            thread._cron_reap_succeeded = True
+            reaped.set()
+
+    from agent.memory_provider import spawn_context_thread
+
+    thread = spawn_context_thread(
+        _reap,
         name=f"cron-worker-reap-{getattr(process, 'pid', '?')}",
-        daemon=True,
-    ).start()
+    )
+    thread._cron_reap_succeeded = False
+    thread._cron_reap_done = reaped
+    thread._cron_reap_joined = False
+    thread.start()
+    if on_done is not None:
+        def _notify_after_join() -> None:
+            while thread.is_alive():
+                thread.join(timeout=0.5)
+            thread._cron_reap_joined = True
+            if not reaped.is_set() or thread._cron_reap_succeeded is not True:
+                return
+            try:
+                on_done()
+            except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError, ValueError):
+                logger.warning("Cron external worker completion notification failed; custody remains pending")
+
+        spawn_context_thread(
+            _notify_after_join,
+            name=f"cron-worker-reap-notify-{getattr(process, 'pid', '?')}",
+        ).start()
+    return thread

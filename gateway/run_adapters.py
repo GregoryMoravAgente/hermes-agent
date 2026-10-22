@@ -15,7 +15,6 @@ from contextlib import suppress
 import functools
 import os
 import time
-import weakref as _weakref
 from agent.async_utils import consume_detached_task_result
 from contextvars import Context
 from datetime import datetime, timedelta, timezone, UTC
@@ -29,7 +28,6 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
 from gateway.run_shutdown import _log_suppressed
-from gateway.session import SessionSource
 from hermes_cli.observability.shared_metrics_gateway import record_platform_connect, record_platform_disconnect
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -939,6 +937,13 @@ class GatewayAdapterLifecycleMixin:
             self._schedule_resume_pending_sessions(platform=platform)
         except Exception:
             logger.debug("resume-pending reschedule after %s reconnect failed", platform.value, exc_info=True)
+        from gateway.session_recovery_custody import observe_consumer_rows
+        authority = getattr(self, 'session_authority', None)
+        if authority is not None:
+            observe_consumer_rows(
+                authority, 'adapter_reconnect',
+                reason=f'{platform.value} reconnect found no accepted admission',
+            )
 
     async def _cancel_secondary_profile_reconnect_tasks(self) -> None:
         """Cancel profile-scoped reconnects before tearing down their registry, so a reconnect
@@ -1352,9 +1357,15 @@ class GatewayAdapterLifecycleMixin:
         busy_session_handler=None, authorization_check=None, platform_event_handler=None,
         busy_text_mode: Optional[str] = None, busy_text_timing: Optional[tuple[float, float]] = None,
         human_delay: Optional[tuple[int, int]] | object = _UNSET,
+        preservation_profile: Optional[str] = None,
     ) -> None:
         """Install the runner callbacks every adapter needs (defaults = primary handlers;
         secondary wiring passes profile-scoped variants). ``set_reaction_handler`` is optional."""
+        # Register the transport before installing any callback. During a reversible preservation
+        # close a new adapter must refuse at this source boundary, rather than becoming a handler
+        # with no close-generation proof behind it.
+        from gateway.preservation_source_close import register_source_adapter
+        register_source_adapter(self, adapter, preservation_profile)
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
@@ -1407,6 +1418,7 @@ class GatewayAdapterLifecycleMixin:
             ),
             busy_text_timing=(timings.get(profile_name) if isinstance(timings, dict) else None),
             human_delay=(delays.get(profile_name, _UNSET) if isinstance(delays, dict) else _UNSET),
+            preservation_profile=profile_name,
         )
         # Voice transcripts from this bot's channels dispatch through THIS adapter.
         self._bind_voice_input_callback(adapter)
@@ -1810,8 +1822,16 @@ class GatewayAdapterLifecycleMixin:
         from tui_gateway.launch_profile_policy import launch_body
 
         async def _handler(*args):
+            event = next((item for item in args if hasattr(item, "source")), None)
+            from gateway.run import get_hermes_home
+            from gateway.session_ingress_context import native_callback, register_transport_home
+            profile = getattr(getattr(event, "source", None), "profile", None)
             with launch_body(), self._standalone_launch_scope():
-                return await handler(*args)
+                transport_home = (getattr(self, "_native_transport_homes", None) or {}).get(profile)
+                transport_home = transport_home or get_hermes_home()
+                register_transport_home(self, profile, transport_home)
+                with native_callback(self, event, transport_home, profile):
+                    return await handler(*args)
 
         return _handler
 
@@ -1824,7 +1844,9 @@ class GatewayAdapterLifecycleMixin:
         with _log_suppressed(logging.DEBUG, "gateway_platform_event hook dispatch failed", exc_info=True):
             from hermes_cli.lifecycle import has_hook, invoke_hook
             if has_hook("gateway_platform_event") and self._is_user_authorized_for_source(source):
-                invoke_hook("gateway_platform_event", **event)
+                from agent.shell_hook_scope import managed_hook_route
+                with managed_hook_route():
+                    invoke_hook("gateway_platform_event", **event)
 
     def _make_profile_platform_event_handler(self, profile_name: str):
         """Bind platform-event auth and hook dispatch to one multiplex profile."""
@@ -1946,35 +1968,5 @@ class GatewayAdapterLifecycleMixin:
         # tap, matching the message path's per-message re-read.
         profile_home = self._routed_profile_home(profile_name) if profile_name else None
 
-        def check(
-            user_id: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None, *,
-            is_bot: bool = False, thread_id: Optional[str] = None,
-        ) -> bool:
-            if not user_id:
-                return False
-            source = SessionSource(
-                platform=platform, chat_id=chat_id or "", chat_type=chat_type or "group",
-                user_id=user_id, thread_id=thread_id, is_bot=bool(is_bot), profile=profile_name,
-            )
-            # Same transport provenance as ``build_source``, so policy reads resolve the receiving adapter.
-            registry = (
-                (getattr(self, "_profile_adapters", None) or {}).get(profile_name)
-                if profile_name else getattr(self, "adapters", None)
-            ) or {}
-            adapter = registry.get(platform)
-            if adapter is not None:
-                source._transport_adapter_ref = _weakref.ref(adapter)
-            if transport_home is None:
-                # Sync, on the adapter's event loop (per tap, per inline-query keystroke): never
-                # hydrate external secret sources here — that takes the process-global source lock
-                # (#99519). Startup and the message path hydrate off-loop; this reads their cache.
-                from gateway.run import _profile_runtime_scope
-                with self._scope_or_null(
-                        functools.partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
-                    return self._is_user_authorized(source)
-            # Canonicalize FIRST (callback sources never went through ``build_source``): the routed
-            # profile's pairing store is consulted, allowlists read under the transport home.
-            if self._canonicalize(source, primary_home=transport_home) is None:
-                return False  # fail-closed, like the ``_handle_message`` ingress gate
-            return self._is_user_authorized_for_source(source)
-        return check
+        from gateway.run_adapter_auth import make_adapter_auth_check
+        return make_adapter_auth_check(self, platform, profile_name, transport_home, profile_home)

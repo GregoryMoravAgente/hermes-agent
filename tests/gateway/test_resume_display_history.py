@@ -30,6 +30,8 @@ async def _local_session(tmp_path, monkeypatch):
                              _cached_agent_for=lambda *a, **k: None, _evict_cached_agent=lambda *a, **k: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     actor = Principal('owner', 'fixture', frozenset({'session:create', 'session:read', 'session:control'}), 'sock')
     ref = session_local.create_local_session(authority, actor, dict(
         request_id='resume', source='gui', cwd=str(tmp_path), model='frozen', toolsets=[]))

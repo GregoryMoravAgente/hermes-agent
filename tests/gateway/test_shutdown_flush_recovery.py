@@ -8,6 +8,7 @@ properties the live drain already guarantees for that spool.
 import json
 import math
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -49,6 +50,21 @@ def make_store(tmp_path):
         with patch("gateway.session.SessionStore._ensure_loaded"):
             store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
         store._loaded = True
+        if isinstance(db, MagicMock):
+            # The live writer now requires an exact row-id readback after append.
+            # These spool-order tests use a synthetic DB, so supply the committed
+            # row at that address while preserving append_message call/side effects.
+            if db.append_message.side_effect is None:
+                db.append_message.return_value = 1
+
+            def read_one(_query, params):
+                session_id, row_id = params
+                row = defaultdict(lambda: None)
+                row.update(id=int(row_id), session_id=session_id,
+                           role=db.append_message.call_args.kwargs["role"])
+                return row
+
+            db._read_one.side_effect = read_one
         store._db = db
         return store
 
@@ -423,6 +439,14 @@ def test_repairable_spool_replay_failure_still_reaches_fts_rebuild(flush_dir, ma
             if self.broken:
                 raise RuntimeError("no such table: messages_fts")
             self.rows.append(kwargs["content"])
+            self._last_role = kwargs["role"]
+            return len(self.rows)
+
+        def _read_one(self, _query, params):
+            session_id, row_id = params
+            row = defaultdict(lambda: None)
+            row.update(id=row_id, session_id=session_id, role=self._last_role)
+            return row
 
         def rebuild_fts(self):
             self.repairs += 1

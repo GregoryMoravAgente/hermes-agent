@@ -50,44 +50,80 @@ def registered():
     _providers._PROVIDER_LIST_CACHE = snapshot[2]
 
 
-def _agent(provider: str = ""):
+@pytest.fixture
+def standalone_external_policy(tmp_path):
+    """Give external-process profiles a real source-owned policy in the seam tests."""
+    from gateway.runtime_service_operations import (
+        close_after_finalizers,
+        policy_for_parent,
+        reserve_standalone_external_process_parent,
+    )
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        with reserve_standalone_external_process_parent(
+            profile_home=tmp_path,
+            profile_id=str(tmp_path),
+            operation_id="provider-client-seam",
+            source_identity="provider-client-seam",
+            profile_db=db,
+        ) as parent:
+            policy = policy_for_parent(parent, mode="standalone_maintenance")
+            yield policy
+            if parent.state != "terminal":
+                assert close_after_finalizers(parent) is True
+    finally:
+        db.close()
+
+
+def _agent(provider: str = "", policy=None):
     return SimpleNamespace(
         provider=provider,
+        _external_process_policy=policy,
         _client_log_context=lambda: "",
         _build_keepalive_http_client=lambda *a, **k: None,
     )
 
 
-def _build(provider, base_url):
+def _build(provider, base_url, policy=None):
     from agent.agent_runtime_helpers import create_openai_client
 
-    return create_openai_client(_agent(provider), {"api_key": "k", "base_url": base_url}, reason="t", shared=False)
+    return create_openai_client(
+        _agent(provider, policy), {"api_key": "k", "base_url": base_url}, reason="t", shared=False,
+    )
 
 
-def test_an_out_of_tree_profile_supplies_the_client_through_create_openai_client(registered):
+def test_an_out_of_tree_profile_supplies_the_client_through_create_openai_client(
+    registered, standalone_external_policy,
+):
     from openai import OpenAI
 
     registered(_SeamProfile(name="seam-test", aliases=("seam",), base_url="acp://seam-test"))
     # By name, by alias, and by base_url prefix when no provider name is set.
-    assert isinstance(_build("seam-test", "acp://seam-test"), _FakeClient)
-    assert isinstance(_build("seam", "acp://seam-test"), _FakeClient)
-    assert isinstance(_build("", "acp://seam-test/x"), _FakeClient)
+    assert isinstance(_build("seam-test", "acp://seam-test", standalone_external_policy), _FakeClient)
+    assert isinstance(_build("seam", "acp://seam-test", standalone_external_policy), _FakeClient)
+    assert isinstance(_build("", "acp://seam-test/x", standalone_external_policy), _FakeClient)
     # No hook → the standard client, untouched by the seam.
     assert isinstance(_build("openai-api", "https://api.example/v1"), OpenAI)
 
 
-def test_a_broken_plugin_falls_through_instead_of_taking_the_turn_down(registered):
+def test_a_broken_plugin_falls_through_instead_of_taking_the_turn_down(
+    registered, standalone_external_policy,
+):
     from agent.agent_runtime_helpers import _provider_supplied_client
 
     registered(_ExplodingProfile(name="seam-boom", base_url="acp://seam-boom"))
-    assert _provider_supplied_client(_agent("seam-boom"), {"api_key": "k"}) is None
+    assert _provider_supplied_client(
+        _agent("seam-boom", standalone_external_policy), {"api_key": "k"},
+    ) is None
 
 
-def test_copilot_acp_still_gets_its_acp_client_via_its_profile():
+def test_copilot_acp_still_gets_its_acp_client_via_its_profile(standalone_external_policy):
     from agent.copilot_acp_client import CopilotACPClient
 
-    assert isinstance(_build("copilot-acp", "acp://copilot"), CopilotACPClient)
-    assert isinstance(_build("", "acp://copilot"), CopilotACPClient)
+    assert isinstance(_build("copilot-acp", "acp://copilot", standalone_external_policy), CopilotACPClient)
+    assert isinstance(_build("", "acp://copilot", standalone_external_policy), CopilotACPClient)
 
 
 def test_skip_flags_replace_the_isinstance_checks_for_in_and_out_of_tree_clients():

@@ -64,7 +64,7 @@ class Owner:
 
     def _turn(self, row, pause):
         from gateway.session_settlement_recovery import commit_and_publish
-        self.authority._stamp_claim(self.ref, self.live, row)
+        self.authority._stamp_claim(self.ref, self.live, row=row)
         if pause:
             self.running.clear()  # Ctrl-Z mid-turn
         for index, delta in enumerate(DELTAS):

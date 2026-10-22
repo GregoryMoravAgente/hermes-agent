@@ -1,6 +1,7 @@
 """Regression for #138992: dispatched cards retain headless approval semantics."""
 import asyncio
 from contextlib import closing
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +31,10 @@ def test_kanban_submission_enters_single_query_approval_context(tmp_path, monkey
     config = {'model': {'default': 'loop-model', 'provider': 'custom'},
               'platform_toolsets': {'cli': ['terminal']}}
     monkeypatch.setattr('gateway.run._load_gateway_config', lambda: config)
-    ref = SessionRef(str(tmp_path), 'owner-session')
+    from gateway.session_local_recovery import local_identity
+    request_id = 'kanban:' + json.dumps(
+        ['owned', task.id, task.current_run_id], separators=(',', ':'))
+    ref = SessionRef(str(tmp_path), local_identity(str(tmp_path), 'owner', request_id))
     policies = []
 
     def create(authority, actor, params, *, trusted_policy, trusted_secrets):
@@ -90,6 +94,11 @@ def kanban_owner(tmp_path, monkeypatch):
             kb.recompute_ready(conn)
             task = kb.claim_task(conn, task_id)
         store, runner, authority, dashboard = _owner(tmp_path)
+        from gateway.runtime_custody import RuntimeCustodyCoordinator
+        from hermes_cli.backend_retirement import RetirementFence
+        runner.runtime_custody = RuntimeCustodyCoordinator(
+            process_instance=authority.instance_id, authority_epoch=authority.epoch,
+            fence=RetirementFence())
         authority.profile_id = str(tmp_path)
         monkeypatch.setattr(authority, '_schedule', lambda ref: None)
         connection = AuthorityConnection(authority, object(), {
@@ -158,26 +167,87 @@ def test_retry_of_pre_finite_kanban_admission_returns_original_receipt(kanban_ow
 
     owner = kanban_owner(_CONFIG)
     authority = owner.authority
-    real_submit = authority.submit
+    real_submit_i09 = authority._submit_i09_automation
 
-    async def pre_finite_submit(actor, submission, **kwargs):
-        # The payload run_task committed before this change: no finite flag (and no card marker).
-        payload = {k: v for k, v in submission.payload.items() if k != 'finite'}
-        return await real_submit(actor, type(submission)(submission.request_id, submission.ref, payload, submission.intent))
+    async def pre_finite_submit_i09(actor, ref, request_id, payload, handle, **kwargs):
+        # The payload run_task committed before this change: no finite flag.
+        payload = {k: v for k, v in payload.items() if k != 'finite'}
+        return await real_submit_i09(actor, ref, request_id, payload, handle, **kwargs)
 
     def no_listing(*args, **kwargs):
         raise AssertionError('retry must use the exact-key admission lookup')
 
     async def scenario():
         try:
-            monkeypatch.setattr(authority, 'submit', pre_finite_submit)
+            monkeypatch.setattr(authority, '_submit_i09_automation', pre_finite_submit_i09)
             first = await run_task(owner.connection, owner.params)
-            monkeypatch.setattr(authority, 'submit', real_submit)
+            monkeypatch.setattr(authority, '_submit_i09_automation', real_submit_i09)
             monkeypatch.setattr(hermes_state_runtime, 'list_session_admissions', no_listing)
             retry = await run_task(owner.connection, owner.params)
             assert retry == first
             rows = list_session_admissions(authority.db, session_id=first['session_id'], pending_only=False)
             assert len(rows) == 1 and 'finite' not in rows[0]['payload']
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_kanban_retry_replays_the_same_authenticated_descriptor(kanban_owner):
+    """A lost delivery acknowledgement replays the real row and never mints a second root."""
+    from gateway.session_kanban import run_task
+    from hermes_state_runtime import list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            descriptor = row['payload']['_automation_custody_v1']
+            assert descriptor['owner_class'] == 'I09_a2a_hosted_kanban'
+            assert descriptor['session_id'] == row['target_session_id']
+            assert descriptor['principal_id'] == row['principal_id']
+            assert descriptor['request_id'] == row['request_id']
+            replay = await run_task(owner.connection, owner.params)
+            assert replay == first
+            rows = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                            pending_only=False)
+            assert len(rows) == 1
+            assert rows[0]['payload']['_automation_custody_v1'] == descriptor
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_kanban_refuses_a_copied_descriptor_before_retry_effect(kanban_owner):
+    """A copied source witness stays unknown instead of becoming a new Kanban admission."""
+    import hashlib
+    import json
+
+    from gateway.session_kanban import run_task
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            payload = dict(row['payload'])
+            payload['_automation_custody_v1'] = dict(
+                payload['_automation_custody_v1'], source_identity='copied-from-foreign-row')
+            encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+            owner.authority.db._execute_write(lambda conn: conn.execute(
+                'UPDATE session_admissions SET payload_json=?, payload_digest=? WHERE admission_id=?',
+                (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row['admission_id'])))
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                await run_task(owner.connection, owner.params)
+            assert len(list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                               pending_only=False)) == 1
         finally:
             await owner.close()
 
@@ -252,17 +322,17 @@ def test_card_admitted_before_the_marker_keeps_pausing_and_retries_cleanly(kanba
 
     owner = kanban_owner(_CONFIG)
     authority = owner.authority
-    real_submit = authority.submit
+    real_submit = authority._submit_i09_automation
 
-    async def unmarked_submit(actor, submission, **kwargs):
-        kwargs.pop('_kanban_card', None)  # the admission main committed: no producer marker
-        return await real_submit(actor, submission, **kwargs)
+    async def unmarked_submit(actor, ref, request_id, payload, handle, **kwargs):
+        kwargs.pop('kanban_card', None)  # the admission main committed: no producer marker
+        return await real_submit(actor, ref, request_id, payload, handle, **kwargs)
 
     async def scenario():
         try:
-            monkeypatch.setattr(authority, 'submit', unmarked_submit)
+            monkeypatch.setattr(authority, '_submit_i09_automation', unmarked_submit)
             first = await run_task(owner.connection, owner.params)
-            monkeypatch.setattr(authority, 'submit', real_submit)
+            monkeypatch.setattr(authority, '_submit_i09_automation', real_submit)
             assert await run_task(owner.connection, owner.params) == first
             row = _lose_across_restart(authority, first['session_id'])
             assert row['status'] == 'unknown', row

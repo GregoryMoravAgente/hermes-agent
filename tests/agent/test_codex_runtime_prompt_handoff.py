@@ -31,7 +31,10 @@ def _agent(**overrides):
     base = dict(_codex_session=None, session_cwd="/tmp", tool_progress_callback=None,
                 _cached_system_prompt="SOUL: you are Hermes", ephemeral_system_prompt="Always start with ZZZ")
     base.update(overrides)
-    return SimpleNamespace(**base)
+    agent = SimpleNamespace(**base)
+    from gateway.runtime_service_operations import policy_without_spawn
+    agent._external_process_policy = policy_without_spawn()
+    return agent
 
 
 def test_runtime_sends_composed_prompt_once_per_thread(monkeypatch):

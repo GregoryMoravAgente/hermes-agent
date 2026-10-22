@@ -149,6 +149,19 @@ async def scan_receipts(home, pins=None):
 
 
 def remember_receipt(authority, home, record):
+    from gateway.session_recovery_custody import observe_consumer_rows
+    admission_id = record.get('admission_id') if isinstance(record, dict) else None
+    rows = []
+    if admission_id and authority is not None:
+        from hermes_state_runtime import get_session_admission
+        row = get_session_admission(authority.db, admission_id=admission_id)
+        if row is not None:
+            rows.append(row)
+    if authority is not None:
+        observe_consumer_rows(
+            authority, 'bot_mailbox', rows=rows,
+            reason='bot mailbox receipt had no accepted admission',
+        )
     index = getattr(authority, '_bot_receipt_index', None)
     if index is None:
         index = authority._bot_receipt_index = {}

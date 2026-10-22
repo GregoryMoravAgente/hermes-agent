@@ -74,7 +74,7 @@ os._exit(0)
     consumer = r'''
 import json, queue
 from tools import async_delegation as ad
-from tools.process_registry import format_process_notification
+from tools.process_registry_notifications import format_process_notification
 q = queue.Queue()
 count = ad.restore_undelivered_completions(q)
 events = [q.get_nowait() for _ in range(count)]

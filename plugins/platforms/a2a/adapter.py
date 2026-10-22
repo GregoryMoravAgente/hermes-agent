@@ -37,6 +37,11 @@ _DEFAULT_PORT = 9900
 # meaningful when A2A_REPLY_TIMEOUT is absurd (1e18 would never fail an orphan).
 _MIN_ORPHAN_TIMEOUT, _MAX_ORPHAN_TIMEOUT, _WATCHDOG_INTERVAL = 300, 86400, 60
 _MAX_BODY = 1_048_576  # 1MB max request body — prevents DoS via memory exhaustion
+
+
+class _A2ASourceOwnerLoopUnavailable(RuntimeError):
+    """The HTTP worker could not reach the registration-owning gateway loop."""
+
 _SSE_KEEPALIVE = 5  # seconds between SSE keepalive comments
 _DEFAULT_DESCRIPTION = "Hermes Agent — a general-purpose agent reachable over A2A."
 
@@ -542,69 +547,328 @@ class A2AAdapter(BasePlatformAdapter):
         protocol.metrics.tasks_failed += state == protocol.STATE_FAILED
         return protocol.build_task(rec["task_id"], rec["context_id"], state, text, created_at=rec["created_iso"]), None
 
-    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
-        """Validate, register, and dispatch an inbound message (HTTP worker thread). Returns
-        (terminal_task, None) when it ends immediately, else (None, pending) with the future to wait on."""
+    def _source_on_owner_loop(self, callback):
+        """Serialize source-custody operations on the loop captured at connect().
+
+        A2ARequestHandler runs on ThreadingHTTPServer worker threads. Admission,
+        handoff, and terminal custody updates therefore run on the adapter's
+        registration-owning loop rather than mutating the registry from a worker.
+        """
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            raise _A2ASourceOwnerLoopUnavailable("A2A gateway loop is unavailable for source custody")
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            return callback()
+
+        async def _invoke():
+            return callback()
+
+        future = asyncio.run_coroutine_threadsafe(_invoke(), loop)
+        try:
+            return future.result(timeout=min(10.0, _reply_timeout()))
+        except FuturesTimeout:
+            future.cancel()
+            raise _A2ASourceOwnerLoopUnavailable("A2A source custody loop did not respond")
+
+    def _source_terminal_on_owner_loop(self, source_token, reason: str) -> None:
+        """Settle a provider-owned terminal completion/refusal on the owner loop."""
+        if source_token is None:
+            return
+
+        def _finish():
+            self._preservation_source_producer_done(source_token)
+            self._preservation_source_release(source_token)
+
+        try:
+            self._source_on_owner_loop(_finish)
+        except (_A2ASourceOwnerLoopUnavailable, FuturesTimeout):
+            # A failed owner-loop update intentionally leaves the exact lease retained.
+            logger.warning("A2A source terminal update retained (%s)", reason)
+
+    def _source_unknown_on_owner_loop(self, source_token, reason: str) -> None:
+        if source_token is None:
+            return
+        try:
+            self._source_on_owner_loop(lambda: self._preservation_source_unknown(source_token, reason))
+        except (_A2ASourceOwnerLoopUnavailable, FuturesTimeout):
+            logger.warning("A2A source UNKNOWN update retained (%s)", reason)
+
+    def _source_dispatch_done(self, task_id: str, source_token, future: Future) -> None:
+        """Resolve the registered waiter when the owner-loop dispatch dies before a reply.
+
+        ``run_coroutine_threadsafe`` reports an exception through its concurrent future, while
+        the HTTP worker is blocked on the separate pending reply future.  Retaining the source
+        token as UNKNOWN without resolving that waiter strands the TaskStore record forever.
+        The owner loop performs only the existing UNKNOWN transition; ``_finalize_task`` remains
+        the sole TaskStore terminalizer and pending-map owner.
+        """
+        try:
+            if future.cancelled():
+                reason = "a2a_dispatch_task_cancelled"
+            elif future.exception() is not None:
+                reason = "a2a_dispatch_task_failed"
+            else:
+                return
+        except BaseException:
+            # A cancelled/opaque owner-loop future is never a successful handoff.
+            logger.warning("A2A owner dispatch future readback failed", exc_info=True)
+            reason = "a2a_dispatch_future_unreadable"
+
+        def _resolve_failure() -> None:
+            if source_token is not None:
+                try:
+                    self._preservation_source_unknown(source_token, reason)
+                except BaseException:
+                    # A source registry readback failure is still fail-closed; the HTTP waiter
+                    # must reach the existing finalizer instead of waiting until its timeout.
+                    logger.warning("A2A source UNKNOWN update failed (%s)", reason, exc_info=True)
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+
+        try:
+            self._source_on_owner_loop(_resolve_failure)
+        except (_A2ASourceOwnerLoopUnavailable, FuturesTimeout):
+            # The concurrent Future is already terminal.  The pending Future is thread-safe;
+            # resolve it locally while leaving source custody UNKNOWN for later reconciliation.
+            self._resolve_task(task_id, protocol.STATE_FAILED, "[agent processing failed]")
+            logger.warning("A2A source failure waiter resolved without owner-loop readback", exc_info=True)
+
+    def _prepare_context(self, params: dict, peer: str, agent: Optional[dict]):
         agent = agent or self._agents[""]
         text = protocol.extract_text(params)
         forwarded = not agent.get("local", True)
         message_id = protocol.extract_message_id(params) if forwarded else ""
         context_id = protocol.extract_context_id(params)
         if not context_id:
-            # A retry of a first send repeats the messageId and omits the contextId it never received.
             scope = "\0".join((*self._scope_for_agent(agent), peer))
             context_id = protocol.message_context_id(scope, message_id) if message_id else protocol.new_context_id()
-        # A retry after a timeout must find its accepted work, not queue a second turn.
-        input_id = ("a2a-msg:" + hashlib.sha256(f"{context_id}\0{message_id}".encode()).hexdigest()
-                    if message_id else None)
-        # The process LRU answers concurrent resends atomically; the durable context log answers
-        # one whose id the LRU evicted or a restart forgot.
-        retry = input_id is not None and (self._note_forwarded_input(input_id)
-                                          or protocol.logged_input(context_id, input_id))
-        task_id = protocol.new_task_id()
-        # The owner answers a resend from the accepted admission; it is not another turn of the loop.
-        turn = 0 if retry else self._turns.track(context_id)
-        max_turns = protocol.max_pingpong_turns()
-        rec = self.tasks.create(task_id, context_id, peer, *self._scope_for_agent(agent),
-                                input_id=(input_id or task_id) if forwarded else "")
-        if not retry and (turn > max_turns or not text):
-            self._forget_forwarded_input(input_id)
-        if turn > max_turns:
-            protocol.metrics.anti_loop_triggers += 1
-            logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
-            return self._end_task(rec, protocol.STATE_REJECTED, f"Anti-loop protection: context {context_id} exceeded "
-                                  f"{max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.")
-        if not text:
-            return self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
-        framed = security.wrap_inbound(peer, text)
-        security.audit("inbound", peer, task_id, text)
-        if not retry:
-            protocol.persist_message(context_id, "user", text, task_id, input_id=input_id or "")
-            protocol.metrics.inbound_total += 1
-        self._register_inline_push(task_id, params, agent=agent)
-        if forwarded:
-            self._activate_task(task_id)
+        return agent, text, forwarded, message_id, context_id, protocol.new_task_id()
+
+    def _admit_prepared_source(self, event, task_id: str, context_id: str, peer: str, forwarded: bool):
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            source_token = self._source_on_owner_loop(
+                lambda: self._preservation_source_admit(
+                    {
+                        "task_id": task_id, "context_id": context_id,
+                        "peer": peer, "forwarded": forwarded,
+                    },
+                    event=event, phase="a2a-http-ingress",
+                )
+            )
+            return source_token, None
+        except RuntimeStoreError as exc:
+            logger.debug("A2A source admission refused: %s", exc)
+            return None, protocol.build_task(
+                task_id, context_id, protocol.STATE_FAILED,
+                "A2A source is not accepting work.",
+            )
+        except (_A2ASourceOwnerLoopUnavailable, FuturesTimeout) as exc:
+            logger.warning("A2A source admission could not reach owner loop: %s", exc)
+            return None, protocol.build_task(
+                task_id, context_id, protocol.STATE_FAILED,
+                "A2A source is temporarily unavailable.",
+            )
+
+    def _prepare_admitted_record(
+        self, params: dict, agent: dict, text: str, forwarded: bool, message_id: str,
+        context_id: str, peer: str, task_id: str, source_token,
+    ):
+        rec = None
+        input_id = None
+        try:
+            input_id = ("a2a-msg:" + hashlib.sha256(f"{context_id}\0{message_id}".encode()).hexdigest()
+                        if message_id else None)
+            retry = input_id is not None and (self._note_forwarded_input(input_id)
+                                              or protocol.logged_input(context_id, input_id))
+            turn = 0 if retry else self._turns.track(context_id)
+            max_turns = protocol.max_pingpong_turns()
+            rec = self.tasks.create(
+                task_id, context_id, peer, *self._scope_for_agent(agent),
+                input_id=(input_id or task_id) if forwarded else "",
+            )
+            if not retry and (turn > max_turns or not text):
+                self._forget_forwarded_input(input_id)
+            if turn > max_turns:
+                protocol.metrics.anti_loop_triggers += 1
+                logger.warning("A2A: anti-loop triggered for context %s (turn %d > %d)", context_id, turn, max_turns)
+                self._source_terminal_on_owner_loop(source_token, "a2a_anti_loop_refusal")
+                return None, input_id, self._end_task(
+                    rec, protocol.STATE_REJECTED,
+                    f"Anti-loop protection: context {context_id} exceeded {max_turns} turns. Start a new context or increase A2A_MAX_PINGPONG_TURNS.",
+                )
+            if not text:
+                self._source_terminal_on_owner_loop(source_token, "a2a_empty_task_refusal")
+                return None, input_id, self._end_task(rec, protocol.STATE_REJECTED, "Empty task — nothing to do.")
+            security.audit("inbound", peer, task_id, text)
+            if not retry:
+                protocol.persist_message(context_id, "user", text, task_id, input_id=input_id or "")
+                protocol.metrics.inbound_total += 1
+            self._register_inline_push(task_id, params, agent=agent)
+        except asyncio.CancelledError:
+            self._source_unknown_on_owner_loop(source_token, "a2a_post_admission_cancelled")
+            if rec is None:
+                raise
+            msg = "A2A admission was cancelled after source acceptance."
             try:
-                reply, state = self._forward_to_profile(agent, peer, context_id, framed, input_id=input_id or task_id)
-                self._record_outcome(task_id, context_id, peer, state, reply)
-                return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+                return None, input_id, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
             finally:
                 self._pop_pending(task_id)
-        if self._loop is None or self._message_handler is None:
-            return self._end_task(rec, protocol.STATE_FAILED, "Agent gateway not ready to accept A2A tasks.")
-        fut = self._add_pending(task_id, context_id)
-        event = MessageEvent(text=framed, message_type=MessageType.TEXT, message_id=task_id,
-                             source=self.build_source(chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm", user_id=peer, user_name=peer))
+        except Exception as exc:
+            logger.warning("A2A post-admission setup failed", exc_info=True)
+            self._source_unknown_on_owner_loop(source_token, "a2a_post_admission_failed")
+            if rec is None:
+                raise
+            msg = security.redact_outbound(f"A2A admission failed: {exc}")
+            try:
+                return None, input_id, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+            finally:
+                self._pop_pending(task_id)
+        return rec, input_id, None
+
+    def _forward_admitted_task(
+        self, agent: dict, peer: str, context_id: str, framed: str, input_id: str,
+        task_id: str, source_token, rec: dict,
+    ):
+        self._activate_task(task_id)
         try:
-            asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
-        except Exception as e:
-            msg = security.redact_outbound(f"Dispatch failed: {e}")
+            reply, state = self._forward_to_profile(
+                agent, peer, context_id, framed, input_id=input_id or task_id,
+            )
+            self._record_outcome(task_id, context_id, peer, state, reply)
+            if state == protocol.STATE_COMPLETED:
+                self._source_terminal_on_owner_loop(source_token, "a2a_forward_completed")
+            else:
+                self._source_unknown_on_owner_loop(source_token, "a2a_forward_unverified")
+            return protocol.build_task(task_id, context_id, state, reply, created_at=rec["created_iso"]), None
+        except asyncio.CancelledError:
+            self._source_unknown_on_owner_loop(source_token, "a2a_forward_cancelled")
+            msg = "A2A forwarded admission was cancelled after source acceptance."
+            return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+        except Exception as exc:
+            logger.warning("A2A forwarded dispatch failed", exc_info=True)
+            self._source_unknown_on_owner_loop(source_token, "a2a_forward_failed")
+            msg = security.redact_outbound(f"A2A dispatch failed: {exc}")
+            return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+        finally:
+            self._pop_pending(task_id)
+
+    def _register_pending_waiter(self, task_id: str, context_id: str, rec: dict, source_token):
+        try:
+            return self._add_pending(task_id, context_id), None
+        except asyncio.CancelledError:
+            self._source_unknown_on_owner_loop(source_token, "a2a_pending_registration_cancelled")
+            msg = "A2A pending registration was cancelled after source acceptance."
+            return None, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+        except Exception as exc:
+            logger.warning("A2A pending registration failed", exc_info=True)
+            self._source_unknown_on_owner_loop(source_token, "a2a_pending_registration_failed")
+            msg = security.redact_outbound(f"A2A pending registration failed: {exc}")
+            return None, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+
+    def _dispatch_pending_task(self, event, source_token, task_id: str, rec: dict):
+        dispatch_coro = self.handle_message(
+            event, source_tokens=(source_token,) if source_token is not None else None,
+        )
+        try:
+            owner_future = asyncio.run_coroutine_threadsafe(dispatch_coro, self._loop)
+            owner_future.add_done_callback(
+                lambda done, tid=task_id, token=source_token: self._source_dispatch_done(tid, token, done)
+            )
+        except asyncio.CancelledError:
+            dispatch_coro.close()
+            self._source_unknown_on_owner_loop(source_token, "a2a_dispatch_cancelled")
+            msg = "A2A dispatch was cancelled after source acceptance."
+            try:
+                return None, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+            finally:
+                self._pop_pending(task_id)
+        except Exception as exc:
+            logger.warning("A2A dispatch scheduling failed", exc_info=True)
+            dispatch_coro.close()
+            msg = security.redact_outbound(f"Dispatch failed: {exc}")
+            self._source_unknown_on_owner_loop(source_token, "a2a_dispatch_failed")
+            try:
+                return None, self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+            finally:
+                self._pop_pending(task_id)
+        return owner_future, None
+
+    def _mark_pending_working(self, task_id: str, source_token, owner_future, rec: dict):
+        try:
+            self._source_on_owner_loop(
+                lambda: self._preservation_source_producer_done(source_token),
+            )
+        except (_A2ASourceOwnerLoopUnavailable, FuturesTimeout):
+            logger.warning("A2A source producer handoff retained after task scheduling")
+        try:
+            self.tasks.set_state(task_id, protocol.STATE_WORKING)
+        except asyncio.CancelledError:
+            self._source_unknown_on_owner_loop(source_token, "a2a_working_state_cancelled")
+            owner_future.cancel()
+            msg = "A2A task state update was cancelled after admission."
             try:
                 return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
             finally:
                 self._pop_pending(task_id)
-        self.tasks.set_state(task_id, protocol.STATE_WORKING)
-        return None, {"task_id": task_id, "context_id": context_id, "peer": peer, "future": fut, "created_iso": rec["created_iso"], "started": time.time()}
+        except Exception as exc:
+            logger.warning("A2A working state update failed", exc_info=True)
+            self._source_unknown_on_owner_loop(source_token, "a2a_working_state_failed")
+            owner_future.cancel()
+            msg = security.redact_outbound(f"A2A task state update failed: {exc}")
+            try:
+                return self._end_task(rec, protocol.STATE_FAILED, msg, stored_reply=msg)
+            finally:
+                self._pop_pending(task_id)
+        return None
+
+    def _prepare_task(self, params: dict, peer: str, agent: Optional[dict] = None) -> tuple[Optional[dict], Optional[dict]]:
+        """Validate, register, and dispatch an inbound message (HTTP worker thread)."""
+        agent, text, forwarded, message_id, context_id, task_id = self._prepare_context(params, peer, agent)
+        if self._loop is None or self._message_handler is None:
+            return protocol.build_task(
+                task_id, context_id, protocol.STATE_FAILED,
+                "Agent gateway not ready to accept A2A tasks.",
+            ), None
+        framed = security.wrap_inbound(peer, text)
+        event = MessageEvent(
+            text=framed, message_type=MessageType.TEXT, message_id=task_id,
+            source=self.build_source(
+                chat_id=context_id, chat_name=f"a2a:{peer}", chat_type="dm",
+                user_id=peer, user_name=peer,
+            ),
+        )
+        source_token, immediate = self._admit_prepared_source(
+            event, task_id, context_id, peer, forwarded,
+        )
+        if immediate is not None:
+            return immediate
+        rec, input_id, immediate = self._prepare_admitted_record(
+            params, agent, text, forwarded, message_id, context_id, peer, task_id, source_token,
+        )
+        if immediate is not None:
+            return immediate
+        if forwarded:
+            return self._forward_admitted_task(
+                agent, peer, context_id, framed, input_id or task_id, task_id, source_token, rec,
+            )
+        fut, immediate = self._register_pending_waiter(task_id, context_id, rec, source_token)
+        if immediate is not None:
+            return immediate
+        owner_future, immediate = self._dispatch_pending_task(event, source_token, task_id, rec)
+        if immediate is not None:
+            return immediate
+        immediate = self._mark_pending_working(task_id, source_token, owner_future, rec)
+        if immediate is not None:
+            return immediate
+        return None, {
+            "task_id": task_id, "context_id": context_id, "peer": peer, "future": fut,
+            "owner_future": owner_future,
+            "created_iso": rec["created_iso"], "started": time.time(),
+        }
 
     def _forward_to_profile(self, agent: dict, peer: str, context_id: str, framed_text: str,
                             *, input_id: Optional[str] = None) -> tuple[str, str]:

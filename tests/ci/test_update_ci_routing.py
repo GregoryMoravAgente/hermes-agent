@@ -267,6 +267,7 @@ def test_replay_evaluator_follows_actions_semantics():
         gha.condition("hashFiles('x') != ''", ctx)  # unmodelled: fail, never guess
 
 
+@_NATIVE_WINDOWS_TOO
 @pytest.mark.parametrize("combo", list(itertools.product((False, True), repeat=len(_GATED))),
                          ids=lambda c: "-".join(n for n, on in zip(_GATED, c) if on) or "none")
 def test_every_set_lane_reaches_its_consumer_whatever_the_other_lanes_say(combo):
@@ -325,6 +326,7 @@ _R6_CASES = {
 }
 
 
+@_NATIVE_WINDOWS_TOO
 @pytest.mark.parametrize("path,lanes", list(_R6_CASES.items()))
 def test_update_path_change_selects_every_suite_that_exercises_it(path, lanes):
     classified = _real_classifier([path])
@@ -524,6 +526,7 @@ def test_replay_rejects_ineffective_required_step(monkeypatch, lane, rel, job, n
         assert all(reached.values()), reached
 
 
+@_NATIVE_WINDOWS_TOO
 def test_selection_receipt_does_not_require_the_native_jobs_venv(tmp_path):
     workflow = _yaml(".github/workflows/tests.yml")
     step = next(s for s in workflow["jobs"]["e2e-upgrade"]["steps"]
@@ -809,6 +812,7 @@ def _strict_env(run: dict, path: tuple[str, ...], rel: str, job: str, step_name:
     return gha.to_string(gha.render(step["env"]["HERMES_E2E_STRICT_ACCEPTANCE"], node["ctx"]))
 
 
+@_NATIVE_WINDOWS_TOO
 @pytest.mark.parametrize("value", ["upd-txn", "1"])
 def test_strict_acceptance_dispatch_reaches_every_e2e_suite(value):
     """`gh workflow run ci.yaml -f strict_acceptance=upd-txn` (the batch's acceptance run)."""

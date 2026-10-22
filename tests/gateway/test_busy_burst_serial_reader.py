@@ -19,7 +19,6 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session_authority import initialize_session_authority
 from gateway.session_ingress_burst import holds_busy_burst
-from gateway.session_results import execution_result
 from hermes_state_runtime import list_session_admissions
 from tests.waiting import async_wait_until
 
@@ -40,17 +39,25 @@ async def _busy_owner(monkeypatch, adapter, source, **wiring):
     adapter.gateway_runner = runner
     runner.adapters = {adapter.platform: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter, **wiring)
     running, finish, executed = asyncio.Event(), asyncio.Event(), []
 
-    async def turn(event, source, quick_key, run_generation):
+    async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
+        event = turn_kwargs['classic_writer_event']
         executed.append((event.text, len(event.media_urls)))
         if event.text == 'A':
             running.set()
             await finish.wait()
-        execution_result.get()['result'] = {'final_response': 'ok', 'messages': []}
-        return 'ok'
-    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+        return {
+            'final_response': 'ok',
+            'messages': [*history, {'role': 'user', 'content': message},
+                         {'role': 'assistant', 'content': 'ok'}],
+            'agent_persisted': False, 'api_calls': 1, 'tools': [],
+            'history_offset': len(history), 'session_id': session_id,
+        }
+    monkeypatch.setattr(runner, '_run_agent', model)
     await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
     await asyncio.wait_for(running.wait(), 10)
     key = adapter._event_session_key(MessageEvent(text='', source=source))
@@ -193,13 +200,20 @@ async def test_restart_waits_for_a_held_text_queued_behind_a_slow_capture(monkey
     adapter.gateway_runner = runner
     runner.adapters = {adapter.platform: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter, busy_text_mode='queue')
     monkeypatch.setattr(runner, 'request_restart', lambda **kw: setattr(runner, '_draining', True))
 
-    async def turn(event, source, quick_key, run_generation):
-        execution_result.get()['result'] = {'final_response': 'ok', 'messages': []}
-        return 'ok'
-    monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+    async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
+        return {
+            'final_response': 'ok',
+            'messages': [*history, {'role': 'user', 'content': message},
+                         {'role': 'assistant', 'content': 'ok'}],
+            'agent_persisted': False, 'api_calls': 1, 'tools': [],
+            'history_offset': len(history), 'session_id': session_id,
+        }
+    monkeypatch.setattr(runner, '_run_agent', model)
     clip = tmp_path / 'clip.mp4'
     clip.write_bytes(b'video-bytes' * 1000)
     video = MessageEvent(text='', message_type=MessageType.VIDEO, source=source, message_id='V',
@@ -225,10 +239,17 @@ async def test_restart_waits_for_a_held_text_queued_behind_a_slow_capture(monkey
     await async_wait_until(lambda: all(live.task is None or live.task.done() for live in authority.sessions.values()),
                            timeout=15, what="the draining owner's drains to exit")
     runner._draining = False
+    from pathlib import Path
     from gateway.run_runtime import recover_profile_native_sessions
-    assert set((await recover_profile_native_sessions(runner, authority)).values()) <= {'ready'}
-    await async_wait_until(lambda: all(row['status'] == 'terminal' for row in _rows(authority)), timeout=15,
-                           what='both turns to run')
+    from gateway.runtime_ownership import process_ownership
+    home = Path(authority.db.db_path).parent.resolve()
+    process_ownership.reserve([home])
+    try:
+        assert set((await recover_profile_native_sessions(runner, authority)).values()) <= {'ready'}
+        await async_wait_until(lambda: all(row['status'] == 'terminal' for row in _rows(authority)), timeout=15,
+                               what='both turns to run')
+    finally:
+        process_ownership.release(home)
     await asyncio.to_thread(authority.db.close)
 
 
@@ -251,6 +272,8 @@ async def test_restart_waits_for_a_direct_busy_input_queued_behind_a_slow_captur
     adapter.gateway_runner = runner
     runner.adapters = {adapter.platform: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)  # no text burst: B goes straight to dispatch_shared_busy
     monkeypatch.setattr(runner, 'request_restart', lambda **kw: setattr(runner, '_draining', True))
     passed, real_gate = [], session_ingress_burst.burst_gate

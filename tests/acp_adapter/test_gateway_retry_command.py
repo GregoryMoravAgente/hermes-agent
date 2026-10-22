@@ -17,6 +17,7 @@ from gateway.session import SessionStore
 from gateway.session_authority import initialize_session_authority
 from gateway.session_controls import AuthorityConnection
 from hermes_cli.gateway_client import GatewayClientError
+from tests.gateway.conftest import bind_authority_runtime_custody
 from tests.acp_adapter.test_gateway_unacked_slash import SlashWire
 
 IMAGE = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AA=='}}
@@ -58,6 +59,7 @@ async def _editor(tmp_path, monkeypatch, wire_class=SlashWire):
                              _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None,
                              _resolve_session_agent_runtime=lambda **kwargs: ('frozen', {}))
     authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     wire = wire_class(asyncio.get_running_loop())
     wire.lose_ack = False
     wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': 'p'})

@@ -150,7 +150,7 @@ class TestInactivityJanitorMultiplex:
 
         with (
             patch("tools.browser_tool_session._run_browser_command", side_effect=fake_close),
-            patch("tools.browser_camofox._delete", return_value={}),
+            patch("tools.browser_camofox._delete", return_value=True),
             patch("tools.browser_tool.os.path.exists", return_value=False),
         ):
             bt_lifecycle._cleanup_inactive_browser_sessions()

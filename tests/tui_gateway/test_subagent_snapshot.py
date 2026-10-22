@@ -311,11 +311,13 @@ def test_list_surfaces_failed_delegations_that_outlived_the_live_roster(runtime)
     import time
 
     from tools import async_delegation as bg
+    from tests.gateway.test_completion_admission import prepared_execution
 
     _server, _owner, _transport, call = runtime
     for did, ui in (("d-mine", "ui-owner"), ("d-foreign", "other")):
         bg._persist_dispatch({"delegation_id": did, "session_key": "", "origin_ui_session_id": ui,
-                              "parent_session_id": None, "dispatched_at": time.time(), "goal": f"{did} goal"})
+                              "parent_session_id": None, "dispatched_at": time.time(), "goal": f"{did} goal",
+                              "execution": prepared_execution(did)})
         bg._persist_completion({"delegation_id": did, "status": "error", "completed_at": time.time()},
                                {"status": "error", "error": "interrupted: waiting for model response"})
 

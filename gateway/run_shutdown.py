@@ -1793,12 +1793,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             from tools.terminal_tool_lifecycle import cleanup_all_environments
             cleanup_all_environments()
 
-        def _cleanup_browsers() -> None:
-            from tools.browser_tool_lifecycle import cleanup_all_browsers
-            cleanup_all_browsers()
-
+        from tools.browser_tool_lifecycle import cleanup_browsers_for_shutdown
         _step("cleanup_all_environments", _cleanup_environments)
-        _step("cleanup_all_browsers", _cleanup_browsers)
+        _step("cleanup_all_browsers", lambda: cleanup_browsers_for_shutdown(phase, logger))
         return _marked_cron_jobs
 
     @staticmethod
@@ -1946,8 +1943,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
+        self._api_server_hook("active_agent_work_count")
         await self._finalize_shutdown_agents(ctx.active_agents)
-        # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
         if _cache_lock is not None and _cache is not None:

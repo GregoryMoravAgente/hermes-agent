@@ -89,6 +89,10 @@ def _group(authority, actor, method, params, *, host_scope=False):
     from gateway import hosted_rooms as rooms
     db_path = authority.db.db_path
     gateway_id = rooms.local_authority_gateway_id()
+    if method in {'groups.create', 'groups.rename', 'groups.send', 'groups.attachment.upload'}:
+        gate = getattr(authority, '_require_fresh_admission_open', None)
+        if callable(gate):
+            gate()
     service = getattr(authority, 'hosted_room_service', None)
     room_authorizer = getattr(service, 'authorize_room', None)
     if service is not None:

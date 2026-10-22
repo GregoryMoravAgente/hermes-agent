@@ -19,12 +19,19 @@ async def probe(peer, target, kind):
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.run_api import start_gateway_api, stop_gateway_api
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from hermes_cli import web_server
     from run_agent import AIAgent
     from tools.approval import resolve_gateway_approval
 
     runner = GatewayRunner()
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='local')
+    bind_authority_runtime_custody(runner, authority)
+    # The low-level listener is started directly, before the production runtime publishes its
+    # descriptor.  Keep the descriptor out of the initial readiness/drain probe, then publish the
+    # minimum ready state before admitting the real session turn.
+    descriptor = runner.session_runtime_descriptor
+    runner.session_runtime_descriptor = None
     api = await start_gateway_api(runner)
     port = api.socket.getsockname()[1]
     web_server.app.state.auth_required = True
@@ -60,6 +67,8 @@ async def probe(peer, target, kind):
             assert set(authority.sessions) == before_sessions
         finally:
             runner._draining = False
+        descriptor.update(state='ready', capabilities=['session-authority-v1'])
+        runner.session_runtime_descriptor = descriptor
         created = await rpc(a, 'session.create', request_id='fresh', source='cli')
         assert 'result' in created, created
         sid = created['result']['session_id']

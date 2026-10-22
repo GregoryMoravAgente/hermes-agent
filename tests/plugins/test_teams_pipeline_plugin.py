@@ -75,7 +75,7 @@ def test_runtime_config_uses_existing_teams_platform_settings():
 
 
 @pytest.mark.anyio
-async def test_bind_gateway_runtime_attaches_scheduler(monkeypatch, tmp_path):
+async def test_bind_gateway_runtime_attaches_scheduler(monkeypatch, tmp_path, teams_gateway):
     from plugins.teams_pipeline import runtime as runtime_module
 
     class FakeAdapter:
@@ -105,12 +105,8 @@ async def test_bind_gateway_runtime_attaches_scheduler(monkeypatch, tmp_path):
 
     adapter = FakeAdapter()
     pipeline = FakePipeline()
-    gateway = SimpleNamespace(
-        adapters={Platform.MSGRAPH_WEBHOOK: adapter},
-        config=GatewayConfig(platforms={}),
-        _teams_pipeline_runtime=None,
-        _teams_pipeline_runtime_error=None,
-    )
+    gateway = teams_gateway
+    gateway.adapters[Platform.MSGRAPH_WEBHOOK] = adapter
 
     monkeypatch.setattr(runtime_module, "build_pipeline_runtime", lambda gateway_runner: pipeline)
 
@@ -128,6 +124,41 @@ async def test_bind_gateway_runtime_attaches_scheduler(monkeypatch, tmp_path):
     await asyncio.gather(*adapter._background_tasks)
     assert pipeline.notifications == [notification]
 
+
+
+@pytest.mark.anyio
+async def test_bind_gateway_runtime_refuses_missing_and_unserved_authority(teams_gateway, tmp_path):
+    from gateway import run as run_module
+    from hermes_state_runtime import RuntimeStoreError
+    from plugins.teams_pipeline import runtime as runtime_module
+
+    class Adapter:
+        def __init__(self):
+            self.scheduler = None
+            self._background_tasks = set()
+
+        def set_notification_scheduler(self, scheduler):
+            self.scheduler = scheduler
+
+    missing_adapter = Adapter()
+    missing = SimpleNamespace(
+        adapters={Platform.MSGRAPH_WEBHOOK: missing_adapter},
+        config=GatewayConfig(platforms={}),
+        _teams_pipeline_runtime=None,
+        _teams_pipeline_runtime_error=None,
+    )
+    assert runtime_module.bind_gateway_runtime(missing) is False
+    with pytest.raises(RuntimeStoreError, match='teams_runtime_unavailable'):
+        await missing_adapter.scheduler({}, object())
+
+    foreign_adapter = Adapter()
+    teams_gateway.adapters[Platform.MSGRAPH_WEBHOOK] = foreign_adapter
+    foreign_home = tmp_path / 'unserved'
+    foreign_home.mkdir()
+    with run_module._profile_runtime_scope(foreign_home, {}):
+        assert runtime_module.bind_gateway_runtime(teams_gateway) is False
+        with pytest.raises(RuntimeStoreError, match='teams_runtime_unavailable'):
+            await foreign_adapter.scheduler({}, object())
 
 def test_store_persists_subscription_event_and_job_state(tmp_path):
     store_path = tmp_path / "teams-store.json"

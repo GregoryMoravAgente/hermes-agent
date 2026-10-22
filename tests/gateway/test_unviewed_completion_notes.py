@@ -14,10 +14,18 @@ from tools import async_delegation as delegation
 
 
 @pytest.fixture(autouse=True)
-def _no_delegations():
-    delegation._reset_for_tests()
-    yield
-    delegation._reset_for_tests()
+def _no_delegations(tmp_path):
+    from gateway.runtime_ownership import process_ownership
+    home = tmp_path.resolve()
+    process_ownership.reserve([home])
+    try:
+        delegation._reset_for_tests()
+        yield
+    finally:
+        try:
+            delegation._reset_for_tests()
+        finally:
+            assert process_ownership.release(home), f'profile ownership cleanup failed: {home}'
 
 
 def _human(authority, ref, request_id, text):
@@ -163,6 +171,8 @@ async def _restart(tmp_path, monkeypatch, old):
     runner.session_store._db = db
     runner._session_db = AsyncSessionDB(db)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='lc7-restarted', db=db)
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     assert authority.epoch > old.epoch
     return runner, authority
 

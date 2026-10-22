@@ -97,8 +97,8 @@ def test_dispatch_rechecks_admission(runtime, monkeypatch, pause_at, change):
             paused.set()
             assert resume.wait(10), "test did not release the waiting call"
 
-    def get(session_id=""):
-        backend = real_get(session_id)
+    def get(session_id="", **kwargs):
+        backend = real_get(session_id, **kwargs)
         if pause_at == "after_lookup":
             pause()
         return backend
@@ -201,8 +201,8 @@ def test_backend_retry_preserves_the_original_human_lease_epoch(runtime, monkeyp
     real_get = cu._get_backend
     old = real_get("shared")
 
-    def get(session_id=""):
-        backend = real_get(session_id)
+    def get(session_id="", **kwargs):
+        backend = real_get(session_id, **kwargs)
         if threading.current_thread().name == "waiting-call" and not paused.is_set():
             paused.set()
             assert resume.wait(10)

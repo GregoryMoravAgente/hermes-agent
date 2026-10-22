@@ -479,11 +479,18 @@ class GatewayAuthorizationMixin:
             return True
         if self._adapter_policy(source.platform, "group" if is_group else "dm", adapter_profile) != "allowlist":
             return None
-        # Re-check DMs via the live adapter's ``_is_dm_allowed`` when present: pairing revoke can clear
+        adapter = self._authorization_adapter(source.platform, profile=adapter_profile)
+        # Re-check the live adapter's policy hook when present: pairing revoke can clear
         # WHATSAPP_ALLOWED_USERS while a construction-time snapshot would keep authorizing until
         # restart. Others keep the historical rubber-stamp.
-        if not is_group:
-            adapter = self._authorization_adapter(source.platform, profile=adapter_profile)
+        if is_group:
+            # A group replay has no intake middleware in front of it.  Adapters that own a live
+            # group allowlist may expose the same narrow hook as AccessPolicy/WeCom; its current
+            # verdict must be read again rather than treating the original intake as a grant.
+            group_check = getattr(adapter, "_is_group_allowed", None) if adapter is not None else None
+            if callable(group_check):
+                return bool(group_check(getattr(source, "chat_id", ""), user_id))
+        else:
             dm_check = getattr(adapter, "_is_dm_allowed", None) if adapter is not None else None
             if callable(dm_check):
                 return bool(dm_check(user_id))

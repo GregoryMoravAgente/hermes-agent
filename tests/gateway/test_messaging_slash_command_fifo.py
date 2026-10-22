@@ -66,9 +66,11 @@ async def _start_a(monkeypatch, mode=None, *, agent=True):
     from gateway.session_authority import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     runner, adapter, sent = _owner(monkeypatch, mode)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     rig = SimpleNamespace(runner=runner, adapter=adapter, sent=sent, authority=authority, source=source,
@@ -78,6 +80,40 @@ async def _start_a(monkeypatch, mode=None, *, agent=True):
     async def turn(event, source, quick_key, run_generation):
         rig.order.append((event.message_id, executing_admission.get()))
         result = {'final_response': 'reply ' + str(event.message_id), 'messages': []}
+        # The stand-in still crosses the real classic custody boundary.  The production turn
+        # attaches its typed transcript receipt and registers Base's exact post-delivery callback
+        # before returning the response; omitting that handoff leaves the I06 running-slot
+        # fail-closed and prevents the durable FIFO from draining.  Keep the synthetic transcript
+        # rows in the fixture so this remains a real receipt, rather than a response-shaped stub.
+        import time
+        from gateway.session_classic_custody import attach_classic_execution_receipt
+        from gateway.session_classic_delivery import register_classic_post_delivery_callback
+
+        entry = runner.session_store.lookup_by_session_key(quick_key)
+        assert entry is not None
+        timestamp = time.time()
+        transcript_proofs = (
+            runner.session_store.append_to_transcript(
+                entry.session_id,
+                {'role': 'user', 'content': event.text, 'message_id': event.message_id,
+                 'timestamp': timestamp},
+            ),
+            runner.session_store.append_to_transcript(
+                entry.session_id,
+                {'role': 'assistant', 'content': result['final_response'],
+                 'timestamp': timestamp + 0.001},
+            ),
+        )
+        assert all(transcript_proofs)
+        event._classic_transcript_write_proofs = tuple(transcript_proofs)
+        event._classic_agent_persisted = False
+        receipt = attach_classic_execution_receipt(runner, event, entry, result)
+        assert receipt is not None
+        register_classic_post_delivery_callback(
+            runner, authority, adapter, event, source, quick_key,
+            result['final_response'] if event.message_id == 'A' else None,
+            receipt, run_generation,
+        )
         if event.message_id == 'A':
             if agent:
                 runner._session_state(quick_key).turn.agent = _Agent()
@@ -151,11 +187,13 @@ async def test_idle_rewrite_waits_behind_a_queued_row(monkeypatch, command):
     from gateway.session_results import execution_result
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     runner, adapter, _sent = _owner(monkeypatch)
     real_schedule = SessionAuthority._schedule
     monkeypatch.setattr(SessionAuthority, '_schedule', lambda self, ref: None)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     order = []
@@ -366,6 +404,7 @@ async def test_reset_during_an_idle_skill_rewrite_drops_it(monkeypatch, reset):
     from gateway.session_authority import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     _skill(monkeypatch)
     started, gate = threading.Event(), threading.Event()
@@ -377,6 +416,7 @@ async def test_reset_during_an_idle_skill_rewrite_drops_it(monkeypatch, reset):
     monkeypatch.setattr(skills, 'build_skill_invocation_message', lambda key, text='', **_: slow(text))
     runner, adapter, _sent = _owner(monkeypatch)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     order = []

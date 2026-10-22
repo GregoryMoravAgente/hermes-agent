@@ -12,6 +12,7 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.run import GatewayRunner, _profile_runtime_scope
 from gateway.session import SessionSource
 from tools import async_delegation as ad
+from tests.gateway.test_completion_admission import prepared_execution
 from tools.process_registry import process_registry
 
 
@@ -80,6 +81,7 @@ async def test_transient_ownership_ancestor_failure_retries_durable_delivery_onc
                 "type": "async_delegation", "delegation_id": "owner-retry",
                 "session_key": entry.session_key, "parent_session_id": "nested-worker",
                 "dispatched_at": 1.0, "status": "completed", "summary": "completed result",
+                "execution": prepared_execution("owner-retry"),
             }
             ad._persist_dispatch(event)
             ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
@@ -167,6 +169,7 @@ async def test_claimed_ownership_retries_do_not_spend_the_delivery_budget(
                 "type": "async_delegation", "delegation_id": "owner-budget",
                 "session_key": entry.session_key, "parent_session_id": "worker",
                 "dispatched_at": 1.0, "status": "completed", "summary": "completed result",
+                "execution": prepared_execution("owner-budget"),
             }
             ad._persist_dispatch(event)
             ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
@@ -219,6 +222,7 @@ async def _admit_with_session_rows_unreadable(runner, store, entry, monkeypatch,
         "type": "async_delegation", "delegation_id": delegation_id,
         "session_key": entry.session_key, "parent_session_id": pinned,
         "dispatched_at": 1.0, "status": "completed", "summary": "completed result",
+        "execution": prepared_execution(delegation_id),
     }
     ad._persist_dispatch(event)
     ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})
@@ -325,6 +329,7 @@ async def test_unconfirmed_owner_after_admission_offers_the_completion_again(
                 "type": "async_delegation", "delegation_id": "requeued-owner",
                 "session_key": entry.session_key, "parent_session_id": "worker",
                 "dispatched_at": 1.0, "status": "completed", "summary": "completed result",
+                "execution": prepared_execution("requeued-owner"),
             }
             ad._persist_dispatch(event)
             ad._persist_completion(event, {"status": "completed", "summary": event["summary"]})

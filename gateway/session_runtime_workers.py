@@ -4,6 +4,31 @@ import asyncio
 from gateway.session_authorities import all_authorities
 
 
+def _notify_write_failure(callback, error):
+    """Invoke an ``on_failure`` callback with its supported arity.
+
+    Older custody reconciliation callbacks are deliberately bound with ``functools.partial``
+    and accept only their identity keywords; newer observers accept the worker exception.  The
+    callback is an observation after the shielded write has finished, so supporting both shapes
+    here keeps a signature mismatch from skipping reconciliation while still propagating an
+    actual callback failure.
+    """
+    try:
+        import inspect
+        signature = inspect.signature(callback)
+    except (TypeError, ValueError):
+        # Preserve the historical error-aware contract for callables whose signature cannot be
+        # inspected (for example some extension callables).
+        callback(error)
+        return
+    try:
+        signature.bind(error)
+    except TypeError:
+        callback()
+    else:
+        callback(error)
+
+
 def executing_sessions(authority):
     for sid, live in getattr(authority, 'sessions', {}).items():
         execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
@@ -74,7 +99,8 @@ def track_mutation(authority, operation):
     return task
 
 
-async def tracked_write(authority, write, then=None, *, ordered=False, after=None):
+async def tracked_write(authority, write, then=None, *, ordered=False, after=None,
+                        on_cancel=None, on_failure=None):
     """Run a synchronous ledger write (``write()``) in a worker thread, off the owner loop.
 
     A held SQLite writer (``_WRITE_PATIENCE_S``) must not freeze every session, timer, socket,
@@ -88,7 +114,9 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
     write returns, as it did when admission was synchronous: the caller registers its delivery
     waiter before any drain it scheduled can claim, settle or pause that admission. A caller
     cancelled while the commit is in flight hands ``after`` to the commit's completion instead,
-    so a committed row is never stranded without a drain."""
+    so a committed row is never stranded without a drain. ``on_cancel`` and ``on_failure`` are
+    late-only custody callbacks: they run after a shielded worker finishes when the caller had
+    already been cancelled, and never authorize releasing a write that is still running."""
     order = getattr(authority, '_ordered_writes', None)
     if ordered and order is None:
         order = authority._ordered_writes = asyncio.Lock()
@@ -104,17 +132,29 @@ async def tracked_write(authority, write, then=None, *, ordered=False, after=Non
         followed = then(result)
         return await followed if asyncio.iscoroutine(followed) else followed
     task = track_mutation(authority, run())
-    if after is None:
+    if after is None and on_cancel is None and on_failure is None:
         return await asyncio.shield(task)
     try:
         result = await asyncio.shield(task)
     except asyncio.CancelledError:
         def late(done):
-            if not done.cancelled() and done.exception() is None:
+            if done.cancelled():
+                if on_failure is not None:
+                    _notify_write_failure(on_failure, asyncio.CancelledError())
+                return
+            error = done.exception()
+            if error is not None:
+                if on_failure is not None:
+                    _notify_write_failure(on_failure, error)
+                return
+            if on_cancel is not None:
+                on_cancel(done.result())
+            elif after is not None:
                 after(done.result())
         task.add_done_callback(late)
         raise
-    after(result)
+    if after is not None:
+        after(result)
     return result
 
 
@@ -168,4 +208,19 @@ async def join_authority_work(authority, timeout):
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError('Profile workers did not stop; ownership retained')
+        await asyncio.sleep(.05)
+
+
+async def await_authority_work(authority, timeout):
+    """Wait for naturally accepted authority work without sending Stop or killing a turn.
+
+    Preservation close uses this path.  A missed deadline raises and leaves the exact owner
+    custody live; it is never converted into a successful zero result.
+    """
+    deadline = asyncio.get_running_loop().time() + max(0.0, float(timeout))
+    while True:
+        if not list(physical_workers(authority)) and not list(executing_sessions(authority)) and not mutation_tasks(authority):
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError('Profile workers remain in preservation custody')
         await asyncio.sleep(.05)

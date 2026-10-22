@@ -319,6 +319,13 @@ class BaseEnvironment(ABC):
         """Spawn a bash process to run *cmd_string*; every backend overrides this."""
         raise NotImplementedError(f"{type(self).__name__} must implement _run_bash()")
 
+    def _run_bash_with_custody(
+        self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+        stdin_data: str | None = None, launch_transaction=None,
+    ) -> ProcessHandle:
+        """Spawn through the normal backend unless it owns a native custody handoff."""
+        return self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
+
     @abstractmethod
     def cleanup(self):
         """Release backend resources (container, instance, connection)."""
@@ -487,6 +494,74 @@ class BaseEnvironment(ABC):
         return f"exec 0< {quoted} || exit $?\nrm -f -- {quoted} || exit $?\n{command}"
 
     # --- Process lifecycle ---
+    @staticmethod
+    def _join_reader_until_deadline(
+        drain_thread: threading.Thread, deadline: float, *, retain_reader_until_eof: bool,
+    ) -> bool:
+        """Join the one stdout reader without extending the command deadline."""
+        join_timeout = 2
+        if retain_reader_until_eof:
+            join_timeout = max(0, min(join_timeout, deadline - time.monotonic()))
+        drain_thread.join(timeout=join_timeout)
+        if not retain_reader_until_eof:
+            return False
+        while drain_thread.is_alive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            drain_thread.join(timeout=min(0.05, remaining))
+        return drain_thread.is_alive()
+
+    def _handle_yield_request(
+        self, proc, output, drain_thread, drain_stop, drain_evidence, yield_handler,
+        retain_reader_until_eof: bool,
+    ):
+        """Handle one interrupt yield while preserving the original reader lease."""
+        if retain_reader_until_eof:
+            deadline = drain_evidence.get("deadline")
+            if isinstance(deadline, (int, float)) and time.monotonic() >= deadline:
+                drain_evidence["deadline_expired"] = True
+                return None, drain_thread, drain_evidence
+            handoff_reader = getattr(yield_handler, "_handoff_managed_reader", None)
+            handed = None
+            if callable(handoff_reader):
+                try:
+                    handed = handoff_reader(
+                        proc, output, drain_thread, drain_stop, drain_evidence,
+                    )
+                except Exception:
+                    logger.warning(
+                        "managed foreground reader handoff failed; retaining custody",
+                        exc_info=True,
+                    )
+            if handed is not None:
+                return handed, drain_thread, drain_evidence
+            drain_evidence["yield_deferred"] = True
+            return None, drain_thread, drain_evidence
+
+        drain_stop.set()
+        drain_thread.join(timeout=1)
+        try:
+            handed = yield_handler(proc, output.render())
+        except Exception:
+            logger.warning("yield-to-background handoff failed; continuing to wait", exc_info=True)
+            handed = None
+        if handed is not None:
+            return handed, drain_thread, drain_evidence
+        drain_stop.clear()
+        drain_evidence = {
+            "reader_lease": retain_reader_until_eof,
+            "reader_state": {"done": False, "status": None},
+            "deadline": drain_evidence.get("deadline"),
+            "stdin_thread": drain_evidence.get("stdin_thread"),
+            "stdin_errors": drain_evidence.get("stdin_errors"),
+        }
+        drain_thread = _start_drain_thread(
+            proc, output, drain_stop, drain_evidence,
+            retain_until_eof=retain_reader_until_eof,
+        )
+        return None, drain_thread, drain_evidence
+
     def _wait_for_process(
         self, proc: ProcessHandle, timeout: int = 120, *,
         bounded_capture: bool = False, watch_interrupt_tid: int | None = None,
@@ -513,16 +588,72 @@ class BaseEnvironment(ABC):
         if output is None:
             output = _new_output_collector(proc, bounded_capture)
         drain_stop = threading.Event() if yield_handler is not None else None
-        drain_thread = _start_drain_thread(proc, output, drain_stop)
         _now = time.monotonic()
         deadline = _now + timeout
+        drain_evidence: dict = {}
+        retain_reader_until_eof = (
+            os.name == "nt"
+            and getattr(yield_handler, "_retain_reader_until_eof", False)
+        )
+        drain_evidence.update(
+            reader_lease=retain_reader_until_eof,
+            reader_state={"done": False, "status": None},
+            deadline=deadline,
+            stdin_thread=getattr(proc, "_hermes_stdin_thread", None),
+            stdin_errors=getattr(proc, "_hermes_stdin_errors", None),
+        )
+        drain_thread = _start_drain_thread(
+            proc, output, drain_stop, drain_evidence,
+            retain_until_eof=retain_reader_until_eof,
+        )
         _activity_state = {"last_touch": _now, "start": _now}
         trace = _WaitTrace(proc, timeout, enabled=_DEBUG_INTERRUPT, logger=logger)
         trace.enter()
 
+        def _publish_evidence() -> None:
+            record_evidence = getattr(yield_handler, "_record_foreground_evidence", None)
+            if callable(record_evidence):
+                record_evidence(proc, drain_evidence)
+
         def _kill_and_join():
             self._kill_process(proc)
-            drain_thread.join(timeout=2)
+            self._join_reader_until_deadline(
+                drain_thread, deadline, retain_reader_until_eof=retain_reader_until_eof,
+            )
+
+        def _managed_timeout_result() -> dict:
+            """Return a bounded failure while retaining any live managed reader lease."""
+            trace.timed_out()
+            drain_evidence["deadline_expired"] = True
+            _kill_and_join()
+            if retain_reader_until_eof:
+                drain_evidence["natural_exit"] = proc.returncode is not None
+                drain_evidence["reader_pending"] = drain_thread.is_alive()
+                drain_evidence["reader_done"] = not drain_thread.is_alive()
+                drain_evidence["drain_joined"] = not drain_thread.is_alive()
+                drain_evidence["true_eof"] = False
+                drain_evidence["stdout_closed"] = False
+                drain_evidence["foreground_reader_pending"] = drain_thread.is_alive()
+                _publish_evidence()
+                rendered = output.render(suffix=f"\n[Command timed out after {timeout}s]")
+                if output.total_chars == 0:
+                    rendered = rendered.lstrip()
+                # Do not close the collector or spill while its authenticated reader is live.
+                # The foreground callback will retain/refuse this transaction; it must never
+                # turn this partial failure into a managed success proof.
+                return {
+                    "output": rendered,
+                    "returncode": 124,
+                    "hermes_timed_out": True,
+                    "foreground_reader_pending": True,
+                }
+            rendered = output.render(suffix=f"\n[Command timed out after {timeout}s]")
+            if output.total_chars == 0:
+                rendered = rendered.lstrip()
+            return {
+                **self._finalize_wait_result(output, rendered, 124),
+                "hermes_timed_out": True,
+            }
 
         try:
             # Adaptive poll: start at 5ms so fast commands return in ~6ms, back
@@ -536,26 +667,16 @@ class BaseEnvironment(ABC):
                     return {**self._finalize_wait_result(output, output.render(suffix="\n[Command interrupted]"), 130),
                             "hermes_interrupted": True}
                 if yield_handler is not None and consume_yield(watch_interrupt_tid):
-                    drain_stop.set()
-                    drain_thread.join(timeout=1)
-                    try:
-                        handed = yield_handler(proc, output.render())
-                    except Exception:
-                        logger.warning("yield-to-background handoff failed; continuing to wait", exc_info=True)
-                        handed = None
+                    handed, drain_thread, drain_evidence = self._handle_yield_request(
+                        proc, output, drain_thread, drain_stop, drain_evidence,
+                        yield_handler, retain_reader_until_eof,
+                    )
                     if handed is not None:
-                        output.close_spill()
+                        if not getattr(yield_handler, "_foreground_reader_transferred", False):
+                            output.close_spill()
                         return handed
-                    drain_stop.clear()
-                    drain_thread = _start_drain_thread(proc, output, drain_stop)
                 if time.monotonic() > deadline:
-                    trace.timed_out()
-                    _kill_and_join()
-                    rendered = output.render(suffix=f"\n[Command timed out after {timeout}s]")
-                    if output.total_chars == 0:
-                        rendered = rendered.lstrip()
-                    # The flag tells Hermes' own deadline apart from a command's own ``exit 124``.
-                    return {**self._finalize_wait_result(output, rendered, 124), "hermes_timed_out": True}
+                    return _managed_timeout_result()
                 touch_activity_if_due(_activity_state, "terminal command running")
                 trace.heartbeat()
                 time.sleep(_poll_sleep)
@@ -569,26 +690,66 @@ class BaseEnvironment(ABC):
                 pass  # cleanup is best-effort
             raise
 
-        # The drain thread exits promptly after bash does (~300ms idle check);
-        # a long join here would itself indicate a bug in the drain loop.
-        drain_thread.join(timeout=2)
-        try:
-            proc.stdout.close()
-        except Exception:
-            pass
-        trace.natural_exit(proc.returncode)
-
-        # Join the stdin writer before reading its error list: a child that exits without
-        # reading stdin can otherwise race ahead of a recorded encode failure. The timeout
-        # is a pure safety net (write raises BrokenPipeError once the pipe closes).
+        # Ordinary readers exit promptly after bash does (~300ms idle check). A managed native
+        # reader may intentionally remain alive while an inherited writer still owns the pipe;
+        # that lease is consumed synchronously while the original deadline still has budget.
+        reader_pending = self._join_reader_until_deadline(
+            drain_thread, deadline, retain_reader_until_eof=retain_reader_until_eof,
+        )
+        drain_evidence["natural_exit"] = proc.returncode is not None
+        drain_evidence["reader_pending"] = reader_pending
+        drain_evidence["reader_done"] = not reader_pending
+        drain_evidence["drain_joined"] = not reader_pending
+        drain_evidence["true_eof"] = (
+            not reader_pending and drain_evidence.get("status") == "true_eof"
+        )
+        reader_state = drain_evidence.get("reader_state")
+        if isinstance(reader_state, dict) and reader_state.get("eof_kind") is not None:
+            drain_evidence["eof_kind"] = reader_state["eof_kind"]
+        # Join the stdin writer before closing stdout or publishing the evidence.  The writer
+        # owns the caller's last input bytes and an unfinished close is not a clean foreground
+        # handoff even when the child has already exited.
         stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
         if stdin_thread is not None:
-            stdin_thread.join(timeout=5)
+            stdin_timeout = 5
+            if retain_reader_until_eof:
+                stdin_timeout = max(0, min(stdin_timeout, deadline - time.monotonic()))
+            stdin_thread.join(timeout=stdin_timeout)
+        drain_evidence["stdin_writer_joined"] = stdin_thread is None or not stdin_thread.is_alive()
+        if retain_reader_until_eof and time.monotonic() >= deadline:
+            return _managed_timeout_result()
+        if reader_pending:
+            # The managed native transaction still owns the reader lease. Closing the stream here
+            # would turn a live inherited writer into an unauthenticated success/failure race.
+            drain_evidence["stdout_closed"] = False
+            drain_evidence["foreground_reader_pending"] = True
+            trace.timed_out()
+            _publish_evidence()
+            rendered = output.render(suffix=f"\n[Command timed out after {timeout}s]")
+            if output.total_chars == 0:
+                rendered = rendered.lstrip()
+            return {
+                "output": rendered,
+                "returncode": 124,
+                "hermes_timed_out": True,
+                "foreground_reader_pending": True,
+            }
+        else:
+            try:
+                proc.stdout.close()
+                drain_evidence["stdout_closed"] = True
+            except (AttributeError, OSError, ValueError):
+                drain_evidence["stdout_closed"] = False
+        trace.natural_exit(proc.returncode)
+
+        # Read its error list only after the writer join: a child that exits without reading
+        # stdin can otherwise race ahead of a recorded encode failure.
         rendered = output.render()
         result = self._finalize_wait_result(output, rendered, proc.returncode)
         if stdin_errors := getattr(proc, "_hermes_stdin_errors", None):
             result["stdin_error"] = err = str(stdin_errors[0])
             result["output"] = rendered + f"\n[stdin write failed: {err}]"
+        _publish_evidence()
         return result
 
     _finalize_wait_result = staticmethod(_finalize_wait_result)
@@ -696,11 +857,30 @@ class BaseEnvironment(ABC):
                 set_activity_callback(parent_activity_cb)
             if not _enter_foreground_spawn():
                 return {"output": "[host is exiting: command not started]", "returncode": 130}
+            prepare_custody = getattr(yield_handler, "_prepare_custody", None)
+            release_custody = getattr(yield_handler, "_release_custody", None)
             spawned = None
             try:
-                spawned = self._run_bash(wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin)
-            finally:
+                if callable(prepare_custody):
+                    prepare_custody()
+                spawned = self._run_bash_with_custody(
+                    wrapped, login=login, timeout=effective_timeout, stdin_data=effective_stdin,
+                    launch_transaction=getattr(yield_handler, "_launch_transaction", None),
+                )
+                bind_source_process = getattr(yield_handler, "_bind_source_process", None)
+                if callable(bind_source_process):
+                    # The source parent was reserved before _run_bash_with_custody. Bind the
+                    # exact returned Popen/transaction before it is published to the live
+                    # foreground set or any reader can transfer it.
+                    bind_source_process(spawned)
+            except BaseException:
+                if callable(release_custody):
+                    release_custody()
                 fenced = _leave_foreground_spawn(self, spawned)
+                if fenced and spawned is not None:
+                    self._force_kill_process(spawned)
+                raise
+            fenced = _leave_foreground_spawn(self, spawned)
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)
@@ -712,6 +892,8 @@ class BaseEnvironment(ABC):
                     watch_interrupt_tid=parent_tid, output=output,
                     **({"yield_handler": yield_handler} if yield_handler is not None else {}))
             finally:
+                if callable(release_custody) and not getattr(yield_handler, "_foreground_pending", False):
+                    release_custody()
                 with _live_foreground_cond:
                     _live_foreground.pop(id(spawned), None)
 

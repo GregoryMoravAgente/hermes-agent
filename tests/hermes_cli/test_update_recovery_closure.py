@@ -98,7 +98,9 @@ def _killed_mid_write(tmp_path: Path, rel: str, committed: dict[str, str] | None
     (root / ".git/info/attributes").unlink()
 
     (tmp_path / "bin").mkdir()
-    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", Path(sys.executable),
+    # The launcher must import from this synthetic checkout.  An editable test venv can
+    # install a meta-path finder for another Hermes checkout ahead of sys.path.
+    launcher = _launchers._mint_shell_launcher("hermes", tmp_path / "bin", Path(sys._base_executable),
                                                _launchers._launcher_script("hermes", root, None))
     assert launcher is not None
     return root, env, original, launcher

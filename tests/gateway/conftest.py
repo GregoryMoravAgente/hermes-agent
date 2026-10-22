@@ -38,6 +38,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+import pytest_asyncio
 
 
 @pytest.fixture
@@ -643,6 +644,526 @@ def _write_guard_cache_atomic(cache_file: Path, content: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def bind_authority_runtime_custody(runner, authority):
+    """Bind a real authority's epoch and identity to the test runner's custody seam."""
+    from pathlib import Path
+
+    from gateway.runtime_custody import install_runtime_custody
+
+    home = str(Path(authority.db.db_path).resolve().parent)
+    descriptor = dict(getattr(runner, 'session_runtime_descriptor', None) or {})
+    descriptor.update({
+        'instance_id': authority.instance_id,
+        'authority_epoch': authority.epoch,
+        'profile_id': authority.profile_id,
+        'served_profiles': [{'profile_id': authority.profile_id, 'home': home}],
+    })
+    runner.session_runtime_descriptor = descriptor
+    return install_runtime_custody(runner)
+
+
+def _api_runtime_cleanup_readback(adapter, runner):
+    """Read source-owned API custody indexes after profile roots have closed."""
+    custody = getattr(adapter, '_run_custody', None)
+    launches = getattr(adapter, '_run_launches', None)
+    if not isinstance(custody, dict) or not isinstance(launches, dict):
+        return False
+    if any(not getattr(item, 'released', False) or getattr(item, 'unknown_reason', None)
+           for item in custody.values()):
+        return False
+    if custody or launches:
+        return False
+    ids = getattr(adapter, '_run_idempotency_ids', None)
+    if isinstance(ids, set) and ids:
+        return False
+    authorities = []
+    authority_registry = getattr(runner, 'session_authorities', None)
+    if authority_registry is not None:
+        try:
+            authorities.extend(item for item in authority_registry if item is not None)
+        except TypeError:
+            return False
+    else:
+        authority = getattr(runner, 'session_authority', None)
+        if authority is not None:
+            authorities.append(authority)
+    for authority in authorities:
+        registry = getattr(authority, '_api_finalizer_completions', None)
+        if registry not in (None, {}):
+            return False
+    return True
+
+
+def runtime_owned_api(tmp_path, monkeypatch, *, api_key=None, legacy=False, cleanup_readback=False):
+    """Yield an API adapter after the real single-profile runtime bootstrap has completed.
+
+    This is an explicit context manager for tests that intentionally construct their own adapter;
+    it is never autouse. The adapter receives the production descriptor, authority registry,
+    process ownership, and coordinator before the test patches only its model boundary.
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def owned():
+        import hermes_state
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.platforms.api_server import APIServerAdapter
+        from gateway.run import GatewayRunner
+        from gateway.run_runtime import initialize_gateway_runtime
+        from gateway.runtime_ownership import process_ownership
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+
+        home = (tmp_path / 'api-profile').resolve()
+        requested_config = (tmp_path / 'config.yaml').read_text() if (tmp_path / 'config.yaml').exists() else None
+        monkeypatch.setenv('HERMES_HOME', str(home))
+        monkeypatch.setattr('gateway.run._hermes_home', home)
+        monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+        home_token = set_hermes_home_override(home)
+        reserved = False
+        runner = None
+        adapter = None
+        try:
+            with FakeLLMServer(default_text='runtime-custody-fixture-ok') as provider:
+                extra_config = requested_config or ''
+                if extra_config.strip() == '{}':
+                    extra_config = ''
+                write_hermes_home(home, provider.base_url, extra_config=extra_config)
+                process_ownership.reserve([home])
+                reserved = True
+                runner = GatewayRunner(GatewayConfig(sessions_dir=home / 'sessions'))
+                extra = {'key': api_key} if api_key else {}
+                adapter = APIServerAdapter(PlatformConfig(enabled=True, extra=extra))
+                adapter.gateway_runner = runner
+                runner.adapters = {Platform.API_SERVER: adapter}
+                await initialize_gateway_runtime(runner)
+                runner._wire_adapter_handlers(adapter)
+                authorities = tuple(getattr(runner, 'session_authorities', ()) or ())
+                if legacy:
+                    # The pre-authority route is supported only after the real bootstrap has
+                    # installed process ownership, descriptor, database, and coordinator.
+                    runner.session_authority = None
+                    runner.session_authorities = None
+                yield adapter
+        finally:
+            cleanup_proven = True
+            if runner is not None:
+                from tui_gateway.hosted_tui_custody import close_profile
+                authorities = tuple(locals().get('authorities', ()) or ())
+                for authority in authorities:
+                    if not close_profile(authority):
+                        cleanup_proven = False
+            if cleanup_readback and adapter is not None and runner is not None:
+                cleanup_proven = (
+                    _api_runtime_cleanup_readback(adapter, runner)
+                    and cleanup_proven
+                )
+            if adapter is not None:
+                adapter._response_store.close()
+                adapter._run_idempotency_store.close()
+            if runner is not None:
+                runner.session_store.close_all_db_handles()
+                runner.close_all_session_db_handles()
+            try:
+                if reserved and cleanup_proven:
+                    process_ownership.close()
+                if cleanup_readback and not cleanup_proven:
+                    raise RuntimeError('api_runtime_cleanup_unproven')
+            finally:
+                reset_hermes_home_override(home_token)
+
+    return owned()
+
+
+@pytest.fixture
+def started_mux(tmp_path, monkeypatch, unused_tcp_port):
+    """Run a real multi-profile gateway through startup and READY publication.
+
+    The direct ``mux`` fixture intentionally stops after runtime initialization so it can test
+    source constructors in isolation.  Public preservation controls need the production startup
+    boundary instead: process/profile ownership, the session API listener, the API adapter, the
+    gateway's ``start()`` path, and the READY transition all have to run before the control call.
+    """
+    import asyncio
+    import json
+    import threading
+
+    from gateway.control_socket import GatewayControlServer
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    from gateway.run_runtime import (
+        drain_gateway_runtime,
+        initialize_gateway_runtime,
+        publish_gateway_runtime_ready,
+        start_gateway_runtime_api,
+    )
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import _IMPORT_DEFAULT_DB_PATH
+    import hermes_state
+    from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+    from tui_gateway.hosted_tui_custody import close_profile
+
+    root = (tmp_path / ".hermes").resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", _IMPORT_DEFAULT_DB_PATH)
+    homes = [("default", root)]
+    for name in ("alpha", "beta"):
+        home = root / "profiles" / name
+        home.mkdir(parents=True, mode=0o700)
+        (home / "config.yaml").write_text("{}")
+        homes.append((name, home))
+    for _name, home in homes:
+        config = {
+            "model": {"default": "fixture-model"},
+            "platform_toolsets": {"cli": []},
+            "hosted_rooms": {"profiles": {n: str(h) for n, h in homes if h != home}},
+        }
+        (home / "config.yaml").write_text(json.dumps(config))
+
+    api_key = "started-mux-api-key-0123456789"
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(
+                enabled=True,
+                extra={"key": api_key, "port": unused_tcp_port},
+            ),
+        },
+        sessions_dir=root / "sessions",
+    )
+    config.multiplex_profiles = True
+    config._runtime_profile_homes = tuple(homes)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name="started-mux-loop")
+    thread.start()
+    runner = None
+    control_server = None
+    home_token = set_hermes_home_override(root)
+    reserved = False
+    started = False
+
+    def call(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(30)
+
+    def call_sync(function, *args):
+        async def invoke():
+            return function(*args)
+        return call(invoke())
+
+    try:
+        with FakeLLMServer(default_text="started-mux-fixture-ok") as provider:
+            try:
+                write_hermes_home(root, provider.base_url)
+                process_ownership.reserve([home for _name, home in homes])
+                reserved = True
+                runner = GatewayRunner(config)
+                call(initialize_gateway_runtime(runner))
+                control_server = runner.session_control_server = GatewayControlServer(
+                    root, verb_handlers={"identify": lambda: runner.session_runtime_descriptor}
+                )
+                call(control_server.start())
+                # This is the same listener startup used by gateway.run.start_gateway; it is required
+                # before GatewayRunner.start(), because publish_gateway_runtime_ready checks its live task.
+                call(start_gateway_runtime_api(runner))
+                assert call(runner.start()) is True
+                started = True
+                call_sync(publish_gateway_runtime_ready, runner)
+                assert runner._running is True
+                assert runner.session_runtime_descriptor["state"] == "ready"
+                yield runner, dict(homes), loop, call
+            finally:
+                if runner is not None:
+                    if started:
+                        yuanbao = getattr(runner, "adapters", {}).get(Platform.YUANBAO)
+                        if yuanbao is not None and getattr(
+                            getattr(yuanbao, "_connection", None), "ws", None
+                        ) is not None:
+                            call(yuanbao.disconnect())
+                        # Drain detached work while the provider is still alive.
+                        call(runner.stop())
+                    else:
+                        if getattr(runner, "session_runtime_descriptor", None) is not None:
+                            call(drain_gateway_runtime(runner))
+                    if control_server is not None:
+                        call(control_server.stop())
+                    for authority in tuple(getattr(runner, "session_authorities", []) or ()):
+                        assert close_profile(authority), "I17 profile root did not close during fixture cleanup"
+                        authority.db.close()
+                    runner.session_store.close_all_db_handles()
+                    runner.close_all_session_db_handles()
+    finally:
+        if reserved:
+            process_ownership.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(30)
+        assert not thread.is_alive(), "started gateway loop did not stop"
+        loop.close()
+        reset_hermes_home_override(home_token)
+
+
+@pytest.fixture
+def started_yuanbao(tmp_path, monkeypatch, unused_tcp_port):
+    """Start the real Gateway/I04 path with Yuanbao configured before READY.
+
+    The only test seam is a loopback websocket and sign-token response installed
+    before ``GatewayRunner.start``.  The adapter constructor, AUTH_BIND decoder,
+    registration, handler wiring, source handoff and READY lifecycle remain the
+    production path; no adapter is inserted after startup.
+    """
+    import asyncio
+    import json
+    import threading
+
+    from gateway.control_socket import GatewayControlServer
+    from gateway.config import GatewayConfig, Platform, PlatformConfig
+    from gateway.run import GatewayRunner
+    from gateway.run_runtime import (
+        drain_gateway_runtime,
+        initialize_gateway_runtime,
+        publish_gateway_runtime_ready,
+        start_gateway_runtime_api,
+    )
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+    from hermes_state import _IMPORT_DEFAULT_DB_PATH
+    import hermes_state
+    from tests.fakes.fake_llm_provider import FakeLLMServer, write_hermes_home
+    from tui_gateway.hosted_tui_custody import close_profile
+
+    class _LoopbackWebSocket:
+        def __init__(self, auth_frame):
+            self.sent = []
+            self.open = True
+            self._auth_frame = auth_frame
+            self._auth_sent = False
+            self._closed = asyncio.Event()
+            self._frames = asyncio.Queue()
+            self._close_sent = False
+
+        async def send(self, payload):
+            self.sent.append(payload)
+            self._auth_sent = True
+            try:
+                decoded = yuanbao_module.decode_conn_msg(payload)
+            except (KeyError, TypeError, ValueError):
+                return
+            head = decoded.get('head', {})
+            if head.get('cmd_type') != yuanbao_module.CMD_TYPE['Request']:
+                return
+            if head.get('cmd') == 'auth-bind':
+                return
+            await self._frames.put(yuanbao_proto.encode_conn_msg_full(
+                cmd_type=yuanbao_module.CMD_TYPE['Response'],
+                cmd=head['cmd'], seq_no=head['seq_no'], msg_id=head['msg_id'],
+                module=head['module'], data=b'',
+            ))
+
+        async def recv(self):
+            if self._auth_sent and self._auth_frame is not None:
+                frame, self._auth_frame = self._auth_frame, None
+                return frame
+            if self._closed.is_set() and self._frames.empty():
+                raise StopAsyncIteration
+            frame = await self._frames.get()
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            if self._closed.is_set() and self._frames.empty():
+                raise StopAsyncIteration
+            frame = await self._frames.get()
+            if frame is None:
+                raise StopAsyncIteration
+            return frame
+
+        async def close(self):
+            self.open = False
+            if not self._close_sent:
+                self._close_sent = True
+                self._closed.set()
+                await self._frames.put(None)
+
+        async def wait_closed(self):
+            if not self._close_sent:
+                self._close_sent = True
+                self._closed.set()
+                await self._frames.put(None)
+
+    from plugins.platforms.yuanbao import adapter as yuanbao_module
+    from plugins.platforms.yuanbao.adapter import ConnectionManager, YuanbaoAdapter
+    from plugins.platforms.yuanbao import yuanbao_proto
+
+    def _auth_frame():
+        auth_data = yuanbao_proto._encode_parts([(1, 'n', 0), (3, 's', 'loopback-connect')])
+        return yuanbao_proto.encode_conn_msg_full(
+            cmd_type=yuanbao_module.CMD_TYPE['Response'], cmd='auth-bind', seq_no=1,
+            msg_id='loopback-auth', module='conn_access', data=auth_data,
+        )
+
+    async def _loopback_token(self):
+        return {
+            'token': 'loopback-token', 'bot_id': 'synthetic-yuanbao-bot',
+            'source': 'bot', 'duration': 3600, 'product': 'fixture',
+        }
+
+    async def _loopback_dial(self, token_data):
+        self._ws = _LoopbackWebSocket(_auth_frame())
+        if not await self._authenticate(token_data):
+            await self._cleanup_ws()
+            return False
+        return True
+
+    monkeypatch.setattr(yuanbao_module.YuanbaoAdapter, '_get_cached_token', _loopback_token)
+    monkeypatch.setattr(ConnectionManager, '_dial', _loopback_dial)
+
+    root = (tmp_path / '.hermes').resolve()
+    root.mkdir(mode=0o700)
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', _IMPORT_DEFAULT_DB_PATH)
+    (root / 'config.yaml').write_text(json.dumps({
+        'model': {'default': 'fixture-model'}, 'platform_toolsets': {'cli': []},
+    }))
+    api_key = 'started-yuanbao-api-key-0123456789'
+    config = GatewayConfig(
+        platforms={
+            Platform.API_SERVER: PlatformConfig(
+                enabled=True, extra={'key': api_key, 'port': unused_tcp_port},
+            ),
+            Platform.YUANBAO: PlatformConfig(
+                enabled=True,
+                extra={
+                    'app_id': 'synthetic-yuanbao-app',
+                    'app_secret': 'synthetic-yuanbao-secret',
+                    'ws_url': 'wss://loopback.invalid/ws',
+                    'api_domain': 'https://loopback.invalid',
+                    'dm_policy': 'allowlist',
+                    'dm_allow_from': 'synthetic-yuanbao-user',
+                    'group_policy': 'allowlist',
+                    'group_allow_from': 'synthetic-group',
+                    'bot_id': 'synthetic-yuanbao-bot',
+                },
+            ),
+        },
+        sessions_dir=root / 'sessions',
+    )
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, name='started-yuanbao-loop')
+    thread.start()
+    runner = None
+    adapter = None
+    control_server = None
+    home_token = set_hermes_home_override(root)
+    previous_active_adapter = YuanbaoAdapter.get_active()
+    reserved = False
+    started = False
+
+    def call(coroutine):
+        return asyncio.run_coroutine_threadsafe(coroutine, loop).result(30)
+
+    def call_sync(function, *args):
+        async def invoke():
+            return function(*args)
+        return call(invoke())
+
+    def close_replaced_active_adapter():
+        active_adapter = YuanbaoAdapter.get_active()
+        if active_adapter is None or active_adapter is adapter or active_adapter is previous_active_adapter:
+            return
+        try:
+            call(active_adapter.disconnect())
+        finally:
+            YuanbaoAdapter.set_active(previous_active_adapter)
+
+    try:
+        with FakeLLMServer(default_text='started-yuanbao-fixture-ok') as provider:
+            write_hermes_home(root, provider.base_url)
+            process_ownership.reserve([root])
+            reserved = True
+            runner = GatewayRunner(config)
+            call(initialize_gateway_runtime(runner))
+            control_server = runner.session_control_server = GatewayControlServer(
+                root, verb_handlers={'identify': lambda: runner.session_runtime_descriptor}
+            )
+            call(control_server.start())
+            call(start_gateway_runtime_api(runner))
+            assert call(runner.start()) is True
+            started = True
+            call_sync(publish_gateway_runtime_ready, runner)
+            assert runner._running is True
+            assert runner.session_runtime_descriptor['state'] == 'ready'
+            adapter = runner.adapters[Platform.YUANBAO]
+            yield runner, adapter, loop, call, adapter._connection
+    finally:
+        if runner is not None:
+            if started:
+                close_replaced_active_adapter()
+                try:
+                    call(runner.stop())
+                finally:
+                    YuanbaoAdapter.set_active(previous_active_adapter)
+            else:
+                if getattr(runner, 'session_runtime_descriptor', None) is not None:
+                    call(drain_gateway_runtime(runner))
+                YuanbaoAdapter.set_active(previous_active_adapter)
+            if control_server is not None:
+                call(control_server.stop())
+            for authority in tuple(getattr(runner, 'session_authorities', []) or ()):
+                assert close_profile(authority), 'Yuanbao fixture profile did not close'
+                authority.db.close()
+            runner.session_store.close_all_db_handles()
+            runner.close_all_session_db_handles()
+        if reserved:
+            process_ownership.close()
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(30)
+        assert not thread.is_alive(), 'started Yuanbao loop did not stop'
+        loop.close()
+        reset_hermes_home_override(home_token)
+
+
+def runtime_owned_legacy_api(tmp_path, monkeypatch, *, api_key=None):
+    """Real API bootstrap followed by the explicit supported pre-authority topology."""
+    return runtime_owned_api(tmp_path, monkeypatch, api_key=api_key, legacy=True)
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_api_owner(tmp_path, monkeypatch):
+    """A real API adapter and its source-owned authority after full runtime bootstrap.
+
+    Tests may replace only the model/turn callback; descriptor, process ownership,
+    profile DB, coordinator, and admission parent remain production-created.
+    """
+    async with runtime_owned_api(tmp_path, monkeypatch) as adapter:
+        yield adapter, adapter.gateway_runner.session_authority
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_api_adapter(tmp_path, monkeypatch):
+    """A real runtime-owned API adapter for direct route/projection tests."""
+    async with runtime_owned_api(tmp_path, monkeypatch) as adapter:
+        yield adapter
+
+
+@pytest_asyncio.fixture
+async def runtime_owned_legacy_api_adapter(tmp_path, monkeypatch):
+    """A real bootstrap followed by the supported legacy adapter topology."""
+    async with runtime_owned_legacy_api(tmp_path / 'legacy-api', monkeypatch) as adapter:
+        runner = adapter.gateway_runner
+        # The legacy direct adapter is served without an authority registry.  Remove the
+        # bootstrap's explicit ``None`` marker only in this wrapper; the shared context and
+        # its cleanup/readback contract remain unchanged.
+        if hasattr(runner, 'session_authorities'):
+            delattr(runner, 'session_authorities')
+        yield adapter
+
+
 @pytest.fixture
 def owner(tmp_path):
     """A canonical ``SessionAuthority`` over a fresh profile ``state.db``."""
@@ -661,6 +1182,7 @@ def owner(tmp_path):
     authority = SessionAuthority(runner, profile_id='default', instance_id='first', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='first'))
     runner.session_authority = authority
+    bind_authority_runtime_custody(runner, authority)
     yield authority
     db.close()
 
@@ -712,6 +1234,7 @@ def hosted_owner(tmp_path, monkeypatch):
     thread = threading.Thread(target=loop.run_forever)
     thread.start()
     authority = asyncio.run_coroutine_threadsafe(initialize_session_authority(runner, profile_id='owned', instance_id='first'), loop).result()
+    bind_authority_runtime_custody(runner, authority)
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     principal = Principal('durable-room-owner', 'owned', frozenset({'session:create', 'session:read', 'session:submit', 'session:control', 'session:approve'}), 'room-worker')
     yield authority, loop, principal, agent

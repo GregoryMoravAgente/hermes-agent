@@ -85,6 +85,7 @@ async def test_reset_and_compress_mutations_use_the_boundary_evict(tmp_path, mon
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway import run
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
@@ -99,6 +100,7 @@ async def test_reset_and_compress_mutations_use_the_boundary_evict(tmp_path, mon
     runner._evict_cached_agent = lambda route, **kw: evicted['plain'].append(route)
     runner._evict_cached_agent_at_boundary = lambda route: evicted['boundary'].append(route)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='test')
+    bind_authority_runtime_custody(runner, authority)
     authority._schedule = lambda ref: None
     conn = AuthorityConnection(authority, SimpleNamespace(write=lambda frame: None), {'user_id': 'me'})
     created = await conn.dispatch({'id': 1, 'method': 'session.create', 'params': {'request_id': 'r', 'source': 'cli', 'cwd': str(tmp_path)}})

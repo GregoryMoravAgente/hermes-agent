@@ -602,7 +602,7 @@ class TestTextBatchFlushRace:
 
         handle_calls = []
 
-        async def fake_handle(evt):
+        async def fake_handle(evt, *, source_tokens=None):
             handle_calls.append(evt)
 
         adapter.handle_message = fake_handle
@@ -645,7 +645,7 @@ class TestTextBatchFlushRace:
 
         handle_calls = []
 
-        async def fake_handle(evt):
+        async def fake_handle(evt, *, source_tokens=None):
             handle_calls.append(evt)
 
         adapter.handle_message = fake_handle

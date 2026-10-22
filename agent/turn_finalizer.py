@@ -522,6 +522,42 @@ def apply_llm_output_transform(
     return final_response, transformed, pre_transform
 
 
+def _commit_shell_turn_after_persistence(agent: Any, messages: list, persisted: Any) -> Any:
+    """Finish shell children after persistence while retaining failed/unknown writer custody."""
+    # A failed or unknown persistence path may already have committed rows or a physical
+    # provider witness.  Keep that exact proof reachable for the authenticated retry;
+    # clearing it here would open a second writer on the next continuation.
+    if persisted is not True:
+        return persisted
+    writer_proof = getattr(agent, "_managed_shell_writer_proof", None)
+    if writer_proof is None:
+        return persisted
+    try:
+        from agent.shell_hook_custody import commit_turn_result, has_pending_turn, mark_pending_unknown
+
+        if has_pending_turn(agent) and commit_turn_result(agent, messages, writer_proof) is not True:
+            agent._managed_persistence_failed = True
+            mark_pending_unknown(agent, "durable_result_unknown")
+            return False
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        agent._managed_persistence_failed = True
+        with suppress(Exception):
+            from agent.shell_hook_custody import mark_pending_unknown
+            mark_pending_unknown(agent, "durable_result_unknown")
+        return False
+    # Gateway owns the typed handoff after this shell fence.  Keep its exact proof until
+    # publish_gateway_writer_proof stores the authenticated handoff; ordinary shell-only
+    # turns can release the local proof after the child commit succeeds.
+    try:
+        from agent.session_persistence_proof import gateway_writer_proof_requested
+        gateway_requested = gateway_writer_proof_requested(agent)
+    except (AttributeError, ImportError, RuntimeError, TypeError, ValueError):
+        gateway_requested = False
+    if not gateway_requested:
+        agent._managed_shell_writer_proof = None
+    return persisted
+
+
 def finalize_turn(
     agent, *, final_response, api_call_count, interrupted, failed, messages, conversation_history,
     effective_task_id, turn_id, user_message, original_user_message, _should_review_memory,
@@ -618,7 +654,7 @@ def finalize_turn(
     # the fallible tail-shaping / override / micro-compaction / persist calls — so a
     # raise in any of them can't drop text the user already saw (#95514, #8049).
     def _persist_step():
-        nonlocal final_response
+        nonlocal final_response, failed, _turn_exit_reason
         _drop_transcript_scaffolding(agent, messages)
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
@@ -632,7 +668,60 @@ def finalize_turn(
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger, effective_task_id)
-        agent._persist_session(messages, conversation_history)
+        sentinel = object()
+        previous_shell_finalize = getattr(agent, "_managed_finalize_shell_turn", sentinel)
+        agent._managed_finalize_shell_turn = True
+        try:
+            from agent.session_persistence_proof import (
+                discard_gateway_writer_proof,
+                gateway_writer_proof_requested,
+                mark_gateway_writer_proof_unknown,
+                publish_gateway_writer_proof,
+            )
+            gateway_proof_requested = gateway_writer_proof_requested(agent)
+            persisted = agent._persist_session(messages, conversation_history)
+        finally:
+            if previous_shell_finalize is sentinel:
+                agent.__dict__.pop("_managed_finalize_shell_turn", None)
+            else:
+                agent._managed_finalize_shell_turn = previous_shell_finalize
+        gateway_handoff_published = False
+        try:
+            managed_acp = getattr(agent, "_managed_acp_client", None)
+            if (
+                persisted is True
+                and managed_acp is not None
+                and managed_acp.has_pending_managed_witness()
+            ):
+                # A successful boolean flush must not outrun the child witness.  Keep the
+                # admission unknown until the canonical writer handoff removes that exact
+                # witness and leaves its readback proof on the physical receipt.
+                persisted = False
+                agent._managed_persistence_failed = True
+                with suppress(Exception):
+                    agent._mark_managed_persistence_unknown(managed_acp)
+            writer_proof = getattr(agent, "_managed_shell_writer_proof", None)
+            persisted = _commit_shell_turn_after_persistence(agent, messages, persisted)
+            if persisted is True and gateway_proof_requested:
+                handoff = publish_gateway_writer_proof(agent, messages, writer_proof, turn_id)
+                gateway_handoff_published = handoff is not None
+                if not gateway_handoff_published:
+                    # A managed Gateway turn cannot borrow a bool result or a transcript scan
+                    # when the exact current-turn proof and authenticated binding were not published.
+                    persisted = False
+                    agent._managed_persistence_failed = True
+            if persisted is False and getattr(agent, "_managed_persistence_failed", False):
+                failed = True
+                _turn_exit_reason = "session_persistence_failed"
+        finally:
+            if gateway_proof_requested and not gateway_handoff_published:
+                # Preserve the exact proof/receipt on every failed or unknown handoff;
+                # discard only the one-turn request after the owner is marked unknown.
+                if getattr(agent, "_managed_shell_writer_proof", None) is not None:
+                    mark_gateway_writer_proof_unknown(
+                        agent, getattr(agent, "_managed_acp_client", None),
+                    )
+                discard_gateway_writer_proof(agent)
 
     _guarded_cleanup("persist_session", _persist_step, _cleanup_errors, logger)
 

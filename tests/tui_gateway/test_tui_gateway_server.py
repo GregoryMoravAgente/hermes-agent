@@ -19,6 +19,7 @@ from hermes_cli.browser_connect import ChromeDebugLaunch
 from tools import async_delegation as ad
 from tui_gateway import server
 from tui_gateway.transport import bind_transport, reset_transport
+from tests._fixtures.thread_shim import ImmediateThread as _ImmediateThread
 
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
@@ -313,8 +314,8 @@ def test_compute_host_explicit_images_do_not_clear_later_attachment(monkeypatch)
             session["attached_images"].append("/tmp/c.png")
 
     session = _session(attached_images=[])
+    monkeypatch.setitem(server._sessions, "sid", session)
     monkeypatch.setattr(server, "_get_compute_host_supervisor", lambda _cfg=None: _Supervisor())
-
     response = server._submit_prompt_to_compute_host(
         "r1", "sid", session, "B", image_paths=["/tmp/b.png"]
     )
@@ -370,13 +371,6 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
                 )
             raise BrokenPipeError("broken pipe")
 
-    class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
-            self._target = target
-
-        def start(self):
-            assert self._target is not None
-            self._target()
 
     session = _session(agent=None, agent_ready=threading.Event())
     server._sessions["iso-fallback"] = session
@@ -629,13 +623,6 @@ def test_slash_exec_compress_flag_on_applies_host_control_mirror(monkeypatch):
 
 
 def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
-            self._target = target
-
-        def start(self):
-            assert self._target is not None
-            self._target()
 
     class _Agent:
         model = "gold-model"
@@ -7776,16 +7763,6 @@ def test_notification_poller_delivers_owned_events(
 def _configure_immediate_prompt_run(
     monkeypatch, tmp_path, *, immediate_threads=True
 ):
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_kwargs):
-            self._target = target
-
-        def start(self):
-            if self._target is not None:
-                self._target()
-
-        def is_alive(self):
-            return False
 
     if immediate_threads:
         monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -8676,12 +8653,6 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
         def set_session_title(self, _key, _title):
             raise ValueError("Title already in use")
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **kw):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     agent = _Agent()
     session = {
@@ -11584,12 +11555,6 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     server._sessions["sid"] = _session(agent=_Agent())
     monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
@@ -11624,12 +11589,6 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     fake_ctx = types.ModuleType("agent.context_references")
     fake_ctx.preprocess_context_references = (
@@ -13200,12 +13159,6 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
                 "messages": [{"role": "assistant", "content": "agent reply"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     server._sessions["sid"] = _session(agent=_RacyAgent())
     session_ref["s"] = server._sessions["sid"]
@@ -13293,12 +13246,6 @@ def test_prompt_submit_merges_on_model_switch_marker(monkeypatch):
         from tui_gateway.server import _is_model_switch_marker
         return _is_model_switch_marker(entry)
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     # Test both: no prior marker, and prior marker present
     for label, prior_history in [
@@ -13392,12 +13339,6 @@ def test_prompt_submit_merges_on_personality_pivot_marker(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     server._sessions["sid"] = _session(
         agent=_PivotAgent(),
@@ -13462,12 +13403,6 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **kw):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     corrupted = "hello[" + "~[[e" * 8
     server._sessions["sid"] = _session(agent=_Agent())
@@ -13503,12 +13438,6 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
                 "messages": [{"role": "assistant", "content": "reply"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     server._sessions["sid"] = _session(agent=_Agent())
     emits: list[tuple] = []
@@ -13558,12 +13487,6 @@ def test_prompt_submit_snapshots_history_after_pending_model_switch(monkeypatch)
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, **_kwargs):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     def _apply_pending(_sid, session):
         with session["history_lock"]:
@@ -13613,12 +13536,6 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     original_history = [
         {"role": "user", "content": "first"},
@@ -13834,12 +13751,6 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     original_history = [
         {"role": "user", "content": "first"},
@@ -13934,12 +13845,6 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     tip_history = [
         {"role": "user", "content": "post-compress A"},
@@ -14809,13 +14714,21 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
     class _FakeThread:
         def __init__(self, target=None, daemon=None, **_thread_options):
             self.target = target
+            self._joined = False
             threads.append(self)
 
         def start(self):
             return None
 
+        def join(self, timeout=None):
+            self._joined = True
+
         def is_alive(self):
-            return True
+            # Win32 pipe readers become fakes too (shared module):
+            # communicate() joins them, then polls is_alive — "alive after
+            # join" would raise TimeoutExpired. Threads this test tracks
+            # are never joined, so they stay alive.
+            return not self._joined
 
     ready = threading.Event()
     ready.set()  # build finished...
@@ -17278,16 +17191,6 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
         server._sessions.pop("sid_trim", None)
 
 
-class _ImmediateThread:
-    """Runs the target callable synchronously so assertions can follow."""
-
-    def __init__(self, target=None, daemon=None, **_thread_options):
-        self._target = target
-
-    def start(self):
-        self._target()
-
-
 def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
     """The gateway hands the agent a hook so a new title repaints the sidebar.
 
@@ -18144,11 +18047,6 @@ def test_notification_poller_delivers_completion(monkeypatch):
                 "messages": [{"role": "assistant", "content": "ok"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-        def start(self):
-            self._target()
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
@@ -18212,11 +18110,6 @@ def test_notification_poller_skips_consumed(monkeypatch):
             turns.append(prompt)
             return {"final_response": "ok", "messages": []}
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-        def start(self):
-            self._target()
 
     sess = _session(agent=_Agent())
     server._sessions["sid_skip"] = sess
@@ -20702,12 +20595,6 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
                 "messages": [{"role": "assistant", "content": "reply"}],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     server._sessions["sid"] = _session(agent=_Agent())
     try:
@@ -21050,12 +20937,6 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     class _StubDb:
         def __init__(self):
@@ -21170,12 +21051,6 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
                 ],
             }
 
-    class _ImmediateThread:
-        def __init__(self, target=None, daemon=None, **_thread_options):
-            self._target = target
-
-        def start(self):
-            self._target()
 
     class _StubDb:
         def get_messages_as_conversation(self, *_args, **_kwargs):
@@ -22270,8 +22145,6 @@ def test_workspace_move_rehomes_running_session(monkeypatch, tmp_path):
 def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, tmp_path):
     """#111105: the raw-config cache must not serve (and later write back) a stale document after a
     same-size replacement that keeps the old mtime."""
-    import shutil
-
     cfg = tmp_path / "config.yaml"
     cfg.write_text("model:\n  default: bbbb-route\n", encoding="utf-8")
     monkeypatch.setattr(server, "_active_config_path", lambda: cfg)
@@ -22286,7 +22159,7 @@ def test_load_cfg_raw_sees_replacement_with_pinned_mtime_and_size(monkeypatch, t
     # cached read leaves every stat field equal. Wait until the fs clock has passed that ctime.
     while other.stat().st_ctime_ns <= st.st_ctime_ns:
         os.utime(other)
-    shutil.copy2(other, cfg)
+    os.replace(other, cfg)
     os.utime(cfg, ns=(st.st_atime_ns, st.st_mtime_ns))
     assert server._load_cfg_raw()["model"]["default"] == "aaaa-route"
 

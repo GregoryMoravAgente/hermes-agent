@@ -293,10 +293,10 @@ class ManagedWorker:
             return
         try:
             proc = psutil.Process(self.worker[0])
-            from hermes_cli.process_identity import process_birth
-            if process_birth(proc) == self.worker[1]:
-                (proc.kill if kill else proc.terminate)()
-        except psutil.Error:
+            from gateway.session_worker import _canonical_worker_birth
+            _canonical_worker_birth(self.worker[0], self.worker[1])
+            (proc.kill if kill else proc.terminate)()
+        except (RuntimeError, RuntimeStoreError, psutil.Error):
             pass
 
     def _signal_group(self, kill):

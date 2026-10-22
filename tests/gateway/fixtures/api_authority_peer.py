@@ -32,22 +32,32 @@ async def probe(peer):
     from gateway.platforms.api_server import APIServerAdapter
     from gateway.run import GatewayRunner
     from gateway.run_api import start_gateway_api, stop_gateway_api
-    from gateway.session_authority import initialize_session_authority
+    from gateway.run_runtime import initialize_gateway_runtime, publish_gateway_runtime_ready
+    from gateway.runtime_ownership import process_ownership
     from gateway.session_contract import SessionRef
-    from hermes_cli import web_server
     from hermes_state_runtime import list_session_admissions
 
-    runner = GatewayRunner()
-    await initialize_session_authority(runner, profile_id='default', instance_id='api-peer')
-    adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'api-probe-owned-secret', 'port': 0}))
-    adapter.gateway_runner = runner
-    adapter.set_message_handler(runner._handle_message)
-    runner.adapters[Platform.API_SERVER] = adapter
-    assert await adapter.connect()
-    api_port = adapter._site._server.sockets[0].getsockname()[1]
-    handle = await start_gateway_api(runner)
+    home = Path(os.environ['HERMES_HOME']).resolve()
+    reserved = False
+    runner = None
+    adapter = None
+    handle = None
     frames = []
     try:
+        process_ownership.reserve([home])
+        reserved = True
+        runner = GatewayRunner()
+        adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={'key': 'api-probe-owned-secret', 'port': 0}))
+        adapter.gateway_runner = runner
+        runner.adapters[Platform.API_SERVER] = adapter
+        await initialize_gateway_runtime(runner)
+        runner._wire_adapter_handlers(adapter)
+        assert await adapter.connect()
+        api_port = adapter._site._server.sockets[0].getsockname()[1]
+        handle = await start_gateway_api(runner)
+        runner.session_api = handle
+        runner._running = True
+        publish_gateway_runtime_ready(runner)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=35)) as client:
             url = f'http://127.0.0.1:{api_port}/v1/chat/completions'
             headers = {'Authorization': 'Bearer api-probe-owned-secret', 'X-Hermes-Session-Id': 'api-shared'}
@@ -63,7 +73,12 @@ async def probe(peer):
             agent = authority.agent(ref)
             assert agent is not None
             port = handle.socket.getsockname()[1]
-            async with websockets.connect(f'ws://127.0.0.1:{port}/api/ws?token={web_server._SESSION_TOKEN}') as ws:
+            ticket = runner.session_ticket_store.mint(
+                profile_id=authority.profile_id, subject='fixture-user', purpose='interactive')
+            async with websockets.connect(
+                f'ws://127.0.0.1:{port}/api/ws',
+                subprotocols=['hermes-gateway-v1', 'hermes-gateway-ticket.' + ticket],
+            ) as ws:
                 async def until(predicate):
                     async with asyncio.timeout(30):
                         while True:
@@ -145,8 +160,16 @@ async def probe(peer):
                     assert authority.agent(ref) is agent
                 Path(os.environ['HERMES_HOME'], 'receipt.json').write_text(json.dumps({'same_agent': True, 'rows': rows, 'http': data, 'frames': frames}))
     finally:
-        await stop_gateway_api(handle)
-        await adapter.disconnect()
+        try:
+            if handle is not None:
+                await stop_gateway_api(handle)
+        finally:
+            try:
+                if adapter is not None:
+                    await adapter.disconnect()
+            finally:
+                if reserved:
+                    process_ownership.close()
 
 
 if __name__ == '__main__':

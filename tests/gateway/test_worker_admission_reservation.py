@@ -159,6 +159,7 @@ def test_reservation_survives_a_clock_step_on_macos(tmp_path, stale_psutil_boot_
     shifted, while the worker reports its own unshifted one, so the exact match refused every
     managed worker. ``process_birth`` (the kernel start) is what both processes see."""
     from gateway.session_worker_reservation import reserve_admission_worker
+    from gateway.status import get_process_start_time
     from hermes_cli.process_identity import process_birth
     db = SessionDB(tmp_path / 'state.db')
     process = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.read()'], stdin=subprocess.PIPE,
@@ -176,7 +177,8 @@ def test_reservation_survives_a_clock_step_on_macos(tmp_path, stale_psutil_boot_
         with pytest.raises(Exception, match='permission_denied'):  # a forged birth still fails
             reserve_admission_worker(authority, hello=frame | {'birth': frame['birth'] + 1}, **kwargs)
         scope = reserve_admission_worker(authority, hello=frame, **kwargs)
-        assert scope['pid'] == process.pid and scope['birth'] == frame['birth']
+        assert process_birth(psutil.Process(process.pid)) == frame['birth']  # the raw witness survives the step
+        assert scope['pid'] == process.pid and scope['birth'] == get_process_start_time(process.pid)
     finally:
         process.stdin.close()
         process.wait(timeout=5)

@@ -33,6 +33,8 @@ async def test_legacy_history_adoption_is_native_owned_atomic_and_retryable(tmp_
     original = db.get_session('old-cli')
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     caps = frozenset({'session:create', 'session:read', 'session:submit', 'session:control'})
     remote = Principal('remote', str(tmp_path), caps, 'remote-socket')
     native = Principal('native', str(tmp_path), caps, 'native-socket')
@@ -111,6 +113,8 @@ async def test_legacy_adoption_refuses_live_owner_and_foreign_profile_without_wr
     db.create_session('foreign', source='cli', model='old', cwd=str(tmp_path), profile_name='other')
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     native = Principal('native', str(tmp_path), frozenset({'session:read', 'session:create'}), 'socket')
     authority._native_legacy_transports = {native.transport_id: native}
     lease, refusal = try_acquire_active_session(session_id='old-live', surface='cli', registry_home=Path(db.db_path).parent, config={})
@@ -163,6 +167,8 @@ async def test_upgraded_oneshot_and_tool_history_resumes_by_id_and_title_but_sta
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     native = AuthorityConnection(authority, object(), {'provider': 'local', 'user_id': 'native',
         'profile_id': str(tmp_path), 'instance_id': 'first'})
     by_id = await native.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 'old-oneshot'}})
@@ -203,6 +209,8 @@ async def test_upgraded_desktop_history_resumes_by_id(tmp_path, monkeypatch):
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     native = AuthorityConnection(authority, object(), {'provider': 'local', 'user_id': 'native',
         'profile_id': str(tmp_path), 'instance_id': 'first'})
     resumed = await native.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 'old-desktop'}})

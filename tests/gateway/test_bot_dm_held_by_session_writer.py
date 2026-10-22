@@ -21,7 +21,9 @@ async def held(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_controls import AuthorityConnection
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_cli import gateway_runtime
     from hermes_cli.active_sessions import release_active_session, try_acquire_active_session
     from hermes_cli.gateway_client import rpc_error
@@ -40,6 +42,11 @@ async def held(tmp_path, monkeypatch):
                              _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='fixture')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id,
+        authority_epoch=authority.epoch,
+        fence=RetirementFence(),
+    )
     connection = AuthorityConnection(authority, object(), {
         'user_id': 'uid:1000', 'provider': 'local', 'profile_id': 'default', 'instance_id': 'fixture',
         'capabilities': ['session:read', 'session:submit', 'session:create']})
@@ -139,8 +146,8 @@ async def test_a_refusal_after_the_owner_may_have_admitted_stays_ambiguous(held,
     held.release()
     real = type(held.authority).admit_automation
 
-    async def committed_then_refused(self, *args):
-        await real(self, *args)
+    async def committed_then_refused(self, *args, **kwargs):
+        await real(self, *args, **kwargs)
         raise RuntimeStoreError('runtime_coordination_required')
 
     monkeypatch.setattr(type(held.authority), 'admit_automation', committed_then_refused)

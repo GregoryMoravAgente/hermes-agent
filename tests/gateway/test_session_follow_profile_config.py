@@ -32,6 +32,8 @@ def _owner(home):
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
                                  epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
     runner.session_authority = authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     return store, runner, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 
 

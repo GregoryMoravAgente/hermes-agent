@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -38,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
+from cron.export_writers import writer_custody_for as _writer_custody_for
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -959,12 +961,9 @@ def _record_forced_release(job_id: str, name: str, age_seconds: float, allowance
         _forced_releases.append(entry)
         del _forced_releases[:-_FORCED_RELEASE_HISTORY]
     try:
-        path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
-        _ensure_cron_dir(path.parent)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
+        _append_forced_release_record(entry)
     except Exception as e:  # never let telemetry break a tick
-        logger.debug("Could not append forced-release record: %s", e)
+        logger.debug("Could not append forced-release record: %s", e, exc_info=True)
 
 
 def _latest_executions_for_releasable_claims() -> dict:
@@ -1266,13 +1265,9 @@ def _write_usage_audit(record: dict) -> None:
     """Append one JSONL line to cron/usage_audit.jsonl. NEVER raises — a logger bug must not
     break cron jobs (the whole write is inside one try)."""
     try:
-        path = _usage_audit_path()
-        _ensure_cron_dir(path.parent)
-        line = json.dumps(record, ensure_ascii=False)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        _append_usage_audit_record(record)
     except Exception as e:
-        logger.warning("usage_audit write failed: %s", e)
+        logger.warning("usage_audit write failed: %s", e, exc_info=True)
 
 
 def _interpreter_shutting_down(exc: Optional[BaseException] = None) -> bool:
@@ -1305,6 +1300,27 @@ def _get_hermes_home() -> Path:
     profile's home (its .env, config.yaml, scripts, skills).
     """
     return _hermes_home or get_hermes_home()
+
+
+def _scheduler_owner_home() -> Path:
+    return Path(_get_hermes_home())
+
+
+@_writer_custody_for(_scheduler_owner_home)
+def _append_forced_release_record(entry: dict) -> None:
+    path = _get_hermes_home() / "cron" / "inflight_forced_releases.jsonl"
+    _ensure_cron_dir(path.parent)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry) + "\n")
+
+
+@_writer_custody_for(_scheduler_owner_home)
+def _append_usage_audit_record(record: dict) -> None:
+    path = _usage_audit_path()
+    _ensure_cron_dir(path.parent)
+    line = json.dumps(record, ensure_ascii=False)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 
 def _get_lock_paths() -> tuple[Path, Path]:
@@ -2825,10 +2841,25 @@ def run_one_job(
     # Every gateway path (built-in scheduler, external providers, and direct
     # API fires) crosses this seam.  Ensure the detached worker has a durable
     # attempt to adopt before any launch can occur.
+    custody = job.get("_cron_custody")
     if not job.get("execution_id"):
-        execution = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))
+        from cron.runtime_custody import custody_required, reserve_execution
+        custody = reserve_execution(
+            owner_class="I12_cron_fire", job_id=job["id"], source="direct",
+            scheduled_instant=job.get("_scheduled_instant"), required=custody_required())
+        try:
+            execution = _create_direct_execution(job, custody)
+        except BaseException:
+            if custody is not None:
+                custody.mark_unknown("read_failed")
+            raise
+        if custody is not None:
+            custody.bind_execution_record(execution)
+            job["_cron_custody"] = custody
         job["execution_id"] = execution["id"]
+    elif custody is not None and getattr(custody, "execution_id", None) not in (None, str(job["execution_id"] )):
+        custody.mark_unknown("foreign_custody")
+        raise RuntimeError("cron custody execution identity mismatch")
 
     execution_id = str(job["execution_id"])
     note_cron_execution(job)
@@ -2873,9 +2904,15 @@ def run_one_job(
                     **({"ladder_rung": True} if is_retry_run(job) else {}),
                 )
             finally:
-                finish_execution(
-                    execution_id, success=False, error=error,
-                    delivery_outcome=delivery_outcome)
+                try:
+                    finish_execution(
+                        execution_id, success=False, error=error,
+                        delivery_outcome=delivery_outcome)
+                finally:
+                    if custody is not None:
+                        # The child reservation was released only for a still-pending row; after
+                        # this durable failure write, let the exact parent observe and settle.
+                        custody.observe_terminal()
             return True
         if handed_off:
             from cron.scheduler_worker_failure import record_unknown_worker_outcome
@@ -2908,7 +2945,8 @@ def run_one_job(
                     extra_prompt=extra_prompt,
                     claim_lost=lost_ownership,
                     transport_cancel=cancel_event,
-                    execution_token=execution_token))
+                    execution_token=execution_token,
+                    custody=custody))
     finally:
         with _running_lock:
             executions = _running_fire_owners.get(_fire_key)
@@ -3282,21 +3320,33 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _create_direct_execution(job: dict, custody=None) -> dict:
+    """Keep unmanaged direct callers on the historical ledger call shape."""
+    kwargs = {"source": "direct", "scheduled_instant": job.get("_scheduled_instant")}
+    if custody is not None:
+        kwargs["execution_id"] = custody.owner_id
+    return create_execution(job["id"], **kwargs)
+
+
+def _execution_id_for_job(job: dict, custody=None) -> str:
+    """Return an existing execution identity or create one through the direct path."""
+    execution_id = job.get("execution_id")
+    return execution_id or _create_direct_execution(job, custody)["id"]
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
     execution_token: Optional[object] = None,
+    custody=None,
 ) -> bool:
     fence = _FireOwnership(job, claim_lost, transport_cancel)
     fire_owner = fence.owner
     _side_effect_fence = fence.side_effect_fence
     _fire_claim_ownership_lost = fence.lost
 
-    execution_id = job.get("execution_id")
-    if not execution_id:
-        execution_id = create_execution(
-            job["id"], source="direct", scheduled_instant=job.get("_scheduled_instant"))["id"]
+    execution_id = _execution_id_for_job(job, custody)
     job = dict(job, execution_id=execution_id)
     delivery_attempted = False
     delivery_error = None
@@ -3361,7 +3411,9 @@ def _run_one_job_body(
         if fence.cancel_event is not None:
             _run_kwargs["cancel_event"] = fence.cancel_event
         try:
-            success, output, final_response, error = run_job(job, **_run_kwargs)
+            from cron.runtime_custody import bind_cron_owner
+            with bind_cron_owner(custody):
+                success, output, final_response, error = run_job(job, **_run_kwargs)
         except BaseException:
             # run_job hands back the agent even when raising; tear down so a failed run never leaks.
             # BaseException so KeyboardInterrupt/SystemExit mid-run still trigger teardown.
@@ -3498,6 +3550,37 @@ def _run_one_job_body(
             from tools.terminal_scope import reset_terminal_scope
 
             reset_terminal_scope(_terminal_scope_token)
+        if custody is not None:
+            custody.observe_terminal()
+
+
+def _start_external_worker_reaper(process: subprocess.Popen, custody=None):
+    """Register a real reaper before terminal reconciliation can observe a fast child."""
+    from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+
+    if custody is not None:
+        custody.expect_reaper()
+    callback_ready = threading.Event() if custody is not None else None
+
+    def _on_reaped() -> None:
+        # The detached notifier may observe a fast exit before bind_reaper returns.  Gate only
+        # the callback, never the scheduler caller: custody is bound first and then the exact
+        # reaper/Job handles remain available to the asynchronous terminal observation.
+        if callback_ready is not None:
+            callback_ready.wait()
+        if custody is not None:
+            custody.observe_terminal()
+
+    try:
+        reaper = reap_terminal_worker_in_background(
+            process, on_done=(_on_reaped if custody is not None else None),
+        )
+        if custody is not None:
+            custody.bind_reaper(reaper)
+    finally:
+        if callback_ready is not None:
+            callback_ready.set()
+    return reaper
 
 
 def _wait_for_external_cron_worker_body(
@@ -3505,6 +3588,8 @@ def _wait_for_external_cron_worker_body(
     *,
     execution_id: str,
     stderr_path: Optional[Path] = None,
+    custody=None,
+    dispatch_mode: Optional[str] = None,
 ) -> bool:
     """Preserve ``run_one_job``'s synchronous contract after handoff.
 
@@ -3533,15 +3618,30 @@ def _wait_for_external_cron_worker_body(
             # cleanup; only a still-live terminal worker needs background reaping.
             returncode = process.poll()
             if returncode is None:
-                from cron.scheduler_detached_worker import reap_terminal_worker_in_background
-
-                reap_terminal_worker_in_background(process)
+                # A terminal row can precede the real child exit even for an unmanaged caller.
+                # Start the existing asynchronous reaper on every early-return path; never join
+                # here, because this waiter must remain bounded and nonblocking.
+                _start_external_worker_reaper(process, custody)
+                if custody is not None:
+                    reconciliation = custody.reconcile_unacknowledged(
+                        process, dispatch_mode=dispatch_mode)
+                    if reconciliation == "unknown":
+                        raise _ExternalWorkerPostHandoffError(
+                            "terminal execution has unverified external ownership")
                 return True
         # The worker can commit its terminal row and exit between the first
         # read and wait(). Re-read the exact attempt before declaring that
         # it died without terminalizing.
         current = get_execution(execution_id)
         if current and current.get("status") in ("completed", "failed"):
+            if custody is not None:
+                _start_external_worker_reaper(process, custody)
+                reconciliation = custody.reconcile_unacknowledged(
+                    process, dispatch_mode=dispatch_mode)
+                if reconciliation == "unknown":
+                    raise _ExternalWorkerPostHandoffError(
+                        "terminal execution has unverified external ownership")
+                custody.observe_terminal()
             return True
         # If the adopted worker died without terminalizing, its owner is
         # now provably gone. Recover to ``unknown`` rather than routing the
@@ -3564,6 +3664,14 @@ def _wait_for_external_cron_worker_body(
             # surface this waiter's exit code and stderr instead of discarding them.
             current = get_execution(execution_id)
             if current and current.get("status") in ("completed", "failed"):
+                if custody is not None:
+                    _start_external_worker_reaper(process, custody)
+                    reconciliation = custody.reconcile_unacknowledged(
+                        process, dispatch_mode=dispatch_mode)
+                    if reconciliation == "unknown":
+                        raise _ExternalWorkerPostHandoffError(
+                            "terminal execution has unverified external ownership")
+                    custody.observe_terminal()
                 return True
         stderr_tail = ""
         if stderr_path is not None:
@@ -3584,10 +3692,13 @@ def _wait_for_external_cron_worker(
     job_id: Optional[str] = None,
     handoff_files: tuple[Path, ...] = (),
     stderr_path: Optional[Path] = None,
+    custody=None,
+    dispatch_mode: Optional[str] = None,
 ) -> bool:
     try:
         return _wait_for_external_cron_worker_body(
-            process, execution_id=execution_id, stderr_path=stderr_path
+            process, execution_id=execution_id, stderr_path=stderr_path, custody=custody,
+            dispatch_mode=dispatch_mode,
         )
     except Exception as wait_error:
         raise _ExternalWorkerPostHandoffError(str(wait_error)) from wait_error
@@ -3604,6 +3715,155 @@ def _wait_for_external_cron_worker(
                 stale.unlink(missing_ok=True)
             except OSError:
                 pass
+        if custody is not None:
+            custody.observe_terminal()
+
+
+def _await_external_worker_handoff(
+    process: subprocess.Popen, *, execution_id: str, job_id: str,
+    payload_path: Path, ack_path: Path, stderr_path: Path, worker_custody,
+    dispatch, worker_env: dict[str, str], scope_unit: Optional[str] = None,
+) -> bool:
+    """Authenticate one external worker or preserve the exact uncertain-owner lane."""
+    # Same window the dead-owner recovery ledger grants a pending handoff: a cold
+    # worker start (imports + secret hydration) measures ~10-12s in the field, and
+    # a dispatch deadline shorter than the adoption grace made the two guards
+    # around one handoff disagree.
+    deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        if ack_path.exists():
+            try:
+                acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
+            except Exception:
+                logger.exception(
+                    "Cron external worker %s published an unreadable acknowledgement; "
+                    "treating handoff as ownership-uncertain",
+                    execution_id,
+                )
+                return _wait_for_external_cron_worker(
+                    process,
+                    execution_id=execution_id,
+                    job_id=job_id,
+                    handoff_files=(payload_path, stderr_path),
+                    stderr_path=stderr_path,
+                    custody=worker_custody,
+                    dispatch_mode=dispatch.mode,
+                )
+            finally:
+                ack_path.unlink(missing_ok=True)
+            if (
+                not isinstance(acknowledgement, dict)
+                or acknowledgement.get("execution_id") != execution_id
+            ):
+                logger.error(
+                    "Cron external worker acknowledgement mismatch for %s; "
+                    "treating handoff as ownership-uncertain",
+                    execution_id,
+                )
+                return _wait_for_external_cron_worker(
+                    process,
+                    execution_id=execution_id,
+                    job_id=job_id,
+                    handoff_files=(payload_path, stderr_path),
+                    stderr_path=stderr_path,
+                    custody=worker_custody,
+                    dispatch_mode=dispatch.mode,
+                )
+            if worker_custody is not None:
+                try:
+                    worker_custody.activate_external_worker(
+                        acknowledgement, process, dispatch_mode=dispatch.mode, scope_unit=scope_unit)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+                    # The worker may have adopted the row even when its acknowledgement is
+                    # malformed or foreign; the exact custody stays unknown and no fallback runs.
+                    return _wait_for_external_cron_worker(
+                        process,
+                        execution_id=execution_id,
+                        job_id=job_id,
+                        handoff_files=(payload_path, stderr_path),
+                        stderr_path=stderr_path,
+                        custody=worker_custody,
+                        dispatch_mode=dispatch.mode,
+                    )
+            logger.info(
+                "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
+                job_id,
+                acknowledgement.get("pid"),
+                execution_id,
+                dispatch.mode,
+            )
+            _record_external_cron_worker(
+                job_id,
+                acknowledgement.get("pid") or process.pid,
+                scope_isolated=dispatch.mode == "scoped",
+            )
+            return _wait_for_external_cron_worker(
+                process,
+                execution_id=execution_id,
+                job_id=job_id,
+                handoff_files=(payload_path, stderr_path),
+                stderr_path=stderr_path,
+                custody=worker_custody,
+                dispatch_mode=dispatch.mode,
+            )
+        returncode = process.poll()
+        if returncode is not None:
+            with _running_lock:
+                _restart_safe_waiter_job_ids.discard(_inflight_key(job_id))
+            payload_path.unlink(missing_ok=True)
+            reconciliation = "not_applicable"
+            if worker_custody is not None:
+                reconciliation = worker_custody.reconcile_unacknowledged(
+                    process, dispatch_mode=dispatch.mode)
+            if reconciliation == "terminalized":
+                return _wait_for_external_cron_worker(
+                    process, execution_id=execution_id, job_id=job_id,
+                    handoff_files=(payload_path, stderr_path), stderr_path=stderr_path,
+                    custody=worker_custody, dispatch_mode=dispatch.mode)
+            if reconciliation == "unknown":
+                # The row may have been adopted or side effects may have started even though the
+                # ready file never authenticated.  Keep the execution in the post-handoff unknown
+                # lane; the pre-handoff failure path is only valid for a still-claimed pending row.
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker exited before authenticated ownership acknowledgement")
+            from cron.scheduler_diagnostics import external_worker_stderr_tail
+            stderr_tail = external_worker_stderr_tail(stderr_path)
+            stderr_path.unlink(missing_ok=True)
+            from tools.process_registry import scoped_spawn_lost_user_bus
+            if dispatch.mode == "scoped" and scoped_spawn_lost_user_bus(worker_env):
+                # systemd-run itself failed before any worker ran, so the captured stderr
+                # holds nothing useful: name the cause, not the exit code.
+                raise RuntimeError(
+                    "restart-safe systemd scope could not be created: the user D-Bus session at "
+                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "  # windows-footgun: ok — scoped dispatch exists only on Linux
+                    "system-level service install, run `sudo loginctl enable-linger <gateway-user>`; "
+                    "the next fire dispatches without scope isolation."
+                )
+            raise RuntimeError(
+                f"cron external worker exited before ownership acknowledgement "
+                f"(exit {returncode}){stderr_tail}"
+            )
+        time.sleep(0.05)
+
+    # The child may have adopted the durable row just before publishing its
+    # acknowledgement.  Never fall back to in-process execution on an uncertain
+    # handoff: that could duplicate side effects.  The execution owner/dead-owner
+    # recovery ledger remains the authority.
+    logger.warning(
+        "Cron external worker for job '%s' did not acknowledge within %.0fs; "
+        "leaving the durable execution claim untouched",
+        job_id,
+        HANDOFF_ADOPTION_GRACE_SECONDS,
+    )
+    return _wait_for_external_cron_worker(
+        process,
+        execution_id=execution_id,
+        job_id=job_id,
+        handoff_files=(payload_path, ack_path, stderr_path),
+        stderr_path=stderr_path,
+        custody=worker_custody,
+        dispatch_mode=dispatch.mode,
+    )
 
 
 def _launch_external_cron_worker(job: dict) -> bool:
@@ -3656,17 +3916,41 @@ def _launch_external_cron_worker(job: dict) -> bool:
         require_restart_safe_scope = bool(
             (load_config_readonly().get("cron") or {}).get("require_restart_safe_scope", False)
         )
-    except Exception:
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
         require_restart_safe_scope = False
+    unit_suffix = f"cron-{job_id}-exec-{execution_id}"
     dispatch = restart_safe_gateway_child_argv(
-        command,
-        unit_suffix=f"cron-{job_id}-exec-{execution_id}",
+        command, unit_suffix=unit_suffix,
         require_restart_safe_scope=require_restart_safe_scope,
     )
+    scope_unit = f"hermes-worker-{unit_suffix}.scope" if dispatch.mode == "scoped" else None
+    custody = job.get("_cron_custody")
     if dispatch.mode == "in_process":
-        return False
+        # The shared dispatch helper intentionally leaves non-Linux hosts in-process because
+        # only Linux has systemd scopes.  A managed Windows gateway still needs an external
+        # worker: its native Job Object is the restart/descendant authority for I13.  Preserve
+        # the legacy in-process path when no managed custody runtime is installed.
+        from cron.runtime_custody import managed_runtime_available
+        if sys.platform != "win32" or (
+            custody is None and not managed_runtime_available()
+        ):
+            return False
+        from tools.process_registry import GatewayChildDispatch
+        dispatch = GatewayChildDispatch("degraded", dispatch.argv)
+
+    worker_custody = None
+    if custody is not None:
+        worker_custody = custody.reserve_external_worker()
+        worker_custody.bind_expected_scope(scope_unit)
+    else:
+        from cron.runtime_custody import custody_required, managed_runtime_available
+        if custody_required() or managed_runtime_available():
+            raise RuntimeError("cron external worker custody unavailable")
 
     if mark_execution_handoff_pending(execution_id) is None:
+        if worker_custody is not None:
+            worker_custody.cancel_unactivated_child()
+            custody.mark_unknown("foreign_custody")
         raise RuntimeError(
             "cron execution claim changed before external worker handoff"
         )
@@ -3681,9 +3965,13 @@ def _launch_external_cron_worker(job: dict) -> bool:
         with os.fdopen(fd, "w", encoding="utf-8") as payload_file:
             json.dump(
                 {
-                    "job": job,
+                    # Custody handles are process-local.  The child receives only the existing
+                    # durable execution snapshot and must adopt it through the ledger.
+                    "job": {k: v for k, v in job.items() if not k.startswith("_cron_custody")},
                     "profile_home": str(_get_hermes_home().resolve()),
                     "multiplex_active": multiplex_active,
+                    "dispatch_mode": dispatch.mode,
+                    "scope_unit": scope_unit,
                 },
                 payload_file,
             )
@@ -3691,6 +3979,8 @@ def _launch_external_cron_worker(job: dict) -> bool:
             os.fsync(payload_file.fileno())
     except BaseException:
         payload_path.unlink(missing_ok=True)
+        if worker_custody is not None:
+            worker_custody.cancel_unactivated_child()
         raise
 
     profile_home = _get_hermes_home().resolve()
@@ -3726,126 +4016,54 @@ def _launch_external_cron_worker(job: dict) -> bool:
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
-            process = subprocess.Popen(
-                dispatch.argv,
-                cwd=str(repo_root),
-                env=worker_env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=stderr_fd,
-                start_new_session=True,
-                creationflags=windows_hide_flags(),
-            )
+            if sys.platform == "win32":
+                from hermes_cli.local_runtime.processes import spawn_server
+                from tui_gateway.windows_owner_recovery import new_windows_job_name
+
+                process, native_job = spawn_server(
+                    dispatch.argv,
+                    cwd=str(repo_root),
+                    env=worker_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_fd,
+                    start_new_session=True,
+                    creationflags=windows_hide_flags(),
+                    owner_job_name=new_windows_job_name(),
+                )
+            else:
+                native_job = None
+                process = subprocess.Popen(
+                    dispatch.argv,
+                    cwd=str(repo_root),
+                    env=worker_env,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=stderr_fd,
+                    start_new_session=True,
+                    creationflags=windows_hide_flags(),
+                )
         finally:
             os.close(stderr_fd)
     except BaseException:
         payload_path.unlink(missing_ok=True)
         stderr_path.unlink(missing_ok=True)
+        if worker_custody is not None:
+            worker_custody.cancel_unactivated_child()
         raise
+
+    if worker_custody is not None:
+        worker_custody.bind_process(process, native_job=native_job)
 
     with _running_lock:
         _restart_safe_waiter_job_ids.add(_inflight_key(job_id))
 
-    # Same window the dead-owner recovery ledger grants a pending handoff: a cold
-    # worker start (imports + secret hydration) measures ~10-12s in the field, and
-    # a dispatch deadline shorter than the adoption grace made the two guards
-    # around one handoff disagree.
-    deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
-    while time.monotonic() < deadline:
-        if ack_path.exists():
-            try:
-                acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
-            except Exception:
-                logger.exception(
-                    "Cron external worker %s published an unreadable acknowledgement; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                )
-            finally:
-                ack_path.unlink(missing_ok=True)
-            if (
-                not isinstance(acknowledgement, dict)
-                or acknowledgement.get("execution_id") != execution_id
-            ):
-                logger.error(
-                    "Cron external worker acknowledgement mismatch for %s; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                )
-            logger.info(
-                "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
-                job_id,
-                acknowledgement.get("pid"),
-                execution_id,
-                dispatch.mode,
-            )
-            _record_external_cron_worker(
-                job_id,
-                acknowledgement.get("pid") or process.pid,
-                scope_isolated=dispatch.mode == "scoped",
-            )
-            return _wait_for_external_cron_worker(
-                process,
-                execution_id=execution_id,
-                job_id=job_id,
-                handoff_files=(payload_path, stderr_path),
-                stderr_path=stderr_path,
-            )
-        returncode = process.poll()
-        if returncode is not None:
-            with _running_lock:
-                _restart_safe_waiter_job_ids.discard(_inflight_key(job_id))
-            payload_path.unlink(missing_ok=True)
-            from cron.scheduler_diagnostics import external_worker_stderr_tail
-            stderr_tail = external_worker_stderr_tail(stderr_path)
-            stderr_path.unlink(missing_ok=True)
-            if dispatch.mode == "scoped" and scoped_spawn_lost_user_bus(worker_env):
-                # systemd-run itself failed before any worker ran, so the captured stderr
-                # holds nothing useful: name the cause, not the exit code.
-                raise RuntimeError(
-                    "restart-safe systemd scope could not be created: the user D-Bus session at "
-                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "  # windows-footgun: ok — scoped dispatch exists only on Linux
-                    "system-level service install, run `sudo loginctl enable-linger <gateway-user>`; "
-                    "the next fire dispatches without scope isolation."
-                )
-            raise RuntimeError(
-                f"cron external worker exited before ownership acknowledgement "
-                f"(exit {returncode}){stderr_tail}"
-            )
-        time.sleep(0.05)
-
-    # The child may have adopted the durable row just before publishing its
-    # acknowledgement.  Never fall back to in-process execution on an uncertain
-    # handoff: that could duplicate side effects.  The execution owner/dead-owner
-    # recovery ledger remains the authority.
-    logger.warning(
-        "Cron external worker for job '%s' did not acknowledge within %.0fs; "
-        "leaving the durable execution claim untouched",
-        job_id,
-        HANDOFF_ADOPTION_GRACE_SECONDS,
+    return _await_external_worker_handoff(
+        process, execution_id=execution_id, job_id=job_id,
+        payload_path=payload_path, ack_path=ack_path, stderr_path=stderr_path,
+        worker_custody=worker_custody, dispatch=dispatch, worker_env=worker_env,
+        scope_unit=scope_unit,
     )
-    return _wait_for_external_cron_worker(
-        process,
-        execution_id=execution_id,
-        job_id=job_id,
-        handoff_files=(payload_path, ack_path, stderr_path),
-        stderr_path=stderr_path,
-    )
-
 
 def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
     """Adopt and execute one gateway-dispatched cron payload.
@@ -3906,7 +4124,8 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
         GatewayStartupMixin._register_config_hooks(
             "Cron external worker: config hook registration failed", level=logging.WARNING)
         with use_cron_store(profile_home):
-            if adopt_claimed_execution(execution_id) is None:
+            adopted = adopt_claimed_execution(execution_id)
+            if adopted is None:
                 logger.error(
                     "Cron external worker refused execution %s: durable ownership "
                     "could not be established",
@@ -3915,6 +4134,20 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 return False
             try:
                 ack_path.parent.mkdir(parents=True, exist_ok=True)
+                scope_control_group = None
+                if payload.get("dispatch_mode") == "scoped" and sys.platform == "linux":
+                    try:
+                        groups = Path(f"/proc/{os.getpid()}/cgroup").read_text(
+                            encoding="utf-8-sig")
+                        candidates = [
+                            line.partition("::")[2].strip()
+                            for line in groups.splitlines()
+                            if line.startswith("0::")
+                        ]
+                        if len(candidates) == 1 and candidates[0].startswith("/"):
+                            scope_control_group = candidates[0]
+                    except (OSError, UnicodeError, ValueError):
+                        scope_control_group = None
                 # Publish via write-to-temp + atomic rename. Writing ack_path in place
                 # (the old approach) let O_CREAT make the empty file visible to the
                 # scheduler's exists()-then-read polling loop before the JSON body was
@@ -3925,7 +4158,17 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
                 fd = os.open(ack_tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as ack_file:
-                        json.dump({"pid": os.getpid(), "execution_id": execution_id}, ack_file)
+                        json.dump(
+                            {
+                                "pid": os.getpid(),
+                                "process_started_at": adopted.get("process_started_at"),
+                                "execution_id": execution_id,
+                                "dispatch_mode": payload.get("dispatch_mode"),
+                                "scope_unit": payload.get("scope_unit"),
+                                "scope_control_group": scope_control_group,
+                            },
+                            ack_file,
+                        )
                         ack_file.flush()
                         os.fsync(ack_file.fileno())
                     os.replace(ack_tmp_path, ack_path)
@@ -4313,10 +4556,24 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     _claim_home = _get_hermes_home()
     # Record the attempt before dispatch; recovery marks abandoned rows unknown (no retry).
     execution = None
+    custody = None
     try:
-        execution = create_execution(
-            job_id, source="builtin", scheduled_instant=job.get("_scheduled_instant"))
+        from cron.runtime_custody import reserve_execution
+        custody = reserve_execution(
+            owner_class="I12_cron_fire", job_id=job_id, source="builtin",
+            scheduled_instant=job.get("_scheduled_instant"), required=False)
+        execution_kwargs = {
+            "source": "builtin",
+            "scheduled_instant": job.get("_scheduled_instant"),
+        }
+        if custody is not None:
+            execution_kwargs["execution_id"] = custody.owner_id
+        execution = create_execution(job_id, **execution_kwargs)
+        if custody is not None:
+            custody.bind_execution_record(execution)
         dispatched_job = dict(job, execution_id=execution["id"])
+        if custody is not None:
+            dispatched_job["_cron_custody"] = custody
         note_cron_execution(dispatched_job)
         _ctx = contextvars.copy_context()
     except Exception as execution_err:
@@ -4326,6 +4583,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         if execution is not None:  # the receipt was persisted; a later step failed
             settle_unstarted_execution(execution["id"], job_id, (
                 f"Dispatch preparation failed: {type(execution_err).__name__}: {execution_err}"))
+        elif custody is not None:
+            custody.mark_unknown("read_failed")
         logger.exception("Job '%s' not dispatched: %s failed: %s", job_label,
                          "execution creation" if execution is None else "dispatch preparation",
                          execution_err)
@@ -4344,6 +4603,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _clear_run_claim_best_effort()
         finish_execution(
             execution["id"], success=False, error=f"Executor dispatch failed: {submit_err}")
+        if custody is not None:
+            custody.observe_terminal()
         if isinstance(submit_err, RuntimeError) and _interpreter_shutting_down(submit_err):
             _not_dispatched_shutdown()
         else:
@@ -4354,6 +4615,8 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         _submit_key = _inflight_key(job_id, _claim_home)
         if _running_registration_owners.get(_submit_key) is registration_owner:
             _running_futures[_submit_key] = fut
+    if custody is not None:
+        custody.bind_future(fut)
     return fut
 
 

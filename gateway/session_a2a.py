@@ -97,6 +97,11 @@ async def forward(connection, params):
     from hermes_state_local import commit_local_session, local_receipt
     from hermes_state_mutation_retirement import first_generation
     from hermes_state_terminal import identity_key
+    # The authority contract distinguishes a bare legacy adapter from an initialized
+    # authority-backed runtime. Resolve it before the first durable generation read: an
+    # authority-backed runtime without its coordinator must refuse, never fall through as legacy.
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
     # A context whose session the user deleted continues on its next generation (the deleted id
     # stays retired). An exact retry of an input the deleted session took stays on it and is
     # refused there, never run again.
@@ -107,39 +112,94 @@ async def forward(connection, params):
     generation, sid = first_generation(
         authority.db, lambda n: local_identity(authority.profile_id, actor.subject, request_id(n)), pinned=pinned)
     key = request_id(generation)
+    # The conversation key is stable across turns, while the delivery identity must distinguish
+    # each input so a new turn cannot reuse the previous turn's retained automation root. An
+    # exact request retry receives the same digest and therefore still converges to its original
+    # root and admission.
+    delivery_id = 'a2a:' + hashlib.sha256(json.dumps(
+        [key, params['input_id']], separators=(',', ':')).encode()).hexdigest()
     authority._require_admission_open()
-    if authority.db.get_session(sid) is not None:
-        receipt = local_receipt(authority.db, sid)
-        if json.loads(receipt['policy']['request_json']).get('a2a_identity') != identity:
+    root = getattr(authority, '_preservation_automation_root', None)
+    if coordinator is not None and not callable(root):
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    handle = None
+    descriptor = None
+    try:
+        # A durable retry is a read-only lookup and may precede session creation.  A new root is
+        # reserved with the already-derived target sid before the local policy/session write.
+        from hermes_state_runtime import find_session_admission
+        existing = await asyncio.to_thread(find_session_admission, authority.db,
+            principal_id=actor.subject, session_id=sid, request_id=params['input_id'])
+        if existing is not None:
+            descriptor = authority._preservation_i09_descriptor_for_row(
+                existing, source_identity='a2a.forward:' + key, delivery_id=delivery_id)
+            handle = authority._preservation_recover_automation(existing)
+            if handle is None and existing.get('status') != 'terminal':
+                raise RuntimeStoreError('preservation_owner_unmapped')
+        elif coordinator is not None:
+            handle = root(
+                request_id=params['input_id'], principal_id=actor.subject, session_id=sid,
+                source_identity='a2a.forward:' + key, delivery_id=delivery_id,
+                owner_class='I09_a2a_hosted_kanban',
+            )
+            if handle is None:
+                raise RuntimeStoreError('runtime_custody_unavailable')
+            authority._preservation_pending_root(
+                params['input_id'], handle, principal_id=actor.subject, session_id=sid,
+                source_identity='a2a.forward:' + key, delivery_id=delivery_id,
+            )
+        if authority.db.get_session(sid) is not None:
+            receipt = local_receipt(authority.db, sid)
+            if json.loads(receipt['policy']['request_json']).get('a2a_identity') != identity:
+                raise RuntimeStoreError('admission_conflict')
+            ref = restore_local_session(authority, sid)
+        else:
+            # Historical `a2a-{agent}-{slug}` titles discarded peer/tenant identity and collapsed
+            # context characters, and those `hermes chat --source a2a` rows stored no origin, so a
+            # titled row never proves it belongs to this exact conversation. Never adopt or retitle
+            # it (that would hand one peer another's history), and never refuse every peer whose
+            # slug collides: start this identity's own canonical session and leave the old row be.
+            from plugins.platforms.a2a.adapter import _safe_context_slug
+            title = f'a2a-{params["agent"]}-{_safe_context_slug(params["context_id"])}'
+            legacy = authority.db.get_session_by_title(title)
+            if legacy is not None:
+                logger.warning('A2A: pre-authority session %s titled %r has no peer identity; '
+                               'forwarding into a new session instead of adopting it', legacy['id'], title)
+            token = _forward_identity.set(identity)
+            try:
+                ref = stage_local_session(authority, actor, {'source': 'a2a', 'request_id': key})
+            finally:
+                _forward_identity.reset(token)
+            if isinstance(ref, dict):  # the creation commit runs off the owner loop (N90); a duplicate converges
+                await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
+                ref = restore_local_session(authority, ref['session_id'])
+        if ref.session_id != sid:
             raise RuntimeStoreError('admission_conflict')
-        ref = restore_local_session(authority, sid)
-    else:
-        # Historical `a2a-{agent}-{slug}` titles discarded peer/tenant identity and collapsed
-        # context characters, and those `hermes chat --source a2a` rows stored no origin, so a
-        # titled row never proves it belongs to this exact conversation. Never adopt or retitle
-        # it (that would hand one peer another's history), and never refuse every peer whose
-        # slug collides: start this identity's own canonical session and leave the old row be.
-        from plugins.platforms.a2a.adapter import _safe_context_slug
-        title = f'a2a-{params["agent"]}-{_safe_context_slug(params["context_id"])}'
-        legacy = authority.db.get_session_by_title(title)
-        if legacy is not None:
-            logger.warning('A2A: pre-authority session %s titled %r has no peer identity; '
-                           'forwarding into a new session instead of adopting it', legacy['id'], title)
-        token = _forward_identity.set(identity)
-        try:
-            ref = stage_local_session(authority, actor, {'source': 'a2a', 'request_id': key})
-        finally:
-            _forward_identity.reset(token)
-        if isinstance(ref, dict):  # the creation commit runs off the owner loop (N90); a duplicate converges
-            await tracked_write(authority, partial(commit_local_session, authority.db, epoch=authority.epoch, receipt=ref))
-            ref = restore_local_session(authority, ref['session_id'])
-    if ref.session_id not in connection.subscriptions:
-        await connection.resume(ref, {})
-    receipt = await authority.submit(actor, Submission(params['input_id'], ref, {'text': params['text']}, 'queue'))
-    from gateway.session_results import admission_result
-    saved = admission_result(authority.db, receipt.admission_id)
-    return dict(asdict(receipt), session_id=ref.session_id,
-                result=saved['result'] if saved is not None else None)
+        if existing is None and coordinator is not None and handle is None:
+            raise RuntimeStoreError('runtime_custody_unavailable')
+        if ref.session_id not in connection.subscriptions:
+            await connection.resume(ref, {})
+        payload = {'text': params['text']}
+        if handle is not None or descriptor is not None:
+            receipt = await authority._submit_i09_automation(
+                actor, ref, params['input_id'], payload, handle,
+                source_identity='a2a.forward:' + key, delivery_id=delivery_id,
+                descriptor=descriptor)
+        else:
+            receipt = await authority.submit(
+                actor, Submission(params['input_id'], ref, payload, 'queue'))
+        if handle is not None and receipt.status == 'terminal':
+            authority._preservation_finish_automation(
+                receipt.admission_id, finalizer_id=f'a2a:{receipt.admission_id}')
+        from gateway.session_results import admission_result
+        saved = admission_result(authority.db, receipt.admission_id)
+        return dict(asdict(receipt), session_id=ref.session_id,
+                    result=saved['result'] if saved is not None else None)
+    except BaseException:
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None and handle is not None:
+            coordinator.mark_unknown(handle, 'join_failed')
+        raise
 
 
 async def forward_to_owner(home, *, agent, tenant, peer, context_id, input_id, text, timeout):

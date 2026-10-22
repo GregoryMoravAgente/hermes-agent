@@ -28,10 +28,29 @@ TOOL_CALL_CONTRACT = (
     "containing id/type/function{name,arguments}. arguments must be a JSON string."
 )
 
+
+class MixedToolEnvelopeError(RuntimeError):
+    """Refuse a response that mixes XML and bare tool-call envelopes.
+
+    ACP tool calls are transported as response text, so accepting one encoding while leaving a
+    second valid encoding in the same response would turn an ambiguous model response into a
+    successful tool turn. The message is deliberately stable and payload-free for the normal
+    API-error classifier; callers must not project the response as text.
+    """
+
+    code = "mixed_tool_envelope"
+    status_code = 400
+
+    def __init__(self) -> None:
+        super().__init__("invalid tool call arguments: mixed XML and bare envelopes")
+        self.body = {"error": {"code": self.code, "message": str(self)}}
+
+
 __all__ = [
     "TOOL_CALL_BLOCK_RE",
     "TOOL_CALL_CONTRACT",
     "TOOL_CALL_JSON_RE",
+    "MixedToolEnvelopeError",
     "StreamChunks",
     "build_openai_tool_call",
     "completion_to_stream_chunks",
@@ -141,19 +160,34 @@ def _parse_tool_call(raw_json: str, ordinal: int) -> ChatCompletionMessageToolCa
 
 def extract_tool_calls_from_text(text: str) -> tuple[list[ChatCompletionMessageToolCall], str]:
     """Pull ``<tool_call>`` blocks out of an ACP response → ``(tool_calls, cleaned_text)`` with the consumed blocks
-    removed so the assistant message doesn't show raw JSON. Bare-JSON fallback runs only when no XML block parsed."""
+    removed so the assistant message doesn't show raw JSON. Bare-JSON fallback runs only when no XML block parsed;
+    a valid bare envelope outside a valid XML block raises :class:`MixedToolEnvelopeError`."""
     if not isinstance(text, str) or not text.strip():
         return [], ""
     extracted: list[ChatCompletionMessageToolCall] = []
     consumed_spans: list[tuple[int, int]] = []
-    for pattern, group in ((TOOL_CALL_BLOCK_RE, 1), (TOOL_CALL_JSON_RE, 0)):
-        for m in pattern.finditer(text):
-            call = _parse_tool_call(m.group(group), len(extracted) + 1)
+    xml_spans: list[tuple[int, int]] = []
+    for m in TOOL_CALL_BLOCK_RE.finditer(text):
+        xml_spans.append((m.start(), m.end()))
+        call = _parse_tool_call(m.group(1), len(extracted) + 1)
+        if call is not None:
+            extracted.append(call)
+        consumed_spans.append((m.start(), m.end()))
+
+    if extracted:
+        # A valid bare envelope outside an XML block is a second wire encoding, not ordinary
+        # assistant prose. Refuse the whole response before any tool call can be projected.
+        for m in TOOL_CALL_JSON_RE.finditer(text):
+            if any(start <= m.start() and m.end() <= end for start, end in xml_spans):
+                continue
+            if _parse_tool_call(m.group(0), len(extracted) + 1) is not None:
+                raise MixedToolEnvelopeError()
+    else:
+        for m in TOOL_CALL_JSON_RE.finditer(text):
+            call = _parse_tool_call(m.group(0), len(extracted) + 1)
             if call is not None:
                 extracted.append(call)
             consumed_spans.append((m.start(), m.end()))
-        if extracted:
-            break
     if not consumed_spans:
         return extracted, text.strip()
 

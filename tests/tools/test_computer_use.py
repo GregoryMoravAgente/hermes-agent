@@ -1021,8 +1021,8 @@ class TestCuaDriverSessionReconnect:
         session._ready_event = None  # populated by real _start_lifecycle
         session._shutdown_event = None
         session._lifecycle_future = None
-        session._setup_error = None
-        session._declared_session_id = None
+        session._setup_error = session._managed_owner = None
+        session._managed_retry_prepared, session._declared_session_id = False, None
         session._call_tool_async = lambda name, args: ("call", name, args)
         # Record what reconnect does — stop then start, in that order.
         session._reconnect_log = []

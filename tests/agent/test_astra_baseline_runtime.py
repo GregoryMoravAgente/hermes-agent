@@ -100,7 +100,8 @@ def test_picker_revalidates_cached_astra_and_never_injects_saved_entitlement(mon
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(models, "_credential_fingerprint", lambda _: "synthetic-account")
-    models._store_cache_entry(provider, models._cache_entry("synthetic-account", ["gpt-5.6-sol", model]))
+    cache_key = models._normalized_cache_slug(provider)
+    models._store_cache_entry(cache_key, models._cache_entry("synthetic-account", ["gpt-5.6-sol", model]))
     live = []
     calls = []
 
@@ -116,7 +117,7 @@ def test_picker_revalidates_cached_astra_and_never_injects_saved_entitlement(mon
     # After the entry ages past the fresh window, a failed refresh must not resurrect Astra from it.
     monkeypatch.setattr(models, "_PROVIDER_MODELS_STALE_SERVE_MAX", 0)
     assert models.cached_provider_model_ids(provider, ttl_seconds=0) == ["gpt-5.6-sol"]
-    assert calls == [provider]
+    assert calls == [cache_key]
     row = {"slug": provider, "is_current": True, "models": ["gpt-5.6-sol"], "total_models": 1}
     assert model not in _finalize_picker_rows([row], {}, model)[0]["models"]
     ctx = ConfigContext(provider, model, "", {}, [])

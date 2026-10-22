@@ -2,6 +2,15 @@
 import subprocess
 from pathlib import Path
 
+import pytest
+
+
+# The picker is executed by the Ubuntu install-E2E job and uses Bash 4+'s
+# mapfile. macOS's system Bash 3.2 cannot execute that workflow script; keep
+# this proof on the host that actually runs it rather than treating a local
+# shell-version mismatch as a routing defect.
+pytestmark = pytest.mark.platforms("linux")
+
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "sandbox" / "pick-release-tags.sh"
 
 

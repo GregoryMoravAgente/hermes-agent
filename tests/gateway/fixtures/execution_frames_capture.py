@@ -41,6 +41,7 @@ async def capture(tmp):
     from gateway.session_authority import LiveSession, initialize_session_authority
     from gateway.session_contract import SessionRef, Submission
     from gateway.session_controls import AuthorityConnection
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     store = SessionStore(tmp / 'sessions', GatewayConfig())
     db = store._db
@@ -57,6 +58,7 @@ async def capture(tmp):
             runner = SimpleNamespace(_session_db=db, session_store=store, _draining=False,
                                      _handle_message=answer, _adapter_for_source=lambda s: None)
             authority = await initialize_session_authority(runner, profile_id='p', instance_id=instance)
+            bind_authority_runtime_custody(runner, authority)
             authority.sessions['shared'] = LiveSession(source, 'shared')
             peer = Peer()
             conn = AuthorityConnection(authority, peer, {'user_id': 'viewer'})

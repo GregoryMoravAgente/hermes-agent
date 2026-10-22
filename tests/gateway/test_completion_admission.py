@@ -1,6 +1,7 @@
 """Real adapter admission is the completion acknowledgement boundary."""
 import asyncio
 import logging
+import os
 import time
 
 import pytest
@@ -14,12 +15,33 @@ from plugins.platforms.discord.adapter import DiscordAdapter
 from tools import async_delegation as delegation
 
 
+def prepared_execution(delegation_id):
+    """Source-aligned unmanaged prepared claim for direct ledger fixtures."""
+    from gateway.status import get_process_start_time
+
+    birth = get_process_start_time(os.getpid())
+    assert type(birth) is int
+    return {
+        "handoff_id": delegation_id, "state": "prepared", "accepted": "unknown",
+        "worker_started": False, "worker_exited": False, "owner_pid": os.getpid(),
+        "owner_started_at": birth,
+        "owner_execution_id": f"test:{os.getpid()}:{delegation_id}",
+        "owner_scope": None, "error": None, "exception": None,
+    }
+
+
 def pending(key, name):
     evt = {"type": "async_delegation", "session_key": key, "delegation_id": name,
-           "summary": name, "status": "completed", "dispatched_at": time.time()}
+           "summary": name, "status": "completed", "dispatched_at": time.time(),
+           "execution": prepared_execution(name)}
     delegation._persist_dispatch(evt)
     delegation._persist_completion(evt, {"status": "completed", "summary": name})
     return evt
+
+
+def test_execution_claim_refuses_missing_claim():
+    with pytest.raises(RuntimeError, match="not authenticated"):
+        delegation._execution_claim({"delegation_id": "missing-claim"})
 
 
 async def drain(adapter):

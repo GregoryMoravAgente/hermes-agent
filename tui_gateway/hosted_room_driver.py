@@ -159,6 +159,11 @@ class HostedRoomRuntime:
         self._blocked_rooms: set[str] = set()
         self._status_lock, self._current_tasks = threading.Lock(), {}
         self._room_schedule_cursor, self._cycles = 0, 0
+        # Preservation closes the room's intake generation while allowing already accepted
+        # tasks to finish through the normal durable worker path.  I09 owns this source fence;
+        # I17 remains responsible for the enclosing hosted process lifecycle.
+        self._preservation_close_generation: int | None = None
+        self._preservation_close_scan_rooms: set[str] | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -188,6 +193,33 @@ class HostedRoomRuntime:
             room_thread.join(max(0.0, deadline - time.monotonic()))
         return not any(t.is_alive() for t in (thread, *room_threads))
 
+    def begin_preservation_close(self, close_generation: int) -> bool:
+        """Close new room intake for one exact preservation generation."""
+        if type(close_generation) is not int or close_generation < 1:
+            return False
+        with self._status_lock:
+            current = self._preservation_close_generation
+            if current is not None:
+                return current == close_generation
+            self._preservation_close_generation = close_generation
+            self._preservation_close_scan_rooms = None
+        self._wake.set()
+        return True
+
+    def abort_preservation_close(self, close_generation: int) -> bool:
+        """Reopen only the exact room-intake generation before handoff."""
+        with self._status_lock:
+            if self._preservation_close_generation != close_generation:
+                return False
+            self._preservation_close_generation = None
+            self._preservation_close_scan_rooms = None
+        self._wake.set()
+        return True
+
+    def preservation_intake_closed(self, close_generation: int) -> bool:
+        with self._status_lock:
+            return self._preservation_close_generation == close_generation
+
     def wakeup(self) -> None:
         """Wake the worker after task admission or a room-state change."""
         with self._status_lock:
@@ -204,9 +236,17 @@ class HostedRoomRuntime:
             return {
                 "running": bool(thread and thread.is_alive()), "stopping": self._stop.is_set(),
                 "process_generation": self.process_generation,
+                "preservation_close_generation": self._preservation_close_generation,
+                "intake_closed": self._preservation_close_generation is not None,
+                "preservation_close_scan_rooms": (
+                    None if self._preservation_close_scan_rooms is None
+                    else tuple(sorted(self._preservation_close_scan_rooms))),
                 "current_task": current_tasks[0] if current_tasks else None,
                 "current_tasks": current_tasks, "leased_rooms": tuple(sorted(self._leases)),
+                "room_threads": tuple(sorted(self._room_threads)),
                 "blocked_rooms": tuple(sorted(self._blocked_rooms)),
+                "ambiguous_rooms": tuple(sorted(self._ambiguous_rooms)),
+                "unavailable_route_retries": tuple(sorted(self._unavailable_route_retries)),
                 "last_error": self._last_error, "cycles": self._cycles}
 
     # ------------------------------------------------------------------ public ops
@@ -466,10 +506,25 @@ class HostedRoomRuntime:
                 room_id: t for room_id, t in self._room_threads.items() if t.is_alive()}
             available = self.max_concurrent_rooms - len(self._room_threads)
             active_rooms = set(self._room_threads)
+            close_generation = self._preservation_close_generation
+            scan_rooms = self._preservation_close_scan_rooms
         if available <= 0:
             return
         bindings = tuple(self._rooms_provider())
+        if close_generation is not None:
+            if scan_rooms is None:
+                scan_rooms = {binding.room_id for binding in bindings}
+                with self._status_lock:
+                    if self._preservation_close_generation == close_generation:
+                        self._preservation_close_scan_rooms = set(scan_rooms)
+            if scan_rooms:
+                bindings = tuple(binding for binding in bindings if binding.room_id in scan_rooms)
+            else:
+                bindings = tuple(
+                    binding for binding in bindings if self._close_room_needs_work(binding))
         if not bindings:
+            if close_generation is not None:
+                self._release_idle_leases(closed_only=True)
             return
         start = self._room_schedule_cursor % len(bindings)
         self._room_schedule_cursor = (start + 1) % len(bindings)
@@ -501,6 +556,8 @@ class HostedRoomRuntime:
             with self._status_lock:
                 if self._room_threads.get(binding.room_id) is threading.current_thread():
                     self._room_threads.pop(binding.room_id, None)
+                if self._preservation_close_scan_rooms is not None:
+                    self._preservation_close_scan_rooms.discard(binding.room_id)
                 should_wake = binding.room_id in self._rooms_needing_reschedule
                 self._rooms_needing_reschedule.discard(binding.room_id)
             if should_wake:
@@ -549,6 +606,16 @@ class HostedRoomRuntime:
         return delay
 
     # ------------------------------------------------------------------ leases
+    def _close_room_needs_work(self, binding: HostedRoomBinding) -> bool:
+        try:
+            return any(
+                task["status"] not in state.TERMINAL_STATUSES
+                for task in state.list_tasks(self.db_path, room_id=binding.room_id))
+        except Exception as exc:
+            logger.exception("Hosted room close inventory failed for %s", binding.room_id)
+            self._record_error(f"room {binding.room_id} close inventory failed: {exc}")
+            return True
+
     def _ensure_lease(self, binding: HostedRoomBinding) -> state.DriverLease:
         with self._status_lock:
             current = self._leases.get(binding.room_id)
@@ -580,8 +647,16 @@ class HostedRoomRuntime:
         with self._status_lock:
             self._leases.pop(room_id, None)
 
-    def _release_idle_leases(self) -> None:
+    def _release_idle_leases(self, *, closed_only: bool = False) -> None:
+        with self._status_lock:
+            active_tasks = set(self._current_tasks)
+            room_threads = set(self._room_threads)
         for room_id, lease in tuple(self._leases.items()):
+            if closed_only and (room_id in active_tasks or room_id in room_threads):
+                continue
+            if closed_only and self._close_room_needs_work(
+                    HostedRoomBinding(room_id, lease.gateway_id, lease.authority_epoch)):
+                continue
             with suppress(state.DriverStateError):
                 state.release_lease(self.db_path, lease, clock=self.clock)
                 self._drop_lease(room_id)

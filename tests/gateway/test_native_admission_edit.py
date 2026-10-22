@@ -9,7 +9,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session_authority import initialize_session_authority
-from hermes_state_runtime import list_session_admissions
+from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 
 CHAT = '15551234567@s.whatsapp.net'
 
@@ -35,6 +35,8 @@ async def test_edit_of_an_admitted_message_is_its_own_admission(tmp_path, monkey
         # A redelivered edit is still a replay of that edit, and a second edit is a third input.
         again = await send('hello', '1800000010')
         second = await send('hello!', '1800000020')
+        with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+            await send('different', '1800000010')
         assert again.admission_id == edit.admission_id
         assert len({first.admission_id, edit.admission_id, second.admission_id}) == 3
         rows = list_session_admissions(authority.db, session_id=first.ref.session_id, pending_only=False)

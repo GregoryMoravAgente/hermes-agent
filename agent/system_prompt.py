@@ -604,9 +604,17 @@ def _workspace_pin_key() -> str:
     directory``: a build with no cwd bound (launch dir) and a later one binding that same dir
     (TUI ``/compress``) are one workspace, not two."""
     try:
-        return str(resolve_context_cwd() or resolve_agent_cwd())
-    except OSError:  # deleted cwd
+        return str(Path(resolve_context_cwd() or resolve_agent_cwd()).resolve())
+    except (OSError, RuntimeError, TypeError, ValueError):  # deleted cwd or an invalid path
         return ""
+
+
+def _canonical_workspace_path(value: Any) -> str:
+    """Compare persisted and live workspace paths after resolving host aliases/symlinks."""
+    try:
+        return str(Path(value).resolve()) if value else ""
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return str(value or "")
 
 
 def _persisted_workspace_block(prompt: str, key: str) -> Optional[str]:
@@ -654,7 +662,7 @@ def _seed_workspace_pin(agent: Any, key: str) -> None:
     if not prompt:
         return
     stored_cwd = runtime_host_value(prompt, "Current working directory")
-    if stored_cwd and stored_cwd != key:
+    if stored_cwd and _canonical_workspace_path(stored_cwd) != _canonical_workspace_path(key):
         return
     block = _persisted_workspace_block(prompt, key)
     # Only a real snapshot is adopted: a prompt without one (built on a surface without the

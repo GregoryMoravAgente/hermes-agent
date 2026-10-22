@@ -367,3 +367,52 @@ async def test_plugin_slash_command_receives_calling_session(monkeypatch):
 
     assert (handled, result) == (True, "ok")
     assert seen == [("details", source, "20261018_live", key, "telegram", "20261018_live")]
+
+
+@pytest.mark.parametrize("platform,marker,physical_id,declaration,expected_chat", [
+    (Platform.API_SERVER, "match", "child", "1", "child"),
+    (Platform.API_SERVER, "match", "child", "", "child"),
+    (Platform.API_SERVER, "foreign", "child", "1", "parent"),
+    (Platform.API_SERVER, "absent", "child", "1", "parent"),
+    (Platform.API_SERVER, "match", "", "1", "parent"),
+    (Platform.LOCAL, "match", "child", "1", "parent"),
+])
+def test_managed_api_context_requires_the_exact_profile_adapter(
+    monkeypatch, platform, marker, physical_id, declaration, expected_chat,
+):
+    from types import SimpleNamespace
+
+    from gateway.session_api_turn import api_execution
+    from gateway.session_context import async_delivery_supported, session_history_delivery_supported
+
+    runner = object.__new__(GatewayRunner)
+    canonical_adapter = SimpleNamespace(supports_async_delivery=False)
+    # A secondary profile's canonical adapter is intentionally different from launch.
+    runner.adapters = {platform: SimpleNamespace(supports_async_delivery=True)}
+    monkeypatch.setattr(runner, "_adapter_for_source", lambda _source: canonical_adapter)
+    source = SessionSource(platform=platform, chat_id="parent", profile="secondary")
+    context = SessionContext(
+        source=source, connected_platforms=[], home_channels={},
+        session_key="stable-logical-key", session_id=physical_id,
+    )
+    prepared = None if marker == "absent" else {
+        "adapter": canonical_adapter if marker == "match" else object(),
+        "settings": {"session_history_delivery": declaration},
+    }
+    marker_token = api_execution.set(prepared)
+    tokens = None
+    try:
+        tokens = runner._set_session_env(context)
+        assert get_session_env("HERMES_SESSION_CHAT_ID") == expected_chat
+        assert get_session_env("HERMES_SESSION_ID") == physical_id
+        assert get_session_env("HERMES_SESSION_KEY") == "stable-logical-key"
+        assert get_session_env("HERMES_SESSION_PROFILE") == "secondary"
+        assert source.chat_id == "parent"
+        if platform == Platform.API_SERVER and marker == "match":
+            assert async_delivery_supported() is False
+        if marker == "absent" or not declaration:
+            assert session_history_delivery_supported() is False
+    finally:
+        if tokens is not None:
+            runner._clear_session_env(tokens)
+        api_execution.reset(marker_token)

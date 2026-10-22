@@ -7,7 +7,14 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.gateway.test_session_follow_profile_config import _create, _owner, _route
+from tests.gateway.test_session_follow_profile_config import _create, _owner as _base_owner, _route
+
+
+def _owner(home):
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    owned = _base_owner(home)
+    bind_authority_runtime_custody(owned[1], owned[2])
+    return owned
 
 
 async def _create_bot_chat(owner, authority, home, request_id, **extra):
