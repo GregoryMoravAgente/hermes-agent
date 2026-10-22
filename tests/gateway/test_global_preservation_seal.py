@@ -2,7 +2,13 @@
 
 import pytest
 
-from tests.gateway.test_preservation_admission_consumers import _install_custody
+from tests.gateway.test_preservation_admission_consumers import _install_custody as _install_partial_custody
+
+
+def _install_custody(authority):
+    coordinator = _install_partial_custody(authority)
+    authority._register_preservation_producer_graph(coordinator)
+    return coordinator
 
 
 def test_quiescent_i05_and_i11_sources_seal_from_global_close(owner):
