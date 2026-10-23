@@ -5,6 +5,16 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _isolate_launchd_direct_runtime(request, tmp_path, monkeypatch):
+    """Keep direct-runtime launchd assertions independent of an inherited PM store."""
+    if request.node.path.name == "test_gateway_service.py" and request.node.name in {
+        "test_launchd_plist_wraps_gateway_stderr_with_timestamps",
+        "test_launchd_osascript_wrapper_round_trips_shell_hostile_paths",
+    }:
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "tools"))
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.
