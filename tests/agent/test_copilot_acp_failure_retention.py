@@ -70,7 +70,8 @@ async def test_managed_launch_bind_failure_retains_receipt_for_same_handle_retry
     try:
         from gateway import runtime_service_operations as operations
 
-        original_bind = operations.bind_physical
+        bind_name = "bind_windows_launch" if sys.platform == "win32" else "bind_physical"
+        original_bind = getattr(operations, bind_name)
         calls = 0
 
         def fail_once(*args, **kwargs):
@@ -80,7 +81,7 @@ async def test_managed_launch_bind_failure_retains_receipt_for_same_handle_retry
                 raise operations.ExternalProcessOperationError("synthetic_bind_failure")
             return original_bind(*args, **kwargs)
 
-        monkeypatch.setattr(operations, "bind_physical", fail_once)
+        monkeypatch.setattr(operations, bind_name, fail_once)
         with pytest.raises(operations.ExternalProcessOperationError, match="synthetic_bind_failure"):
             client._spawn()
 
