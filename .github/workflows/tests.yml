@@ -75,6 +75,7 @@ jobs:
           toolchain: all
           node-cache-dependency-path: scripts/whatsapp-bridge/package-lock.json
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web"]'
+          checkout-environment: 'true'
           test-environment: 'true'
           prune-python-cache: true
 
@@ -169,6 +170,7 @@ jobs:
           # `messaging`: tests/e2e/core/platforms runs the real Telegram/Discord/Slack
           # adapters (their SDKs) against local stand-ins.
           extras: '["all", "anthropic", "bedrock", "mistral", "fal", "modal", "daytona", "parallel-web", "messaging"]'
+          checkout-environment: 'true'
           test-environment: 'true'
           prune-python-cache: true
 

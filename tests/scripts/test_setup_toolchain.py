@@ -83,6 +83,70 @@ def test_development_setup_keeps_test_groups_out_of_the_runtime(tmp_path, monkey
         assert bundle.returncode == 0, bundle.stderr
 
 
+def test_checkout_environment_builds_project_before_side_test_environment(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    import pm
+    from scripts.ci import setup_toolchain
+
+    project = tmp_path / "core"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        '[project]\nname="ci-checkout-environment"\nversion="1"\n'
+        'requires-python=">=3.11"\n[project.optional-dependencies]\nall=[]\n',
+        encoding="utf-8",
+    )
+    home = tmp_path / "ci-home"
+    files = {name: tmp_path / name for name in ("GITHUB_ENV", "GITHUB_OUTPUT", "GITHUB_PATH")}
+    for name, file in files.items():
+        monkeypatch.setenv(name, str(file))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr("pm.paths.repo_root", lambda: project)
+    monkeypatch.setattr(pm, "check_project_lock", lambda *args, **kwargs: None)
+    monkeypatch.setattr(pm, "sync_venv", lambda *args, **kwargs: pytest.fail("checkout mode must not sync the store"))
+
+    events = []
+    checkout_venv = project / ".venv"
+
+    def fake_build_environment(**kwargs):
+        events.append(("checkout", kwargs))
+        python = kwargs["out"] / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        python.parent.mkdir(parents=True)
+        python.write_text("", encoding="utf-8")
+        return python
+
+    monkeypatch.setattr(pm, "build_environment", fake_build_environment)
+
+    test_venv = tmp_path / "test-environment"
+    test_python = test_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+
+    def fake_ensure_testenv(project_root, extras):
+        events.append(("test", project_root, extras))
+        test_python.parent.mkdir(parents=True)
+        test_python.write_text("", encoding="utf-8")
+        return test_python
+
+    monkeypatch.setattr("pm.testenv.ensure_testenv", fake_ensure_testenv)
+
+    setup_toolchain.dependencies(SimpleNamespace(
+        extras=["all"], home=home, test_environment=True, checkout_environment=True))
+
+    assert [event[0] for event in events] == ["checkout", "test"]
+    checkout_args = events[0][1]
+    assert checkout_args["source"] == project
+    assert checkout_args["out"] == checkout_venv
+    assert checkout_args["python"] == Path(sys.executable)
+    assert checkout_args["extras"] == ["all"]
+    assert checkout_args["groups"] == ("dev", "test")
+    assert checkout_args["explicit"] is True
+    assert "no_install_project" not in checkout_args
+    assert events[1][1:] == (project, ["all"])
+
+    outputs = dict(line.split("=", 1) for line in files["GITHUB_OUTPUT"].read_text(encoding="utf-8").splitlines())
+    assert outputs["python-path"] == str(test_python)
+    assert outputs["venv"] == str(test_venv)
+
+
 @pytest.mark.parametrize("toolchain,names", [
     ("python", {"python", "uv"}),
     ("node", {"node", "npm"}),
