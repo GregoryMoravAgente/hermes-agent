@@ -12,6 +12,7 @@ on:
       - codex/AGC-1721/native-managed-worker-m1r4-20261023
       - codex/AGC-1721/native-integration-watcher-recovery-r1-20261023
       - codex/AGC-1721/native-recovery-physical-owner-r2-20261023
+      - codex/AGC-1721/receiving-r8-native-20261023
 
 permissions:
   contents: read
