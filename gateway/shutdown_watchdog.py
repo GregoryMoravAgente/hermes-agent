@@ -283,7 +283,12 @@ def _invalidate_clean_shutdown_marker() -> None:
 def _release_shutdown_watchdog_ownership() -> bool:
     """Resolve physical custody and PID fencing before the watchdog stamps shutdown."""
     try:
-        from gateway.status import remove_pid_file_checked, release_gateway_runtime_lock
+        from gateway.status import (
+            _get_process_hermes_home, remove_pid_file_checked, release_gateway_runtime_lock,
+        )
+        from gateway.lifecycle_handoff import finalize_predecessor_release, handoff_needs_release
+        process_home = _get_process_hermes_home()
+        needs_handoff_release = handoff_needs_release(process_home)
         summary = release_gateway_runtime_lock()
         if summary is not None and getattr(summary, 'failed', True):
             logger.error('Shutdown watchdog retained physical profile custody: %s', summary.describe())
@@ -291,6 +296,12 @@ def _release_shutdown_watchdog_ownership() -> bool:
             return False
         if remove_pid_file_checked() is not True:
             logger.error('Shutdown watchdog could not prove removal of the physical-owner PID marker')
+            _invalidate_clean_shutdown_marker()
+            return False
+        if needs_handoff_release and not finalize_predecessor_release(
+            process_home, summary, pid_removed=True,
+        ):
+            logger.error('Shutdown watchdog could not persist the released gateway handoff')
             _invalidate_clean_shutdown_marker()
             return False
         return True

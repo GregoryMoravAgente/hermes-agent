@@ -27,6 +27,22 @@ def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+async def _attest_successor_before_public_ready(runner: Any, home: Path) -> None:
+    """Authenticate a prepared successor while its descriptor is still private/starting.
+
+    This is a production bootstrap seam rather than a test-only ordering helper: a refused
+    control/lineage/peer observation raises before ``publish_gateway_runtime_ready`` can expose
+    the public admission state.
+    """
+    import asyncio
+
+    from gateway.lifecycle_handoff import verify_successor_ready
+    if not await asyncio.to_thread(verify_successor_ready, runner, home):
+        raise RuntimeError("gateway successor READY control roundtrip was not authenticated")
+    from gateway.run_runtime import publish_gateway_runtime_ready
+    publish_gateway_runtime_ready(runner)
+
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
     Returns False when startup must abort (refused, permission denied, target still alive)."""
@@ -294,7 +310,9 @@ async def _start_gateway_start_control_socket(runner):
             payload = build_identify_payload()
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+                "served_profiles", "parked_profiles", "capabilities", "handoff_id",
+                "handoff_lineage", "handoff_attempt_id", "handoff_predecessor_instance")
+                           if key in descriptor})
             if getattr(runner, '_draining', False):
                 payload.update(state='draining')
                 # The restart's after-turn wait still owns its turns: clients reach it to answer a
@@ -913,6 +931,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             start_nous_auth_keepalive()
 
         _unclean_exit = _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+        # A prepared/released journal handoff is adopted only after this process owns every
+        # canonical profile lock and has opened each profile's real runtime epoch.  Ordinary boots
+        # with no active handoff keep their historical startup path.
+        from gateway.lifecycle_handoff import adopt_successor_or_refuse
+        from gateway.status import _get_process_hermes_home
+        _handoff_home = _get_process_hermes_home()
+        if not adopt_successor_or_refuse(runner, _handoff_home):
+            raise RuntimeError("gateway successor handoff could not be authenticated")
         _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
         _ensure_windows_gateway_venv_imports()
 
@@ -926,10 +952,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _start_gateway_start_cron_and_housekeeping(runner))
         # From here every exit (a READY publication that raises included) runs the shutdown tail,
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
-        from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
+        from gateway.run_runtime import wait_gateway_runtime
         try:
-            # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
-            publish_gateway_runtime_ready(runner)
+            # The control identify runs off-loop because the local server is owned by this same
+            # event loop.  A refusal therefore never exposes READY to clients.
+            await _attest_successor_before_public_ready(runner, _handoff_home)
             runner._start_systemd_watchdog()
             if idle_exit:
                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
@@ -966,10 +993,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 _planned_stop_watcher_stop.set()
             if _control_server is not None:
                 await _control_server.stop()
-            release_summary = release_gateway_runtime_lock()
-            if release_summary is None or not getattr(release_summary, 'failed', True):
-                if remove_pid_file_checked() is not True:
-                    logger.error('Startup teardown could not prove removal of the physical-owner PID marker')
-            else:
-                logger.error('Startup teardown retained physical profile custody: %s',
-                             release_summary.describe())
+            from gateway.status import _get_process_hermes_home, remove_pid_file_checked, release_gateway_runtime_lock
+            from gateway.lifecycle_handoff import release_predecessor_at_shutdown
+            _process_home = _get_process_hermes_home()
+            release_predecessor_at_shutdown(
+                _process_home, release_gateway_runtime_lock, remove_pid_file_checked,
+            )

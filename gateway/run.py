@@ -3549,29 +3549,30 @@ class GatewayRunner(
     def _session_db(self, value) -> None:
         self._session_db_pinned = value
 
-    def close_all_session_db_handles(self) -> None:
+    def close_all_session_db_handles(self):
         """Close every per-profile AsyncSessionDB this runner opened.
 
         Drained under the lock, closed outside it; a pinned handle is the pinner's to close. Wrappers
         BORROWED from ``session_store`` are skipped: the store's sweep (runs first) closes them.
 
-        See #98573.
+        See #98573.  Legacy callers may ignore the typed lifecycle receipt.
         """
-        def _close(db) -> None:
+        def _close(db) -> bool:
             if getattr(db, "__dict__", {}).get("_hermes_borrowed_handle"):
-                return
+                return True
             inner = getattr(db, "_db", db)
             if inner is None or not hasattr(inner, "close"):
-                return
+                return False
             # Shared instances no-op on close() (the registry owns the lifecycle). Release the refcount
             # instead (#90837).
-            from hermes_state_registry import release_or_close
+            from hermes_state_registry import release_or_close_checked
             try:
-                release_or_close(inner)
+                return release_or_close_checked(inner).verified
             except Exception as exc:
                 logger.debug("SessionDB close error during handle sweep: %s", exc)
+                return False
 
-        self._session_db_handle_cache.close_all(_close)
+        return self._session_db_handle_cache.close_all_checked(_close)
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress (no-op if adapter/plugin off)."""

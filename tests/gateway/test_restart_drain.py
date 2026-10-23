@@ -2,6 +2,7 @@ import asyncio
 import subprocess
 import time
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -311,6 +312,8 @@ async def test_windows_detached_restart_scrubs_gateway_marker(monkeypatch, tmp_p
 
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda _pid: 777)
+    monkeypatch.setattr("hermes_cli.process_identity._process_create_time", lambda _pid: 888.0)
     monkeypatch.setenv("_HERMES_GATEWAY", "1")
 
     import hermes_cli._subprocess_compat as subprocess_compat
@@ -362,6 +365,8 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
     monkeypatch.setattr(gateway_run.sys, "executable", r"C:\venv\Scripts\python.exe")
     monkeypatch.setattr(gateway_run, "_resolve_hermes_bin", lambda: ["hermes"])
     monkeypatch.setattr(gateway_run.os, "getpid", lambda: 321)
+    monkeypatch.setattr("gateway.status.get_process_start_time", lambda _pid: 777)
+    monkeypatch.setattr("hermes_cli.process_identity._process_create_time", lambda _pid: 888.0)
     monkeypatch.setenv("VIRTUAL_ENV", str(venv_dir))
 
     import hermes_cli._subprocess_compat as subprocess_compat
@@ -385,6 +390,44 @@ async def test_windows_detached_restart_watcher_keeps_console_python(monkeypatch
     assert cmd[0] == r"C:\venv\Scripts\python.exe"
     assert cmd[-3:] == ["hermes", "gateway", "restart"]
     assert kwargs["creationflags"] == 0x08000200
+
+
+def test_detached_restart_watcher_refuses_live_recycled_pid(tmp_path):
+    """A live PID with a different start fingerprint must not trigger a restart."""
+    import os
+    import subprocess
+    import sys
+
+    from gateway.run_shutdown import _WINDOWS_RESTART_WATCHER
+    from gateway.status import get_process_start_time
+    from hermes_cli.process_identity import _process_create_time
+
+    expected = get_process_start_time(os.getpid())
+    expected_birth = _process_create_time(os.getpid())
+    if expected is None or expected_birth is None:
+        pytest.skip("process start fingerprint unavailable on this host")
+    marker = tmp_path / "restart-started"
+    marker_code = (
+        "from pathlib import Path; "
+        f"Path({str(marker)!r}).write_text('started', encoding='utf-8')"
+    )
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    result = subprocess.run(
+        [
+            sys.executable, "-c", _WINDOWS_RESTART_WATCHER,
+            str(os.getpid()), str(expected + 1), str(expected_birth), "0.2",
+            sys.executable, "-c", marker_code,
+        ],
+        cwd=Path(__file__).resolve().parents[2],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 0
+    assert not marker.exists()
 
 
 # ── Shutdown notification tests ──────────────────────────────────────

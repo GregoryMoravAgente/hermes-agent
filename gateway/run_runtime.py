@@ -247,6 +247,12 @@ async def initialize_gateway_runtime(runner):
     # registration remains UNKNOWN and cannot be converted into an empty-map success.
     from gateway.runtime_i16_source_registry import bootstrap_i16_source_registry
     bootstrap_i16_source_registry(runner, coordinator)
+    # Bind the source-owned I19 lifecycle graph at the same authenticated runtime boundary.  The
+    # graph is intentionally independent from the preservation owner seal loop: ordinary stop/
+    # restart must retain its ForeignLifecycleLease until its own finalizer/native/global-close
+    # receipt is observed, while a later preservation handoff still requires every owner class.
+    from gateway.lifecycle_custody import install_lifecycle_custody
+    install_lifecycle_custody(runner, coordinator)
     # Every managed authority now has the process coordinator. Each source reserves its I10/I11
     # owner before the existing compression write; the legacy initializer never enters this loop.
     from gateway.session_authorities import all_authorities, owner_scope
@@ -826,6 +832,12 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
 
     _seal_physical_profile_owner(runner, coordinator, receipt, descriptor)
 
+    # I19 is a dedicated source hook: the live lifecycle ingress is fenced at begin-close, and its
+    # source graph can prove either exact native/helper/successor receipts or a registered zero-work
+    # absence. It must not inherit the generic ``observed=True`` fallback used by unrelated owners.
+    from gateway.lifecycle_custody import seal_preservation_owner
+    seal_preservation_owner(runner, coordinator, receipt, descriptor)
+
     try:
         from cron.runtime_custody import preservation_owner_evidence
         for owner_class in (
@@ -892,6 +904,15 @@ async def begin_preservation_drain(runner, params, peer_subject):
     else:
         wire = {'status': 'refused', 'reason': getattr(receipt, 'code', 'close_conflict')}
     if wire.get('status') == 'closing':
+        # Fence the actual lifecycle ingress before any preservation source starts its await.  An
+        # already accepted stop/restart/idle operation keeps its exact ForeignLifecycleLease and
+        # makes this reversible close refuse; an empty registered ingress is valid live no-work.
+        from gateway.lifecycle_custody import begin_preservation_lifecycle_close
+        from gateway.lifecycle_custody import abort_preservation_lifecycle_close as _abort_lifecycle_close
+        lifecycle_refusal = begin_preservation_lifecycle_close(runner, receipt.close_generation)
+        if lifecycle_refusal is not None:
+            coordinator.abort_before_handoff(receipt)
+            return lifecycle_refusal.as_wire()
         # Freeze MCP discovery before any close worker can cancel its task.  The
         # factory is attached to each authority during bootstrap and uses the
         # existing finalizer/coordinator roots for every accepted route.
@@ -913,6 +934,8 @@ async def begin_preservation_drain(runner, params, peer_subject):
             )
             if not completed:
                 return {'status': 'refused', 'reason': reason, 'receipt': wire}
+            if not _abort_lifecycle_close(runner, receipt.close_generation):
+                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
             return {'status': 'refused', 'reason': mcp_failure}
         if not begin_i09_source_close(runner, receipt.close_generation):
             if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
@@ -923,6 +946,8 @@ async def begin_preservation_drain(runner, params, peer_subject):
             )
             if not completed:
                 return {'status': 'refused', 'reason': reason, 'receipt': wire}
+            if not _abort_lifecycle_close(runner, receipt.close_generation):
+                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
             return {'status': 'refused', 'reason': 'hosted_source_close_conflict'}
         source_registry = getattr(runner, '_preservation_source_close', None)
         if source_registry is not None and not begin_source_close(runner, receipt.close_generation):
@@ -948,6 +973,8 @@ async def begin_preservation_drain(runner, params, peer_subject):
                     runner, receipt.close_generation, source_registry, mcp_entries,
                 )
                 return {'status': 'refused', 'reason': reason, 'receipt': wire}
+            if not _abort_lifecycle_close(runner, receipt.close_generation):
+                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
             return {'status': 'refused', 'reason': 'source_close_conflict'}
         # Preserve the existing reversible external-drain distinction: fresh roots refuse, while
         # already accepted FIFO continuations may claim and settle under their live parent lease.
@@ -1238,6 +1265,9 @@ async def abort_preservation_drain(runner, params, peer_subject):
             runner, receipt.close_generation, source_registry, mcp_entries,
         )
         return refused.as_wire()
+    from gateway.lifecycle_custody import abort_preservation_lifecycle_close
+    if not abort_preservation_lifecycle_close(runner, receipt.close_generation):
+        return {'status': 'refused', 'reason': 'lifecycle_resume_conflict'}
     if not _finish_mcp_factories(mcp_entries, coordinator, receipt):
         return {'status': 'refused', 'reason': 'mcp_source_finalization_pending'}
     descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
@@ -1841,6 +1871,20 @@ async def drain_gateway_runtime(runner):
     """Withdraw admission before any await; close sockets before DB teardown."""
     descriptor = getattr(runner, 'session_runtime_descriptor', None)
     if descriptor is None:
+        return
+    from gateway.lifecycle_custody import admit_lifecycle
+    from gateway.runtime_custody import CustodyRefusal
+    _lifecycle_custody = getattr(runner, "lifecycle_custody", None)
+    _action = next(
+        (
+            action for action in ("restart", "idle", "stop")
+            if _lifecycle_custody is not None
+            and _lifecycle_custody.active_lease(action) is not None
+        ),
+        "stop",
+    )
+    _lifecycle = admit_lifecycle(runner, _action, owner_id=f"gateway:runtime-drain:{_action}")
+    if isinstance(_lifecycle, CustodyRefusal):
         return
     runner._draining = True
     descriptor.update(state='draining', capabilities=[])
