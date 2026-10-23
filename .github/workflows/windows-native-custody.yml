@@ -419,6 +419,23 @@ jobs:
                   if line.strip()
               ]
 
+          # Required new Windows fault cases must execute, not disappear behind a platform skip.
+          required_fault_cases = ['test_windows_post_popen_failure_retains_exact_job_process_and_retries', 'test_windows_pre_popen_refusal_releases_only_verified_no_effect', 'test_windows_resume_failure_retains_assigned_job_and_retries_same_receipt', 'test_windows_worker_constructor_failure_retains_spawned_child_for_retry', 'test_windows_reader_start_failure_retains_same_receipt_for_retry', 'test_windows_reader_body_baseexception_marks_same_native_receipt_unknown', 'test_windows_reader_join_failure_retains_same_receipt_for_retry', 'test_windows_stdout_close_failure_retains_same_receipt_for_retry']
+          fault_junit = proof / "rows" / "tests__gateway__test_managed_worker_native_custody.py.junit.xml"
+          fault_outcomes = {}
+          fault_parse_error = None
+          try:
+              if fault_junit.is_file():
+                  for case in ET.parse(fault_junit).getroot().iter("testcase"):
+                      name = case.get("name")
+                      if name in required_fault_cases:
+                          fault_outcomes.setdefault(name, []).append(
+                              next((kind for kind in ("failure", "error", "skipped") if case.find(kind) is not None), "passed")
+                          )
+          except (OSError, ET.ParseError) as error:
+              fault_parse_error = type(error).__name__
+          required_faults_passed = all(fault_outcomes.get(name) == ["passed"] for name in required_fault_cases)
+
           rows = [validate_row(row, proof / "rows") for row in read_rows(proof / "results.tsv")]
           seam_rows = read_rows(proof / "product-seam.tsv")
           seam = validate_row(seam_rows[0], proof) if len(seam_rows) == 1 else {"valid": False, "reason": "missing-product-seam-row"}
@@ -460,6 +477,10 @@ jobs:
                   "all_rows_valid": bool(rows) and len(rows) == len(expected_files) and all(row["valid"] for row in rows),
                   "junit_requires_cases_and_executed_pass": True,
                   "skip_statuses_retained": True,
+                  "required_native_fault_cases": required_fault_cases,
+                  "required_native_fault_outcomes": fault_outcomes,
+                  "native_fault_junit_error": fault_parse_error,
+                  "all_required_native_fault_cases_passed": required_faults_passed,
               },
               "product_seam": seam,
               "runner_controls": {
@@ -484,6 +505,7 @@ jobs:
               json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
           )
           valid = all((
+              required_faults_passed,
               whole_environment_equal,
               receipt["source"]["head_matches"],
               receipt["source"]["status_clean_before"],

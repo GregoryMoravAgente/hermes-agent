@@ -916,7 +916,7 @@ async def _windows_custody_fixture(tmp_path, monkeypatch, request_id):
     return fixture, binding, custody
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_post_popen_failure_retains_exact_job_process_and_retries(
     tmp_path, monkeypatch,
@@ -971,7 +971,7 @@ async def test_windows_post_popen_failure_retains_exact_job_process_and_retries(
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_pre_popen_refusal_releases_only_verified_no_effect(tmp_path, monkeypatch):
     """A CreateProcess refusal releases its Job only after the exact no-effect proof."""
@@ -1004,7 +1004,7 @@ async def test_windows_pre_popen_refusal_releases_only_verified_no_effect(tmp_pa
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_resume_failure_retains_assigned_job_and_retries_same_receipt(
     tmp_path, monkeypatch,
@@ -1053,7 +1053,7 @@ async def test_windows_resume_failure_retains_assigned_job_and_retries_same_rece
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_worker_constructor_failure_retains_spawned_child_for_retry(
     tmp_path, monkeypatch,
@@ -1102,7 +1102,7 @@ async def test_windows_worker_constructor_failure_retains_spawned_child_for_retr
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_reader_start_failure_retains_same_receipt_for_retry(tmp_path, monkeypatch):
     """An opaque reader-start fault is not treated as a missing reader effect."""
@@ -1149,7 +1149,7 @@ async def test_windows_reader_start_failure_retains_same_receipt_for_retry(tmp_p
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_reader_body_baseexception_marks_same_native_receipt_unknown(
     tmp_path, monkeypatch,
@@ -1196,7 +1196,7 @@ async def test_windows_reader_body_baseexception_marks_same_native_receipt_unkno
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_reader_join_failure_retains_same_receipt_for_retry(tmp_path, monkeypatch):
     """A reader join fault retains the exact Job/process until the same retry closes it."""
@@ -1244,7 +1244,7 @@ async def test_windows_reader_join_failure_retains_same_receipt_for_retry(tmp_pa
         fixture.cleanup()
 
 
-@pytest.mark.platforms("windows", arch="x64")
+@pytest.mark.platforms("windows", arch="x86_64")
 @pytest.mark.asyncio
 async def test_windows_stdout_close_failure_retains_same_receipt_for_retry(tmp_path, monkeypatch):
     """A native stdout-close fault is UNKNOWN, not a fabricated clean finalization."""
