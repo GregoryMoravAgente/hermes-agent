@@ -725,3 +725,84 @@ def test_failed_old_close_never_overwrites_newer_same_path_handle(tmp_path):
         old_db.close()
         if new_db is not None:
             new_db.close()
+
+
+def test_legacy_sweep_cannot_drop_a_failed_checked_handle(tmp_path):
+    path = tmp_path / 'retained.db'
+    cache = RecoverableHandleCache()
+    db = cache.get(path, lambda: registry.acquire(path))
+    try:
+        assert cache.close_all_checked(lambda _handle: False).verified is False
+        assert db._conn is not None
+        cache.close_all(lambda _handle: None)
+        assert db._conn is not None
+        second = cache.close_all_checked(lambda handle: registry.release_or_close_checked(handle).verified)
+        assert second.attempted == 1, 'legacy callback dropped a native handle requiring checked retry'
+        assert second.verified is True
+        assert db._conn is None
+    finally:
+        registry.close_all_checked()
+
+
+def test_legacy_sessiondb_close_consumes_source_owned_proof(tmp_path):
+    """A real SessionDB can leave the compatibility cache once its source proof is true."""
+    path = tmp_path / 'compat-closed.db'
+    cache = RecoverableHandleCache()
+    db = cache.get(path, lambda: registry.acquire(path))
+    try:
+        cache.close_all(registry.release_or_close)
+        assert db._conn is None
+
+        receipt = cache.close_all_checked(
+            lambda handle: registry.release_or_close_checked(handle).verified,
+        )
+        assert receipt.verified is True
+        assert receipt.attempted == 0
+    finally:
+        registry.close_all_checked()
+
+
+@pytest.mark.platforms('posix')
+def test_failed_retired_close_keeps_current_generation_registered(tmp_path, monkeypatch):
+    from tests.hermes_state.test_shared_session_db_registry import _replace_file_preserving_schema
+
+    path = tmp_path / 'state.db'
+    old = registry.acquire(path)
+    native = old._conn
+    new = None
+    try:
+        _replace_file_preserving_schema(path, path)
+        new = registry.acquire(path)
+        assert new is not old
+        with monkeypatch.context() as patched:
+            patched.setattr(old, 'close', lambda: None)
+            assert registry.release_checked(old).verified is False
+        assert old._conn is native
+        assert registry._failed_generations[id(old)].db is old
+        assert registry._generations.get(path) is not None, 'failed old close removed the live replacement'
+        assert registry._generations[path].db is new
+        assert new._conn is not None
+    finally:
+        if new is not None:
+            new.close()
+        old._shared_registry_owned = False
+        native.close()
+        old._connection_pinned = False
+        registry.close_all_checked()
+
+
+def test_empty_typed_legacy_receipt_cannot_close_an_admitted_bare_handle(tmp_path):
+    from hermes_state import SessionDB
+
+    path = tmp_path / 'bare.db'
+    db = SessionDB(path)
+    cache = RecoverableHandleCache(handles={path: db})
+    try:
+        cache.close_all(registry.release_checked)
+        assert db._conn is not None
+        second = cache.close_all_checked(lambda handle: registry.release_or_close_checked(handle).verified)
+        assert second.attempted == 1, 'empty typed receipt hid an actually open admitted native handle'
+        assert second.verified is True
+        assert db._conn is None
+    finally:
+        db.close()

@@ -52,6 +52,34 @@ def _registry_owned(handle: Any) -> bool:
     return getattr(inner, "_shared_registry_owned", None) is True
 
 
+def _legacy_close_proven(handle: Any, result: Any) -> bool:
+    """Return a strict source-owned proof for a compatibility close callback.
+
+    The legacy callback contract returns ``None`` for ordinary ``close()`` calls, so its
+    return value cannot establish that an opaque native handle is physically closed.  A
+    typed ``SessionDbCloseReceipt`` is sufficient when it is the actual receipt type; a
+    SessionDB's own checked-close predicate is the only source-owned proof available after
+    its legacy API returns.  Every other result remains unknown and is retained for a
+    checked retry.
+    """
+    try:
+        from hermes_state_registry import SessionDbCloseReceipt
+    except (ImportError, AttributeError):
+        SessionDbCloseReceipt = None
+    if SessionDbCloseReceipt is not None and isinstance(result, SessionDbCloseReceipt):
+        # A zero-work receipt can describe a registry that never owned this
+        # admitted handle. It cannot prove closure of the handle being settled.
+        return result.attempted > 0 and result.verified is True
+
+    source = getattr(handle, "_db", handle)
+    prover = getattr(source, "_checked_close_proven", None)
+    if not callable(prover):
+        return False
+    # The caller already suppresses callback/prover errors and settles this handle as unknown;
+    # do not turn an arbitrary source failure into a claimed physical close here.
+    return prover() is True
+
+
 class RecoverableHandleCache:
     """Cache handles by path while allowing failed opens to heal in-process.
 
@@ -141,15 +169,26 @@ class RecoverableHandleCache:
             # exact handle for a later checked retry instead of claiming its opaque return.
             upgraded = current is not None and current[3] and not checked
             if upgraded:
-                self._failed_handles[key] = (path, handle)
+                if closed:
+                    self._failed_handles.pop(key, None)
+                else:
+                    self._failed_handles[key] = (path, handle)
                 return
             if not checked:
+                if closed:
+                    self._failed_handles.pop(key, None)
+                else:
+                    # An unchecked callback may be a compatibility no-op or an opaque close.  Keep
+                    # the exact handle until a checked retry proves its native closure.
+                    self._failed_handles[key] = (path, handle)
                 return
             if closed:
                 self._failed_handles.pop(key, None)
                 return
-            if key in self._failed_handles:
-                return
+            # Checked failure remains sticky even when the compatibility cache also
+            # retains the object. A later unchecked sweep may drain that cache, but
+            # cannot erase the exact handle's requirement for a typed checked retry.
+            self._failed_handles[key] = (path, handle)
             if any(existing is handle for existing in self.handles.values()):
                 return
             if path in self.handles:
@@ -290,9 +329,11 @@ class RecoverableHandleCache:
             self._registry_backed.clear()
             self._unavailable.clear()
         for path, handle, _callback, checked in admitted_handles:
+            closed = False
             with contextlib.suppress(Exception):
-                close(handle)
-            self._settle_closing_handle(path, handle, False, checked)
+                result = close(handle)
+                closed = _legacy_close_proven(handle, result)
+            self._settle_closing_handle(path, handle, closed, checked)
         with _health_lock:
             states = _health_states.get(self._health_source, {})
             for path in paths:

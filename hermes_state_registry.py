@@ -330,7 +330,12 @@ def _retain_failed_generation(path: Path, db: SessionDB) -> _Generation:
             generation = _Generation(path, db, _stat_db_file_identity(path))
         generation.retired = True
         generation.refcount = 0
-        _generations.pop(path, None)
+        current = _generations.get(path)
+        if current is not None and current.db is db:
+            # A retired handle may fail after an inode replacement has already
+            # registered a successor. Retaining the old native handle must not
+            # remove that distinct live generation from the registry.
+            _generations.pop(path, None)
         _retired.pop(key, None)
         _failed_generations[key] = generation
         return generation
