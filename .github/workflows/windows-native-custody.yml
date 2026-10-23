@@ -58,6 +58,10 @@ env:
     tests/tui_gateway/test_host_supervisor_test_env.py
     tests/tui_gateway/test_compute_host_ack_writer_settlement_r9.py
     tests/tui_gateway/test_host_supervisor_owner_r5_startup.py
+    tests/hermes_state/test_complete_export.py
+    tests/gateway/test_notification_source_watcher_rebind.py
+    tests/tui_gateway/test_hosted_tui_custody.py
+    tests/gateway/test_started_gateway_discovery.py
 
 jobs:
   native-custody:
