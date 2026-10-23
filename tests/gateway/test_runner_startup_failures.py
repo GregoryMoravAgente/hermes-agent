@@ -119,6 +119,11 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
             self.exit_reason = None
             self.exit_code = None
             self.adapters = {}
+            self._failed_platforms = {}
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             assert self._platform_lock_takeover_on_start is False
@@ -267,6 +272,11 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
             self.exit_reason = None
             self.exit_code = None
             self.adapters = {}
+            self._failed_platforms = {}
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             return True
@@ -505,6 +515,11 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
             self.exit_reason = "discord: Discord bot token already in use"
             self.exit_code = GATEWAY_FATAL_CONFIG_EXIT_CODE
             self.adapters = {}
+            self._failed_platforms = {}
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             return True
