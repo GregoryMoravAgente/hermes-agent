@@ -2843,20 +2843,23 @@ def run_one_job(
     # attempt to adopt before any launch can occur.
     custody = job.get("_cron_custody")
     if not job.get("execution_id"):
-        from cron.runtime_custody import custody_required, reserve_execution
-        custody = reserve_execution(
-            owner_class="I12_cron_fire", job_id=job["id"], source="direct",
-            scheduled_instant=job.get("_scheduled_instant"), required=custody_required())
-        try:
-            execution = _create_direct_execution(job, custody)
-        except BaseException:
+        from cron.runtime_custody import admit_cron_source, custody_required, reserve_execution
+        with admit_cron_source(
+            "builtin_dispatch", home=_get_hermes_home(), parent=custody,
+        ) as admission:
+            custody = reserve_execution(
+                owner_class="I12_cron_fire", job_id=job["id"], source="direct",
+                scheduled_instant=job.get("_scheduled_instant"), required=custody_required())
+            try:
+                execution = _create_direct_execution(job, custody, admission=admission)
+            except BaseException:
+                if custody is not None:
+                    custody.mark_unknown("read_failed")
+                raise
             if custody is not None:
-                custody.mark_unknown("read_failed")
-            raise
-        if custody is not None:
-            custody.bind_execution_record(execution)
-            job["_cron_custody"] = custody
-        job["execution_id"] = execution["id"]
+                custody.bind_execution_record(execution)
+                job["_cron_custody"] = custody
+            job["execution_id"] = execution["id"]
     elif custody is not None and getattr(custody, "execution_id", None) not in (None, str(job["execution_id"] )):
         custody.mark_unknown("foreign_custody")
         raise RuntimeError("cron custody execution identity mismatch")
@@ -3320,11 +3323,13 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
-def _create_direct_execution(job: dict, custody=None) -> dict:
+def _create_direct_execution(job: dict, custody=None, admission=None) -> dict:
     """Keep unmanaged direct callers on the historical ledger call shape."""
     kwargs = {"source": "direct", "scheduled_instant": job.get("_scheduled_instant")}
     if custody is not None:
         kwargs["execution_id"] = custody.owner_id
+    if admission is not None:
+        kwargs["admission"] = admission
     return create_execution(job["id"], **kwargs)
 
 
@@ -3574,6 +3579,7 @@ def _start_external_worker_reaper(process: subprocess.Popen, custody=None):
     try:
         reaper = reap_terminal_worker_in_background(
             process, on_done=(_on_reaped if custody is not None else None),
+            custody=custody,
         )
         if custody is not None:
             custody.bind_reaper(reaper)
@@ -3866,7 +3872,7 @@ def _await_external_worker_handoff(
     )
 
 
-def _launch_external_cron_worker(job: dict) -> bool:
+def _launch_external_cron_worker_effect(job: dict, admission) -> bool:
     """Launch *job* outside the managed gateway process when required.
 
     Returns ``False`` outside a managed systemd gateway (in-process path).  In
@@ -4064,6 +4070,16 @@ def _launch_external_cron_worker(job: dict) -> bool:
         worker_custody=worker_custody, dispatch=dispatch, worker_env=worker_env,
         scope_unit=scope_unit,
     )
+
+
+def _launch_external_cron_worker(job: dict) -> bool:
+    """Hold the exact source lease through payload creation and native worker spawn."""
+    from cron.runtime_custody import admit_cron_source
+
+    with admit_cron_source(
+        "worker", home=_get_hermes_home(), parent=job.get("_cron_custody"),
+    ) as admission:
+        return _launch_external_cron_worker_effect(job, admission)
 
 def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
     """Adopt and execute one gateway-dispatched cron payload.
@@ -4502,7 +4518,9 @@ def _process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     return run_one_job(claimed_job, adapters=adapters, loop=loop, verbose=verbose)
 
 
-def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
+def _submit_with_guard_effect(
+    job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job, admission,
+):
     """Submit with the in-flight dedup guard; None if a prior tick's run is still in flight.
     Running-set membership is released in the worker's finally."""
     job_id = job["id"]
@@ -4569,7 +4587,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
         }
         if custody is not None:
             execution_kwargs["execution_id"] = custody.owner_id
-        execution = create_execution(job_id, **execution_kwargs)
+        execution = create_execution(job_id, admission=admission, **execution_kwargs)
         if custody is not None:
             custody.bind_execution_record(execution)
         dispatched_job = dict(job, execution_id=execution["id"])
@@ -4599,7 +4617,7 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
 
     try:
         fut = pool.submit(_run_and_release)
-    except Exception as submit_err:
+    except Exception as submit_err:  # health: allow BLE001 -- executor implementations raise shutdown-specific exceptions; durable cleanup must always run.
         release_running_job(job_id, home=_claim_home, owner=registration_owner)
         _clear_run_claim_best_effort()
         finish_execution(
@@ -4619,6 +4637,22 @@ def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, p
     if custody is not None:
         custody.bind_future(fut)
     return fut
+
+
+def _submit_with_guard(job: dict, pool: concurrent.futures.ThreadPoolExecutor, process_job):
+    """Acquire the source lease before preparing the durable row and submitting the run."""
+    try:
+        from cron.runtime_custody import admit_cron_source
+
+        admission = admit_cron_source("builtin_dispatch", home=_get_hermes_home())
+        with admission:
+            return _submit_with_guard_effect(job, pool, process_job, admission)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as admission_error:
+        logger.warning(
+            "Job '%s' not dispatched: cron source admission refused: %s",
+            job.get("name", job.get("id")), admission_error,
+        )
+        return None
 
 
 def _sweep_mcp_orphans_when_all_done(futures: list) -> None:

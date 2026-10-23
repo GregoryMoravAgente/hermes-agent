@@ -78,6 +78,17 @@ def custody_parent() -> Optional[CronOwnerBinding]:
     return _PARENT.get()
 
 
+def active_cron_binding() -> Optional[CronOwnerBinding]:
+    """Return the exact in-process owner around an already-admitted cron run.
+
+    Script/monitor subprocesses execute below ``bind_cron_owner`` rather than the provider's
+    ``require_cron_custody`` context.  Exposing the binding through this typed seam lets the
+    source registry distinguish an existing owner from a late standalone Popen without treating
+    an execution id or a boolean as custody.
+    """
+    return _ACTIVE_BINDING.get()
+
+
 @contextmanager
 def bind_cron_owner(binding: Optional[CronOwnerBinding]):
     """Bind one exact owner while the existing cron execution invokes a script.
@@ -107,6 +118,18 @@ def finish_script_process(process: Any) -> None:
 def managed_runtime_available() -> bool:
     """Return whether the live gateway has a descriptor-backed custody coordinator."""
     return _runtime() is not None
+
+
+def admit_cron_source(source_key: str, *, home: Any = None, parent: Any = None) -> Any:
+    """Return a lease held across one cron claim/row/handoff's durable/native effects.
+
+    The source registry owns the closed producer graph when a gateway is live.  Standalone CLI
+    callers still receive a strict profile-scoped jobs-lock lease, but they never get to downgrade
+    a held cross-process lock to in-process ownership.
+    """
+    from gateway.runtime_cron_source_registry import admit_cron_source as _admit
+
+    return _admit(source_key, home=home, parent=parent)
 
 
 def _runtime():
@@ -1315,12 +1338,13 @@ def _cron_profile_ledgers_are_quiet(runner: Any) -> bool:
         from gateway.run_runtime import reserved_profile_homes
         from cron.executions import list_unsettled_executions
         from cron import scheduler as cron_scheduler
+        from cron import scheduler_provider
 
         homes = tuple(home for _name, home in reserved_profile_homes(runner))
         if not homes or cron_scheduler.get_running_job_ids() or cron_scheduler.get_wedged_job_ids():
             return False
         for home in homes:
-            with cron_scheduler._profile_cron_scope(home):
+            with scheduler_provider._profile_cron_scope(home):
                 records = list_unsettled_executions()
             external_workers = home / "cron" / "external-workers"
             if external_workers.exists() and any(external_workers.iterdir()):
@@ -1343,7 +1367,7 @@ def _cron_external_scope_is_quiet(runner: Any, *, require_external_row: bool = F
     try:
         from cron import executions
         from cron.executions import list_executions
-        from cron import scheduler as cron_scheduler
+        from cron import scheduler_provider
         from gateway.run_runtime import reserved_profile_homes
         current_process_id = getattr(executions, "_PROCESS_ID", None)
         for _name, home in reserved_profile_homes(runner):
@@ -1351,7 +1375,7 @@ def _cron_external_scope_is_quiet(runner: Any, *, require_external_row: bool = F
             external_seen = False
             before_claimed_at = None
             while True:
-                with cron_scheduler._profile_cron_scope(home):
+                with scheduler_provider._profile_cron_scope(home):
                     page = list_executions(
                         limit=500, before_claimed_at=before_claimed_at)
                 if not page:
@@ -1428,6 +1452,23 @@ def preservation_owner_evidence(
         or type(owner_id) is not str
         or not owner_id
     ):
+        return None
+    # A live gateway uses the source-owned registry first.  Its strict profile jobs-lock fences
+    # and native profile-owner observations permit a legitimate zero-row profile to seal; the
+    # historical foreign-row path remains only for runtimes that predate the registry.
+    try:
+        from gateway.runtime_cron_source_registry import CronSourceRegistry
+
+        registry = getattr(_coordinator, "_cron_source_registry", None)
+        if isinstance(registry, CronSourceRegistry):
+            return registry.source_owner_evidence(
+                owner_class,
+                process_instance=process_instance,
+                authority_epoch=authority_epoch,
+                close_generation=close_generation,
+                owner_id=owner_id,
+            )
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
         return None
     if not _cron_bindings_are_quiet() or not _cron_profile_ledgers_are_quiet(_runner):
         return None

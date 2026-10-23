@@ -233,6 +233,10 @@ async def initialize_gateway_runtime(runner):
     # registration remains UNKNOWN and cannot be converted into an empty-map success.
     from gateway.runtime_i16_source_registry import bootstrap_i16_source_registry
     bootstrap_i16_source_registry(runner, coordinator)
+    # Cron claims, execution rows, detached workers and manual/API fires share one source graph.
+    # Bind its immutable producer/native profile witness before any ticker or recovery path runs.
+    from gateway.runtime_cron_source_registry import bootstrap_cron_source_registry
+    bootstrap_cron_source_registry(runner, coordinator)
     from gateway.platforms.api_server_run_factory import refresh_api_run_factories
     refresh_api_run_factories(runner)
     # Bind the source-owned I19 lifecycle graph at the same authenticated runtime boundary.  The
@@ -409,15 +413,21 @@ def _preservation_ownership_reason(runner, *, require_running: bool = True):
     return None
 
 
-def _preservation_receipt(params):
+def _preservation_receipt(params, *, allow_closed: bool = False):
     receipt = params.get('receipt') if isinstance(params, dict) else None
     if not isinstance(receipt, dict):
         raise ValueError('invalid_params')
     from gateway.runtime_custody import DrainReceipt
     required = {'receipt_id', 'process_instance', 'authority_epoch', 'close_generation', 'status'}
-    if set(receipt) != required:
+    optional_closed = {'cleanup', 'reason'}
+    if allow_closed and receipt.get('status') == 'closed':
+        if not required.issubset(receipt) or set(receipt) - required - optional_closed:
+            raise ValueError('invalid_params')
+        if 'cleanup' in receipt and receipt['cleanup'] not in {'pending', 'complete', 'unknown'}:
+            raise ValueError('invalid_params')
+    elif set(receipt) != required:
         raise ValueError('invalid_params')
-    if receipt.get('status') not in {'closing', 'handoff_pending'}:
+    if receipt.get('status') not in ({'closing', 'handoff_pending', 'closed'} if allow_closed else {'closing', 'handoff_pending'}):
         raise ValueError('invalid_params')
     return DrainReceipt(
         receipt['receipt_id'], receipt['process_instance'], receipt['authority_epoch'],
@@ -895,105 +905,8 @@ def _preservation_begin_gate(runner, params, peer_subject):
 
 
 async def begin_preservation_drain(runner, params, peer_subject):
-    """Atomically close fresh roots through the existing authenticated private socket.
-
-    This reversible phase only changes the admission state. It intentionally does not call the
-    destructive shutdown drain/interrupt/kill path: a pre-handoff refusal must be able to restore
-    the same owner without losing accepted leases.
-    """
-    refusal, descriptor, coordinator = _preservation_begin_gate(runner, params, peer_subject)
-    if refusal is not None:
-        return refusal
-    receipt = coordinator.begin_close(
-        owner_id=f'{peer_subject}:{params["owner_id"]}',
-        scope=params['scope'],
-        deadline_s=params['deadline_s'],
-    )
-    if hasattr(receipt, 'as_wire'):
-        wire = receipt.as_wire()
-    else:
-        wire = {'status': 'refused', 'reason': getattr(receipt, 'code', 'close_conflict')}
-    if wire.get('status') == 'closing':
-        # Fence the actual lifecycle ingress before any preservation source starts its await.  An
-        # already accepted stop/restart/idle operation keeps its exact ForeignLifecycleLease and
-        # makes this reversible close refuse; an empty registered ingress is valid live no-work.
-        from gateway.lifecycle_custody import begin_preservation_lifecycle_close
-        from gateway.lifecycle_custody import abort_preservation_lifecycle_close as _abort_lifecycle_close
-        lifecycle_refusal = begin_preservation_lifecycle_close(runner, receipt.close_generation)
-        if lifecycle_refusal is not None:
-            coordinator.abort_before_handoff(receipt)
-            return lifecycle_refusal.as_wire()
-        # Freeze MCP discovery before any close worker can cancel its task.  The
-        # factory is attached to each authority during bootstrap and uses the
-        # existing finalizer/coordinator roots for every accepted route.
-        mcp_entries, mcp_failure = _close_mcp_factories_for_begin(
-            runner, receipt.close_generation,
-        )
-        from gateway.session_hosted_service import begin_i09_source_close
-        from gateway.preservation_source_close import (
-            abort_source_close,
-            await_source_resume,
-            begin_source_close,
-        )
-        if mcp_failure is not None:
-            if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
-                _reclose_mcp_factories(mcp_entries)
-                return {'status': 'refused', 'reason': 'mcp_source_resume_pending', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
-                coordinator, receipt, mcp_entries,
-            )
-            if not completed:
-                return {'status': 'refused', 'reason': reason, 'receipt': wire}
-            if not _abort_lifecycle_close(runner, receipt.close_generation):
-                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
-            return {'status': 'refused', 'reason': mcp_failure}
-        if not begin_i09_source_close(runner, receipt.close_generation):
-            if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
-                _reclose_mcp_factories(mcp_entries)
-                return {'status': 'refused', 'reason': 'mcp_source_resume_pending', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
-                coordinator, receipt, mcp_entries,
-            )
-            if not completed:
-                return {'status': 'refused', 'reason': reason, 'receipt': wire}
-            if not _abort_lifecycle_close(runner, receipt.close_generation):
-                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
-            return {'status': 'refused', 'reason': 'hosted_source_close_conflict'}
-        source_registry = getattr(runner, '_preservation_source_close', None)
-        if source_registry is not None and not begin_source_close(runner, receipt.close_generation):
-            from gateway.session_hosted_service import abort_i09_source_close
-            remaining = coordinator.remaining_seconds()
-            source_rolled_back = False
-            if remaining is not None and await await_source_resume(runner, receipt.close_generation, remaining):
-                source_rolled_back = bool(
-                    abort_i09_source_close(runner, receipt.close_generation)
-                    and abort_source_close(runner, receipt.close_generation)
-                )
-            mcp_rolled_back = _resume_mcp_factories(runner, receipt.close_generation, mcp_entries)
-            if not source_rolled_back or not mcp_rolled_back:
-                _reclose_preservation_sources(
-                    runner, receipt.close_generation, source_registry, mcp_entries,
-                )
-                return {'status': 'refused', 'reason': 'source_close_conflict', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
-                coordinator, receipt, mcp_entries,
-            )
-            if not completed:
-                _reclose_preservation_sources(
-                    runner, receipt.close_generation, source_registry, mcp_entries,
-                )
-                return {'status': 'refused', 'reason': reason, 'receipt': wire}
-            if not _abort_lifecycle_close(runner, receipt.close_generation):
-                return {'status': 'refused', 'reason': 'lifecycle_resume_conflict', 'receipt': wire}
-            return {'status': 'refused', 'reason': 'source_close_conflict'}
-        # Preserve the existing reversible external-drain distinction: fresh roots refuse, while
-        # already accepted FIFO continuations may claim and settle under their live parent lease.
-        # Ordinary ``_draining`` remains reserved for shutdown/restart and must stay false here.
-        runner._external_drain_active = True
-        runner._preservation_drain_active = True
-        descriptor.update(state='draining', capabilities=[], drain_reason='preservation')
-    return wire
-
+    from gateway.run_runtime_source_transition import begin_preservation_drain_impl
+    return await begin_preservation_drain_impl(runner, params, peer_subject)
 
 async def preservation_drain_status(runner, params, peer_subject):
     if not isinstance(peer_subject, str) or not peer_subject:
@@ -1031,6 +944,16 @@ async def prepare_preservation_handoff(runner, params, peer_subject):
     remaining = coordinator.remaining_seconds()
     if remaining is None:
         return {'status': 'refused', 'reason': 'stale_close_receipt'}
+    # I08 watcher cancellation can leave an executor future alive.  Fence and join the exact
+    # source graph before any owner-readiness snapshot; a task's done bit is not native closure.
+    from gateway.session_goal_tick_custody import begin_i08_source_close, has_i08_source_graph
+    if has_i08_source_graph(runner) and not await begin_i08_source_close(
+            runner, receipt.close_generation, remaining):
+        _seal_integrated_preservation_owners(runner, coordinator, receipt)
+        blocked = coordinator.prepare_handoff(receipt)
+        if hasattr(blocked, 'as_wire'):
+            return blocked.as_wire()
+        return {'status': 'refused', 'reason': getattr(blocked, 'code', 'custody_pending')}
     # The source close is an awaited transport boundary.  Its close response carries the exact
     # queue epoch, registration and retained backlog snapshot; source_owner_ready is meaningful
     # only after that response and every accepted callback have settled.
@@ -1085,15 +1008,18 @@ def _mcp_factory_participants(runner):
 def _close_mcp_factories_for_begin(runner, close_generation: int):
     """Close configured factories and retain their exact witnesses for rollback."""
     entries = []
+    failure = None
     for factory in _mcp_factory_participants(runner):
         try:
             receipt = factory.close_ingress(close_generation)
         except (RemoteSourceError, OSError, RuntimeError, TypeError, ValueError):
-            return tuple(entries), 'mcp_source_close_conflict'
+            if failure is None:
+                failure = 'mcp_source_close_conflict'
+            continue
         entries.append((factory, receipt))
-        if receipt.outcome == 'unknown':
-            return tuple(entries), 'mcp_source_close_unknown'
-    return tuple(entries), None
+        if receipt.outcome == 'unknown' and failure is None:
+            failure = 'mcp_source_close_unknown'
+    return tuple(entries), failure
 
 
 def _mcp_factory_entries(runner, close_generation: int):
@@ -1182,18 +1108,21 @@ def _finish_mcp_factories(entries, coordinator, coordinator_receipt) -> bool:
     return ok
 
 
-def _abort_mcp_factories(coordinator, receipt, entries) -> tuple[bool, str | None]:
-    """Open the coordinator only after every resumed MCP source has a prepared release."""
-    if not _prepare_mcp_factories(entries, coordinator, receipt):
+def _abort_mcp_factories(runner, coordinator, receipt, entries) -> tuple[bool, str | None]:
+    """Compatibility adapter for early-failure callers using the shared typed transition."""
+    from gateway.run_runtime_source_abort import (
+        finish_sources_atomically, prepare_source_participants,
+    )
+    prepared, reason = prepare_source_participants(
+        runner, coordinator, receipt, include_i08=False,
+    )
+    if not prepared:
         _reclose_mcp_factories(entries)
-        return False, 'mcp_source_finalization_pending'
-    refused = coordinator.abort_before_handoff(receipt)
-    if refused is not None:
-        _reclose_mcp_factories(entries)
-        return False, getattr(refused, 'code', 'close_release_failed')
-    if not _finish_mcp_factories(entries, coordinator, receipt):
-        return False, 'mcp_source_finalization_pending'
-    return True, None
+        return False, reason
+    outcome = finish_sources_atomically(runner, entries, coordinator, receipt)
+    if outcome.completed:
+        return True, None
+    return False, outcome.reason or 'mcp_source_finalization_pending'
 
 
 def _reclose_preservation_sources(runner, close_generation: int, source_registry, mcp_entries=None) -> bool:
@@ -1211,89 +1140,14 @@ def _reclose_preservation_sources(runner, close_generation: int, source_registry
 
 
 async def abort_preservation_drain(runner, params, peer_subject):
-    """Reopen only the exact receipt after every source and profile root has restored."""
-    if not isinstance(peer_subject, str) or not peer_subject:
-        return {'status': 'refused', 'reason': 'permission_denied'}
-    try:
-        receipt = _preservation_receipt(params)
-    except (TypeError, ValueError, KeyError):
-        return {'status': 'refused', 'reason': 'invalid_params'}
-    coordinator = getattr(runner, 'runtime_custody', None)
-    if coordinator is None:
-        return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
-    ownership_reason = _preservation_ownership_reason(runner)
-    if ownership_reason is not None:
-        # Keep the close receipt and all unresolved leases live for the active lifecycle owner.
-        # A failed ownership check is never permission to release or reopen that custody.
-        return {'status': 'refused', 'reason': ownership_reason}
-    remaining = coordinator.remaining_seconds()
-    if remaining is None:
-        return {'status': 'refused', 'reason': 'stale_close_receipt'}
-    from gateway.preservation_source_close import abort_source_close, await_source_resume
-    from gateway.session_hosted_service import abort_i09_source_close
-    source_registry = getattr(runner, '_preservation_source_close', None)
-    mcp_entries = _mcp_factory_entries(runner, receipt.close_generation)
-    if mcp_entries is None:
-        return {'status': 'refused', 'reason': 'mcp_source_receipt_missing'}
-    source_close_active = (
-        source_registry is not None
-        and getattr(source_registry, 'state', None) == 'closing'
-        and getattr(source_registry, 'close_generation', None) == receipt.close_generation
-    )
-    if (source_close_active
-            and not await await_source_resume(runner, receipt.close_generation, remaining)):
-        return {'status': 'refused', 'reason': 'source_resume_pending'}
-
-    # Keep RuntimeCustodyCoordinator CLOSING while source and I17 finalizers restore.  A partial
-    # source abort is re-fenced at the same generation, so retry sees the original receipt and
-    # exact accepted leases instead of a falsely reopened runtime.
-    i09_close_active = _i09_close_active(runner)
-    if i09_close_active and not abort_i09_source_close(runner, receipt.close_generation):
-        return {'status': 'refused', 'reason': 'hosted_source_resume_conflict'}
-    if source_close_active and not abort_source_close(runner, receipt.close_generation):
-        _reclose_preservation_sources(runner, receipt.close_generation, source_registry)
-        return {'status': 'refused', 'reason': 'source_resume_conflict'}
-    from tui_gateway.hosted_tui_custody import restore_after_abort
-    if not restore_after_abort(runner, receipt):
-        _reclose_preservation_sources(
-            runner, receipt.close_generation, source_registry, mcp_entries,
-        )
-        return {'status': 'refused', 'reason': 'i17_rebind_pending'}
-    if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
-        _reclose_preservation_sources(
-            runner, receipt.close_generation, source_registry, mcp_entries,
-        )
-        return {'status': 'refused', 'reason': 'mcp_source_resume_conflict'}
-    if not _prepare_mcp_factories(mcp_entries, coordinator, receipt):
-        _reclose_preservation_sources(
-            runner, receipt.close_generation, source_registry, mcp_entries,
-        )
-        return {'status': 'refused', 'reason': 'mcp_source_finalization_pending'}
-    refused = coordinator.abort_before_handoff(receipt)
-    if refused is not None:
-        _reclose_preservation_sources(
-            runner, receipt.close_generation, source_registry, mcp_entries,
-        )
-        return refused.as_wire()
-    from gateway.lifecycle_custody import abort_preservation_lifecycle_close
-    if not abort_preservation_lifecycle_close(runner, receipt.close_generation):
-        return {'status': 'refused', 'reason': 'lifecycle_resume_conflict'}
-    if not _finish_mcp_factories(mcp_entries, coordinator, receipt):
-        return {'status': 'refused', 'reason': 'mcp_source_finalization_pending'}
-    descriptor = getattr(runner, 'session_runtime_descriptor', None) or {}
-    runner._external_drain_active = False
-    runner._preservation_drain_active = False
-    descriptor.update(state='ready', capabilities=['session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
-    descriptor.pop('drain_reason', None)
-    return {'status': 'open', 'instance_id': descriptor.get('instance_id'),
-            'authority_epoch': descriptor.get('authority_epoch')}
-
+    from gateway.run_runtime_source_transition import abort_preservation_drain_impl
+    return await abort_preservation_drain_impl(runner, params, peer_subject)
 
 async def acknowledge_preservation_native(runner, params, peer_subject):
     if not isinstance(peer_subject, str) or not peer_subject:
         return {'status': 'refused', 'reason': 'permission_denied'}
     try:
-        receipt = _preservation_receipt(params)
+        receipt = _preservation_receipt(params, allow_closed=True)
     except (TypeError, ValueError, KeyError):
         return {'status': 'refused', 'reason': 'invalid_params'}
     coordinator = getattr(runner, 'runtime_custody', None)
@@ -1302,7 +1156,8 @@ async def acknowledge_preservation_native(runner, params, peer_subject):
     ownership_reason = _preservation_ownership_reason(runner, require_running=False)
     if ownership_reason is not None:
         return {'status': 'refused', 'reason': ownership_reason}
-    result = coordinator.acknowledge_native(receipt)
+    from gateway.run_runtime_native_cleanup import acknowledge_native_cleanup
+    result = await acknowledge_native_cleanup(runner, coordinator, receipt)
     if hasattr(result, 'as_wire'):
         return result.as_wire()
     return {'status': 'refused', 'reason': getattr(result, 'code', 'native_ack_mismatch')}
@@ -1668,6 +1523,8 @@ async def serve_profile_runtime(runner, name, home):
             bind_automation_graph = getattr(authority, '_register_automation_source_graph', None)
             if callable(bind_automation_graph):
                 bind_automation_graph(coordinator)
+            from gateway.session_goal_tick_custody import register_i08_source_graph
+            register_i08_source_graph(runner, authority, coordinator)
             from gateway.runtime_i16_source_registry import refresh_i16_source_registry
             refresh_i16_source_registry(runner, coordinator)
             # A hot-served authority joins the same source-owned I15 factory before its recovery
@@ -1680,6 +1537,10 @@ async def serve_profile_runtime(runner, name, home):
                 runner=runner,
                 profiles=((str(home), authority.epoch, home),),
             )
+            cron_registry = getattr(coordinator, '_cron_source_registry', None)
+            if cron_registry is not None:
+                from gateway.runtime_cron_source_registry import refresh_cron_source_registry
+                refresh_cron_source_registry(runner, coordinator)
         # Hot-served profiles are added after the hosted runtime binding is published.  Reserve
         # the I17 root before recovery can publish a hosted service, room, or compute-host
         # producer; waiting for owner_evidence would be too late because preservation has already
@@ -1799,6 +1660,10 @@ async def start_gateway_runtime_api(runner):
     from gateway.run_api import start_gateway_api
     runner.session_api = await start_gateway_api(runner)
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is not None and getattr(coordinator, '_cron_source_registry', None) is not None:
+        from gateway.runtime_cron_source_registry import refresh_cron_source_registry
+        refresh_cron_source_registry(runner, coordinator)
     for authority in _authorities(runner):
         await _recover_profile_bot_mailbox(runner, authority)
 
@@ -1879,6 +1744,13 @@ def publish_gateway_runtime_ready(runner):
     descriptor = runner.session_runtime_descriptor
     if runner.session_api.task.done() or not runner._running or runner._draining:
         raise RuntimeError('gateway stopped before session API readiness')
+    # The API adapter is attached during the runner start phase, after the initial source-graph
+    # bootstrap. Refresh the exact adapter identity before READY publishes a graph that can seal a
+    # cron zero-work profile; a pre-API empty snapshot is not a valid source binding.
+    coordinator = getattr(runner, 'runtime_custody', None)
+    if coordinator is not None and getattr(coordinator, '_cron_source_registry', None) is not None:
+        from gateway.runtime_cron_source_registry import refresh_cron_source_registry
+        refresh_cron_source_registry(runner, coordinator)
     descriptor.update(state='ready', capabilities=[
         'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
     from gateway.session_hosted_service import start_ready_hosted_services

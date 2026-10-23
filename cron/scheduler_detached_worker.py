@@ -57,7 +57,9 @@ def defer_teardown_to_running_worker(
     return True
 
 
-def reap_terminal_worker_in_background(process: subprocess.Popen, on_done=None):
+def _reap_terminal_worker_in_background_effect(
+    process: subprocess.Popen, on_done=None, *, custody=None,
+):
     """Keep the reap contract and report its physical completion to custody.
 
     The ledger turning terminal lets ``_wait_for_external_cron_worker_body`` return while the
@@ -111,3 +113,12 @@ def reap_terminal_worker_in_background(process: subprocess.Popen, on_done=None):
             name=f"cron-worker-reap-notify-{getattr(process, 'pid', '?')}",
         ).start()
     return thread
+
+
+def reap_terminal_worker_in_background(process: subprocess.Popen, on_done=None, *, custody=None):
+    """Start the exact reaper continuation under its parent admission lease."""
+    from cron.runtime_custody import admit_cron_source
+
+    with admit_cron_source("worker_reaper", parent=custody):
+        return _reap_terminal_worker_in_background_effect(
+            process, on_done, custody=custody)

@@ -863,9 +863,13 @@ def _require_auth(handler):
 
 
 @contextmanager
-def _reserve_pending_api_work(adapter):
+def _reserve_pending_api_work(adapter, *, cron: bool = False):
     """Keep externally-triggered background work visible across awaits; a handler may detach
     the reservation to a task whose done callback then owns release."""
+    # This is request bookkeeping, not the durable cron effect.  Holding a profile jobs lock
+    # across the async request would block unrelated profile work and still would not cover the
+    # detached claim.  ``_handle_authenticated_fire``/the provider acquire the typed lease at the
+    # actual claim, row, and handoff boundary.
     reservation = {"active": True, "detached": False}
     adapter._pending_agent_requests += 1
     try:

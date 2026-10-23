@@ -389,5 +389,5 @@ async def handle_cron_fire(adapter: Any, request: web.Request) -> web.Response:
     draining = adapter._draining_response()
     if draining is not None:
         return draining
-    with _reserve_pending_api_work(adapter) as reservation:
+    with _reserve_pending_api_work(adapter, cron=True) as reservation:
         return await _handle_authenticated_fire(adapter, request, reservation, received_at)

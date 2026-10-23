@@ -52,8 +52,11 @@ class GatewayGoalsMixin:
         override alive under multiplex; a failed warm-up is a bounded stall, never a crash."""
         try:
             from hermes_cli.goals import _get_session_db as _warm_goals_db
-
-            await self._run_in_executor_with_context(_warm_goals_db)
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            from gateway.session_authorities import active_authority
+            await run_tracked_executor(
+                self, _warm_goals_db, authority=active_authority(self), kind="goal-warm",
+            )
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
 
@@ -205,7 +208,7 @@ class GatewayGoalsMixin:
             elif quick_key not in adapter._active_sessions:
                 mgr.abandon_fire()
 
-    def _start_heartbeat_poller(self) -> None:
+    def _start_heartbeat_poller(self, *, _i08_resume_generation: int | None = None) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
         existing = getattr(self, "_heartbeat_poll_task", None)
         if existing is not None and not existing.done():
@@ -232,7 +235,9 @@ class GatewayGoalsMixin:
                 _bg.add(task)
                 task.add_done_callback(_bg.discard)
             from gateway.session_goal_tick_custody import register_runner_watcher
-            register_runner_watcher(self, "heartbeat", task)
+            register_runner_watcher(
+                self, "heartbeat", task, resume_generation=_i08_resume_generation,
+            )
         except Exception:
             logger.debug("Failed to start heartbeat poller", exc_info=True)
 
@@ -353,11 +358,14 @@ class GatewayGoalsMixin:
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
         try:
-            decision = await self._run_in_executor_with_context(
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            decision = await run_tracked_executor(
+                self,
                 lambda: mgr.evaluate_after_turn(
                     final_response or "", user_initiated=True, background_processes=_bg_procs,
                     active_delegations=_active_deleg,
                 ),
+                authority=_authority, kind="goal-evaluate",
             )
         except BaseException:
             if goal_tick is not None:
@@ -457,10 +465,15 @@ class GatewayGoalsMixin:
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
         try:
-            decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            decision = await run_tracked_executor(
+                self, mgr.complete_tick, final_response or "",
+                authority=authority, kind="loop-complete",
+            )
         except BaseException:
-            from gateway.session_authorities import active_authority
             from gateway.session_goal_tick_custody import mark_unknown, view_for_handle
             handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
             tick = view_for_handle(active_authority(self), handle)
@@ -468,11 +481,9 @@ class GatewayGoalsMixin:
                 mark_unknown(tick, 'join_failed')
             raise
         msg = decision.get("message") or ""
-        from gateway.session_authorities import active_authority
         from gateway.session_goal_tick_custody import (
             handle_for_admission, mark_unknown, view_for_handle,
         )
-        authority = active_authority(self)
         handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
         if handle is None and authority is not None:
             live = authority.sessions.get(session_entry.session_id)
@@ -564,7 +575,12 @@ class GatewayGoalsMixin:
             else:
                 await adapter.handle_message(event)
         if is_command:
-            await self._run_in_executor_with_context(mgr.complete_tick, "")
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            from gateway.session_authorities import active_authority
+            await run_tracked_executor(
+                self, mgr.complete_tick, "", authority=active_authority(self),
+                kind="loop-command-complete",
+            )
             from gateway.session_goal_tick_custody import finish_unbound, view_for_handle
             from gateway.session_authorities import active_authority
             tick = view_for_handle(active_authority(self), handle)
@@ -634,7 +650,10 @@ class GatewayGoalsMixin:
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
         try:
-            wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            wakeup = await run_tracked_executor(
+                self, mgr.fire_tick, authority=authority, kind="loop-fire",
+            )
         except BaseException:
             self._loop_custody_unknown(authority, handle, 'join_failed')
             raise
@@ -674,7 +693,9 @@ class GatewayGoalsMixin:
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         self._publish_local_control(source)
 
-    async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
+    async def _loop_wakeup_watcher(
+        self, interval: float = 15.0, *, _i08_resume_generation: int | None = None,
+    ) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
         (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.
         Deferrals: session running a turn (FIFO would race the live turn); active non-parked /goal
@@ -686,8 +707,11 @@ class GatewayGoalsMixin:
         and each hit is fired against that profile's adapters."""
         from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop
-        from gateway.session_goal_tick_custody import register_runner_watcher
-        register_runner_watcher(self, 'loop', asyncio.current_task())
+        from gateway.session_authorities import active_authority, authority_for_home
+        from gateway.session_goal_tick_custody import register_runner_watcher, run_tracked_executor
+        register_runner_watcher(
+            self, 'loop', asyncio.current_task(), resume_generation=_i08_resume_generation,
+        )
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
@@ -706,7 +730,11 @@ class GatewayGoalsMixin:
             # run the state.db init on the loop thread before the first read.
             await self._warm_goals_session_db("loop wakeup")
             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            active_loops = await run_tracked_executor(
+                self, list_active_loops,
+                authority=active_authority(self),
+                kind="loop-scan",
+            )
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
@@ -718,8 +746,13 @@ class GatewayGoalsMixin:
                 for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop. The root scan (None) is unscoped and stays cheap.
-                    if profile_home is not None and not await self._run_in_executor_with_context(
-                            profile_has_active_loop, profile_home):
+                    gate_authority = (
+                        authority_for_home(self, profile_home)
+                        if profile_home is not None else active_authority(self)
+                    )
+                    if profile_home is not None and not await run_tracked_executor(
+                            self, profile_has_active_loop, profile_home,
+                            authority=gate_authority, kind="loop-gate"):
                         continue
                     async with _scope(profile_home):
                         await _scan_one_store(profile_name)

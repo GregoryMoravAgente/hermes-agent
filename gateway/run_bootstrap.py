@@ -382,8 +382,24 @@ async def _start_gateway_start_control_socket(runner):
                 try:
                     return future.result(timeout=1.5)
                 except concurrent.futures.TimeoutError:
+                    if operation.__name__ == 'acknowledge_preservation_native':
+                        try:
+                            from gateway.run_runtime_native_cleanup import pending_wire
+                            retained = pending_wire(runner, params)
+                        except Exception:  # health: allow BLE001 -- lookup failure must retain the pending custody response
+                            retained = None
+                        if retained is not None:
+                            return retained
                     return {"status": "pending", "operation": operation.__name__}
                 except Exception:  # health: allow BLE001 -- authenticated preservation operation callback is opaque; constant refusal retains receipt and custody without exposing exception values
+                    if operation.__name__ == 'acknowledge_preservation_native':
+                        try:
+                            from gateway.run_runtime_native_cleanup import pending_wire
+                            retained = pending_wire(runner, params)
+                        except Exception:  # health: allow BLE001 -- lookup failure must retain the refusal custody response
+                            retained = None
+                        if retained is not None:
+                            return retained
                     return {"status": "refused", "reason": "runtime_draining"}
             return handler
 
@@ -476,6 +492,12 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
+    # Publish the exact provider and ticker object before either can admit work.  The source
+    # registry uses these identities when sealing a zero-work preservation graph.
+    from gateway.runtime_cron_source_registry import bind_cron_scheduler_runtime
+    coordinator = getattr(runner, "runtime_custody", None)
+    if coordinator is not None:
+        bind_cron_scheduler_runtime(runner, coordinator, cron_provider, cron_thread)
     from gateway.runtime_ownership import process_ownership
     process_ownership.start_writer(cron_thread)
 

@@ -212,7 +212,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
 
 def create_execution(
     job_id: str, *, source: str, scheduled_instant: Optional[str] = None,
-    execution_id: Optional[str] = None,
+    execution_id: Optional[str] = None, admission: Any = None,
 ) -> dict[str, Any]:
     """Persist a claimed attempt before executor/provider dispatch.
 
@@ -220,25 +220,33 @@ def create_execution(
     optional argument is additive: ordinary callers still receive a fresh id here.
     """
     from cron.occurrences import scheduled_instant as canonical_instant
+    if admission is None:
+        from cron.runtime_custody import admit_cron_source
+        from hermes_constants import get_hermes_home
 
-    now = _hermes_now().isoformat()
-    if execution_id is None:
-        execution_id = uuid.uuid4().hex
-    elif type(execution_id) is not str or not execution_id:
-        raise ValueError("execution_id is required")
-    pid = os.getpid()
-    with _transaction() as conn:
-        conn.execute(
-            """INSERT INTO executions
-               (id, job_id, source, process_id, pid, process_started_at,
-                status, claimed_at, scheduled_instant)
-               VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
-            (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
-             _process_start_time(pid), now, canonical_instant(scheduled_instant)),
-        )
-        record = _fetch(conn, execution_id)
-    _emit_execution_state(record)
-    return record  # type: ignore[return-value]
+        try:
+            admission = admit_cron_source("execution_row", home=get_hermes_home())
+        except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"cron execution admission refused: {exc}") from exc
+    with admission:
+        now = _hermes_now().isoformat()
+        if execution_id is None:
+            execution_id = uuid.uuid4().hex
+        elif type(execution_id) is not str or not execution_id:
+            raise ValueError("execution_id is required")
+        pid = os.getpid()
+        with _transaction() as conn:
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, process_started_at,
+                    status, claimed_at, scheduled_instant)
+                   VALUES (?, ?, ?, ?, ?, ?, 'claimed', ?, ?)""",
+                (execution_id, str(job_id), str(source), _PROCESS_ID, pid,
+                 _process_start_time(pid), now, canonical_instant(scheduled_instant)),
+            )
+            record = _fetch(conn, execution_id)
+        _emit_execution_state(record)
+        return record  # type: ignore[return-value]
 
 
 def set_execution_occurrence(execution_id: str, instant: Optional[str]) -> None:

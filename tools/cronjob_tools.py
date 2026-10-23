@@ -242,7 +242,10 @@ def _claim_for_manual_run(job_id: str, log_label: str):
     ``(None, error_dict)`` in the ``_execute_job_now`` shape. A lost claim is labelled precisely —
     claim_job_for_fire also returns False for paused/disabled/missing jobs, not just in-flight ones."""
     try:
-        claimed_job = claim_job_for_fire(job_id, manual=True, return_job=True)
+        from cron.runtime_custody import admit_cron_source
+        from hermes_constants import get_hermes_home
+        with admit_cron_source("manual_cli", home=get_hermes_home()):
+            claimed_job = claim_job_for_fire(job_id, manual=True, return_job=True)
         if isinstance(claimed_job, dict):
             return claimed_job, None
         refreshed = get_job(job_id)

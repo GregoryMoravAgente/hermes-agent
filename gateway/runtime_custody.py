@@ -7,7 +7,7 @@ It never treats a counter, empty registry, PID, task completion, or deadline as 
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 import math
 import secrets
 import threading
@@ -22,6 +22,14 @@ from hermes_cli.backend_retirement import (
     retirement,
 )
 from gateway.runtime_custody_profiles import ProfileScopeResolver, ProfileScopeResult
+from gateway.runtime_native_cleanup import (
+    NativeCleanupCapability,
+    NativeCleanupCompletionReceipt,
+    NativeCleanupMixin,
+    NativeCleanupPlan,
+    NativeCleanupResult,
+    NativeCleanupZeroWorkReceipt,
+)
 
 
 _UNSPECIFIED_PHYSICAL_OWNER = object()
@@ -118,6 +126,26 @@ class DrainReceipt:
 
 
 @dataclass(frozen=True)
+class PostOpenTransitionCapability:
+    """Coordinator-issued authority for cleanup after a reversible OPEN transition.
+
+    The wire ``DrainReceipt`` remains the pre-open retry identity.  Once the coordinator
+    releases the close fence, source cleanup must use this exact capability rather than
+    replaying a receipt or manufacturing a new generation.
+    """
+
+    coordinator: Any = field(repr=False, compare=False)
+    receipt: DrainReceipt = field(repr=False, compare=False)
+    transition: object = field(repr=False, compare=False)
+    process_instance: str
+    authority_epoch: int
+    close_generation: int
+    source_participants: tuple[tuple[Any, Any, Any], ...] = field(
+        default_factory=tuple, repr=False, compare=False,
+    )
+
+
+@dataclass(frozen=True)
 class CustodyHandle:
     owner_class: str
     owner_id: str
@@ -185,7 +213,7 @@ class _Record:
     reason: Optional[str] = None
 
 
-class RuntimeCustodyCoordinator:
+class RuntimeCustodyCoordinator(NativeCleanupMixin):
     """One process-owned ledger for the closed runtime source graph.
 
     ``RetirementFence`` supplies the exact lease/close linearization.  The coordinator only
@@ -213,6 +241,8 @@ class RuntimeCustodyCoordinator:
         # profiles do not leave a strong global profile/binding cache behind.
         self._source_rebind_bindings = weakref.WeakValueDictionary()
         self._source_rebind_transition = object()
+        self._post_open_transition: PostOpenTransitionCapability | None = None
+        self._completed_post_open_transition: PostOpenTransitionCapability | None = None
         self._receipt_id: Optional[str] = None
         self._records: dict[str, _Record] = {}
         self._completed: dict[str, str] = {}
@@ -249,6 +279,12 @@ class RuntimeCustodyCoordinator:
         self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
         self._owner_reason: dict[str, str] = {}
         self._native_ack = False
+        self._native_cleanup_plan: NativeCleanupPlan | None = None
+        self._native_cleanup_capability: NativeCleanupCapability | None = None
+        self._native_cleanup_state = "not_started"
+        self._native_cleanup_reason: str | None = None
+        self._native_cleanup_in_progress = False
+        self._native_cleanup_pending_participants: tuple[tuple[Any, Any, Any], ...] = ()
 
     def _profile_scope_result_locked(
         self, profile_id: Optional[str], authority_epoch: int, process_instance: str, *,
@@ -499,8 +535,11 @@ class RuntimeCustodyCoordinator:
         if not isinstance(deadline_s, (int, float)) or not math.isfinite(deadline_s) or deadline_s <= 0:
             return CustodyRefusal("invalid_deadline")
         with self._lock:
+            if self._post_open_transition is not None:
+                return CustodyRefusal("post_open_cleanup_pending")
             if self._state != "open":
                 return CustodyRefusal("close_already_owned")
+            self._completed_post_open_transition = None
             close = self._fence.begin_close(
                 owner_kind="runtime-preservation",
                 owner_id=owner_id,
@@ -520,6 +559,12 @@ class RuntimeCustodyCoordinator:
             self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
             self._owner_reason.clear()
             self._native_ack = False
+            self._native_cleanup_plan = None
+            self._native_cleanup_capability = None
+            self._native_cleanup_state = "not_started"
+            self._native_cleanup_reason = None
+            self._native_cleanup_in_progress = False
+            self._native_cleanup_pending_participants = ()
             return DrainReceipt(
                 self._receipt_id,
                 self.process_instance,
@@ -644,6 +689,8 @@ class RuntimeCustodyCoordinator:
         """Reserve and index one root while ``_lock`` is held."""
         if owner_class not in OWNER_SPECS:
             return CustodyRefusal("unknown_owner_class", owner_class)
+        if self._post_open_transition is not None and parent is None:
+            return CustodyRefusal("post_open_cleanup_pending", owner_class)
         scope_result = self._profile_scope_result_locked(
             profile_id, authority_epoch, self.process_instance,
             require_serving=parent is None, allow_retiring=parent is not None,
@@ -1577,50 +1624,175 @@ class RuntimeCustodyCoordinator:
             if not self._fence.commit_close(self._close):
                 # This includes any legacy/foreign lease that has not been adopted into this ledger.
                 return CustodyRefusal("foreign_or_unmapped_lease")
-            self._state = "handoff_pending"
-            return DrainReceipt(
+            handoff = DrainReceipt(
                 self._receipt_id or "",
                 self.process_instance,
                 self.authority_epoch,
                 self._close.close_generation,
                 "handoff_pending",
             )
+            closed = replace(handoff, state="closed")
+            self._state = "handoff_pending"
+            self._native_ack = False
+            self._native_cleanup_plan = None
+            self._native_cleanup_capability = NativeCleanupCapability(
+                coordinator=self,
+                receipt=handoff,
+                closed_receipt=closed,
+                close=self._close,
+                transition=self._source_rebind_transition,
+                process_instance=self.process_instance,
+                authority_epoch=self.authority_epoch,
+                close_generation=self._close.close_generation,
+            )
+            self._native_cleanup_state = "not_started"
+            self._native_cleanup_reason = None
+            self._native_cleanup_in_progress = False
+            self._native_cleanup_pending_participants = ()
+            return handoff
 
-    def acknowledge_native(self, receipt: DrainReceipt):
+    def acknowledge_native(
+        self, receipt: DrainReceipt, *, native_observation: NativeCleanupPlan | None = None,
+    ):
         with self._lock:
+            capability = self._native_cleanup_capability
+            if capability is None or not isinstance(receipt, DrainReceipt):
+                return CustodyRefusal("native_ack_mismatch")
+            if self._state == "closed":
+                if receipt != capability.closed_receipt:
+                    return CustodyRefusal("native_ack_mismatch")
+                if native_observation is not None and native_observation is not self._native_cleanup_plan:
+                    return CustodyRefusal("native_cleanup_plan_replaced")
+                return self._native_result_locked()
             if (
                 self._state != "handoff_pending"
-                or not isinstance(receipt, DrainReceipt)
-                or receipt.receipt_id != self._receipt_id
-                or receipt.process_instance != self.process_instance
-                or receipt.authority_epoch != self.authority_epoch
-                or self._close is None
-                or receipt.close_generation != self._close.close_generation
+                or receipt != capability.receipt
+                or not self._native_capability_valid_locked(capability)
             ):
                 return CustodyRefusal("native_ack_mismatch")
+            if native_observation is not None:
+                refusal = self._native_plan_identity_refusal_locked(native_observation)
+                if refusal is not None:
+                    return refusal
+                if self._native_cleanup_plan is not None and self._native_cleanup_plan is not native_observation:
+                    return CustodyRefusal("native_cleanup_plan_replaced")
+                if self._native_cleanup_plan is None:
+                    self._native_cleanup_plan = native_observation
+                    self._native_cleanup_capability = replace(capability, plan=native_observation)
+                    capability = self._native_cleanup_capability
             self._native_ack = True
             self._state = "closed"
-            return DrainReceipt(
-                self._receipt_id or "",
-                self.process_instance,
-                self.authority_epoch,
-                self._close.close_generation,
-                "closed",
-            )
+            if self._native_cleanup_plan is None:
+                self._native_cleanup_state = "unknown"
+                self._native_cleanup_reason = "native_cleanup_missing"
+            elif self._native_cleanup_plan.zero_work is not None:
+                self._native_cleanup_state = "complete"
+                self._native_cleanup_reason = None
+            else:
+                self._native_cleanup_state = "pending"
+                self._native_cleanup_reason = "native_cleanup_pending"
+                self._native_cleanup_pending_participants = self._native_cleanup_plan.source_participants
+            return self._native_result_locked()
 
-    def abort_before_handoff(self, receipt: DrainReceipt):
-        """Reopen only the exact pre-handoff owner; unresolved leases remain live."""
+    def abort_before_handoff(
+        self, receipt: DrainReceipt, *, return_transition: bool = False,
+        source_participants: tuple[tuple[Any, Any, Any], ...] = (),
+    ):
+        """Reopen the exact pre-handoff owner and optionally issue one post-open token."""
         with self._lock:
             if not self._check_close_identity(receipt) or self._state != "closing":
                 return CustodyRefusal("stale_close_receipt")
+            transition = object()
+            capability = None
+            if return_transition:
+                capability = PostOpenTransitionCapability(
+                    coordinator=self,
+                    receipt=receipt,
+                    transition=transition,
+                    process_instance=self.process_instance,
+                    authority_epoch=self.authority_epoch,
+                    close_generation=receipt.close_generation,
+                    source_participants=tuple(source_participants),
+                )
             if not self._fence.release_close(self._close):
                 return CustodyRefusal("close_release_failed")
             self._state = "open"
             self._close = None
             self._receipt_id = None
+            self._native_ack = False
+            self._native_cleanup_plan = None
+            self._native_cleanup_capability = None
+            self._native_cleanup_state = "not_started"
+            self._native_cleanup_reason = None
+            self._native_cleanup_in_progress = False
+            self._native_cleanup_pending_participants = ()
             self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
             self._owner_reason.clear()
-            self._source_rebind_transition = object()
+            self._source_rebind_transition = transition
+            if not return_transition:
+                return None
+            self._post_open_transition = capability
+            return capability
+
+    @staticmethod
+    def _same_drain_receipt(left: DrainReceipt, right: DrainReceipt) -> bool:
+        return (
+            isinstance(left, DrainReceipt)
+            and isinstance(right, DrainReceipt)
+            and left.receipt_id == right.receipt_id
+            and left.process_instance == right.process_instance
+            and left.authority_epoch == right.authority_epoch
+            and left.close_generation == right.close_generation
+        )
+
+    def pending_post_open_transition_for(self, receipt: DrainReceipt):
+        with self._lock:
+            capability = self._post_open_transition
+            if capability is None or not self._same_drain_receipt(capability.receipt, receipt):
+                return None
+            return capability
+
+    def completed_post_open_transition_for(self, receipt: DrainReceipt):
+        with self._lock:
+            capability = self._completed_post_open_transition
+            if capability is None or not self._same_drain_receipt(capability.receipt, receipt):
+                return None
+            return capability
+
+    def pending_post_open_transition(self):
+        with self._lock:
+            return self._post_open_transition
+
+    def bind_post_open_participants(self, capability, participants):
+        """Bind the exact source participant tuples to the issued transition token."""
+        with self._lock:
+            if self._post_open_transition is not capability or self._state != "open":
+                return None
+            bound = replace(capability, source_participants=tuple(participants))
+            self._post_open_transition = bound
+            return bound
+
+    def check_post_open_transition(self, capability) -> bool:
+        with self._lock:
+            return (
+                isinstance(capability, PostOpenTransitionCapability)
+                and capability.coordinator is self
+                and self._post_open_transition is capability
+                and self._state == "open"
+                and self._source_rebind_transition is capability.transition
+                and capability.process_instance == self.process_instance
+                and capability.authority_epoch == self.authority_epoch
+                and capability.close_generation == capability.receipt.close_generation
+            )
+
+    def complete_post_open_transition(self, capability):
+        with self._lock:
+            if self._completed_post_open_transition is capability:
+                return None
+            if not self.check_post_open_transition(capability):
+                return CustodyRefusal("post_open_transition_mismatch")
+            self._post_open_transition = None
+            self._completed_post_open_transition = capability
             return None
 
     def status(self) -> dict[str, Any]:
@@ -1645,6 +1817,10 @@ class RuntimeCustodyCoordinator:
                 "active_bound_parent_children": sorted(self._bound_parent_by_child),
                 "pending_child_parents": sorted(key for key, value in self._pending_children_by_parent.items() if value),
                 "native_ack": self._native_ack,
+                "native_cleanup": self._native_cleanup_state,
+                "native_cleanup_reason": self._native_cleanup_reason,
+                "native_cleanup_pending_participants": len(self._native_cleanup_pending_participants),
+                "post_open_cleanup_pending": self._post_open_transition is not None,
             }
 
     def remaining_seconds(self) -> Optional[float]:
@@ -1680,4 +1856,7 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
             # I07 has several real producer families sharing the existing automation indexes.
             # Bind their identity witness before any runtime source can publish a new root.
             bind_automation_graph(coordinator)
+        from gateway.session_goal_tick_custody import register_i08_source_graph
+        # Bind I08's real watcher/goal/heartbeat indexes before any source task starts.
+        register_i08_source_graph(runner, authority, coordinator)
     return coordinator

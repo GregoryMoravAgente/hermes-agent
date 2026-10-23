@@ -21,7 +21,13 @@ async def resolve_heartbeat_owner(runner, event, entry):
         def compression_tip():
             return runner.session_store._db_for_key(entry.session_key).get_compression_tip(expected)
 
-        tip = await runner._run_in_executor_with_context(compression_tip)
+        from gateway.session_goal_tick_custody import run_tracked_executor
+        from gateway.session_authorities import active_authority
+        tip = await run_tracked_executor(
+            runner, compression_tip,
+            authority=active_authority(runner),
+            kind="heartbeat-compression",
+        )
         if tip != resolved:
             return False
     # Keep a value, not the mutable routing entry: preparation and hooks can yield
