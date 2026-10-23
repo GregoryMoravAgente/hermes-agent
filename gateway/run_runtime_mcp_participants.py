@@ -19,7 +19,43 @@ def participant_tokens(
         if cron is not None:
             from gateway.runtime_cron_source_registry import cron_abort_participant
             tokens.append(cron_abort_participant(cron))
+    if runner is not None:
+        from tui_gateway.hosted_tui_custody import i17_cold_abort_participant
+        tokens.extend(
+            i17_cold_abort_participant(capability)
+            for capability in getattr(runner, "_i17_post_open_capabilities", ())
+        )
     return tuple(tokens)
+
+
+def complete_source_participant(coordinator: Any, transition: Any, capability: Any) -> bool:
+    """Complete one non-MCP source participant under the exact OPEN transition."""
+    kind = capability.__class__.__name__
+    if kind == "I08AbortCapability":
+        from gateway.session_goal_tick_custody import complete_i08_abort
+        return bool(complete_i08_abort(capability, transition))
+    if kind == "CronAbortCapability":
+        from gateway.runtime_cron_source_registry import complete_cron_abort
+        return bool(complete_cron_abort(capability, transition))
+    if kind == "I17ColdPostOpenCapability":
+        from tui_gateway.hosted_tui_custody import complete_i17_cold_abort
+        return bool(complete_i17_cold_abort(capability, coordinator, transition))
+    return True
+
+
+def clear_source_participant(transition: Any, capability: Any) -> bool:
+    """Clear one source participant only after the coordinator consumed its token."""
+    kind = capability.__class__.__name__
+    if kind == "I08AbortCapability":
+        from gateway.session_goal_tick_custody import clear_i08_abort
+        return bool(clear_i08_abort(capability, transition))
+    if kind == "CronAbortCapability":
+        from gateway.runtime_cron_source_registry import clear_cron_abort
+        return bool(clear_cron_abort(capability, transition))
+    if kind == "I17ColdPostOpenCapability":
+        from tui_gateway.hosted_tui_custody import clear_i17_cold_abort
+        return bool(clear_i17_cold_abort(capability, transition))
+    return True
 
 
 def _same_identity_set(expected: tuple[Any, ...], actual: tuple[Any, ...]) -> bool:
@@ -47,6 +83,9 @@ def _participant_is_current(runner: Any, coordinator: Any, transition: Any, entr
     if capability.__class__.__name__ == "CronAbortCapability":
         from gateway.runtime_cron_source_registry import validate_cron_abort_participant
         return validate_cron_abort_participant(coordinator, transition, entry)
+    if capability.__class__.__name__ == "I17ColdPostOpenCapability":
+        from tui_gateway.hosted_tui_custody import validate_i17_cold_abort_participant
+        return validate_i17_cold_abort_participant(runner, coordinator, transition, entry)
     if (
         not isinstance(capability, FactoryAbortCapability)
         or capability.factory is not factory
@@ -107,4 +146,8 @@ def validate_post_open_participants(runner: Any, coordinator: Any, transition: A
     cron = getattr(getattr(coordinator, "_cron_source_registry", None), "_post_open_capability", None)
     if cron is not None:
         current += (cron.registry,)
+    current += tuple(
+        capability.authority
+        for capability in getattr(runner, "_i17_post_open_capabilities", ())
+    )
     return _same_identity_set(factories, current)

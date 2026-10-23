@@ -22,6 +22,7 @@ from hermes_cli.backend_retirement import (
     retirement,
 )
 from gateway.runtime_custody_profiles import ProfileScopeResolver, ProfileScopeResult
+from gateway.runtime_custody_i17 import I17PreparedChildCustodyMixin
 from gateway.runtime_native_cleanup import (
     NativeCleanupCapability,
     NativeCleanupCompletionReceipt,
@@ -213,7 +214,7 @@ class _Record:
     reason: Optional[str] = None
 
 
-class RuntimeCustodyCoordinator(NativeCleanupMixin):
+class RuntimeCustodyCoordinator(I17PreparedChildCustodyMixin, NativeCleanupMixin):
     """One process-owned ledger for the closed runtime source graph.
 
     ``RetirementFence`` supplies the exact lease/close linearization.  The coordinator only
@@ -260,6 +261,11 @@ class RuntimeCustodyCoordinator(NativeCleanupMixin):
         self._rebound_terminal_roots: weakref.WeakValueDictionary[str, CustodyHandle] = (
             weakref.WeakValueDictionary()
         )
+        # A prepared I17 abort needs one short-lived witness tying the live successor root to the
+        # exact terminal predecessor, source binding, proof, and close receipt that created it.
+        # This is an identity witness, not a second ownership ledger; it is consumed before the
+        # coordinator reopens and is cleared with the close transition.
+        self._rebound_successor_witnesses: dict[str, tuple] = {}
         # Keep exact parent/child identity in the coordinator itself.  The RetirementFence
         # retains the opaque leases, but its public count is intentionally only diagnostic;
         # this index is what prevents a parent terminalizer from racing an active child.
@@ -1577,6 +1583,9 @@ class RuntimeCustodyCoordinator(NativeCleanupMixin):
             )
             self._records[lease.lease_id] = _Record(handle)
             self._rebound_terminal_roots[lease_id] = retired
+            self._rebound_successor_witnesses[lease.lease_id] = (
+                retired, binding, source_proof, receipt,
+            )
             return handle
 
     def release_child_reservation(self, child: ChildReservation):
@@ -1726,6 +1735,7 @@ class RuntimeCustodyCoordinator(NativeCleanupMixin):
             self._native_cleanup_reason = None
             self._native_cleanup_in_progress = False
             self._native_cleanup_pending_participants = ()
+            self._rebound_successor_witnesses.clear()
             self._owner_state = {owner_class: "unwired" for owner_class in OWNER_CLASSES}
             self._owner_reason.clear()
             self._source_rebind_transition = transition

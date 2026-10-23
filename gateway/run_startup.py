@@ -900,6 +900,12 @@ class GatewayStartupMixin:
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
         while self._running:
+            # Preservation owns a separate terminal source phase: I09 has already fenced intake
+            # and I17 may be joining the exact hosted service.  Do not respawn a stopped service
+            # while that authenticated close remains reversible.
+            if getattr(self, '_preservation_drain_active', False) or getattr(self, '_draining', False):
+                await asyncio.sleep(interval)
+                continue
             await self._ensure_hosted_room_worker()
             await asyncio.sleep(interval)
 

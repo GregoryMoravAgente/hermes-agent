@@ -243,17 +243,11 @@ def _complete_mcp_capabilities(capabilities, coordinator, coordinator_receipt, t
                 return pending_outcome()
         except (AttributeError, OSError, RemoteSourceError, RuntimeError, TypeError, ValueError):
             return pending_outcome()
-    # I08 and Cron are source participants in the same coordinator transition; their exact
-    # capability completion is deliberately after OPEN and before the token is consumed.
+    # Source participants are completed after OPEN and before the token is consumed.
+    from gateway.run_runtime_mcp_participants import complete_source_participant
     for _source, _receipt, capability in getattr(transition, "source_participants", ()):
-        if capability.__class__.__name__ == "I08AbortCapability":
-            from gateway.session_goal_tick_custody import complete_i08_abort
-            if not complete_i08_abort(capability, transition):
-                return pending_outcome()
-        elif capability.__class__.__name__ == "CronAbortCapability":
-            from gateway.runtime_cron_source_registry import complete_cron_abort
-            if not complete_cron_abort(capability, transition):
-                return pending_outcome()
+        if not complete_source_participant(coordinator, transition, capability):
+            return pending_outcome()
     # Source callbacks above ran without the coordinator lock.  Revalidate the exact token before
     # consuming it; only the coordinator transition itself belongs in this critical section.
     with lock:
@@ -268,19 +262,16 @@ def _complete_mcp_capabilities(capabilities, coordinator, coordinator_receipt, t
         return outcome
     # Clearing source-side opaque capabilities is also source work; do not hold the coordinator
     # lock while it calls back into source registries.
+    from gateway.run_runtime_mcp_participants import clear_source_participant
     for _source, _receipt, capability in getattr(transition, "source_participants", ()):
-        if capability.__class__.__name__ == "I08AbortCapability":
-            from gateway.session_goal_tick_custody import clear_i08_abort
-            if not clear_i08_abort(capability, transition):
-                return MCPFinishOutcome(
-                    "committed_open_cleanup_pending", "i08_source_finalization_pending", transition,
-                )
-        elif capability.__class__.__name__ == "CronAbortCapability":
-            from gateway.runtime_cron_source_registry import clear_cron_abort
-            if not clear_cron_abort(capability, transition):
-                return MCPFinishOutcome(
-                    "committed_open_cleanup_pending", "cron_source_finalization_pending", transition,
-                )
+        if not clear_source_participant(transition, capability):
+            reason = (
+                f"{capability.__class__.__name__.replace('AbortCapability', '').lower()}"
+                "_source_finalization_pending"
+            )
+            return MCPFinishOutcome(
+                "committed_open_cleanup_pending", reason, transition,
+            )
     return outcome
 
 
@@ -340,6 +331,9 @@ def _complete_post_open_participant(factory, capability, coordinator, transition
     if kind == "CronAbortCapability":
         from gateway.runtime_cron_source_registry import complete_cron_abort
         return bool(complete_cron_abort(capability, transition))
+    if kind == "I17ColdPostOpenCapability":
+        from tui_gateway.hosted_tui_custody import complete_i17_cold_abort
+        return bool(complete_i17_cold_abort(capability, coordinator, transition))
     pending = getattr(factory, "pending_finish_capability", lambda *_: None)(
         coordinator, transition,
     )
@@ -357,6 +351,9 @@ def _clear_post_open_participant(capability, transition) -> bool:
     if kind == "CronAbortCapability":
         from gateway.runtime_cron_source_registry import clear_cron_abort
         return bool(clear_cron_abort(capability, transition))
+    if kind == "I17ColdPostOpenCapability":
+        from tui_gateway.hosted_tui_custody import clear_i17_cold_abort
+        return bool(clear_i17_cold_abort(capability, transition))
     return True
 
 

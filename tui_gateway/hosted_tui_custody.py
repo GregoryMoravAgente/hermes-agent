@@ -7,10 +7,13 @@ already own the work; it never mirrors those objects in a second registry.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import os
 import hashlib
 import json
+import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,25 @@ _PRODUCER_REGISTRY_SOURCE = "tui_gateway.hosted_tui_custody:i17-producer-registr
 _RUNTIME_RUNNER = None
 _RUNTIME_COORDINATOR = None
 _CHILD_BRIDGE = None
+_LOG = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class I17ColdPostOpenCapability:
+    """Coordinator-bound completion for a cold prepared I17 successor registry."""
+
+    runner: Any
+    coordinator: Any
+    authority: Any
+    registry: dict
+    binding: Any
+    root: Any
+    receipt: Any
+
+
+def i17_cold_abort_participant(capability):
+    """Return the exact source tuple retained by the canonical post-OPEN transition."""
+    return capability.authority, capability.receipt, capability
 
 
 class _I17RebindSource:
@@ -228,8 +250,19 @@ def _rebind_existing_authority(
     authority._i17_service_closed = False
     authority._i17_service_owner_id = owner_id
     authority._i17_runtime_custody = coordinator
-    _reset_producer_registry(authority, coordinator, runner=runner)
+    authority._i17_prepared_successor_pending = (
+        close_receipt is not None and source_proof is not None
+    )
+    _reset_producer_registry(
+        authority, coordinator, runner=runner,
+        intake_closed=close_receipt is not None and source_proof is not None,
+    )
     binding.update_registry(_producer_registry(authority))
+    service = getattr(authority, "hosted_room_service", None)
+    if service is not None and close_receipt is not None and source_proof is not None:
+        # Keep the exact predecessor room handle reachable until the prepared successor child is
+        # authenticated below the rebound root.  This is an identity witness, not a new registry.
+        service._i17_retired_service_root = existing
     return rebound
 
 
@@ -279,6 +312,11 @@ def _new_producer_registry(
         "authority_epoch": authority_epoch,
         "profile_id": profile_id,
         "intake_closed": False,
+        # The rebind source is the typed, boot-installed witness for this exact registry.  A
+        # registry object without its source binding is only an untrusted dict and cannot certify
+        # a cold/no-room close or an authenticated successor.
+        "source_binding": None,
+        "prepared_successor_pending": False,
         "authority": authority,
         "runner": runner,
         "room_factory": {
@@ -291,16 +329,33 @@ def _new_producer_registry(
     }
 
 
-def _reset_producer_registry(authority, coordinator, *, runner=None) -> None:
+def _reset_producer_registry(
+    authority, coordinator, *, runner=None, intake_closed: bool = False,
+) -> None:
     """Reopen the exact source graph after abort; no prior terminal receipt is reused."""
     profile_id = str(getattr(authority, "profile_id", ""))
     epoch = getattr(authority, "epoch", None)
     if not profile_id or type(epoch) is not int or epoch < 1:
         raise RuntimeError("I17 authority identity is unavailable")
-    authority._i17_producer_registry = _new_producer_registry(
+    binding = getattr(authority, "_i17_rebind_source", None)
+    registry = _new_producer_registry(
         coordinator, profile_id=profile_id, authority_epoch=epoch,
         authority=authority, runner=runner,
     )
+    registry["intake_closed"] = bool(intake_closed)
+    registry["prepared_successor_pending"] = bool(intake_closed)
+    if isinstance(binding, _I17RebindSource):
+        binding.update_registry(registry)
+        registry["source_binding"] = binding
+    authority._i17_producer_registry = registry
+    # A new registry cannot inherit scalar receipts or mutable producer entries from its
+    # predecessor.  The exact room service object is rebound later under the new source witness.
+    for name in (
+        "_i17_host_producer_entry", "_i17_room_producer_entry",
+        "_i17_host_shutdown_receipt", "_i17_host_terminal_identity",
+        "_i17_room_terminal_receipt", "_i17_room_terminal_identity",
+    ):
+        setattr(authority, name, None)
 
 
 def _authority_for_home(home):
@@ -334,6 +389,7 @@ def _ensure_rebind_source(authority, runner, coordinator, registry):
         or binding.registry is not registry
     ):
         raise RuntimeError("I17 source binding is not canonical")
+    registry["source_binding"] = binding
     refusal = coordinator._register_source_rebind_binding(
         _OWNER_CLASS, str(getattr(authority, "profile_id", "")), binding,
     )
@@ -342,6 +398,55 @@ def _ensure_rebind_source(authority, runner, coordinator, registry):
             f"I17 source binding refused: {getattr(refusal, 'code', 'unknown')}"
         )
     return binding
+
+
+def _host_entry_is_current(authority, producer, supervisor=None, handle=None) -> bool:
+    """Require the source-owned host entry and its opaque custody objects to be identical."""
+    registry = _producer_registry(authority)
+    root = getattr(authority, "_i17_service_handle", None)
+    expected_handle = handle if handle is not None else getattr(supervisor, "_i17_host_handle", None)
+    expected_supervisor = supervisor
+    return bool(
+        registry is not None
+        and isinstance(producer, dict)
+        and producer is registry.get("host")
+        and producer is getattr(authority, "_i17_host_producer_entry", None)
+        and producer is getattr(supervisor, "_i17_host_producer_entry", None)
+        and producer.get("authority") is authority
+        and producer.get("root") is root
+        and getattr(supervisor, "_i17_service_root", None) is root
+        and producer.get("handle") is expected_handle
+        and producer.get("supervisor") is expected_supervisor
+        and producer.get("state") in {"registered", "terminal"}
+        and _registry_identity_valid(authority, registry)
+    )
+
+
+def _room_entry_is_current(authority, producer, service=None, handle=None) -> bool:
+    """Require the exact room/service/runtime graph captured at admission."""
+    registry = _producer_registry(authority)
+    expected_service = service
+    expected_handle = handle if handle is not None else getattr(service, "_i17_room_handle", None)
+    expected_runtime = getattr(expected_service, "runtime", None)
+    expected_db = getattr(authority, "db", None)
+    expected_member_rpcs = getattr(expected_service, "member_rpcs", None)
+    return bool(
+        registry is not None
+        and isinstance(producer, dict)
+        and producer is registry.get("room")
+        and producer is getattr(authority, "_i17_room_producer_entry", None)
+        and producer is getattr(expected_service, "_i17_room_producer_entry", None)
+        and producer.get("authority") is authority
+        and producer.get("root") is getattr(authority, "_i17_service_handle", None)
+        and getattr(expected_service, "_i17_service_root", None) is producer.get("root")
+        and producer.get("handle") is expected_handle
+        and producer.get("service") is expected_service
+        and producer.get("runtime") is expected_runtime
+        and producer.get("db") is expected_db
+        and producer.get("member_rpcs") is expected_member_rpcs
+        and producer.get("state") in {"registered", "terminal"}
+        and _registry_identity_valid(authority, registry)
+    )
 
 
 def _child(parent, owner_id: str, coordinator):
@@ -374,6 +479,10 @@ def bind_supervisor(supervisor, home, owner_id: str):
         raise RuntimeError("I17 producer intake is closed or unregistered")
     existing = getattr(supervisor, "_i17_host_handle", None)
     if existing is not None and coordinator.is_active_handle(existing, owner_class=_OWNER_CLASS):
+        if not _host_entry_is_current(
+            authority, registry.get("host"), supervisor, existing,
+        ):
+            raise RuntimeError("I17 host producer entry is stale")
         return existing
     if existing is not None and not coordinator.is_terminal_handle(existing, owner_class=_OWNER_CLASS):
         raise RuntimeError("I17 host producer handle is stale")
@@ -383,11 +492,16 @@ def bind_supervisor(supervisor, home, owner_id: str):
     supervisor._i17_host_handle = handle
     supervisor._i17_profile_home = str(Path(home).resolve())
     supervisor._i17_profile_authority = authority
-    registry["host"] = {
+    supervisor._i17_shutdown_native_identity = None
+    entry = {
         "state": "registered", "owner_id": f"host:{owner_id}",
         "profile_id": root.profile_id, "authority_epoch": root.authority_epoch,
         "process_instance": root.process_instance, "supervisor": supervisor,
+        "authority": authority, "root": root, "handle": handle,
     }
+    registry["host"] = entry
+    authority._i17_host_producer_entry = entry
+    supervisor._i17_host_producer_entry = entry
     from tui_gateway.i17_child_bridge import build_identity
     supervisor._i17_child_bridge = build_identity(
         root, handle, profile_home=str(Path(home).resolve()))
@@ -396,7 +510,39 @@ def bind_supervisor(supervisor, home, owner_id: str):
 
 def _host_effect_started(supervisor) -> bool:
     return any(getattr(supervisor, name, None) is not None for name in (
-        "_proc", "_owner", "_registry_lease", "_producer_identity", "_registry_owner_key"))
+        "_proc", "_owner", "_registry_lease", "_producer_identity", "_producer_process_handle",
+        "_registry_owner_key"))
+
+
+def _host_native_identity(supervisor):
+    return {
+        "process_handle": getattr(supervisor, "_producer_process_handle", None),
+        "owner": getattr(supervisor, "_owner", None),
+        "producer_identity": getattr(supervisor, "_producer_identity", None),
+        "owner_identity": getattr(supervisor, "_owner_identity", None),
+    }
+
+
+def _capture_host_shutdown_identity(supervisor):
+    """Retain the native owner before a producer's shutdown clears its mutable fields."""
+    identity = _host_native_identity(supervisor)
+    supervisor._i17_shutdown_native_identity = identity
+    return identity
+
+
+def _host_native_identity_unchanged(supervisor, identity) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    return all(
+        getattr(supervisor, attribute, None) is None
+        or getattr(supervisor, attribute, None) is identity[key]
+        for attribute, key in (
+            ("_producer_process_handle", "process_handle"),
+            ("_owner", "owner"),
+            ("_producer_identity", "producer_identity"),
+            ("_owner_identity", "owner_identity"),
+        )
+    )
 
 
 def host_start_failed(supervisor):
@@ -429,8 +575,8 @@ def host_start_failed(supervisor):
         or registry.get("runner") is not getattr(authority, "runner", None)
         or not _registry_identity_valid(authority, registry)
         or not isinstance(producer, dict)
+        or not _host_entry_is_current(authority, producer, supervisor, handle)
         or producer.get("state") != "registered"
-        or producer.get("supervisor") is not supervisor
         or producer.get("profile_id") != handle.profile_id
         or producer.get("authority_epoch") != handle.authority_epoch
         or producer.get("process_instance") != handle.process_instance
@@ -440,6 +586,9 @@ def host_start_failed(supervisor):
     if coordinator.release_unaccepted(handle) is not None:
         return False
     producer["state"] = "absent"
+    if authority is not None:
+        authority._i17_host_producer_entry = None
+    supervisor._i17_shutdown_native_identity = None
     return True
 
 
@@ -459,25 +608,105 @@ def host_shutdown(supervisor, receipt: dict | None):
     if not _host_receipt_valid(receipt):
         coordinator.mark_unknown(handle, "host_close_unknown")
         return False
+    authority = getattr(supervisor, "_i17_profile_authority", None)
+    registry = _producer_registry(authority)
+    producer = registry.get("host") if registry is not None else None
+    if not _host_entry_is_current(authority, producer, supervisor, handle):
+        coordinator.mark_unknown(handle, "host_close_unknown")
+        return False
+    if producer.get("state") == "terminal":
+        return producer.get("receipt") == receipt and coordinator.is_terminal_handle(
+            handle, owner_class=_OWNER_CLASS,
+        )
     coordinator.reconcile_unknown(
         handle, owner_id=handle.owner_id, profile_id=handle.profile_id,
         process_instance=handle.process_instance, authority_epoch=handle.authority_epoch)
     refusal = coordinator.mark_terminal(handle)
     if refusal is not None:
+        coordinator.mark_unknown(handle, "host_close_unknown")
         return False
-    authority = getattr(supervisor, "_i17_profile_authority", None)
     if authority is not None:
-        authority._i17_host_shutdown_receipt = dict(receipt)
-        registry = _producer_registry(authority)
-        if registry is not None:
-            producer = registry.get("host")
-            if isinstance(producer, dict) and producer.get("supervisor") is supervisor:
-                producer.update({"state": "terminal", "receipt": dict(receipt)})
+        # Keep the exact source-owned supervisor/child handle and the native identity observed by
+        # the real shutdown path.  Later evidence must not reread mutable supervisor scalar fields.
+        native_identity = getattr(supervisor, "_i17_shutdown_native_identity", None)
+        if native_identity is None:
+            native_identity = _host_native_identity(supervisor)
+        terminal_identity = {
+            "supervisor": supervisor,
+            "root": producer.get("root"),
+            "handle": handle,
+            "native_identity": native_identity,
+            "process_handle": native_identity["process_handle"],
+            "producer_identity": native_identity["producer_identity"],
+            "owner_identity": native_identity["owner_identity"],
+            "host_generation": receipt["host_generation"],
+            "host_boot_id": receipt["host_boot_id"],
+            "host_pid": receipt["host_pid"],
+        }
+        producer.update({
+            "state": "terminal", "receipt": dict(receipt),
+            "native_identity": native_identity,
+            "terminal_identity": terminal_identity,
+        })
+        authority._i17_host_shutdown_receipt = producer["receipt"]
+        authority._i17_host_terminal_identity = terminal_identity
     supervisor._i17_terminal_receipt = dict(receipt)
     return True
 
 
-def bind_room_service(service, authority):
+def _bind_prepared_room_child(
+    service, authority, coordinator, registry, root, existing, close_receipt,
+):
+    if close_receipt is None:
+        raise RuntimeError("I17 prepared successor proof is required")
+    existing_binding = getattr(authority, "_i17_rebind_source", None)
+    source_runner = getattr(existing_binding, "runner", None)
+    if source_runner is None:
+        source_runner, _source_coordinator = _runtime()
+    binding = _ensure_rebind_source(authority, source_runner, coordinator, registry)
+    if coordinator.validate_i17_prepared_root(root, close_receipt, binding) is not None:
+        raise RuntimeError("I17 prepared successor root is not authenticated")
+    predecessor = coordinator.i17_prepared_predecessor(root, close_receipt, binding)
+    if getattr(predecessor, "lease", None) is None:
+        raise RuntimeError("I17 prepared predecessor is unavailable")
+    if existing is not None and coordinator.is_active_handle(existing, owner_class=_OWNER_CLASS):
+        if existing.lease.parent_lease_id != root.lease.lease_id:
+            raise RuntimeError("I17 room producer parent is not the rebound root")
+        current = registry.get("room")
+        if _room_entry_is_current(authority, current, service, existing):
+            return existing
+    if existing is not None:
+        if not coordinator.is_terminal_handle(existing, owner_class=_OWNER_CLASS):
+            raise RuntimeError("I17 room producer handle is stale")
+        if existing.lease.parent_lease_id != predecessor.lease.lease_id:
+            raise RuntimeError("I17 room predecessor does not own the terminal child")
+    profile = str(getattr(authority, "profile_id", ""))
+    handle = coordinator.admit_i17_prepared_child(
+        root, owner_id=f"room-service:{profile}", profile_id=profile,
+        authority_epoch=root.authority_epoch, receipt=close_receipt,
+        source_binding=binding,
+    )
+    if getattr(handle, "lease", None) is None:
+        raise RuntimeError(
+            f"I17 prepared child custody refused: {getattr(handle, 'code', 'unknown')}"
+        )
+    return handle
+
+
+def _bind_open_room_child(service, authority, coordinator, registry, root, existing, close_receipt):
+    if close_receipt is not None:
+        raise RuntimeError("I17 prepared successor registry is missing")
+    if existing is not None and coordinator.is_active_handle(existing, owner_class=_OWNER_CLASS):
+        current = registry.get("room")
+        if _room_entry_is_current(authority, current, service, existing):
+            return existing
+    if existing is not None and not coordinator.is_terminal_handle(existing, owner_class=_OWNER_CLASS):
+        raise RuntimeError("I17 room producer handle is stale")
+    profile = str(getattr(authority, "profile_id", ""))
+    return _child(root, f"room-service:{profile}", coordinator)
+
+
+def bind_room_service(service, authority, *, close_receipt=None):
     """Reserve a hosted-room worker below the profile root before its thread starts."""
     existing = getattr(service, "_i17_room_handle", None)
     root = getattr(authority, "_i17_service_handle", None)
@@ -490,25 +719,42 @@ def bind_room_service(service, authority):
         coordinator = coordinator_runtime
     if root is None or coordinator is None:
         return None
+    current_service = getattr(authority, "hosted_room_service", None)
+    if current_service is not None and current_service is not service:
+        raise RuntimeError("I17 room producer service is replaced")
     registry = _producer_registry(authority)
-    if registry is None or registry.get("intake_closed") is True:
-        raise RuntimeError("I17 producer intake is closed or unregistered")
-    if existing is not None and coordinator.is_active_handle(existing, owner_class=_OWNER_CLASS):
-        return existing
-    if existing is not None and not coordinator.is_terminal_handle(existing, owner_class=_OWNER_CLASS):
-        raise RuntimeError("I17 room producer handle is stale")
+    if registry is None:
+        raise RuntimeError("I17 producer registry is unavailable")
+    if registry.get("intake_closed") is True:
+        handle = _bind_prepared_room_child(
+            service, authority, coordinator, registry, root, existing, close_receipt,
+        )
+    else:
+        handle = _bind_open_room_child(
+            service, authority, coordinator, registry, root, existing, close_receipt,
+        )
     profile = str(getattr(authority, "profile_id", ""))
-    handle = _child(root, f"room-service:{profile}", coordinator)
+    if current_service is None:
+        # Publish the service only after the exact child admission succeeds; an unproven prepared
+        # successor must not leave a mutable service object attached to the authority.
+        authority.hosted_room_service = service
     service._i17_runtime_custody = coordinator
     service._i17_service_root = root
     service._i17_room_handle = handle
     service._i17_profile_authority = authority
     service._i17_room_started = False
-    registry["room"] = {
+    entry = {
         "state": "registered", "owner_id": f"room-service:{profile}",
         "profile_id": root.profile_id, "authority_epoch": root.authority_epoch,
         "process_instance": root.process_instance, "service": service,
+        "authority": authority, "root": root, "handle": handle,
+        "runtime": getattr(service, "runtime", None),
+        "db": getattr(authority, "db", None),
+        "member_rpcs": getattr(service, "member_rpcs", None),
     }
+    registry["room"] = entry
+    authority._i17_room_producer_entry = entry
+    service._i17_room_producer_entry = entry
     return handle
 
 
@@ -516,6 +762,12 @@ def room_service_start_failed(service):
     handle = getattr(service, "_i17_room_handle", None)
     coordinator = getattr(service, "_i17_runtime_custody", None)
     if handle is None or coordinator is None:
+        return
+    authority = getattr(service, "_i17_profile_authority", None)
+    registry = _producer_registry(authority)
+    producer = registry.get("room") if registry is not None else None
+    if not _room_entry_is_current(authority, producer, service, handle):
+        coordinator.mark_unknown(handle, "room_start_unknown")
         return
     runtime = getattr(service, "runtime", None)
     try:
@@ -526,6 +778,13 @@ def room_service_start_failed(service):
         coordinator.mark_unknown(handle, "room_start_unknown")
     else:
         coordinator.release_unaccepted(handle)
+        if authority is not None:
+            producer = _producer_registry(authority)
+            producer = producer.get("room") if producer is not None else None
+            if isinstance(producer, dict) and producer.get("service") is service:
+                producer["state"] = "absent"
+                authority._i17_room_producer_entry = None
+                service._i17_room_producer_entry = None
 
 
 def _room_runtime_stopped(service) -> bool:
@@ -559,27 +818,81 @@ def room_service_stop(service, stopped: bool):
     coordinator = getattr(service, "_i17_runtime_custody", None)
     if handle is None or coordinator is None:
         return True
-    if stopped is not True or not _room_runtime_stopped(service):
+    identity = _room_terminal_identity(service)
+    if stopped is not True or identity is None or not _room_runtime_stopped(service):
+        coordinator.mark_unknown(handle, "room_close_unknown")
+        return False
+    authority = getattr(service, "_i17_profile_authority", None)
+    registry = _producer_registry(authority)
+    producer = registry.get("room") if registry is not None else None
+    if not _room_entry_is_current(authority, producer, service, handle):
         coordinator.mark_unknown(handle, "room_close_unknown")
         return False
     refusal = coordinator.mark_terminal(handle)
     if refusal is not None:
+        coordinator.mark_unknown(handle, "room_close_unknown")
         return False
     receipt = {
         "stopped": True,
         "running": False,
         "workers_joined": True,
     }
-    service._i17_room_terminal_receipt = receipt
-    authority = getattr(service, "_i17_profile_authority", None)
+    service._i17_room_terminal_identity = identity
     if authority is not None:
-        authority._i17_room_terminal_receipt = dict(receipt)
+        authority._i17_room_terminal_identity = identity
         registry = _producer_registry(authority)
         if registry is not None:
             producer = registry.get("room")
             if isinstance(producer, dict) and producer.get("service") is service:
-                producer.update({"state": "terminal", "receipt": dict(receipt)})
+                producer.update({
+                    "state": "terminal", "receipt": receipt,
+                    "terminal_identity": identity,
+                })
+                receipt = producer["receipt"]
+                authority._i17_room_terminal_receipt = receipt
+                service._i17_room_terminal_receipt = receipt
+    if getattr(service, "_i17_room_terminal_receipt", None) is None:
+        service._i17_room_terminal_receipt = receipt
     return True
+
+
+def _room_terminal_identity(service):
+    """Capture the exact runtime/thread objects observed at a real room stop.
+
+    The legacy three-field receipt is intentionally kept stable for existing callers.  This
+    separate source-owned observation prevents a boolean ``stop`` result from certifying a
+    replacement runtime or a worker whose thread/accepted task was only *reported* as done.
+    """
+    runtime = getattr(service, "runtime", None)
+    if runtime is None:
+        return None
+    try:
+        status = runtime.status()
+        with getattr(runtime, "_status_lock", _NullLock()):
+            supervisor_thread = getattr(runtime, "_thread", None)
+            room_threads = tuple(getattr(runtime, "_room_threads", {}).values())
+            current_tasks = tuple(getattr(runtime, "_current_tasks", {}).values())
+    except BaseException:  # health: allow BLE001 -- unreadable runtime retains UNKNOWN custody.
+        return None
+    if (
+        not isinstance(status, dict)
+        or not isinstance(status.get("process_generation"), str)
+        or not status.get("process_generation")
+        or status.get("running") is not False
+        or status.get("current_tasks")
+        or status.get("room_threads")
+        or current_tasks
+        or supervisor_thread is not None and supervisor_thread.is_alive()
+        or any(thread.is_alive() for thread in room_threads)
+    ):
+        return None
+    return {
+        "runtime": runtime,
+        "process_generation": status["process_generation"],
+        "supervisor_thread": supervisor_thread,
+        "room_threads": room_threads,
+        "workers_joined": True,
+    }
 
 
 def _settle(handle, coordinator, *, known: bool, reason: str):
@@ -737,7 +1050,18 @@ def _profile_host_evidence(authority):
     receipt = getattr(authority, "_i17_host_shutdown_receipt", None)
     room_receipt = getattr(authority, "_i17_room_terminal_receipt", None)
     registry = _producer_registry(authority)
-    if not _registry_identity_valid(authority, registry) or not registry.get("intake_closed"):
+    if registry is None:
+        return False, (receipt, room_receipt)
+    terminal_registry = getattr(authority, "_i17_terminal_registry", None)
+    intake_closed = registry.get("intake_closed") is True
+    # I09 reopens its intake fence before I17's authenticated abort rebind.  A terminal root may
+    # therefore carry ``intake_closed=False`` during that one reversible window, but only when
+    # the exact source registry object that was terminalized is still attached to this authority.
+    reopened_for_abort = (
+        getattr(authority, "_i17_service_closed", False) is True
+        and terminal_registry is registry
+    )
+    if not _registry_identity_valid(authority, registry) or not (intake_closed or reopened_for_abort):
         return False, (receipt, room_receipt)
     host_ok = _host_producer_evidence(authority, registry.get("host"), receipt)
     room_ok = _room_producer_evidence(authority, registry.get("room"), room_receipt)
@@ -748,27 +1072,126 @@ def _registry_identity_valid(authority, registry) -> bool:
     if registry is None:
         return False
     coordinator = getattr(authority, "_i17_runtime_custody", None)
+    binding = getattr(authority, "_i17_rebind_source", None)
     return bool(
         coordinator is not None
         and registry.get("process_instance") == coordinator.process_instance
         and registry.get("profile_id") == str(getattr(authority, "profile_id", ""))
         and registry.get("authority_epoch") == getattr(authority, "epoch", None)
+        and registry.get("authority") is authority
+        and binding is not None
+        and registry.get("source_binding") is binding
+        and binding.authority is authority
+        and binding.coordinator is coordinator
+        and binding.registry is registry
+        and registry.get("runner") is binding.runner
     )
+
+
+def validate_i17_cold_abort_participant(runner, coordinator, transition, entry) -> bool:
+    """Validate one cold successor before its authenticated post-OPEN completion."""
+    if type(entry) is not tuple or len(entry) != 3:
+        return False
+    authority, receipt, capability = entry
+    if not isinstance(capability, I17ColdPostOpenCapability):
+        return False
+    if (
+        capability.runner is not runner
+        or capability.coordinator is not coordinator
+        or capability.authority is not authority
+        or capability.receipt is not receipt
+        or capability.registry is not getattr(authority, "_i17_producer_registry", None)
+        or capability.binding is not getattr(authority, "_i17_rebind_source", None)
+        or capability.root is not getattr(authority, "_i17_service_handle", None)
+        or getattr(authority, "_i17_service_closed", False) is True
+        or getattr(authority, "hosted_room_service", None) is not None
+        or not _registry_identity_valid(authority, capability.registry)
+        or capability.registry.get("intake_closed") is not True
+        or capability.registry.get("prepared_successor_pending") is not True
+        or capability.registry.get("host", {}).get("state") != "absent"
+        or capability.registry.get("room", {}).get("state") != "absent"
+    ):
+        return False
+    transition_receipt = getattr(transition, "receipt", None)
+    fields = ("receipt_id", "process_instance", "authority_epoch", "close_generation")
+    if any(getattr(transition_receipt, field, None) != getattr(receipt, field, None)
+           for field in fields):
+        return False
+    check = getattr(coordinator, "check_post_open_transition", None)
+    return callable(check) and check(transition)
+
+
+def complete_i17_cold_abort(capability, coordinator, transition) -> bool:
+    """Validate one cold registry before consuming its coordinator-issued token."""
+    entry = i17_cold_abort_participant(capability)
+    return validate_i17_cold_abort_participant(
+        capability.runner, coordinator, transition, entry,
+    )
+
+
+def clear_i17_cold_abort(capability, transition) -> bool:
+    """Drop the source capability only after the coordinator consumed the exact token."""
+    runner = capability.runner
+    completed = getattr(capability.coordinator, "completed_post_open_transition_for", None)
+    if not callable(completed) or completed(capability.receipt) is not transition:
+        return False
+    capabilities = tuple(getattr(runner, "_i17_post_open_capabilities", ()))
+    if not any(item is capability for item in capabilities):
+        return False
+    registry = capability.registry
+    if (
+        registry.get("intake_closed") is not True
+        or registry.get("prepared_successor_pending") is not True
+        or registry.get("host", {}).get("state") != "absent"
+        or registry.get("room", {}).get("state") != "absent"
+        or getattr(capability.authority, "_i17_producer_registry", None) is not registry
+    ):
+        return False
+    registry["intake_closed"] = False
+    registry["prepared_successor_pending"] = False
+    capability.authority._i17_prepared_successor_pending = False
+    capability.authority._i17_terminal_registry = None
+    runner._i17_post_open_capabilities = tuple(
+        item for item in capabilities if item is not capability
+    )
+    return True
 
 
 def _host_producer_evidence(authority, producer, receipt) -> bool:
     if not isinstance(producer, dict) or producer.get("state") == "absent":
-        return receipt is None and not _unregistered_host_present(authority)
+        return (
+            receipt is None
+            and getattr(authority, "_i17_host_producer_entry", None) is None
+            and not _unregistered_host_present(authority)
+        )
     supervisor = producer.get("supervisor")
-    if producer.get("state") != "terminal" or supervisor is None:
+    handle = producer.get("handle")
+    if (
+        producer.get("state") != "terminal"
+        or supervisor is None
+        or handle is None
+        or not _host_entry_is_current(authority, producer, supervisor, handle)
+    ):
         return False
     if producer.get("profile_id") != str(getattr(authority, "profile_id", "")):
         return False
-    if not _host_receipt_valid(receipt):
+    stored_receipt = producer.get("receipt")
+    terminal_identity = producer.get("terminal_identity")
+    if not _host_receipt_valid(receipt) or stored_receipt is not receipt:
+        return False
+    if not isinstance(terminal_identity, dict):
         return False
     return (
-        receipt.get("host_generation") == getattr(supervisor, "_host_generation", None)
-        and receipt.get("host_boot_id") == getattr(supervisor, "_host_boot_id", None)
+        terminal_identity.get("supervisor") is supervisor
+        and terminal_identity.get("root") is producer.get("root")
+        and terminal_identity.get("handle") is handle
+        and terminal_identity.get("native_identity") is producer.get("native_identity")
+        and _host_native_identity_unchanged(
+            supervisor, terminal_identity.get("native_identity"),
+        )
+        and terminal_identity.get("host_generation") == receipt.get("host_generation")
+        and terminal_identity.get("host_boot_id") == receipt.get("host_boot_id")
+        and terminal_identity.get("host_pid") == receipt.get("host_pid")
         and not _has_active_isolated_sessions(authority)
         and not _has_live_host(authority)
     )
@@ -782,17 +1205,23 @@ def _room_producer_evidence(authority, producer, receipt) -> bool:
         # no-work state only after the real runtime reports no live worker and no child handle.
         return (
             receipt is None
+            and getattr(authority, "_i17_room_producer_entry", None) is None
             and (service is None or (
                 getattr(service, "_i17_room_handle", None) is None
                 and not _has_live_room_service(authority)
             ))
         )
     service = producer.get("service")
+    current_service = getattr(authority, "hosted_room_service", None)
     return (
         producer.get("state") == "terminal"
         and service is not None
+        and current_service is service
+        and _room_entry_is_current(authority, producer, service, producer.get("handle"))
         and producer.get("profile_id") == str(getattr(authority, "profile_id", ""))
+        and producer.get("receipt") is receipt
         and _room_receipt_valid(receipt)
+        and _room_terminal_identity_matches(service, producer.get("terminal_identity"))
         and not _has_live_room_service(authority)
     )
 
@@ -836,6 +1265,146 @@ def _room_receipt_valid(receipt) -> bool:
     )
 
 
+def _room_terminal_identity_matches(service, identity) -> bool:
+    if not isinstance(identity, dict):
+        return False
+    runtime = getattr(service, "runtime", None)
+    if runtime is None or identity.get("runtime") is not runtime:
+        return False
+    try:
+        status = runtime.status()
+        with getattr(runtime, "_status_lock", _NullLock()):
+            supervisor_thread = getattr(runtime, "_thread", None)
+            room_threads = tuple(getattr(runtime, "_room_threads", {}).values())
+            current_tasks = tuple(getattr(runtime, "_current_tasks", {}).values())
+    except BaseException:  # health: allow BLE001 -- replacement/unreadable runtime stays UNKNOWN.
+        return False
+    if (
+        not isinstance(status, dict)
+        or status.get("process_generation") != identity.get("process_generation")
+        or status.get("running") is not False
+        or status.get("current_tasks")
+        or status.get("room_threads")
+        or current_tasks
+        or supervisor_thread is not identity.get("supervisor_thread")
+        or tuple(room_threads) != tuple(identity.get("room_threads", ()))
+        or supervisor_thread is not None and supervisor_thread.is_alive()
+        or any(thread.is_alive() for thread in room_threads)
+    ):
+        return False
+    profile_authority = getattr(service, "_i17_profile_authority", None)
+    service_authority = getattr(service, "authority", profile_authority)
+    if profile_authority is not None and service_authority is not profile_authority:
+        return False
+    # A canonical hosted service must have completed transport installation before it may
+    # contribute a terminal source receipt.  Small legacy unit doubles do not expose this flag;
+    # their existing three-field tests remain covered by the local runtime identity above.
+    installed = getattr(service, "_transport_installed", None)
+    return installed is not False
+
+
+async def _stage_terminal_room_authority(authority, deadline, loop):
+    """Stage one source-owned room stop without consuming its custody handle."""
+    registry = _producer_registry(authority)
+    if not _registry_identity_valid(authority, registry):
+        return False
+    if registry.get("intake_closed") is not True:
+        return False
+    if not _settle_registered_host(authority):
+        return False
+    room = registry.get("room")
+    if not isinstance(room, dict):
+        return False
+    if room.get("state") == "absent":
+        return None if _room_producer_evidence(authority, room, None) else False
+    if room.get("state") == "terminal":
+        receipt = getattr(authority, "_i17_room_terminal_receipt", None)
+        return None if _room_producer_evidence(authority, room, receipt) else False
+    service = room.get("service")
+    if room.get("state") != "registered" or service is None:
+        return False
+    if service is not getattr(authority, "hosted_room_service", None):
+        return False
+    if not _room_entry_is_current(authority, room, service, room.get("handle")):
+        return False
+    runtime = getattr(service, "runtime", None)
+    if runtime is None:
+        return False
+    try:
+        before = runtime.status()
+    except BaseException:  # health: allow BLE001 -- unreadable worker stays UNKNOWN.
+        return False
+    remaining = deadline - loop.time()
+    if remaining <= 0:
+        return False
+    try:
+        stopped = await asyncio.to_thread(service.stop, timeout=remaining)
+    except BaseException:  # health: allow BLE001 -- stop failure retains exact custody.
+        return False
+    return authority, service, stopped, before.get("running") is True
+
+
+async def _stage_terminal_room_services(authorities, deadline, loop):
+    staged = []
+    for authority in authorities:
+        result = await _stage_terminal_room_authority(authority, deadline, loop)
+        if result is False:
+            return staged, False
+        if result is not None:
+            staged.append(result)
+    return staged, True
+
+
+def _rollback_terminal_room_services(staged):
+    for _authority, service, _stopped, was_running in reversed(staged):
+        if not was_running:
+            continue
+        try:
+            service.start()
+        except BaseException:  # health: allow BLE001 -- rollback failure retains source custody.
+            _LOG.exception("I17 hosted-room rollback failed; retaining source custody")
+
+
+def _retain_partial_terminalization(staged):
+    """Keep exact stopped objects and roots UNKNOWN after a late sibling finalization failure."""
+    snapshot = []
+    for authority, service, _stopped, _was_running in staged:
+        root = getattr(authority, "_i17_service_handle", None)
+        handle = getattr(service, "_i17_room_handle", None)
+        coordinator = getattr(authority, "_i17_runtime_custody", None)
+        snapshot.append((authority, service, root, handle))
+        if root is not None and coordinator is not None:
+            coordinator.mark_unknown(root, "i17_partial_terminalization")
+        authority._i17_terminalization_partial = tuple(snapshot)
+
+
+async def terminalize_preservation_rooms(runner, timeout: float) -> bool:
+    """Stop exact registered hosted rooms before I17 sealing and retain them for abort."""
+    from gateway.session_authorities import all_authorities
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout))
+    staged, valid = await _stage_terminal_room_services(
+        tuple(all_authorities(runner)), deadline, loop,
+    )
+    # Do not consume any child handle until every real runtime has stopped.  If a later service
+    # misses its deadline, restart the exact earlier objects while their children remain owned.
+    if not valid or any(
+        stopped is not True or _room_terminal_identity(service) is None
+        for _authority, service, stopped, _was_running in staged
+    ):
+        _rollback_terminal_room_services(staged)
+        return False
+    for authority, service, _stopped, was_running in staged:
+        if not room_service_stop(service, True):
+            _retain_partial_terminalization(staged)
+            return False
+        if was_running:
+            authority._i17_terminal_room_service = service
+            authority._i17_terminal_room_was_running = True
+    return True
+
+
 def _has_active_isolated_sessions(authority) -> bool:
     server = _server()
     sessions = getattr(server, "_sessions", {}) if server is not None else {}
@@ -854,6 +1423,35 @@ def _has_live_host(authority) -> bool:
             if getattr(supervisor, "_proc", None) is not None or supervisor.is_running():
                 return True
     return False
+
+
+def _settle_registered_host(authority) -> bool:
+    """Consume the real compute-host shutdown receipt before I17 can seal a profile."""
+    registry = _producer_registry(authority)
+    producer = registry.get("host") if registry is not None else None
+    if not isinstance(producer, dict) or producer.get("state") == "absent":
+        return True
+    supervisor = producer.get("supervisor")
+    handle = producer.get("handle")
+    if producer.get("state") == "terminal":
+        return _host_entry_is_current(authority, producer, supervisor, handle)
+    if (
+        producer.get("state") != "registered"
+        or supervisor is None
+        or not _host_entry_is_current(authority, producer, supervisor, handle)
+    ):
+        return False
+    # A reservation with no Popen/owner effect is a pre-effect start failure.  It must be settled
+    # by host_start_failed, not by manufacturing a shutdown receipt from an unstarted supervisor.
+    if not _host_effect_started(supervisor):
+        return False
+    supervisor._i17_shutdown_native_identity = _host_native_identity(supervisor)
+    try:
+        receipt = supervisor.shutdown()
+    except BaseException:  # health: allow BLE001 -- native shutdown failure retains the exact host handle.
+        host_shutdown_failed(supervisor)
+        return False
+    return host_shutdown(supervisor, receipt)
 
 
 def _has_live_room_service(authority) -> bool:
@@ -885,6 +1483,9 @@ def close_profile(authority):
     # Closing intake is a source-owned transition.  It prevents a producer from appearing between
     # the graph snapshot and exact root terminalization; abort reopens it only after a fresh root.
     registry["intake_closed"] = True
+    if not _settle_registered_host(authority):
+        coordinator.mark_unknown(root, "host_close_unknown")
+        return False
     valid, _receipt = _profile_host_evidence(authority)
     if not valid:
         coordinator.mark_unknown(root, "host_close_unknown")
@@ -895,6 +1496,10 @@ def close_profile(authority):
     refusal = coordinator.mark_terminal(root)
     if refusal is not None:
         return False
+    # Keep the exact source registry identity through I09's reversible intake reopen.  This is
+    # a binding fact, not a second ownership ledger: the coordinator still owns the root lease,
+    # while the registry object proves that abort is reusing the same terminal graph.
+    authority._i17_terminal_registry = registry
     authority._i17_service_closed = True
     return True
 
@@ -932,7 +1537,20 @@ def owner_evidence(runner, receipt):
     snapshots = []
     for authority in authorities:
         try:
-            bind_authority(authority, runner=runner, coordinator=coordinator)
+            if getattr(authority, "_i17_service_closed", False) is True:
+                # The handoff ACK path re-reads I17 after its first seal.  A terminal root is
+                # already the exact source-owned predecessor; calling bind_authority without the
+                # authenticated abort proof would try to mint a replacement root and turn an
+                # otherwise valid reread into UNKNOWN.  Validate the retained graph in place.
+                root = getattr(authority, "_i17_service_handle", None)
+                if (
+                    root is None
+                    or not coordinator.is_terminal_handle(root, owner_class=_OWNER_CLASS)
+                    or not _profile_host_evidence(authority)[0]
+                ):
+                    return None
+            else:
+                bind_authority(authority, runner=runner, coordinator=coordinator)
         except (RuntimeError, TypeError, ValueError):
             return None
         if not close_profile(authority):
@@ -1015,6 +1633,16 @@ def _producer_graph_digest(registry, receipts):
             "state": registry["room"].get("state"),
             "profile_id": registry["room"].get("profile_id"),
             "receipt": receipt_facts(receipts[1]),
+            "terminal_identity": (
+                {
+                    "process_generation": registry["room"].get(
+                        "terminal_identity", {}).get("process_generation"),
+                    "workers_joined": registry["room"].get(
+                        "terminal_identity", {}).get("workers_joined"),
+                }
+                if isinstance(registry["room"].get("terminal_identity"), dict)
+                else None
+            ),
         },
     }
     encoded = json.dumps(graph, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
@@ -1066,9 +1694,11 @@ def restore_after_abort(runner, receipt=None) -> bool:
     from gateway.session_authorities import all_authorities
 
     ok = True
+    cold_capabilities = []
     for authority in tuple(all_authorities(runner)):
         registry = _producer_registry(authority)
         if getattr(authority, "_i17_service_closed", False):
+            terminal_room_service = getattr(authority, "_i17_terminal_room_service", None)
             try:
                 if receipt is None:
                     # Preserve the established post-abort API for callers that already released
@@ -1083,10 +1713,53 @@ def restore_after_abort(runner, receipt=None) -> bool:
                         authority, runner=runner, coordinator=runner.runtime_custody,
                         close_receipt=receipt, source_proof=proof,
                     )
+                if terminal_room_service is not None:
+                    if terminal_room_service is not getattr(authority, "hosted_room_service", None):
+                        raise RuntimeError("I17 terminal room service was replaced")
+                    if not getattr(authority, "_i17_terminal_room_was_running", False):
+                        raise RuntimeError("I17 terminal room restore state is missing")
+                    bind_room_service(
+                        terminal_room_service, authority,
+                        close_receipt=receipt if receipt is not None else None,
+                    )
+                    try:
+                        terminal_room_service.start()
+                    except BaseException:
+                        room_service_start_failed(terminal_room_service)
+                        raise
+                    terminal_room_service._i17_room_started = True
+                    restored_registry = _producer_registry(authority)
+                    if restored_registry is not None:
+                        restored_registry["intake_closed"] = False
+                    authority._i17_prepared_successor_pending = False
+                    authority._i17_terminal_room_service = None
+                    authority._i17_terminal_room_was_running = False
+                    authority._i17_terminal_registry = None
+                elif receipt is not None:
+                    registry = _producer_registry(authority)
+                    binding = getattr(authority, "_i17_rebind_source", None)
+                    root = getattr(authority, "_i17_service_handle", None)
+                    if (
+                        registry is None
+                        or binding is None
+                        or root is None
+                        or registry.get("intake_closed") is not True
+                        or registry.get("prepared_successor_pending") is not True
+                        or registry.get("host", {}).get("state") != "absent"
+                        or registry.get("room", {}).get("state") != "absent"
+                    ):
+                        raise RuntimeError("I17 cold successor witness is unavailable")
+                    cold_capabilities.append(I17ColdPostOpenCapability(
+                        runner=runner, coordinator=runner.runtime_custody,
+                        authority=authority, registry=registry, binding=binding,
+                        root=root, receipt=receipt,
+                    ))
             except (RuntimeError, TypeError, ValueError):
                 ok = False
         elif registry is not None and registry.get("intake_closed"):
             # A failed close left an accepted root/UNKNOWN producer state.  Keep it fail-closed;
             # the owner must reconcile that source receipt before another admission.
             ok = False
+    if ok:
+        runner._i17_post_open_capabilities = tuple(cold_capabilities)
     return ok

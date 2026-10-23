@@ -225,8 +225,11 @@ def _retire_compute_host_target(sid: str, session: dict) -> None:
             _compute_host_supervisor_retiring.add(target.key)
     shutdown_succeeded = False
     try:
+        from tui_gateway.hosted_tui_custody import (
+            _capture_host_shutdown_identity, host_shutdown,
+        )
+        _capture_host_shutdown_identity(supervisor)
         receipt = supervisor.shutdown()
-        from tui_gateway.hosted_tui_custody import host_shutdown
         shutdown_succeeded = host_shutdown(supervisor, receipt)
     except Exception:
         # Leave the target in the pool for a later retry; a failed close is not proof of cleanup.

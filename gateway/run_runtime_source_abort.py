@@ -114,6 +114,15 @@ async def prepare_global_provider_handoff(runner, coordinator, receipt) -> dict:
     await prepare_global_memory_providers(
         runner, receipt.close_generation, remaining=coordinator.remaining_seconds(),
     )
+    # Provider preparation must complete before I17 terminalizes the enclosing hosted
+    # service.  This preserves the source-owned provider prepare/rollback boundary while
+    # still requiring the real hosted-room stop/join receipt before profile sealing.
+    from gateway.run_runtime_i17_terminal import terminalize_i17_rooms_before_seal
+    blocked = await terminalize_i17_rooms_before_seal(
+        runner, coordinator, receipt, coordinator.remaining_seconds(),
+    )
+    if blocked is not None:
+        return blocked
     _seal_integrated_preservation_owners(runner, coordinator, receipt)
     result = coordinator.prepare_handoff(receipt)
     return result.as_wire() if hasattr(result, "as_wire") else {

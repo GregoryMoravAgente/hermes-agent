@@ -81,14 +81,37 @@ class CanonicalHostedRoomService(HostedControls, HostedRoomService):
             for record in records.values()
         )
 
-    def _preservation_inventory(self, close_generation: int) -> dict[str, Any] | None:
+    def _terminal_room_inventory_is_valid(self, receipt) -> bool:
+        """Validate the source-owned room stop before accepting a stopped service receipt.
+
+        The ordinary I09 close fence observes a running service with intake closed.  I17 then
+        stops that exact service before the global owner seal.  A stopped runtime cannot satisfy
+        the ordinary ``running`` predicate, so the terminal path must use the room producer's
+        retained identity/receipt instead of treating ``running=False`` as proof by itself.
+        """
+        from tui_gateway.hosted_tui_custody import _producer_registry, _room_producer_evidence
+
+        registry = _producer_registry(self.authority)
+        room = registry.get('room') if isinstance(registry, dict) else None
+        return _room_producer_evidence(self.authority, room, receipt)
+
+    def _preservation_inventory(
+        self, close_generation: int, *, allow_terminal: bool = False,
+    ) -> dict[str, Any] | None:
         if not getattr(self, '_transport_installed', False):
             return None
         runtime = self.runtime.status()
+        terminal = (
+            allow_terminal
+            and runtime.get('running') is False
+            and self._terminal_room_inventory_is_valid(
+                getattr(self.authority, '_i17_room_terminal_receipt', None),
+            )
+        )
         if (runtime.get('preservation_close_generation') != close_generation
                 or runtime.get('intake_closed') is not True
-                or runtime.get('stopping') is True
-                or runtime.get('running') is not True
+                or (runtime.get('stopping') is True and not terminal)
+                or (runtime.get('running') is not True and not terminal)
                 or any(runtime.get(name) for name in (
                     'current_tasks', 'room_threads', 'leased_rooms', 'blocked_rooms',
                     'ambiguous_rooms', 'unavailable_route_retries',
@@ -162,7 +185,7 @@ class CanonicalHostedRoomService(HostedControls, HostedRoomService):
         self, *, process_instance: str, authority_epoch: int,
         close_generation: int, owner_id: str,
     ) -> dict[str, Any] | None:
-        inventory = self._preservation_inventory(close_generation)
+        inventory = self._preservation_inventory(close_generation, allow_terminal=True)
         if inventory is None:
             return None
         from gateway.runtime_custody import OWNER_SPECS
@@ -786,6 +809,15 @@ def abort_i09_source_close(runner, close_generation: int) -> bool:
     if catalog.no_producer:
         if not _i09_intake_is_closed(catalog.rows):
             return False
+        # A rebound cold registry is already fenced for an authenticated successor.  It has no
+        # room callback to resume, but reopening its intake would create an unbound admission
+        # window before the typed I17 source witness is restored.  Keep the same generation closed;
+        # the caller must retry the source-owned rebind instead of clearing the marker.
+        if any(
+            row.get('i17_registry', {}).get('prepared_successor_pending') is True
+            for row in catalog.rows
+        ):
+            return True
         _i09_set_intake_closed(catalog.rows, False)
         return True
     for _authority, service in catalog.pairs:

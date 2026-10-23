@@ -391,6 +391,60 @@ class RetirementFence:
             self._child_reservations[reservation_id] = reservation
             return reservation
 
+    def acquire_abort_child(
+        self, close_receipt, parent, *, owner_kind, owner_id, profile_id,
+        coordinator_id, source_transition,
+    ):
+        """Admit one source-authenticated child below a restored root during abort.
+
+        Ordinary child admission remains closed while a reversible close is held.  This narrow
+        path is available only to the coordinator-owned source transition that authenticated the
+        terminal-root rebind, and only for the exact successor root from that close generation.
+        """
+        if not isinstance(close_receipt, RetirementClose):
+            return None
+        if not isinstance(parent, RetirementLease):
+            return None
+        if (
+            type(owner_kind) is not str or not owner_kind
+            or type(owner_id) is not str or not owner_id
+            or type(coordinator_id) is not str or not coordinator_id
+            or source_transition is None
+        ):
+            return None
+        with self._lock:
+            self._expire()
+            close = self._close
+            capability = self._abort_rebind_capabilities.get(id(close_receipt))
+            if (
+                close is not close_receipt
+                or not close.reversible
+                or self._preparing
+                or self._committed
+                or close.process_instance != self._process_instance
+                or close._fence_id != self._fence_id
+                or not self._is_current_lease(parent)
+                or parent.close_generation != close.close_generation
+                or parent.profile_id != profile_id
+                or capability is None
+                or capability[0] != coordinator_id
+                or capability[1] is not source_transition
+            ):
+                return None
+            lease_id = secrets.token_urlsafe(18)
+            lease = RetirementLease(
+                lease_id=lease_id,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                profile_id=profile_id,
+                parent_lease_id=parent.lease_id,
+                close_generation=close.close_generation,
+                process_instance=self._process_instance,
+                _fence_id=self._fence_id,
+            )
+            self._active[lease_id] = lease
+            return lease
+
     def activate_child(self, reservation):
         """Activate one exact pre-close reservation after preparation has settled."""
         if not isinstance(reservation, RetirementChildReservation):
