@@ -371,6 +371,26 @@ class ServiceProcessReceipt:
             return False
         return time.monotonic() <= deadline
 
+    def _close_windows_transaction(self, *, deadline: float) -> str | None:
+        """Drain and close the exact Windows transaction after root exit."""
+        process = self.process
+        transaction = self.transaction
+        if (
+            process is None
+            or transaction is None
+        ):
+            return "physical_receipt_incomplete"
+        if getattr(transaction, "process", None) is not process or process.poll() is None:
+            return "physical_process_live"
+        if not getattr(transaction, "native_empty_observed", False):
+            if not self._drain_windows_transaction(transaction, deadline):
+                return "native_job_state_unknown"
+        if getattr(transaction, "native_empty_observed", False) is not True:
+            return "native_job_state_unknown"
+        if transaction.close_after_observed_empty() is not True:
+            return "native_close_failed"
+        return None
+
     def stop_process_for_retry(self, *, deadline: float | None = None) -> bool:
         """Stop the retained process while leaving readers and native handles reachable."""
         setup_fence = self.setup_fence
@@ -732,14 +752,14 @@ class ServiceProcessReceipt:
         ):
             return self._delivery_finalize_unknown("managed_witness_missing")
         if self.transaction is not None:
-            process = self.process
-            if getattr(self.transaction, "process", None) is not process or process.poll() is None:
-                return self._delivery_finalize_unknown("physical_process_live")
-            if not getattr(self.transaction, "native_empty_observed", False):
-                if self.transaction.observe_empty() is not True:
-                    return self._delivery_finalize_unknown("native_job_state_unknown")
-            if self.transaction.close_after_observed_empty() is not True:
-                return self._delivery_finalize_unknown()
+            close_failure = self._close_windows_transaction(
+                deadline=time.monotonic() + _PROCESS_RETRY_CLEANUP_BUDGET_SECONDS,
+            )
+            if close_failure is not None:
+                return self._delivery_finalize_unknown(
+                    "delivery_finalize_failed"
+                    if close_failure == "native_close_failed" else close_failure,
+                )
         elif self.scope == "posix_process_group":
             if not self._posix_process_group_empty():
                 return self._delivery_finalize_unknown("posix_process_group_live")
@@ -826,19 +846,17 @@ class ServiceProcessReceipt:
             self.mark_unknown("managed_witness_missing")
             return False
         if self.transaction is not None:
-            process = self.process
-            if getattr(self.transaction, "process", None) is not process or process.poll() is None:
-                self.mark_unknown("physical_process_live")
-                return False
-            if not getattr(self.transaction, "native_empty_observed", False):
-                if self.transaction.observe_empty() is not True:
-                    self.mark_unknown("native_job_state_unknown")
+            close_failure = self._close_windows_transaction(
+                deadline=time.monotonic() + _PROCESS_RETRY_CLEANUP_BUDGET_SECONDS,
+            )
+            if close_failure is not None:
+                if close_failure == "physical_process_live":
+                    self.mark_unknown(close_failure)
                     return False
-            if self.transaction.close_after_observed_empty() is not True:
                 self.state = "unknown"
-                self.unknown_reason = "native_close_failed"
+                self.unknown_reason = close_failure
                 self.service.unknown = True
-                self.service.coordinator.mark_unknown(self.handle, "native_close_failed")
+                self.service.coordinator.mark_unknown(self.handle, close_failure)
                 return False
             if self.state == "unknown":
                 # A native close can fail after the exact empty proof while the retained
