@@ -14,9 +14,18 @@ import os
 import sys
 from pathlib import Path
 
+import pytest
+
 from tui_gateway import server as tui_server
 
 class TestPrependToolPaths:
+    @pytest.fixture(autouse=True)
+    def _unconfigured_tool_store(self, monkeypatch, tmp_path):
+        # The first two controls exercise the fallback with no installed PM tools.
+        # Keep CI's genuinely installed store out of that scenario; the explicit
+        # store-first control below supplies its own store-path dependency.
+        monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "unconfigured-tools"))
+
     def test_prepends_managed_venv_and_user_bin(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hh"))
         env = {"PATH": "/usr/bin"}
