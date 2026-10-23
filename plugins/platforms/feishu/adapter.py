@@ -1627,6 +1627,12 @@ class FeishuAdapter(BasePlatformAdapter):
         tasks.clear()
 
     def _reset_batch_buffers(self) -> None:
+        # A cancelled debounce is still an accepted source item.  Preserve the
+        # exact token as UNKNOWN before dropping local buffers so close cannot
+        # mistake a cleared dict for a proven producer handoff.
+        for batches in (self._pending_text_batches, self._pending_media_batches):
+            for event in tuple(batches.values()):
+                self._preservation_source_unknown(event, "feishu_batch_shutdown")
         self._pending_text_batches.clear()
         self._pending_text_batch_counts.clear()
         self._pending_media_batches.clear()
@@ -2670,17 +2676,28 @@ class FeishuAdapter(BasePlatformAdapter):
             channel_prompt=self._resolve_channel_prompt(chat_id, thread_id or None),
             timestamp=datetime.now(),
         )
+        # The SDK callback may return/ack before the adapter's downstream handler runs;
+        # source custody must begin at this authenticated producer boundary.
+        self._admit_batched_event(normalized, "feishu-ingress")
         await self._dispatch_inbound_event(normalized)
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
-        if event.message_type == MessageType.TEXT and not event.is_command():
-            await self._enqueue_text_event(event)
-            return
-        if self._should_batch_media_event(event):
-            await self._enqueue_media_event(event)
-            return
-        await self._handle_message_with_guards(event)
+        try:
+            if event.message_type == MessageType.TEXT and not event.is_command():
+                await self._enqueue_text_event(event)
+                return
+            if self._should_batch_media_event(event):
+                await self._enqueue_media_event(event)
+                return
+            await self._handle_message_with_guards(event)
+            self._preservation_source_producer_done(event)
+        except asyncio.CancelledError:
+            self._preservation_source_unknown(event, "feishu_dispatch_cancelled")
+            raise
+        except Exception:
+            self._preservation_source_unknown(event, "feishu_dispatch_failed")
+            raise
 
     # --- Media batching ---
     def _should_batch_media_event(self, event: MessageEvent) -> bool:
@@ -2695,27 +2712,42 @@ class FeishuAdapter(BasePlatformAdapter):
         return existing.message_type == incoming.message_type and FeishuAdapter._text_batch_is_compatible(existing, incoming)
 
     async def _enqueue_media_event(self, event: MessageEvent) -> None:
-        key = self._media_batch_key(event)
-        existing = self._pending_media_batches.get(key)
-        if existing is None:
-            self._pending_media_batches[key] = event
+        source_tokens = tuple(self._admit_batched_event(event, "feishu-media-batch"))
+        prior_tokens = ()
+        try:
+            key = self._media_batch_key(event)
+            existing = self._pending_media_batches.get(key)
+            if existing is None:
+                self._pending_media_batches[key] = event
+                self._schedule_media_batch_flush(key)
+                return
+            prior_tokens = tuple(self._preservation_source_tokens(existing))
+            if not self._media_batch_is_compatible(existing, event):
+                await self._flush_media_batch_now(key)
+                self._pending_media_batches[key] = event
+                self._schedule_media_batch_flush(key)
+                return
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            existing.media_text_inlined.extend(event.media_text_inlined)
+            if event.text:
+                existing.text = self._merge_caption(existing.text, event.text)
+            existing.timestamp = event.timestamp
+            if event.message_id:
+                existing.message_id = event.message_id
+                existing.source.message_id = event.message_id
+            registry = self._preservation_source_registry()
+            if registry is not None:
+                registry.merge_events(existing, event)
             self._schedule_media_batch_flush(key)
-            return
-        if not self._media_batch_is_compatible(existing, event):
-            await self._flush_media_batch_now(key)
-            self._pending_media_batches[key] = event
-            self._schedule_media_batch_flush(key)
-            return
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
-        if event.text:
-            existing.text = self._merge_caption(existing.text, event.text)
-        existing.timestamp = event.timestamp
-        if event.message_id:
-            existing.message_id = event.message_id
-            existing.source.message_id = event.message_id
-        self._schedule_media_batch_flush(key)
+        except asyncio.CancelledError:
+            for token in (*prior_tokens, *source_tokens):
+                self._preservation_source_unknown(token, "feishu_media_batch_setup_cancelled")
+            raise
+        except Exception:
+            for token in (*prior_tokens, *source_tokens):
+                self._preservation_source_unknown(token, "feishu_media_batch_setup_failed")
+            raise
 
     def _schedule_media_batch_flush(self, key: str) -> None:
         self._reschedule_batch_task(self._pending_media_batch_tasks, key, self._flush_media_batch)
@@ -2741,7 +2773,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if not event:
             return
         logger.info("[Feishu] Flushing media batch %s with %d attachment(s)", key, len(event.media_urls))
-        await self._handle_message_with_guards(event)
+        try:
+            await self._handle_message_with_guards(event)
+            self._preservation_source_producer_done(event)
+        except asyncio.CancelledError:
+            self._preservation_source_unknown(event, "feishu_media_batch_cancelled")
+            raise
+        except Exception:
+            self._preservation_source_unknown(event, "feishu_media_batch_failed")
+            raise
 
     async def _download_remote_image(self, image_url: str) -> str:
         ext = self._guess_remote_extension(image_url, default=".jpg")
@@ -2931,6 +2971,14 @@ class FeishuAdapter(BasePlatformAdapter):
         return True
 
     # --- Text batching ---
+    def _admit_batched_event(self, event: MessageEvent, phase: str) -> tuple:
+        """Admit an inbound event before Feishu's pending-batch mutation."""
+        bound = tuple(self._preservation_source_tokens(event))
+        self._preservation_source_admit(
+            event, event=event, phase=phase, source_token=bound or None,
+        )
+        return tuple(self._preservation_source_tokens(event))
+
     @staticmethod
     def _text_batch_is_compatible(existing: MessageEvent, incoming: MessageEvent) -> bool:
         """Only merge text events when reply/thread context is identical."""
@@ -2942,43 +2990,58 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Debounce rapid Feishu text bursts into a single MessageEvent."""
-        key = self._text_batch_key(event)
-        chunk_len = len(event.text or "")
+        source_tokens = tuple(self._admit_batched_event(event, "feishu-text-batch"))
+        prior_tokens = ()
+        try:
+            key = self._text_batch_key(event)
+            chunk_len = len(event.text or "")
 
-        def _start_batch() -> None:
-            self._pending_text_batches[key] = event
-            self._pending_text_batch_counts[key] = 1
+            def _start_batch() -> None:
+                self._pending_text_batches[key] = event
+                self._pending_text_batch_counts[key] = 1
+                self._schedule_text_batch_flush(key)
+
+            existing = self._pending_text_batches.get(key)
+            if existing is None:
+                event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+                _start_batch()
+                return
+            prior_tokens = tuple(self._preservation_source_tokens(existing))
+            if not self._text_batch_is_compatible(existing, event):
+                await self._flush_text_batch_now(key)
+                _start_batch()
+                return
+
+            next_count = self._pending_text_batch_counts.get(key, 1) + 1
+            appended_text = event.text or ""
+            next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
+            if next_count > self._text_batch_max_messages or len(next_text) > self._text_batch_max_chars:
+                await self._flush_text_batch_now(key)
+                _start_batch()
+                return
+
+            existing.text = next_text
+            existing.media_urls.extend(event.media_urls)
+            existing.media_types.extend(event.media_types)
+            existing.media_text_inlined.extend(event.media_text_inlined)
+            existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
+            existing.timestamp = event.timestamp
+            if event.message_id:
+                existing.message_id = event.message_id
+                existing.source.message_id = event.message_id
+            registry = self._preservation_source_registry()
+            if registry is not None:
+                registry.merge_events(existing, event)
+            self._pending_text_batch_counts[key] = next_count
             self._schedule_text_batch_flush(key)
-
-        existing = self._pending_text_batches.get(key)
-        if existing is None:
-            event._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-            _start_batch()
-            return
-        if not self._text_batch_is_compatible(existing, event):
-            await self._flush_text_batch_now(key)
-            _start_batch()
-            return
-
-        next_count = self._pending_text_batch_counts.get(key, 1) + 1
-        appended_text = event.text or ""
-        next_text = f"{existing.text}\n{appended_text}" if existing.text and appended_text else (existing.text or appended_text)
-        if next_count > self._text_batch_max_messages or len(next_text) > self._text_batch_max_chars:
-            await self._flush_text_batch_now(key)
-            _start_batch()
-            return
-
-        existing.text = next_text
-        existing.media_urls.extend(event.media_urls)
-        existing.media_types.extend(event.media_types)
-        existing.media_text_inlined.extend(event.media_text_inlined)
-        existing._last_chunk_len = chunk_len  # type: ignore[attr-defined]
-        existing.timestamp = event.timestamp
-        if event.message_id:
-            existing.message_id = event.message_id
-            existing.source.message_id = event.message_id
-        self._pending_text_batch_counts[key] = next_count
-        self._schedule_text_batch_flush(key)
+        except asyncio.CancelledError:
+            for token in (*prior_tokens, *source_tokens):
+                self._preservation_source_unknown(token, "feishu_text_batch_setup_cancelled")
+            raise
+        except Exception:
+            for token in (*prior_tokens, *source_tokens):
+                self._preservation_source_unknown(token, "feishu_text_batch_setup_failed")
+            raise
 
     def _schedule_text_batch_flush(self, key: str) -> None:
         """Reset the debounce timer for a pending Feishu text batch."""
@@ -2996,7 +3059,15 @@ class FeishuAdapter(BasePlatformAdapter):
         return self._pending_text_batches.pop(key, None)
 
     async def _dispatch_text_batch(self, event: MessageEvent) -> None:
-        await self._handle_message_with_guards(event)
+        try:
+            await self._handle_message_with_guards(event)
+            self._preservation_source_producer_done(event)
+        except asyncio.CancelledError:
+            self._preservation_source_unknown(event, "feishu_text_batch_cancelled")
+            raise
+        except Exception:
+            self._preservation_source_unknown(event, "feishu_text_batch_failed")
+            raise
 
     # --- Message content extraction and resource download ---
     def _normalize(self, message_type: Any, raw_content: Any, mentions: Any) -> FeishuNormalizedMessage:

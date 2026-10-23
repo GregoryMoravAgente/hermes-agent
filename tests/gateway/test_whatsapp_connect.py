@@ -79,7 +79,6 @@ def _connect_patches(mock_proc, mock_fh):
         patch("subprocess.Popen", return_value=mock_proc),
         patch("builtins.open", return_value=mock_fh),
         patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
-        patch("plugins.platforms.whatsapp.adapter.asyncio.create_task"),
     ]
     return base
 
@@ -150,7 +149,7 @@ class TestFileHandleClosedOnError:
         patches = _connect_patches(mock_proc, mock_fh)
 
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-             patches[5], patches[6], patches[7]:
+             patches[5], patches[6]:
             result = await adapter.connect()
 
         assert result is False

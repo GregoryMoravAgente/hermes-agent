@@ -910,7 +910,10 @@ def _make_live_adapter(monkeypatch, reply_fn=None):
     # port through config.extra so both construction paths bind the same port.
     adapter = A2AAdapter(PlatformConfig(enabled=True, extra={"port": port}))
 
-    async def fake_handle_message(event):
+    adapter._received_source_tokens = []
+
+    async def fake_handle_message(event, *, source_tokens=None):
+        adapter._received_source_tokens.append(source_tokens)
         if reply_fn is None:
             reply = "ECHO: " + event.text
         else:
@@ -997,6 +1000,9 @@ class TestInboundRoundTrip:
             reply = protocol.extract_text(task["artifacts"][0])
             assert "ECHO:" in reply
             assert "hello agent" in reply  # framed text still contains the task
+            # The handler seam receives the source-token keyword even when this
+            # standalone fixture has no registry and therefore no concrete token.
+            assert adapter._received_source_tokens == [None]
 
             # 3) tasks/get finds the COMPLETED task (task store, not popped)
             get_resp = await asyncio.to_thread(_post_json, base + "/", {
@@ -1419,7 +1425,8 @@ class TestMultiAgentRouting:
         route = adapter._route_for_request("/dev/", {"tenant": "research"})
         assert "error" in route
 
-    def test_forwarded_retry_of_the_same_message_reuses_its_admission_id(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_forwarded_retry_of_the_same_message_reuses_its_admission_id(self, monkeypatch):
         """A peer that resends after a timeout repeats its messageId; the forwarded input id must
         repeat with it so the owner answers from the accepted work instead of queueing a second turn."""
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1428,6 +1435,8 @@ class TestMultiAgentRouting:
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
         }))
+        adapter._loop = asyncio.get_running_loop()
+        adapter._message_handler = object()
         agent = adapter._agents["dev"]
         seen = []
 
@@ -1451,7 +1460,8 @@ class TestMultiAgentRouting:
                               "peer-x", agent=agent)
         assert not seen[4].startswith("a2a-msg:")
 
-    def test_forwarded_retry_without_a_context_reopens_the_same_context(self):
+    @pytest.mark.asyncio
+    async def test_forwarded_retry_without_a_context_reopens_the_same_context(self):
         """A first send is retried with the same messageId and no contextId, because the peer never
         received one. It must land in the same context and admission as the first attempt."""
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1460,6 +1470,8 @@ class TestMultiAgentRouting:
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
         }))
+        adapter._loop = asyncio.get_running_loop()
+        adapter._message_handler = object()
         agent = adapter._agents["dev"]
         seen = []
 
@@ -1486,7 +1498,8 @@ class TestMultiAgentRouting:
         two, _ = adapter._prepare_task({"tenant": "dev", "message": dict(bare)}, "peer-x", agent=agent)
         assert one["contextId"] != two["contextId"]
 
-    def test_forwarded_retries_do_not_spend_the_turn_budget(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_forwarded_retries_do_not_spend_the_turn_budget(self, monkeypatch):
         """The owner answers a resend from the accepted admission, so the anti-loop counter and the
         conversation log see the message once. Distinct messages in the context still count."""
         from plugins.platforms.a2a.adapter import A2AAdapter
@@ -1498,6 +1511,8 @@ class TestMultiAgentRouting:
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
         }))
+        adapter._loop = asyncio.get_running_loop()
+        adapter._message_handler = object()
         agent = adapter._agents["dev"]
         seen = []
 
@@ -1519,13 +1534,16 @@ class TestMultiAgentRouting:
         assert rejected["status"]["state"] == protocol.STATE_REJECTED
         assert len(seen) == 5
 
-    def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch):
+    @pytest.mark.asyncio
+    async def test_forwarded_profile_task_completes_in_task_store(self, monkeypatch):
         from plugins.platforms.a2a.adapter import A2AAdapter
         from gateway.config import PlatformConfig
 
         adapter = A2AAdapter(PlatformConfig(enabled=True, extra={
             "agents": {"dev": {"profile": "dev", "tenant": "dev"}}
         }))
+        adapter._loop = asyncio.get_running_loop()
+        adapter._message_handler = object()
         agent = adapter._agents["dev"]
 
         def fake_forward(agent_arg, peer, context_id, framed_text, *, input_id):

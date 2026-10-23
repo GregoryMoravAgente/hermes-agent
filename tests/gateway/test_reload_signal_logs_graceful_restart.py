@@ -27,6 +27,7 @@ class _AbortedStartupRunner:
         self._draining = False
         self.config = config
         self.adapters = {}
+        self._failed_platforms = {}
         self._running = False
         self._restart_requested = False
         self._restart_via_service = False
@@ -35,6 +36,10 @@ class _AbortedStartupRunner:
         self.exit_reason = None
         self.exit_code = None
         self.restart_calls = []
+
+    def register_i10_source(self, authority):
+        from gateway.run_adapters_recovery import register_i10_source
+        return register_i10_source(self, authority)
 
     async def start(self):
         return False

@@ -191,6 +191,11 @@ async def test_start_gateway_replace_reaps_old_gateway_children_posix(
             self.exit_reason = None
             self.exit_code = None
             self.adapters = {}
+            self._failed_platforms = {}
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             assert self._platform_lock_takeover_on_start is True

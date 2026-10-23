@@ -8,6 +8,7 @@ import ipaddress
 import json
 import logging
 import re
+import uuid
 from collections import deque
 from hashlib import sha1
 from typing import Any, Awaitable, Callable, Dict, Optional
@@ -25,6 +26,7 @@ from gateway.platforms.base import (
     BasePlatformAdapter, SendResult, is_network_accessible,
 )
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.session_authority import SchedulerTaskHandoff
 from datetime import UTC
 
 logger = logging.getLogger(__name__)
@@ -37,7 +39,13 @@ DEFAULT_PORT = 8646
 DEFAULT_WEBHOOK_PATH = "/msgraph/webhook"
 DEFAULT_MAX_SEEN_RECEIPTS = 5000
 DEFAULT_MAX_BODY_BYTES = 1_048_576
-NotificationScheduler = Callable[[dict[str, Any], MessageEvent], Awaitable[None] | None]
+NotificationScheduler = Callable[
+    [dict[str, Any], MessageEvent],
+    Awaitable[asyncio.Future | SchedulerTaskHandoff | None]
+    | asyncio.Future
+    | SchedulerTaskHandoff
+    | None,
+]
 _TEMPLATE_KEY_RE = re.compile(r"\{([a-zA-Z0-9_.]+)\}")
 
 
@@ -312,9 +320,62 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
     async def _schedule_notification(self, notification: dict[str, Any], event: MessageEvent) -> None:
         scheduler = self._notification_scheduler
         if scheduler is not None:
-            result = scheduler(notification, event)
-            if asyncio.iscoroutine(result):
-                await result
+            # The shipped Teams scheduler persists a job inside the request and returns its real
+            # background task. Keep one I01 root across that task; a scheduler callback that only
+            # returns None is a deliberate drop and has no accepted work to retain.
+            from gateway.platforms.webhook_ingress import producer_scope
+            async with producer_scope(self, event) as authority:
+                reservation_id = str(getattr(event, 'message_id', None) or uuid.uuid4().hex)
+                handle = authority._preservation_root(
+                    'I01_native_inbound', f'scheduler:{reservation_id}')
+                invoked = False
+                unjoinable = False
+                try:
+                    invoked = True
+                    result = scheduler(notification, event)
+                    if asyncio.iscoroutine(result):
+                        result = await result
+                    expected_job_id = None
+                    if isinstance(result, SchedulerTaskHandoff):
+                        task = result.task
+                        expected_job_id = result.expected_job_id
+                    else:
+                        task = result
+                    if expected_job_id is not None and not str(expected_job_id).strip():
+                        unjoinable = True
+                        coordinator = authority._preservation_coordinator()
+                        if coordinator is not None:
+                            coordinator.mark_unknown(handle, 'unmapped_writer')
+                        from hermes_state_runtime import RuntimeStoreError
+                        raise RuntimeStoreError('unmapped_writer')
+                    if task is None:
+                        authority._preservation_bind_or_release(None, handle)
+                        return  # Drop-scheduler path; no accepted work exists.
+                    if not isinstance(task, asyncio.Future):
+                        # A scheduler that starts work without returning a joinable task has not
+                        # supplied an ownership boundary. Retain unknown custody rather than
+                        # pretending its adapter-local work is settled, and make Graph retry the
+                        # notification instead of recording a successful receipt for lost work.
+                        unjoinable = True
+                        coordinator = authority._preservation_coordinator()
+                        if coordinator is not None:
+                            coordinator.mark_unknown(handle, 'unmapped_writer')
+                        from hermes_state_runtime import RuntimeStoreError
+                        raise RuntimeStoreError('unmapped_writer')
+                    authority._preservation_bind_scheduler(
+                        reservation_id, handle, expected_job_id=expected_job_id)
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                    task.add_done_callback(
+                        lambda done: authority._preservation_scheduler_done(reservation_id, done))
+                except BaseException:
+                    if invoked and not unjoinable:
+                        coordinator = authority._preservation_coordinator()
+                        if coordinator is not None and handle is not None:
+                            coordinator.mark_unknown(handle, 'join_failed')
+                    else:
+                        authority._preservation_bind_or_release(None, handle)
+                    raise
             return  # Plugin-owned pipeline; never also start a gateway inference.
         await self._admit_notification(event)
 
@@ -328,32 +389,103 @@ class MSGraphWebhookAdapter(BasePlatformAdapter):
         # Reuse the existing private automation envelope: public native admission
         # continues to reject internal events and arbitrary metadata.
         from datetime import datetime, timezone
+        from functools import partial
         from gateway.platforms.webhook_ingress import producer_scope
         from gateway.session_ingress_context import capture_provenance
         from hermes_state_runtime import admit_session_input, RuntimeStoreError
 
         async with producer_scope(self, event) as authority:
-            authority._require_admission_open()
-            provenance = capture_provenance(authority.runner, event)
-            if provenance is None:
-                raise RuntimeStoreError('permission_denied')
-            # The routing reservation writes too: off the owner loop like the admission below.
-            ref = authority._publish_route(event.source, *await asyncio.to_thread(authority._reserve_route, event.source))
-            route = authority.sessions[ref.session_id].route
-            source = event.source.to_dict()
-            source['is_bot'] = event.source.is_bot
-            envelope = {'source': source, 'route': route, 'provenance': provenance,
-                'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
-                'event': {'message_id': event.message_id},
-                'automation': {'identity': event.message_id, 'owner': ref.session_id}}
-            # Off the owner loop and in admission order (``tracked_write``), committed before the
-            # 202: a held SQLite writer must not freeze every session while Graph waits.
-            from functools import partial
-            from gateway.session_runtime_workers import tracked_write
-            return await tracked_write(authority, partial(
-                admit_session_input, authority.db, epoch=authority.epoch,
-                principal_id='msgraph:' + route, session_id=ref.session_id, request_id=event.message_id,
-                payload={'text': event.text, 'native_text_v1': envelope},
-                _authorize_write=authority._admission_gate()),
-                then=partial(authority._admitted, ref, event), ordered=True,
-                after=partial(authority._schedule_admitted, ref))
+            authority._require_fresh_admission_open()
+            reservation_id = str(getattr(event, 'message_id', None) or uuid.uuid4().hex)
+            # Graph keeps its authenticated automation envelope and route identity instead of using
+            # the generic prepare_native path.  It still has the same producer preparation boundary:
+            # reserve one exact I01 root before provenance/route preparation and transfer that root
+            # to durable-row reconciliation below.
+            preservation_handle = authority._preservation_root(
+                'I01_native_inbound', f'native:{reservation_id}')
+            admission_identity_ready = False
+            request_id = principal_id = session_id = None
+            route_write_pending = False
+            try:
+                # Keep the existing Graph callback binding, client-state/resource gates, and
+                # capability/provenance check unchanged.  This is a custody seam, not a new Graph
+                # authorization route.
+                provenance = capture_provenance(authority.runner, event)
+                if provenance is None:
+                    raise RuntimeStoreError('permission_denied')
+                # The routing reservation writes too: off the owner loop like the admission below.
+                from gateway.session_runtime_workers import tracked_write
+
+                route_write_pending = True
+
+                def route_finished(_result):
+                    # No durable admission identity exists until the route has returned. Release the
+                    # root only after the shielded route worker completes.
+                    authority._preservation_bind_or_release(None, preservation_handle)
+
+                try:
+                    route_result = await tracked_write(
+                        authority, partial(authority._reserve_route, event.source, fresh=True),
+                        on_cancel=route_finished, on_failure=lambda _error: route_finished(None))
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    route_write_pending = False
+                    authority._preservation_bind_or_release(None, preservation_handle)
+                    raise
+                route_write_pending = False
+                ref = authority._publish_route(
+                    event.source,
+                    *route_result,
+                    fresh=True,
+                )
+                route = authority.sessions[ref.session_id].route
+                source = event.source.to_dict()
+                source['is_bot'] = event.source.is_bot
+                envelope = {'source': source, 'route': route, 'provenance': provenance,
+                    'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
+                    'event': {'message_id': event.message_id},
+                    'producer_process_mode': 'direct',
+                    'automation': {'identity': event.message_id, 'owner': ref.session_id}}
+                request_id = event.message_id
+                principal_id = 'msgraph:' + route
+                session_id = ref.session_id
+                admission_identity_ready = True
+                authority._preservation_pending_root(
+                    request_id, preservation_handle, principal_id=principal_id, session_id=session_id)
+                # Off the owner loop and in admission order (``tracked_write``), committed before the
+                # 202: a held SQLite writer must not freeze every session while Graph waits.
+                def admitted(row):
+                    # Bind the same producer root before any terminal/FIFO observer can seal I01.
+                    # An exact Graph retry returns the already-admitted row.  Its original root is
+                    # still the admission's custody; never overwrite that lease with the retry's
+                    # new root, which must be released as an unaccepted duplicate.
+                    authority._preservation_bind_or_release(row, preservation_handle)
+                    return authority._admitted(ref, event, row)
+
+                return await tracked_write(authority, partial(
+                    admit_session_input, authority.db, epoch=authority.epoch,
+                    principal_id=principal_id, session_id=session_id, request_id=request_id,
+                    payload={'text': event.text, 'native_text_v1': envelope},
+                    _authorize_write=authority._admission_gate(fresh=True)),
+                    then=admitted, ordered=True,
+                    after=partial(authority._schedule_admitted, ref),
+                    on_failure=partial(
+                        authority._preservation_reconcile_failed, preservation_handle,
+                        principal_id=principal_id, session_id=session_id, request_id=request_id))
+            except asyncio.CancelledError:
+                # The late worker callback reconciles the exact tuple after a shielded commit; do
+                # not release or mark it unaccepted from this cancelled request task.
+                raise
+            except BaseException:
+                # If no durable identity was established, release the unaccepted root.  Once route
+                # identity exists, reconcile the exact Graph principal/session/request tuple; a
+                # shielded writer may have committed after caller cancellation, so never release by
+                # exception alone.
+                if admission_identity_ready:
+                    authority._preservation_reconcile_failed(
+                        preservation_handle, principal_id=principal_id, session_id=session_id,
+                        request_id=request_id)
+                elif not route_write_pending:
+                    authority._preservation_bind_or_release(None, preservation_handle)
+                raise

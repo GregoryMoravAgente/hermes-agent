@@ -1445,6 +1445,7 @@ class TestConfirmedFinalDeliveryConsultsCommentaryRecord:
         response = {"final_response": final_text}
         turn_ctx = SimpleNamespace(
             stream_consumer_holder=[consumer], source=SimpleNamespace(platform="telegram"), session_key="s1",
+            run_generation=1,
         )
         asyncio.run(GatewayTurnMixin()._run_agent_mark_streamed_delivery(response, turn_ctx))
         return response

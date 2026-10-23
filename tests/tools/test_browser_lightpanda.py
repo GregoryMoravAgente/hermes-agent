@@ -688,6 +688,18 @@ class TestLightpandaSessionLifecycle:
         assert "task-1" not in bt._active_sessions
         assert "task-1" not in bt._session_last_activity
 
+    def test_cleanup_retains_session_when_native_close_is_unknown(self, monkeypatch):
+        bt = self.bt
+        self._seed()
+        monkeypatch.setattr("tools.browser_lightpanda.stop_lightpanda", lambda _name: False)
+        with patch("tools.browser_tool._maybe_stop_recording"), \
+             patch("tools.browser_tool_session._run_browser_command") as run, \
+             patch("tools.browser_tool.os.path.exists", return_value=False):
+            bt_lifecycle.cleanup_browser("task-1")
+        run.assert_not_called()
+        assert "task-1" in bt._active_sessions
+        assert "task-1" in bt._session_last_activity
+
     def test_emergency_cleanup_stops_all_lightpanda(self, monkeypatch):
         bt = self.bt
         bt._cleanup_done = False

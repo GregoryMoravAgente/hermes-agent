@@ -47,6 +47,13 @@ def restart_wait_open(runner) -> bool:
             and descriptor.get("drain_reason") == RESTART_WAIT_REASON)
 
 
+def admit_external_drain(runner):
+    """Reserve the source-owned I19 lifecycle lease before entering a reversible drain."""
+    from gateway.lifecycle_custody import admit_lifecycle
+
+    return admit_lifecycle(runner, "external-drain", owner_id="gateway:external-drain")
+
+
 # The reads a client needs during that wait to find and open the conversation parked on
 # approval/clarify: Desktop's session picker, the session detail and its transcript pages, and the
 # health probes. GET only and still authenticated; every write and every other route keeps the

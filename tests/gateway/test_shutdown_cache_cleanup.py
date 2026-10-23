@@ -27,6 +27,8 @@ import gateway.run as gw_mod
 class _FakeGateway:
     """Minimal stand-in with just enough state for ``stop()`` to run."""
 
+    _api_server_hook = gw_mod.GatewayRunner._api_server_hook
+
     def __init__(self):
         self._running = True
         self._draining = False

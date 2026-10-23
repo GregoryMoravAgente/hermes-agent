@@ -54,6 +54,129 @@ def _acp_launch(runner, source) -> bool:
 
 
 class GatewayTurnPersistenceMixin:
+    def _event_thread_metadata(self, event, source):
+        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+
+    @staticmethod
+    def _pop_post_delivery_callback(adapter, key, generation):
+        """Pop the adapter's deferred post-delivery callback for ``key`` (legacy dict fallback)."""
+        if getattr(type(adapter), "pop_post_delivery_callback", None) is not None:
+            return adapter.pop_post_delivery_callback(key, generation=generation)
+        if adapter and hasattr(adapter, "_post_delivery_callbacks"):
+            return adapter._post_delivery_callbacks.pop(key, None)
+        return None
+
+    async def _finish_classic_queued_first_response(
+        self, turn_ctx: TurnContext, adapter: Any, response: str, result: Any, delivered: bool,
+    ) -> None:
+        """Settle the direct classic occurrence delivered before an in-band queued follow-up.
+
+        The queued lane sends the first answer through a temporary ledger event, so the adapter's
+        outer finally cannot see that occurrence's delivery proof.  Read the canonical ledger row
+        back onto the original typed owner before the recursive follow-up starts; no response text
+        or empty custody map is accepted as a terminal witness.
+        """
+        event = getattr(turn_ctx, "classic_writer_event", None)
+        binding = getattr(turn_ctx, "classic_writer_binding", None)
+        if event is None or binding is None or not isinstance(result, dict):
+            return
+        from gateway.session_classic_custody import ClassicWriterBinding
+        if not isinstance(binding, ClassicWriterBinding):
+            return
+        authority = getattr(event, "_classic_custody_authority", None)
+        key = getattr(event, "_classic_custody_key", None)
+        records = getattr(authority, "_preservation_operations", None)
+        record = records.get(key) if isinstance(records, dict) and key is not None else None
+        if authority is None or not isinstance(record, dict) or record.get("parent_handle") is not None:
+            return
+        if result.get("_classic_writer_proof") is None:
+            return
+
+        async def _consume_registered_classic_callback() -> bool:
+            """Consume the outer turn's real callback before this queued lane finishes its owner.
+
+            The queued first reply is delivered inside ``_run_agent`` before the outer Base
+            task reaches its finally block.  Waiting for that finally to pop the callback would
+            leave the first I06 operation open while the recursive follow-up claims the FIFO.
+            The adapter's existing callback consumer is therefore invoked at this actual queued
+            delivery boundary; if the outer active-turn event is unavailable, leave the owner
+            for Base's normal finalizer instead of manufacturing a callback context.
+            """
+            bridge = getattr(event, '_classic_execution_bridge', None)
+            if not getattr(bridge, 'post_delivery_callback_expected', False):
+                return True
+            active = getattr(adapter, '_active_sessions', None)
+            interrupt_event = active.get(turn_ctx.session_key) if isinstance(active, dict) else None
+            fire = getattr(adapter, '_fire_post_delivery_callback', None)
+            if interrupt_event is None or not callable(fire):
+                return False
+            await fire(turn_ctx.session_key, interrupt_event)
+            return bool(getattr(bridge, 'post_delivery_callback_executed', False))
+
+        try:
+            if not delivered:
+                if not await _consume_registered_classic_callback():
+                    return
+                authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                return
+            if isinstance(response, dict):
+                stream_witness = response.get("_classic_stream_delivery_witness")
+                if stream_witness is not None:
+                    event._classic_stream_delivery_witness = stream_witness
+                first_text = response.get("final_response") or ""
+            else:
+                first_text = str(response or "")
+            from gateway.run import _strip_response_attachments_for_direct_send
+            first_text = _strip_response_attachments_for_direct_send(first_text, adapter)
+            if not first_text and not getattr(event, "_classic_stream_delivery_witness", None):
+                return
+            if first_text:
+                from gateway import delivery_ledger
+                inbound_id = getattr(turn_ctx, "inbound_message_id", None) or getattr(event, "message_id", None)
+                if not inbound_id:
+                    if not await _consume_registered_classic_callback():
+                        return
+                    authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                    return
+                obligation_id = delivery_ledger.compute_obligation_id(
+                    turn_ctx.session_key, str(inbound_id), first_text,
+                )
+                with self._media_delivery_scope_for_source(turn_ctx.source):
+                    proof = await asyncio.to_thread(
+                        delivery_ledger.read_obligation,
+                        obligation_id,
+                        session_key=turn_ctx.session_key,
+                        platform=str(getattr(turn_ctx.source.platform, "value", turn_ctx.source.platform)),
+                        chat_id=turn_ctx.source.chat_id,
+                        thread_id=getattr(turn_ctx.source, "thread_id", None),
+                        content=first_text,
+                        adapter_profile=getattr(adapter, "_owner_profile", None),
+                        expected_state="delivered",
+                    )
+                if proof is None:
+                    if not await _consume_registered_classic_callback():
+                        return
+                    authority._classic_finish(event, success=False, reason="delivery_proof_missing")
+                    return
+                event._classic_delivery_proof = proof
+            store = getattr(self, "session_store", None)
+            entry = store.lookup_by_session_key(turn_ctx.session_key) if store is not None else None
+            from gateway.session_classic_custody import attach_classic_execution_receipt
+            receipt = attach_classic_execution_receipt(self, event, entry, result) if entry is not None else None
+            if receipt is None:
+                if not await _consume_registered_classic_callback():
+                    return
+                authority._classic_finish(event, success=False, reason="completion_receipt_missing")
+                return
+            if not await _consume_registered_classic_callback():
+                return
+            authority._classic_finish(event, success=True, receipt=receipt)
+        except Exception:
+            logger.debug("Queued classic occurrence reconciliation failed", exc_info=True)
+            with suppress(Exception):
+                authority._classic_finish(event, success=False, reason="delivery_proof_readback_failed")
+
     async def _hmwa_shape_agent_response(
         self, agent_result, source, history, session_entry, session_key,
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
@@ -230,13 +353,11 @@ class GatewayTurnPersistenceMixin:
         # Pending process watchers (check_interval on background processes)
         try:
             from tools.process_registry import process_registry
-            # Detach the batch atomically (reassign, not clear()) so concurrent appends aren't dropped.
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            for i, watcher in enumerate(watchers):
-                asyncio.create_task(self._run_process_watcher(watcher))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
+            from gateway.run_process_watchers import drain_pending_process_watchers
+            await drain_pending_process_watchers(
+                self, process_registry,
+                lambda watcher: asyncio.create_task(self._run_process_watcher(watcher)),
+            )
         except Exception as e:
             logger.error("Process watcher setup error: %s", e)
 
@@ -432,6 +553,90 @@ class GatewayTurnPersistenceMixin:
             _user_entry["message_id"] = str(event.message_id)
         return _user_entry
 
+    async def _hmwa_persist_transcript_rows(
+        self, *, event, source, sid, history, agent_result, agent_messages, prepared, response,
+        agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure, store,
+        agent_persisted, ts, resolve_gateway_model,
+    ):
+        """Persist the transcript rows and return their typed proofs plus unknown state."""
+        _classic_transcript_proofs = []
+        _classic_transcript_unknown = False
+
+        async def _append_classic_transcript(message, *, skip_db=False):
+            """Capture the exact row proof returned by the canonical SessionStore writer."""
+            nonlocal _classic_transcript_unknown
+            proof = await store.append_to_transcript(sid, message, skip_db=skip_db)
+            if proof is None and not skip_db:
+                _classic_transcript_unknown = True
+            else:
+                _classic_transcript_proofs.append(proof)
+            return proof
+
+        _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+
+        if is_context_overflow_failure:
+            _classic_transcript_unknown = True  # No durable turn witness exists.
+        else:
+            if not history and source.platform != Platform.LOCAL:
+                # Fresh session: the tool definitions (as sent in the API request) make the transcript
+                # self-describing. A LOCAL route (one-shot, chat -q, ACP, TUI attach) keeps the classic
+                # in-process CLI's transcript shape: the marker is gateway bookkeeping every local
+                # reader filters out, and the session row already carries model/model_config.
+                await _append_classic_transcript({
+                    "role": "session_meta",
+                    "tools": agent_result.get("tools", []) or [],
+                    "model": resolve_gateway_model(),
+                    "platform": source.platform.value if source.platform else "",
+                    "timestamp": ts,
+                })
+            if agent_failed_early or hidden_reasoning_incomplete:
+                # Transient failure / hidden-reasoning incomplete: persist only the user message (the
+                # assistant error text is a gateway hint, not model output). Dedupe on platform
+                # message_id (Telegram retries after transient failures).
+                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
+                    logger.info(
+                        "Skipping duplicate user turn (message_id=%s) in session %s",
+                        event.message_id, sid,
+                    )
+                    _classic_transcript_unknown = True
+                else:
+                    await _append_classic_transcript(_user_row, skip_db=agent_persisted)
+                # Close the failed turn: a user-only tail lets alternation repair merge this request
+                # into an unrelated future message and replay stale side effects (#107070).
+                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+            else:
+                # Only the NEW messages: history_offset (what the agent saw), not len(history), which
+                # counts session_meta entries stripped before the agent saw them.
+                history_len = agent_result.get("history_offset", len(history))
+                new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+                if not new_messages:
+                    # Edge case: fall back to simple user/assistant rows.
+                    await _append_classic_transcript(_user_row, skip_db=agent_persisted)
+                    if response:
+                        await _append_classic_transcript(
+                            {"role": "assistant", "content": response, "timestamp": ts},
+                            skip_db=agent_persisted,
+                        )
+                else:
+                    # Attach the inbound platform message_id to the first user entry so platform-level
+                    # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
+                    _user_msg_id_attached = False
+                    for msg in new_messages:
+                        if msg.get("role") == "system":
+                            continue  # rebuilt each run
+                        entry = {**msg, "timestamp": ts}
+                        if (
+                            not _user_msg_id_attached
+                            and msg.get("role") == "user"
+                            and event.message_id
+                            and "message_id" not in entry
+                        ):
+                            entry["message_id"] = str(event.message_id)
+                            _user_msg_id_attached = True
+                        await _append_classic_transcript(entry, skip_db=agent_persisted)
+
+        return _classic_transcript_proofs, _classic_transcript_unknown
+
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -454,67 +659,59 @@ class GatewayTurnPersistenceMixin:
         # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
         # into a gateway-side write by returning False.
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
-        _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
+        _classic_transcript_proofs, _classic_transcript_unknown = await self._hmwa_persist_transcript_rows(
+            event=event, source=source, sid=sid, history=history, agent_result=agent_result,
+            agent_messages=agent_messages, prepared=prepared, response=response,
+            agent_failed_early=agent_failed_early, hidden_reasoning_incomplete=hidden_reasoning_incomplete,
+            is_context_overflow_failure=is_context_overflow_failure, store=store,
+            agent_persisted=agent_persisted, ts=ts, resolve_gateway_model=_resolve_gateway_model,
+        )
 
-        if is_context_overflow_failure:
-            pass  # Skip all transcript writes — don't grow a broken session
-        else:
-            if not history and source.platform != Platform.LOCAL:
-                # Fresh session: the tool definitions (as sent in the API request) make the transcript
-                # self-describing. A LOCAL route (one-shot, chat -q, ACP, TUI attach) keeps the classic
-                # in-process CLI's transcript shape: the marker is gateway bookkeeping every local
-                # reader filters out, and the session row already carries model/model_config.
-                await store.append_to_transcript(sid, {
-                    "role": "session_meta",
-                    "tools": agent_result.get("tools", []) or [],
-                    "model": _resolve_gateway_model(),
-                    "platform": source.platform.value if source.platform else "",
-                    "timestamp": ts,
-                })
-            if agent_failed_early or hidden_reasoning_incomplete:
-                # Transient failure / hidden-reasoning incomplete: persist only the user message (the
-                # assistant error text is a gateway hint, not model output). Dedupe on platform
-                # message_id (Telegram retries after transient failures).
-                if event.message_id and await store.has_platform_message_id(sid, str(event.message_id)):
-                    logger.info(
-                        "Skipping duplicate user turn (message_id=%s) in session %s",
-                        event.message_id, sid,
-                    )
-                else:
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
-                # Close the failed turn: a user-only tail lets alternation repair merge this request
-                # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
-            else:
-                # Only the NEW messages: history_offset (what the agent saw), not len(history), which
-                # counts session_meta entries stripped before the agent saw them.
-                history_len = agent_result.get("history_offset", len(history))
-                new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
-                if not new_messages:
-                    # Edge case: fall back to simple user/assistant rows.
-                    await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
-                    if response:
-                        await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
-                        )
-                else:
-                    # Attach the inbound platform message_id to the first user entry so platform-level
-                    # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
-                    _user_msg_id_attached = False
-                    for msg in new_messages:
-                        if msg.get("role") == "system":
-                            continue  # rebuilt each run
-                        entry = {**msg, "timestamp": ts}
-                        if (
-                            not _user_msg_id_attached
-                            and msg.get("role") == "user"
-                            and event.message_id
-                            and "message_id" not in entry
-                        ):
-                            entry["message_id"] = str(event.message_id)
-                            _user_msg_id_attached = True
-                        await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
+        # Private custody fields never enter the public result.  A managed writer may provide its
+        # canonical SessionDBWriteProof through the explicit typed handoff; without it the managed
+        # route remains unknown instead of borrowing a gateway row.
+        # A queued chain persists through the outer handler, but its final typed writer handoff
+        # belongs to the recursive event that produced it.  Keep the outer event as a compatibility
+        # carrier for transcript state while retaining the exact terminal occurrence separately.
+        _writer_event = agent_result.pop("_classic_writer_event", None) if isinstance(agent_result, dict) else None
+        if _writer_event is None:
+            _writer_event = event
+        _classic_carriers = (event,) if _writer_event is event else (event, _writer_event)
+        for _carrier in _classic_carriers:
+            _carrier._classic_transcript_write_proofs = tuple(_classic_transcript_proofs)
+            _carrier._classic_transcript_write_unknown = _classic_transcript_unknown
+            _carrier._classic_agent_persisted = bool(agent_persisted)
+        if isinstance(agent_result, dict):
+            _writer_handoff = agent_result.pop("_classic_writer_proof", None)
+            if _writer_handoff is not None:
+                # The custody consumer reads the one-use typed envelope from the owner/execution
+                # event pair.  Keep the envelope intact so it can revalidate both the exact
+                # SessionDB proof and the authenticated direct/I04 binding; separate proof and
+                # binding attributes cannot express that atomic handoff.
+                from agent.session_persistence_proof import GatewayWriterProofHandoff
+                # CUA also examines malformed/stale envelopes while its exact owner is
+                # retained; an active CUA parent must not silently fall through to a
+                # different writer family.  With no CUA owner, ``None`` preserves the
+                # existing classic/API typed handoff path.
+                from gateway.runtime_sidecar_cua import consume_cua_writer_handoff
+                from hermes_state_runtime import RuntimeStoreError
+                _cua_writer_consumed = consume_cua_writer_handoff(
+                    _writer_event, _writer_handoff,
+                )
+                if _cua_writer_consumed is False:
+                    raise RuntimeStoreError("cua_durable_result_unknown")
+                if _cua_writer_consumed is True:
+                    if _writer_event is not event:
+                        event._classic_terminal_event = _writer_event
+                elif type(_writer_handoff) is GatewayWriterProofHandoff:
+                    _writer_event._classic_writer_handoff = _writer_handoff
+                    if _writer_event is not event:
+                        event._classic_terminal_event = _writer_event
+            _stream_witness = agent_result.pop("_classic_stream_delivery_witness", None)
+            if _stream_witness is not None:
+                _writer_event._classic_stream_delivery_witness = _stream_witness
+                if _writer_event is not event:
+                    event._classic_terminal_event = _writer_event
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
         await store.update_session(

@@ -484,10 +484,13 @@ class TestTaskStore:
             return "forwarded reply", protocol.STATE_COMPLETED
 
         monkeypatch.setattr(adapter, "_forward_to_profile", fake_forward)
-        terminal, pending = adapter._prepare_task(
-            {"message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="forwarded")},
-            "peer", agent=agent,
-        )
+        async def on_owner_loop():
+            adapter._loop = asyncio.get_running_loop()
+            return adapter._prepare_task(
+                {"message": protocol.text_message(protocol.ROLE_USER, "hello", context_id="forwarded")},
+                "peer", agent=agent,
+            )
+        terminal, pending = asyncio.run(on_owner_loop())
 
         assert pending is None
         assert adapter.tasks.get(terminal["id"])["state"] == protocol.STATE_COMPLETED

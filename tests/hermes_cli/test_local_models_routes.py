@@ -611,7 +611,7 @@ def _pause_when_flowing(client, job_id):
     raise AssertionError("pause never reached the live download handle")
 
 
-_BIG_BODY = bytes(range(256)) * (8 * 1024 * 1024 // 256)  # 8 MiB, deterministic
+_BIG_BODY = bytes(range(256)) * (16 * 1024 * 1024 // 256)  # 16 MiB, two progress ticks per ranged writer
 
 
 def test_download_resume_completes_bytes(client, monkeypatch, dl_server,

@@ -1305,7 +1305,6 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
     from agent.safe_worker_policy import safe_worker_enabled
-
     if safe_worker_enabled():
         agent._memory_manager = None
         return
@@ -2285,6 +2284,7 @@ def init_agent(
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    external_process_policy: Any = None,
 ):
     from agent.safe_worker_policy import safe_worker_enabled
 
@@ -2294,8 +2294,8 @@ def init_agent(
         prefill_messages = []
         fallback_model = {}
     _install_safe_stdio()
-
     _params = locals()
+    agent._external_process_policy = external_process_policy
     for _name in _PASSTHROUGH_PARAMS:
         setattr(agent, _name, _params[_name])
     for _name in _GATEWAY_IDENTITY_PARAMS:

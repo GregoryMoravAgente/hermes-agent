@@ -12,6 +12,7 @@ exactly-once are the admission contract's. With a viewer attached it runs as the
 messaging, cron, Kanban, ``/loop`` and heartbeat wakes never reach here.
 """
 import json
+import asyncio
 from functools import partial
 
 # ``_completion_delivery_identity`` kinds: an async delegation's result, a background process's exit
@@ -38,12 +39,30 @@ async def note_if_unviewed(authority, ref, row):
     input committed after; the viewer check and the decision share one loop step."""
     if not noted_completion(row):
         return None
+    preservation_key = authority._preservation_operation_start(
+        'I11_session_mutations_finalizers',
+        principal_id=row.get('principal_id') or 'completion', session_id=ref.session_id,
+        operation='completion-note', request_id=row['admission_id'],
+        admission_id=row['admission_id'], generation=row.get('generation'))
+    try:
+        return await _note_if_unviewed(authority, ref, row, preservation_key)
+    except asyncio.CancelledError:
+        authority._preservation_operation_unknown(preservation_key, 'join_failed')
+        raise
+    except Exception:  # health: allow BLE001 -- completion finalizer failure retains custody unknown
+        authority._preservation_operation_unknown(preservation_key, 'read_failed')
+        raise
+
+
+async def _note_if_unviewed(authority, ref, row, preservation_key):
     from gateway.session_runtime_workers import tracked_write
     live = authority.sessions.get(ref.session_id)
     if live is None or live.subscribers:
         # The claim left a closed row closed for a note; the turn reopens it as any first turn does.
         from gateway.session_local_recovery import reopen_local_session
         await tracked_write(authority, partial(reopen_local_session, authority, ref))
+        authority._preservation_operation_terminal(
+            preservation_key, f'completion-reopen:{row["admission_id"]}')
         return None
     from gateway.session_viewer_close import _physical_target
     descriptor = row['payload']['local_automation_v1']
@@ -58,4 +77,6 @@ async def note_if_unviewed(authority, ref, row):
     if refresh is not None:  # the owner's own row: a cached agent stays, as after a turn's writes
         await refresh(live.route, target)
     authority.pending_results[row['admission_id']] = {'result': {'final_response': '', 'messages': []}, 'usage': {}}
+    authority._preservation_operation_terminal(
+        preservation_key, f'completion-note:{row["admission_id"]}')
     return ''

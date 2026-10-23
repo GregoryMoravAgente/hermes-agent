@@ -232,7 +232,8 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
 
     def guarded_run(command, *args, **kwargs):
         command = list(map(str, command))
-        assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
+        if Path(command[0]).name.lower() not in {'git', 'git.exe'}:
+            return run(command, *args, **kwargs)
         cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
         assert cwd in {t.clone, t.origin}, (command, cwd)
         assert 'push' not in command and 'pull' not in command and 'ls-remote' not in command, command
@@ -243,6 +244,16 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
 
     monkeypatch.setattr(subprocess, 'run', guarded_run)
     if server == 'fetch-refused':
+        from hermes_cli import gitlock
+
+        def refuse_target_fetch(runner, git_cmd, fetch_args, repo_root):
+            assert fetch_args == ['fetch', '--no-tags', 'origin', t.wanted]
+            assert repo_root == t.clone
+            calls.append([*git_cmd, *fetch_args])
+            return subprocess.CompletedProcess([*git_cmd, *fetch_args], 128, stdout='',
+                                               stderr='fixture: raw SHA wants disabled')
+
+        monkeypatch.setattr(gitlock, 'fetch_with_partial_clone_recovery', refuse_target_fetch)
         with pytest.raises(SystemExit) as error:
             cli_main.cmd_update(t.args)
         assert error.value.code == 1

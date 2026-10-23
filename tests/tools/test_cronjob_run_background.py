@@ -68,17 +68,16 @@ class TestBackgroundDispatch:
                  patch("tools.cronjob_tools.get_job",
                        return_value={"last_status": "ok", "last_error": None}):
                 res = _try_dispatch_background_run(_job('job-bg-01'))
-
-        try:
-            # Returned BEFORE the job finished — that's the whole point.
-            assert res is not None
-            assert res["claimed"] is True
-            assert res["dispatched"] is True
-            assert res["delegation_id"]
-            # The job actually starts on the daemon executor.
-            assert run_started.wait(timeout=5.0), "job never started in background"
-        finally:
-            run_release.set()
+                try:
+                    # Returned BEFORE the job finished — that's the whole point.
+                    assert res is not None
+                    assert res["claimed"] is True
+                    assert res["dispatched"] is True
+                    assert res["delegation_id"]
+                    # Keep the worker's patch alive until it actually starts.
+                    assert run_started.wait(timeout=5.0), "job never started in background"
+                finally:
+                    run_release.set()
 
     def test_completion_event_reaches_shared_queue(self):
         """The finished run pushes a type='async_delegation' event carrying

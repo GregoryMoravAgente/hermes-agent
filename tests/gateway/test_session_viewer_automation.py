@@ -17,10 +17,12 @@ async def owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_state_local import local_receipt
     from hermes_cli import goals
+    from hermes_cli.backend_retirement import RetirementFence
 
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
@@ -28,6 +30,8 @@ async def owner(tmp_path, monkeypatch):
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path / 'fixture'), instance_id='owner')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     monkeypatch.setattr(goals, '_get_session_db', lambda: authority.db)  # the owner's own store
     viewer = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': str(tmp_path / 'fixture')})
     ref = create_local_session(authority, viewer.actor, {'request_id': 'r', 'source': 'cli',

@@ -26,6 +26,8 @@ async def _owner(tmp_path, monkeypatch):
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     return store._db, authority
 
 

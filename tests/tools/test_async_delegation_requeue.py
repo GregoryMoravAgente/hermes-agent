@@ -1,5 +1,6 @@
 """An acknowledged completion goes back to the delivery queue when its turn could not confirm the owner."""
 
+import os
 import queue
 
 import pytest
@@ -15,10 +16,23 @@ def _clean_state():
     ad._reset_for_tests()
 
 
+def _prepared_execution(delegation_id):
+    from gateway.status import get_process_start_time
+    birth = get_process_start_time(os.getpid())
+    assert type(birth) is int
+    return {
+        "handoff_id": delegation_id, "state": "prepared", "accepted": "unknown",
+        "worker_started": False, "worker_exited": False, "owner_pid": os.getpid(),
+        "owner_started_at": birth, "owner_execution_id": f"test:{delegation_id}",
+        "owner_scope": None, "error": None, "exception": None,
+    }
+
+
 def _persisted(delegation_id: str, *, delivered: bool = True) -> None:
     event = {
         "type": "async_delegation", "delegation_id": delegation_id, "session_key": "agent:main:telegram:dm:1",
         "parent_session_id": "parent", "dispatched_at": 1.0, "status": "completed", "summary": "done",
+        "execution": _prepared_execution(delegation_id),
     }
     ad._persist_dispatch(event)
     ad._persist_completion(event, {"status": "completed", "summary": "done"})

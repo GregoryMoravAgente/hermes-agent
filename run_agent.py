@@ -278,14 +278,59 @@ class AIAgent(
         capabilities: dict[str, bool] | None = None, cwd: str | None = None,
         side_agent: bool = False, memory_manager=None,
         tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+        external_process_policy: Any = None,
     ):
         """Forwarder — see ``agent.agent_init.init_agent`` (same keyword parameters, minus ``tool_delay``)."""
-        init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
         if tool_delay is not None:
             warnings.warn("tool_delay is deprecated and ignored; sequential tool calls "
                           "no longer sleep between executions.", DeprecationWarning, stacklevel=2)
+        # Capture only the public constructor arguments before owner setup introduces locals.
+        init_kwargs = {k: v for k, v in locals().items() if k not in ("self", "tool_delay")}
+        owned_external_session_db = False
+        if external_process_policy is None and (
+            str(base_url or "").lower().startswith("acp://") or str(provider or "").strip().lower() == "copilot-acp"
+        ):
+            try:
+                if session_db is None:
+                    from hermes_state_registry import acquire
+                    session_db = acquire()
+                    owned_external_session_db = True
+                from gateway.runtime_service_operations import standalone_policy_for_session_db
+                external_process_policy = standalone_policy_for_session_db(
+                    provider or base_url, session_db, base_url=base_url, producer_key="acp",
+                )
+            except BaseException:
+                if owned_external_session_db:
+                    from hermes_state_registry import release_or_close
+                    release_or_close(session_db)
+                raise
+        init_kwargs["session_db"] = session_db
+        init_kwargs["external_process_policy"] = external_process_policy
         from agent.agent_init import init_agent
-        init_agent(self, **init_kwargs)
+        try:
+            init_agent(self, **init_kwargs)
+        except BaseException:
+            parent = getattr(external_process_policy, "parent", None)
+            parent_clean = parent is None
+            if parent is not None:
+                try:
+                    from gateway.runtime_service_operations import (
+                        close_after_finalizers, release_agent_process_parent,
+                    )
+                    self._external_process_parent = parent
+                    self._external_process_parent_context = getattr(parent, "_maintenance_context", None)
+                    parent_clean = close_after_finalizers(parent) is True
+                    if parent_clean:
+                        parent_clean = release_agent_process_parent(self) is True
+                except Exception:
+                    logger.debug("external process owner cleanup failed", exc_info=True)
+                    parent_clean = False
+            if owned_external_session_db and parent_clean:
+                from hermes_state_registry import release_or_close
+                release_or_close(session_db)
+            raise
+        if owned_external_session_db:
+            self._owns_session_db = True
 
     def _get_session_db_for_recall(self):
         """SessionDB for recall, opening the default state DB when no ``session_db`` was passed so the
@@ -882,6 +927,48 @@ class AIAgent(
             _quietly(lambda: self._memory_manager.shutdown_all())
         _notify_context_engine_session_end(self, messages)
 
+    def retire_memory_provider(self):
+        """Request receipt-bound hard retirement and return its unresolved/released report.
+
+        This is an explicit owner operation.  It intentionally does not use ``_quietly``: the
+        caller must observe ``unknown`` and retain the profile until the same provider instance
+        and receipt can be retried successfully.
+        """
+        from agent.memory_retirement import MemoryRetirementReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return MemoryRetirementReport(status="released", reason="no_provider")
+        report = manager.retire_hard()
+        if report.released:
+            self._memory_provider_shutdown = True
+        return report
+
+    def prepare_memory_provider(self):
+        """Acquire a reversible manager/provider retirement lease for global maintenance."""
+        from agent.memory_retirement import ManagerPreparationReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return ManagerPreparationReport(status="prepared", reason="no_provider", lease=None)
+        return manager.prepare_retirement()
+
+    def resume_memory_provider(self, lease) -> bool:
+        """Resume the exact reversible provider lease before native handoff."""
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return lease is None
+        return manager.resume_retirement(lease)
+
+    def commit_memory_provider(self, lease):
+        """Commit the exact prepared provider lease and return its typed terminal report."""
+        from agent.memory_retirement import MemoryRetirementReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return MemoryRetirementReport(status="released", reason="no_provider")
+        return manager.commit_retirement(lease)
+
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
@@ -970,8 +1057,12 @@ class AIAgent(
         """Detach and close per-turn child agents; ``soft`` releases their clients first, falling back to close()."""
         try:
             with self._active_children_lock:
-                children = list(self._active_children)
-                self._active_children.clear()
+                review = getattr(self, "_background_review_agent", None) if soft else None
+                children = [child for child in self._active_children if child is not review]
+                # The asynchronous review owns its own completion/cleanup. Cache retirement
+                # must not cut its live request short; hard close still owns every child.
+                for child in children:
+                    self._active_children.remove(child)
         except Exception:
             return
         for child in children:
@@ -1001,12 +1092,31 @@ class AIAgent(
         _quietly(self._close_cached_request_anthropic_client, reason=reason)
 
     def _close_codex_session(self) -> None:
-        """Close the Codex app-server session (else the child keeps running); the attribute is cleared BEFORE
-        close() so a concurrent reader can't grab a half-closed session."""
-        codex_session = getattr(self, "_codex_session", None)
-        if codex_session is not None:
-            self._codex_session = None
-            codex_session.close()
+        """Retire this instance's writer before dropping its ownership reference."""
+        from agent.codex_lifecycle import close_codex_session
+        session = getattr(self, "_codex_session", None)
+        if session is None:
+            return
+        close_error = None
+        cleanup_error = None
+        try:
+            close_codex_session(self)
+        except BaseException as exc:
+            close_error = exc
+            logger.debug("codex session close failed before owner cleanup", exc_info=True)
+        finally:
+            if getattr(session, "custody_retained", False) is not True and getattr(self, "_codex_session", None) is session:
+                self._codex_session = None
+                from gateway.runtime_service_operations import release_agent_process_parent
+                try:
+                    release_agent_process_parent(self)
+                except BaseException as exc:
+                    cleanup_error = exc
+                    logger.exception("codex external owner cleanup failed")
+        if close_error is not None:
+            raise close_error
+        if cleanup_error is not None:
+            raise cleanup_error
 
     @staticmethod
     def _trim_process_memory() -> None:

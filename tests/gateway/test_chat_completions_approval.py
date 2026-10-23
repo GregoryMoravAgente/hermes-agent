@@ -10,6 +10,18 @@ from aiohttp.test_utils import TestClient, TestServer
 from tests.gateway.test_api_server import _create_app, _make_adapter
 
 
+@pytest.fixture
+def _approval_process_registry(owner, monkeypatch):
+    """Give explicit stream tests the same process-registry binding as runtime bootstrap."""
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    registry.bind_runtime_custody(owner.runner.runtime_custody)
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+    return registry
+
+
 def _approval_agent(decisions):
     agent = MagicMock()
     agent.session_prompt_tokens = agent.session_completion_tokens = agent.session_total_tokens = 0
@@ -32,7 +44,7 @@ def _approval_agent(decisions):
 async def test_streamed_completion_approval_resolves_via_runs_endpoint(monkeypatch):
     # Bound the agent thread's blocking wait so a regression fails fast instead of holding teardown.
     monkeypatch.setattr("tools.approval_context._get_approval_timeout", lambda: 5)
-    adapter, decisions = _make_adapter(), []
+    adapter, decisions = _make_adapter(monkeypatch=monkeypatch), []
     app = _create_app(adapter)
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     async with TestClient(TestServer(app)) as cli:
@@ -90,7 +102,9 @@ async def _sse_event(resp, name):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("surface", ["chat_completions", "session_stream"])
-async def test_canonical_streamed_approval_reaches_sse_and_resolves_via_runs_endpoint(api, owner, monkeypatch, surface):
+async def test_canonical_streamed_approval_reaches_sse_and_resolves_via_runs_endpoint(
+    api, owner, monkeypatch, _approval_process_registry, surface,
+):
     """Under the session authority the advertised stream run id is bound to its exact durable
     admission: the shared approval prompt reaches the SSE, and the generation-fenced reply to
     ``POST /v1/runs/{run_id}/approval`` resolves the same waiter WS viewers see."""
@@ -126,7 +140,9 @@ async def test_canonical_streamed_approval_reaches_sse_and_resolves_via_runs_end
 
 
 @pytest.mark.asyncio
-async def test_exact_streamed_retry_replays_the_already_pending_approval(api, owner, monkeypatch):
+async def test_exact_streamed_retry_replays_the_already_pending_approval(
+    api, owner, monkeypatch, _approval_process_registry,
+):
     """A client that disconnects while an approval is pending and retries the unchanged request
     (same session, Idempotency-Key, auth scope) reuses the admission under a new completion id.
     The prompt was published before the retry subscribed, so the retry stream must replay it from

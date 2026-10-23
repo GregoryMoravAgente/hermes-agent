@@ -321,6 +321,7 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         "_elicitation",
         "_error",
         "_ever_connected",
+        "_i16_source_owner",
         "_idle_timeout_seconds",
         "_inflight_tasks",
         "_last_park_line",
@@ -434,6 +435,9 @@ class MCPServerTask(MCPServerRunMixin, MCPServerTransportMixin, MCPServerHealthM
         self._pending_call_context: Optional[contextvars.Context] = None
         self._lifecycle_started_at = self._last_tool_call_at = time.monotonic()
         self._idle_timeout_seconds = self._max_lifetime_seconds = self._recycled_reason = None
+        # When running inside a served profile, discovery attaches the exact I16 external
+        # process parent here before the SDK can spawn.  Direct/standalone MCP keeps this None.
+        self._i16_source_owner = None
         # Handshake InitializeResult: the server's REAL advertised capabilities.
         # Captures the ``InitializeResult`` returned by ``await session.initialize()`` so downstream code
         # can inspect the server's real advertised capabilities (``.capabilities.resources``,

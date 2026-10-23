@@ -56,10 +56,12 @@ class _Owners:
 
     async def boot(self, instance_id):
         from gateway.session_authority import initialize_session_authority
+        from tests.gateway.conftest import bind_authority_runtime_custody
         owner = SimpleNamespace(session_store=self.store, _session_db=self.store._db, adapters={}, _draining=False,
                                 _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None)
         owner._adapter_for_source = lambda source: owner.adapters.get(source.platform)
         self.current = await initialize_session_authority(owner, profile_id=self.profile, instance_id=instance_id)
+        bind_authority_runtime_custody(owner, self.current)
         return self.current
 
     async def _open(self):

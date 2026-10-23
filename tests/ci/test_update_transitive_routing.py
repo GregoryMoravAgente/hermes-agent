@@ -15,6 +15,9 @@ from tests.ci.test_update_ci_routing import _REPO, _ci_run, _consumers_reached, 
 # bounded_probe_run -> spawn_server, kill_process_tree -> deadline; the
 # remaining edges are migrate_all_homes' provider/profile/install decisions.
 # backup is the update transaction's pre-build step, not a build dependency.
+# Both replayed update workflows run on Ubuntu and require Bash's mapfile (absent
+# from macOS's system Bash 3.2); the migration trace below remains host-neutral.
+@pytest.mark.platforms("linux")
 @pytest.mark.parametrize("path", [
     "hermes_cli/local_runtime/processes.py",
     # Importing processes runs the package init: v2026.9.24's update died there on a name

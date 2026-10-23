@@ -38,7 +38,7 @@ class _Adapter(BasePlatformAdapter):
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         return {}
 
-    async def handle_message(self, event: MessageEvent) -> None:
+    async def handle_message(self, event: MessageEvent, *, source_tokens=None) -> None:
         self.entered.set()
         await self.release.wait()  # a real agent turn awaits here
         self.dispatched.append(event)

@@ -101,9 +101,40 @@ def _owner_ref(authority, ref, params):
 async def mutate_session(authority, actor, ref, params):
     from gateway.session_runtime_workers import track_mutation
     authority._require_admission_open()
+    operation = params.get('operation') if isinstance(params, dict) else None
+    request_id = params.get('request_id') if isinstance(params, dict) else None
+    preservation_key = None
+    live = authority.sessions.get(ref.session_id)
+    execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
+    execution_admission = execution.get('admission_id')
+    operation_generation = (
+        params.get('expected_generation')
+        if isinstance(params, dict) else None
+    )
+    if operation_generation is None:
+        operation_generation = execution.get('execution_generation')
+    if (isinstance(operation, str) and isinstance(request_id, str)
+            and isinstance(params.get('session_id'), str) and params['session_id'] == ref.session_id):
+        preservation_key = authority._preservation_operation_start_direct_mutation(
+            principal_id=actor.subject,
+            session_id=ref.session_id, operation=operation, request_id=request_id,
+            admission_id=execution_admission, generation=operation_generation)
     # A request socket can disappear while its writer is inside to_thread. The owner task keeps
     # the session gate until commit AND publication finish, and retirement joins that same task.
-    task = track_mutation(authority, _owned_mutation(authority, actor, ref, params))
+    try:
+        task = track_mutation(authority, _owned_mutation(authority, actor, ref, params))
+    except RuntimeError:
+        # Task-registration failure retains mutation custody; no exception value is published.
+        authority._preservation_operation_unknown(preservation_key, 'join_failed')
+        raise
+    if preservation_key is not None:
+        def finish(done):
+            if done.cancelled():
+                authority._preservation_mutation_done(preservation_key, cancelled=True)
+                return
+            error = done.exception()
+            authority._preservation_mutation_done(preservation_key, error=error)
+        task.add_done_callback(finish)
     return await asyncio.shield(task)
 
 

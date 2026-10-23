@@ -37,6 +37,53 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 
 
+def i10_source_snapshot(authority):
+    """Read the startup recovery registries that can still publish work at close.
+
+    Startup recovery owns the session-store active-turn markers and the native/local durable
+    admissions it replays.  The snapshot is intentionally read-only; the close witness is the
+    only place that may turn an empty result into a typed absence.
+    """
+    store = getattr(authority.runner, "session_store", None)
+    if store is None or not hasattr(store, "_lock"):
+        raise RuntimeError("startup recovery registry unavailable")
+    markers = []
+    with store._lock:
+        store._ensure_loaded_locked()
+        for entry in store._entries.values():
+            if entry.active_turn_token and entry.active_turn_started_at and not entry.suspended:
+                markers.append(str(entry.active_turn_token))
+    from hermes_state_runtime import get_session_admission
+    admission_ids = authority.db._read_all(
+        "SELECT admission_id FROM session_admissions ORDER BY seq"
+    )
+    rows = [
+        row for candidate in admission_ids
+        if (row := get_session_admission(authority.db, admission_id=candidate["admission_id"])) is not None
+    ]
+    active_rows = tuple(
+        row for row in rows
+        if isinstance(row, dict)
+        and row.get("status") in {"queued", "started", "unknown"}
+        and isinstance(row.get("payload"), dict)
+        and ("native_text_v1" in row["payload"] or "local_automation_v1" in row["payload"])
+    )
+    pending = set(markers)
+    pending.update(str(row["admission_id"]) for row in active_rows if row.get("admission_id"))
+    return {
+        "pending_ids": tuple(sorted(pending)),
+        "rows": active_rows,
+        "registry": {"active_turn_markers": tuple(sorted(markers)),
+                      "admissions": tuple(sorted(row["admission_id"] for row in active_rows))},
+    }
+
+
+def register_i10_source(authority):
+    """Install startup's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "startup", i10_source_snapshot)
+
+
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> None:
     """Install the catalog plugin of every feature that left core (Home Assistant) *home* uses, in
     *home*'s runtime scope (its config, secrets and allow_lazy_installs); once per process per home.
@@ -753,6 +800,10 @@ class GatewayStartupMixin:
             ledgered = await self._ledger_crash_left_replies(max_age)
         with _log_suppressed(logging.WARNING, "Exact active-turn recovery on startup failed: %s"):
             resumed = await self.async_session_store.recover_interrupted_turns(max_age_seconds=max_age)
+        from gateway.session_recovery_custody import observe_consumer_rows
+        authority = getattr(self, 'session_authority', None)
+        if authority is not None:
+            observe_consumer_rows(authority, 'startup', reason='startup recovery found no accepted native row')
         return resumed, ledgered
 
     async def _ledger_crash_left_replies(self, max_age_seconds: int) -> int:
@@ -849,6 +900,12 @@ class GatewayStartupMixin:
     async def _hosted_room_worker_watcher(self, interval: float = 1.0) -> None:
         """Keep the room worker alive for the messaging gateway lifetime."""
         while self._running:
+            # Preservation owns a separate terminal source phase: I09 has already fenced intake
+            # and I17 may be joining the exact hosted service.  Do not respawn a stopped service
+            # while that authenticated close remains reversible.
+            if getattr(self, '_preservation_drain_active', False) or getattr(self, '_draining', False):
+                await asyncio.sleep(interval)
+                continue
             await self._ensure_hosted_room_worker()
             await asyncio.sleep(interval)
 
@@ -1149,6 +1206,14 @@ class GatewayStartupMixin:
             try:
                 with _profile_runtime_scope(Path(profile_home), {}):
                     recovered += process_registry.recover_from_checkpoint()
+                    factory = getattr(process_registry, "_i15_zero_factory", None)
+                    if factory is not None and not factory.note_checkpoint_recovery(
+                        str(Path(profile_home).resolve()),
+                    ):
+                        logger.warning(
+                            "I15 checkpoint recovery for profile %r was not a typed observation",
+                            profile_name,
+                        )
             except Exception:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
         return recovered
@@ -1168,6 +1233,9 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
             from tools.process_registry import process_registry
             recovered = process_registry.recover_from_checkpoint()
+            factory = getattr(process_registry, "_i15_zero_factory", None)
+            if factory is not None and not factory.note_checkpoint_recovery():
+                logger.warning("I15 launch-profile checkpoint recovery was not a typed observation")
             recovered += self._recover_secondary_process_checkpoints(process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
@@ -1564,20 +1632,18 @@ class GatewayStartupMixin:
         await self._send_session_db_warning_notifications()
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(self, asyncio.get_running_loop())
-        # Resume recovered process watchers. Detach the batch atomically (fresh list, not clear(): a
-        # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
+        # Retain the canonical watcher index while accepted descriptors transfer to the
+        # supervisor. Concurrent appends stay pending; source factory bindings remain exact.
         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
             from tools.process_registry import process_registry
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            for i, watcher in enumerate(watchers):
-                self._spawn_supervised(
+            from gateway.run_process_watchers import drain_pending_process_watchers
+            await drain_pending_process_watchers(
+                self, process_registry,
+                lambda watcher: self._spawn_supervised(
                     lambda w=watcher: self._run_process_watcher(w),
                     f"process_watcher:{watcher.get('session_id')}", restart=False,
-                )
-                logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
+                ),
+            )
 
     # Long-lived supervised watchers spawned at the end of start(), in order; supervised name = method
     # name minus the leading underscore.

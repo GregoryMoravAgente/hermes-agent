@@ -51,9 +51,11 @@ async def _max_gap_while(create, release):
 async def test_a2a_forward_creation_commits_off_the_owner_loop(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
+    from hermes_cli.backend_retirement import RetirementFence
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
@@ -62,6 +64,10 @@ async def test_a2a_forward_creation_commits_off_the_owner_loop(tmp_path, monkeyp
     runner = run.GatewayRunner.__new__(run.GatewayRunner)
     runner.adapters, runner.session_store, runner._session_db, runner._draining = {}, store, store._db, False
     authority = await initialize_session_authority(runner, profile_id='target', instance_id='test')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch,
+        fence=RetirementFence(),
+    )
     authority._schedule = lambda ref: None
     conn = AuthorityConnection(authority, SimpleNamespace(write=lambda frame: None), {'user_id': 'producer'})
     params = dict(agent='dev', tenant='team', peer='alice', context_id='ctx', text='hello')

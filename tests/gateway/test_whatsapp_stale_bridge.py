@@ -18,6 +18,7 @@ package.json changes, not only when node_modules is missing.
 
 import asyncio
 import os
+import socket
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -58,6 +59,7 @@ def _make_adapter(bridge_script: str = "/tmp/test-bridge.js",
     adapter._bridge_port = 19876
     adapter._bridge_script = bridge_script
     adapter._session_path = Path(os.path.abspath(os.path.expanduser(str(session_path))))
+    adapter._profile_home = adapter._session_path.parent
     adapter._foreign_bridge_session = None  # mirror __init__; harness builds via __new__
     adapter._bridge_probe_timed_out = False
     adapter._bridge_log_fh = None
@@ -76,6 +78,8 @@ def _make_adapter(bridge_script: str = "/tmp/test-bridge.js",
     adapter._active_sessions = {}
     adapter._pending_messages = {}
     adapter._background_tasks = set()
+    adapter._consumer_id = "fixture-consumer"
+    adapter._consumer_epoch = 1
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
@@ -179,6 +183,24 @@ class TestStaleBridgeHandshake:
             bridge_script=str(bridge_dir / "bridge.js"),
             session_path=tmp_path / "session",
         )
+        from gateway.status import get_process_start_time
+        from plugins.platforms.whatsapp.adapter import _write_bridge_pidfile
+        from plugins.platforms.whatsapp.bridge_state_lock import BridgeStateLock
+
+        # The adapter now requires the same durable physical proof as production: a live listener,
+        # pid/start/port record, a private authority, and an owner lock.  Keep this fixture's
+        # session-ownership assertions focused on the health verdict while retaining that proof.
+        adapter._session_path.mkdir(parents=True, exist_ok=True)
+        listener = socket.socket()
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("127.0.0.1", 0))
+        listener.listen()
+        adapter._bridge_port = listener.getsockname()[1]
+        _write_bridge_pidfile(adapter._session_path, os.getpid(), adapter._bridge_port)
+        authority = adapter._load_bridge_authority()
+        assert authority is not None
+        owner_lock = BridgeStateLock(adapter._session_path / "inbound-queue" / "owner-lock.sqlite3")
+        owner_lock.acquire()
         reported = tmp_path / ("session" if holder == "own" else "other-profile-session")
         mock_client = _mock_health(
             {
@@ -186,36 +208,51 @@ class TestStaleBridgeHandshake:
                 "scriptHash": _file_content_hash(bridge_dir / "bridge.js"),
                 "sendReadReceipts": False,
                 "session": str(reported),
+                "profileDigest": adapter._bridge_identity()["profile_digest"],
+                "queue": {
+                    "queue_epoch": "fixture-queue",
+                    "bridge_instance": "fixture-bridge",
+                    "owner_epoch": 1,
+                    "process_start": get_process_start_time(os.getpid()),
+                    "listener_ready": True,
+                    "owner_ready": True,
+                    "producer_generation": "fixture-generation",
+                },
             },
             raise_on=holder.split("-")[0] if "timeout" in holder else None,
         )
         windows = holder.endswith("-windows")  # the listener scan must be the platform's own, or Windows still kills
 
-        with (
-            patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
-            patch("aiohttp.ClientSession", mock_client),
-            patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
-            patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile") as mock_kill_pidfile,
-            patch("plugins.platforms.whatsapp.adapter._kill_port_process") as mock_kill_port,
-            patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", windows),
-            patch("plugins.platforms.whatsapp.adapter._listener_pids_on_port", return_value=[] if windows else [4242]),
-            patch("plugins.platforms.whatsapp.adapter._windows_listener_pids", return_value=[4242] if windows else []),
-            patch("subprocess.Popen", return_value=MagicMock()) as mock_popen,
-            patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True),
-        ):
-            assert await adapter.connect() is (fatal is None)
+        try:
+            with (
+                patch("plugins.platforms.whatsapp.adapter.check_whatsapp_requirements", return_value=True),
+                patch("aiohttp.ClientSession", mock_client),
+                patch("plugins.platforms.whatsapp.adapter.asyncio.sleep", new_callable=AsyncMock),
+                patch("plugins.platforms.whatsapp.adapter._kill_stale_bridge_by_pidfile") as mock_kill_pidfile,
+                patch("plugins.platforms.whatsapp.adapter._kill_port_process") as mock_kill_port,
+                patch("plugins.platforms.whatsapp.adapter._IS_WINDOWS", windows),
+                patch("plugins.platforms.whatsapp.adapter._listener_pids_on_port", return_value=[] if windows else [4242]),
+                patch("plugins.platforms.whatsapp.adapter._windows_listener_pids", return_value=[4242] if windows else []),
+                patch("subprocess.Popen", return_value=MagicMock()) as mock_popen,
+                patch.object(adapter, "_bridge_operation", AsyncMock(return_value={"status": "attached"})),
+                patch.object(adapter, "_acquire_platform_lock", return_value=True, create=True),
+            ):
+                assert await adapter.connect() is (fatal is None)
 
-        mock_popen.assert_not_called()
-        mock_kill_port.assert_not_called()
-        # Reaping by this profile's own pidfile is identity-based; only a foreign verdict skips it.
-        assert mock_kill_pidfile.called is (fatal == "whatsapp_bridge_unresponsive")
-        if fatal:
-            assert adapter._fatal_error_code == fatal
-            assert adapter._fatal_error_retryable is (fatal == "whatsapp_bridge_unresponsive")
-            assert f"nothing on port {adapter._bridge_port} was" in adapter._fatal_error_message
-            assert "bridge_port" in adapter._fatal_error_message
-        if fatal == "whatsapp_bridge_foreign_session":
-            assert str(reported) in adapter._fatal_error_message
+            mock_popen.assert_not_called()
+            mock_kill_port.assert_not_called()
+            # Reaping by this profile's own pidfile is identity-based; only a foreign verdict skips it.
+            assert mock_kill_pidfile.called is (fatal == "whatsapp_bridge_unresponsive")
+            if fatal:
+                assert adapter._fatal_error_code == fatal
+                assert adapter._fatal_error_retryable is (fatal == "whatsapp_bridge_unresponsive")
+                assert f"nothing on port {adapter._bridge_port} was" in adapter._fatal_error_message
+                assert "bridge_port" in adapter._fatal_error_message
+            if fatal == "whatsapp_bridge_foreign_session":
+                assert str(reported) in adapter._fatal_error_message
+        finally:
+            owner_lock.release()
+            listener.close()
 
 
 class TestDepRefreshStamp:

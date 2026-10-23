@@ -229,7 +229,7 @@ def _ensure_screen_for_headed_chromium() -> None:
 
 
 def _popen_agent_browser(argv: list[str], env: dict[str, str], socket_dir: str, tag: str,
-                         stdin_payload: Optional[bytes] = None) -> subprocess.Popen:
+                         stdin_payload: Optional[bytes] = None, custody: Any = None) -> subprocess.Popen:
     """Spawn agent-browser with stdout/stderr redirected to ``socket_dir/_std{out,err}_<tag>``;
     ``stdin_payload`` (a ``batch`` JSON body) is served from ``_stdin_<tag>`` the same way.
 
@@ -250,9 +250,40 @@ def _popen_agent_browser(argv: list[str], env: dict[str, str], socket_dir: str, 
     try:
         _popen_extra: dict = {}
         if os.name == "nt":
+            if custody is not None:
+                from tools.process_registry_windows import begin_windows_launch
+                physical = getattr(custody, "physical", None)
+                if physical is None:
+                    raise RuntimeError("browser_windows_physical_receipt_missing")
+                transaction = begin_windows_launch(physical)
+                if not physical.retain_launch_transaction(transaction):
+                    raise RuntimeError("browser_windows_launch_transaction_rejected")
+                try:
+                    process = transaction.launch(
+                        argv,
+                        text=False,
+                        env=env,
+                        cwd=os.getcwd(),
+                        stdin=stdin,
+                        stdout=fds[0],
+                        stderr=fds[1],
+                        encoding=None,
+                        errors=None,
+                        creationflags=windows_hide_flags(),
+                    )
+                except BaseException:
+                    if transaction.process is not None:
+                        physical.retain_partial_launch(
+                            transaction.process, transaction, reason="partial_launch",
+                        )
+                    raise
+                process._hermes_browser_launch_transaction = transaction
+                return process
             _si = subprocess.STARTUPINFO()
             _si.dwFlags |= subprocess.STARTF_USESTDHANDLES
             _popen_extra = {"creationflags": windows_hide_flags(), "close_fds": True, "startupinfo": _si}
+        else:
+            _popen_extra["start_new_session"] = True
         return subprocess.Popen(argv, stdout=fds[0], stderr=fds[1], stdin=stdin, env=env, **_popen_extra)
     finally:
         for fd in fds:
@@ -306,12 +337,19 @@ def _create_local_session(task_id: str, allow_real_profile: bool = True) -> dict
 def _create_lightpanda_session(task_id: str) -> dict[str, Any]:
     """Spawn ``lightpanda serve`` for this session key (Browser Use mode)."""
     from tools.browser_lightpanda import launch_lightpanda
+    from gateway.runtime_browser_native_backends import reserve_lightpanda_backend
 
     info = _session_record("lp", None, {"local": True, "lightpanda": True})
-    server, err = launch_lightpanda(info["session_name"], block_private_networks=not _cloud._is_local_backend())
+    source_receipt = reserve_lightpanda_backend(task_id, info["session_name"])
+    launch_kwargs = {"block_private_networks": not _cloud._is_local_backend()}
+    if source_receipt is not None:
+        launch_kwargs["source_receipt"] = source_receipt
+    server, err = launch_lightpanda(info["session_name"], **launch_kwargs)
     if err:
         raise RuntimeError(err)
     info["cdp_url"] = server.cdp_url
+    if source_receipt is not None:
+        info["native_backend_receipt"] = source_receipt
     _bt.logger.info("Created Lightpanda session %s (port %s) for task %s", info["session_name"], server.port, task_id)
     return info
 
@@ -780,6 +818,7 @@ def _browser_command_preflight() -> dict[str, Any]:
 def _spawn_and_collect(
     task_id: str, session_info: dict[str, Any], cmd_parts: list[str],
     command: str, engine: str, timeout: int, stdin_payload: Optional[bytes] = None,
+    custody: Any = None,
 ) -> dict[str, Any]:
     """Run the prepared agent-browser argv once and interpret its output (handles timeout)."""
     task_socket_dir = _prepare_session_socket_dir(session_info["session_name"])
@@ -807,26 +846,46 @@ def _spawn_and_collect(
     stdout_path = os.path.join(task_socket_dir, f"_stdout_{command}")
     stderr_path = os.path.join(task_socket_dir, f"_stderr_{command}")
     cmd_parts, browser_env = _sandbox_wrap(cmd_parts, browser_env, task_socket_dir)
-    proc = _popen_agent_browser(cmd_parts, browser_env, task_socket_dir, command, stdin_payload)
+    try:
+        proc = _popen_agent_browser(
+            cmd_parts, browser_env, task_socket_dir, command, stdin_payload, custody,
+        )
+        if custody is not None:
+            custody.bind_process(
+                proc,
+                stdout_path,
+                stderr_path,
+                transaction=getattr(proc, "_hermes_browser_launch_transaction", None),
+            )
+    except Exception:
+        if custody is not None:
+            custody.abort("browser_launch_failed")
+        raise
 
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.wait()
+        if custody is not None:
+            custody.wait_for_output()
         stdout, stderr = _read_command_output_files(stdout_path, stderr_path)
-        _unlink_command_output_files(stdout_path, stderr_path)
+        if custody is None:
+            _unlink_command_output_files(stdout_path, stderr_path)
         _handle_browser_command_timeout(task_id, session_info, task_socket_dir)
         if stderr and stderr.strip():
             _bt.logger.warning("browser '%s' stderr after timeout: %s", command, stderr.strip()[:500])
         _bt.logger.warning("browser '%s' timed out after %ds (task=%s, socket_dir=%s)",
                        command, timeout, task_id, task_socket_dir)
         return {"success": False, "error": _format_browser_timeout_error(command, timeout, stdout, stderr)}
+    if custody is not None:
+        custody.wait_for_output()
     with open(stdout_path, "r", encoding="utf-8-sig") as f:
         stdout = f.read()
     with open(stderr_path, "r", encoding="utf-8-sig") as f:
         stderr = f.read()
-    _unlink_command_output_files(stdout_path, stderr_path)
+    if custody is None:
+        _unlink_command_output_files(stdout_path, stderr_path)
     return _interpret_browser_command_output(command, stdout, stderr, proc.returncode)
 
 
@@ -892,41 +951,83 @@ def _dispatch_browser_command(
     timeout: int, _engine_override: Optional[str],
 ) -> tuple[str, dict[str, Any]]:
     """Build the agent-browser argv for ``session_info`` and run it once → ``(engine, result)``."""
-    # Cleanup stops the supervisor before closing the backend; keep it stopped.
-    if command != "close" and session_info.get("cdp_url"):
-        _cdp._ensure_cdp_supervisor(task_id)
-
-    # Every backend runs in this task's own daemon (``--session <name>``); Cloud/CDP adds
-    # ``--cdp <ws_url>`` to attach it to the remote browser. Without --session every CDP task
-    # shared agent-browser's default daemon, so one task's snapshot refs or close hit the others.
-    # Engine injection keys off the resolved session backend, not global provider
-    # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
     engine = _engine_override or _cloud._get_browser_engine()
-    backend_args = ["--session", session_info["session_name"]]
-    if session_info.get("cdp_url"):
-        backend_args += ["--cdp", session_info["cdp_url"]]
-    else:
-        if (bd_port := _bot_desktop_attach_port(session_info)) is not None:
-            # A Chromium already runs on the Bot Desktop's shared profile (the human clicked the dock's
-            # Browser first): a launch would be forwarded into it by Chromium's singleton and die without
-            # a DevTools endpoint, so the session's daemon attaches to the port it advertises instead.
-            # Same daemon (keyed by --session) either way, so snapshot refs stay valid across commands.
-            backend_args += ["--cdp", str(bd_port)]
-        if _cloud._is_headed_mode():
-            backend_args.append("--headed")
-        if engine != "auto" and not _bt._is_camofox_mode():
-            backend_args += ["--engine", engine]
-
-    argv = _agent_browser_argv(browser_cmd)
-    spawn_command, spawn_args, stdin_payload = _shim_safe_args(argv[0], command, args)
-    cmd_parts = argv + backend_args + ["--json", spawn_command] + spawn_args
-
+    owner = None
     try:
-        result = _unwrap_batch_result(
-            _spawn_and_collect(task_id, session_info, cmd_parts, command, engine, timeout, stdin_payload), command)
-    except Exception as e:
+        from gateway.runtime_sidecar_browser import begin_browser_command
+        owner = begin_browser_command(task_id, session_info)
+    except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        _bt.logger.warning("browser custody reservation failed for task=%s: %s", task_id, exc, exc_info=True)
+        return (engine, {
+            "success": False, "error": str(exc), "code": "browser_custody_unavailable",
+        })
+    # Cleanup stops the supervisor before closing the backend; keep it stopped.
+    try:
+        if command != "close" and session_info.get("cdp_url"):
+            _cdp._ensure_cdp_supervisor(task_id)
+
+        # Every backend runs in this task's own daemon (``--session <name>``); Cloud/CDP adds
+        # ``--cdp <ws_url>`` to attach it to the remote browser. Without --session every CDP task
+        # shared agent-browser's default daemon, so one task's snapshot refs or close hit the others.
+        # Engine injection keys off the resolved session backend, not global provider
+        # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
+        engine = _engine_override or _cloud._get_browser_engine()
+        backend_args = ["--session", session_info["session_name"]]
+        if session_info.get("cdp_url"):
+            backend_args += ["--cdp", session_info["cdp_url"]]
+        else:
+            if (bd_port := _bot_desktop_attach_port(session_info)) is not None:
+                # A Chromium already runs on the Bot Desktop's shared profile (the human clicked the dock's
+                # Browser first): a launch would be forwarded into it by Chromium's singleton and die without
+                # a DevTools endpoint, so the session's daemon attaches to the port it advertises instead.
+                # Same daemon (keyed by --session) either way, so snapshot refs stay valid across commands.
+                backend_args += ["--cdp", str(bd_port)]
+            if _cloud._is_headed_mode():
+                backend_args.append("--headed")
+            if engine != "auto" and not _bt._is_camofox_mode():
+                backend_args += ["--engine", engine]
+
+        argv = _agent_browser_argv(browser_cmd)
+        spawn_command, spawn_args, stdin_payload = _shim_safe_args(argv[0], command, args)
+        cmd_parts = argv + backend_args + ["--json", spawn_command] + spawn_args
+        # Keep the historical seam for standalone callers and test doubles that
+        # do not participate in the managed custody path.  A live owner gets
+        # the source-owned binding; the unbound path keeps the original call
+        # shape so direct browser compatibility remains intact.
+        if owner is None:
+            collected = _spawn_and_collect(
+                task_id, session_info, cmd_parts, command, engine, timeout, stdin_payload,
+            )
+        else:
+            collected = _spawn_and_collect(
+                task_id, session_info, cmd_parts, command, engine, timeout, stdin_payload, owner,
+            )
+        result = _unwrap_batch_result(collected, command)
+        if owner is not None:
+            from gateway.runtime_sidecar_browser import finish_browser_command
+            finish_browser_command(owner, command, result)
+            if owner._finished:
+                owner.cleanup_output_files()
+    except (AttributeError, ImportError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+            subprocess.SubprocessError) as e:
+        if owner is not None and not owner._finished:
+            try:
+                from gateway.runtime_sidecar_browser import fail_browser_command
+                fail_browser_command(owner, "browser_command_exception")
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                _bt.logger.warning("browser custody failure retained unknown for task=%s", task_id, exc_info=True)
         _bt.logger.warning("browser '%s' exception: %s", command, e, exc_info=True)
         result = {"success": False, "error": str(e)}
+    except BaseException:
+        if owner is not None and not owner._finished:
+            try:
+                from gateway.runtime_sidecar_browser import fail_browser_command
+                fail_browser_command(owner, "browser_command_exception")
+            except BaseException:  # health: allow BLE001 -- preserve the original cancellation after retaining exact custody
+                _bt.logger.warning(
+                    "browser custody cleanup retained unknown for task=%s", task_id, exc_info=True,
+                )
+        raise
     return engine, result
 
 

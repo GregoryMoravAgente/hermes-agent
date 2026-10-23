@@ -73,6 +73,7 @@ def diagnostic_event(ev) -> bool:
 # every 5 seconds forever. A genuinely dead chat still drops, just ~60s later — a fine trade for an
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
+_KANBAN_OCCURRENCE_SCHEMA = "kanban_task_events.v1"
 
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
@@ -86,6 +87,29 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
     return reason
+
+
+def _kanban_wake_occurrence(delivery: dict, events: list) -> dict:
+    """Build the source-owned occurrence witness for one claimed wake group."""
+    event_ids = [getattr(event, "id", None) for event in events]
+    if (not events or any(type(event_id) is not int or event_id <= 0 for event_id in event_ids)
+            or event_ids != sorted(set(event_ids))):
+        raise RuntimeError("Kanban event claim has no exact ordered occurrence ids")
+    old_cursor, claimed_cursor = delivery.get("old_cursor"), delivery.get("cursor")
+    board, task_id = delivery.get("board"), delivery.get("sub", {}).get("task_id")
+    if (type(old_cursor) is not int or old_cursor < 0
+            or type(claimed_cursor) is not int or claimed_cursor < old_cursor
+            or not isinstance(board, str) or not board.strip()
+            or not isinstance(task_id, str) or not task_id.strip()):
+        raise RuntimeError("Kanban event claim has invalid cursor or route identity")
+    return {
+        "schema": _KANBAN_OCCURRENCE_SCHEMA,
+        "board": board.strip(),
+        "task_id": task_id.strip(),
+        "old_cursor": old_cursor,
+        "claimed_cursor": claimed_cursor,
+        "event_ids": list(event_ids),
+    }
 
 
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
@@ -520,6 +544,7 @@ class _KanbanNotification:
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
+        self.wake_occurrence: Optional[dict] = None
         self.plat: Any = None
         self.adapter: Any = None
         self.is_push_adapter = True
@@ -631,7 +656,11 @@ class _KanbanNotification:
     async def wake(self) -> None:
         """Wake the creator session (raises on failure): push adapters get a full SessionSource, non-push a raw self-post."""
         from gateway.wake import deliver_wake
+        from gateway.session_automation_custody import kanban_occurrence_metadata
         sub = self.sub
+        occurrence_metadata = kanban_occurrence_metadata(
+            {'kanban_occurrence': self.wake_occurrence}
+        ) if self.wake_occurrence is not None else {}
         if not self.is_push_adapter:
             # A served profile's raw-session wake runs in THAT profile's scope, in-process: the
             # shared listener's /p/<profile>/ self-post would need the profile's own
@@ -640,7 +669,8 @@ class _KanbanNotification:
             async with self._owner_scope():
                 await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key,
                                    profile=self._served_wake_profile(),
-                                   notification_category="diagnostic" if self.wake_diagnostic else "result")
+                                   notification_category="diagnostic" if self.wake_diagnostic else "result",
+                                   wake_metadata=occurrence_metadata)
             self._log_woke()
             return
         from gateway.session import SessionSource
@@ -669,7 +699,8 @@ class _KanbanNotification:
                 raise RuntimeError(f"Kanban wake profile {self.sub_profile!r} no longer exists")
         async with _async_profile_runtime_scope(self.runner._resolve_profile_home_for_source(_source)):
             await deliver_wake(self.adapter, text=self.synth, session_id=self.session_key, source=_source,
-                               notification_category="diagnostic" if self.wake_diagnostic else "result")
+                               notification_category="diagnostic" if self.wake_diagnostic else "result",
+                               wake_metadata=occurrence_metadata)
         self._log_woke()
 
     async def _send_event(self, ev: Any, msg: str) -> bool:
@@ -784,11 +815,13 @@ class _KanbanNotification:
                     continue
                 self.d = {**self.d, "events": events}
                 self.wake_handoff = self.wake_review_detail = ""
+                self.wake_occurrence = _kanban_wake_occurrence(self.d, events)
                 for ev in events:
                     self.format_event(ev)
                 self.build_wake_text()
                 if self.wake_kinds:
-                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
+                    wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds,
+                                          self.wake_occurrence))
             self.d = {**self.d, "events": original_events}
         is_push = self.is_push_adapter
         from gateway.wake import WakeNotAccepted
@@ -796,7 +829,7 @@ class _KanbanNotification:
         # A requested wake is required even when its passive ping already landed.
         if wake_payloads:
             try:
-                for self.synth, self.wake_diagnostic, self.wake_kinds in wake_payloads:
+                for self.synth, self.wake_diagnostic, self.wake_kinds, self.wake_occurrence in wake_payloads:
                     await self.wake()
                 self.clear_failures()
             except WakeNotAccepted:

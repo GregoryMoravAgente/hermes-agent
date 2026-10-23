@@ -1,6 +1,6 @@
 import path from 'path';
 import { mkdirSync, writeFileSync } from 'fs';
-import { randomBytes } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 import { format } from 'util';
 
 export const MIME_MAP = {
@@ -13,6 +13,56 @@ export const MIME_MAP = {
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
+
+/**
+ * The only production enqueue seam.  Both Baileys event handlers call this
+ * helper, so the queue receives the same immutable wire descriptor whether a
+ * normal message, poll update, or source-driver event produced it.  Test code
+ * may exercise queue state directly, but it cannot claim production proof by
+ * calling a private enqueue branch.
+ */
+export async function enqueueInboundWireEvent(queue, payload, wireIdentity, requestId = randomUUID()) {
+  if (!queue || typeof queue.enqueue !== 'function') throw new TypeError('source queue is required');
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) throw new TypeError('wire payload is required');
+  const identity = {
+    ...(wireIdentity && typeof wireIdentity === 'object' ? wireIdentity : {}),
+    source: String(wireIdentity?.source || 'messages.upsert'),
+  };
+  if (!identity.messageId && payload.messageId) identity.messageId = String(payload.messageId);
+  if (!identity.chatId && payload.chatId) identity.chatId = String(payload.chatId);
+  if (!identity.messageId || !identity.chatId) throw new TypeError('wire identity is required');
+  const ownerFence = typeof queue.currentOwnerFence === 'function'
+    ? queue.currentOwnerFence()
+    : null;
+  return queue.enqueue(payload, { requestId, wireIdentity: identity, ownerFence });
+}
+
+/**
+ * Bind the queue-owned producer lifecycle to the real Baileys event emitter.
+ * Connection state is evidence only when it crosses this production boundary;
+ * callers cannot supply a readiness boolean or a foreign generation.
+ */
+export function bindInboundProducerLifecycle(queue, eventEmitter) {
+  if (!queue || typeof queue.createProducerLifecycle !== 'function') return null;
+  if (!eventEmitter || typeof eventEmitter.on !== 'function') {
+    throw new TypeError('producer event emitter is required');
+  }
+  const lifecycle = queue.createProducerLifecycle();
+  const onUpdate = (update = {}) => {
+    const connection = update?.connection;
+    if (connection === 'open' || connection === 'close' || connection === 'connecting') {
+      return lifecycle.update(connection);
+    }
+    return true;
+  };
+  eventEmitter.on('connection.update', onUpdate);
+  return Object.freeze({
+    generation: lifecycle.generation,
+    detach: () => {
+      if (typeof eventEmitter.off === 'function') eventEmitter.off('connection.update', onUpdate);
+    },
+  });
+}
 
 export function normalizeWhatsAppId(value) {
   if (!value) return '';

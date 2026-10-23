@@ -1,12 +1,14 @@
 """Authenticated production WebSockets and loopback-only inference."""
 import asyncio
 from http.server import ThreadingHTTPServer
+import hashlib
 import json
 import os
 from pathlib import Path
 import sqlite3
 import sys
 import threading
+import time
 
 from automation_peer import Model
 from local_recovery_probe import daemon, websocket, rpc
@@ -34,6 +36,36 @@ def probe(base):
             db.row_factory = sqlite3.Row
             return [dict(r) for r in db.execute('SELECT * FROM session_admissions ORDER BY seq')]
 
+    trace_path = home / 'bot_authority_trace.jsonl'
+
+    def trace_tail():
+        if trace_path.exists():
+            lines = trace_path.read_text(encoding='utf-8').splitlines()
+            print('BOT_AUTHORITY_TRACE_TAIL', file=sys.stderr)
+            print('\n'.join(lines[-100:]), file=sys.stderr)
+        else:
+            print('BOT_AUTHORITY_TRACE_TAIL unavailable', file=sys.stderr)
+
+    def trace_parent(label):
+        scalar_rows = []
+        for row in rows():
+            scalar_rows.append({
+                'admission': str(row.get('admission_id', ''))[-8:],
+                'request': str(row.get('request_id', ''))[-8:],
+                'status': row.get('status'),
+                'outcome': row.get('outcome'),
+                'seq': row.get('seq'),
+                'generation': row.get('generation'),
+                'session_hash': hashlib.sha256(str(row.get('target_session_id', '')).encode()).hexdigest()[:12],
+            })
+        with trace_path.open('a', encoding='utf-8') as stream:
+            stream.write(json.dumps({
+                'event': 'parent.' + label,
+                'monotonic_ns': time.monotonic_ns(),
+                'model_request_count': len(model.requests),
+                'rows': scalar_rows,
+            }, sort_keys=True) + '\n')
+
     async def wait(predicate):
         await async_wait_until(predicate, timeout=30, interval=.05)
 
@@ -56,8 +88,10 @@ def probe(base):
             assert 'result' in renamed, renamed
             await rpc(ws, 'prompt.submit', session_id=sid, input_id='warm', text='WARM_BOT')
             await wait(lambda: rows()[0]['status'] == 'terminal')
+            trace_parent('warm_terminal')
             await rpc(ws, 'prompt.submit', session_id=sid, input_id='hold', text='HOLD_AUTOMATION')
             assert await asyncio.to_thread(model.blocked.wait, 20)
+            trace_parent('hold_model_blocked')
             from tools.bot_mode_dm import _admit_live_dm
             from tools.bot_live_delivery import _locked, _write, _read
             legacy_owner = dict(profile_home=str(home), session_id=sid, lease_id='departed', live_session_id='old-ui')
@@ -84,6 +118,7 @@ def probe(base):
             # Discard an actual response at the socket boundary before reconnecting.
             await ws.send(json.dumps({'id': 'lost-ack', 'method': 'bot_relay.deliver', 'params': params}))
             await wait(lambda: any('BOT_DM_ONCE' in r['payload_json'] for r in rows()))
+            trace_parent('bot_delivery_row_committed')
         async with websocket(home, desc) as observer:
             assert 'result' in await rpc(observer, 'session.resume', session_id=sid)
             retry = await rpc(observer, 'bot_relay.deliver', **params)
@@ -98,8 +133,14 @@ def probe(base):
             assert json.loads(bot[0]['payload_json'])['local_automation_v1']['turn_author'] == params['author']
             legacy = next(r for r in rows() if 'LEGACY_QUEUED_ONCE' in r['payload_json'])
             assert json.loads(legacy['payload_json'])['local_automation_v1']['turn_author']['id'] == 'bot:legacy'
+            trace_parent('before_model_release')
             model.release.set()
-            await wait(lambda: all(r['status'] == 'terminal' for r in rows()))
+            try:
+                await wait(lambda: all(r['status'] == 'terminal' for r in rows()))
+            except AssertionError:
+                trace_parent('terminal_wait_timeout')
+                raise
+            trace_parent('terminal_wait_satisfied')
             settled = await rpc(observer, 'bot_relay.deliver', **params)
             assert settled['result']['status'] == 'settled', settled
             assert settled['result']['reply'] == 'AUTOMATION_ACK', settled
@@ -113,11 +154,14 @@ def probe(base):
         return sid
 
     try:
+        # Keep the acceptance fixture on the ordinary gateway.run bootstrap. Trace output remains
+        # an optional failure artifact; it must never become the producer or scheduler seam.
         with daemon(root, home, env, barrier=False) as (proc, desc):
             try:
                 sid = asyncio.run(run(desc))
                 print(json.dumps({'ordinary_daemon_pid': proc.pid}))
             except BaseException:
+                trace_tail()
                 print((home / 'restart.log').read_text()[-10000:], file=sys.stderr)
                 raise
         # Model the exact post-settlement/pre-mailbox-publication crash boundary.

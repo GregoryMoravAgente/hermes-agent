@@ -11,6 +11,9 @@ from typing import Any, Dict, List
 from agent.memory_context import sanitize_context
 from agent.message_content import flatten_message_text
 from agent.history_commentary import visible_commentary
+# Resolve the custody adapter while the agent module is loading so the first streamed token
+# does not pay the import cost on its latency-sensitive path.
+from agent.shell_hook_custody import stream_dispatch
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
@@ -40,7 +43,13 @@ class StreamDeliveryMixin:
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
-            enqueue_plugin_stream_hook(event, **self._stream_hook_base_payload(), **fields)
+            with stream_dispatch(self, event):
+                queued = enqueue_plugin_stream_hook(event, **self._stream_hook_base_payload(), **fields)
+            if not queued:
+                from agent.shell_hook_scope import current_hook_parent, mark_current_hook_unknown
+
+                if current_hook_parent() is not None:
+                    mark_current_hook_unknown("stream_delivery_dropped")
         except Exception:
             logger.debug("%s plugin hook enqueue failed", label or event, exc_info=True)
 
@@ -307,7 +316,6 @@ class StreamDeliveryMixin:
         prepended_break = bool(getattr(self, "_stream_needs_break", False) and text and text.strip())
         if prepended_break:
             self._stream_needs_break = False
-            text = "\n\n" + text
         if isinstance(text, str):
             # Stateful scrubbers: per-delta regex stripping destroyed downstream state machines when a
             # tag was split across deltas; memory-context spans split across chunks must not leak to
@@ -328,10 +336,16 @@ class StreamDeliveryMixin:
                 text = text.lstrip("\n")
         if not text:
             return
-        delivered = self._deliver_to_stream_callbacks(text)
-        self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
+        # The paragraph break is display formatting for the assistant stream.  Hook consumers
+        # receive the provider's actual scrubbed delta so their durable/event payload is not
+        # changed by UI-only decoration.  Keep recording the display text below: transcript
+        # continuity and callback output still include the paragraph separator.
+        hook_text = text
+        display_text = "\n\n" + text if prepended_break else text
+        delivered = self._deliver_to_stream_callbacks(display_text)
+        self._enqueue_stream_hook("on_stream_delta", delta=hook_text, kind="text")
         if delivered:
-            self._record_streamed_assistant_text(text)
+            self._record_streamed_assistant_text(display_text)
 
     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.

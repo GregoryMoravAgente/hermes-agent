@@ -433,6 +433,23 @@ def _run_job_script(
     script_path: str, workdir: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
 ) -> tuple[bool, str]:
+    """Hold the source admission lease through the script's native process lifetime."""
+    try:
+        from cron.runtime_custody import active_cron_binding, admit_cron_source
+        with admit_cron_source(
+            "script_process", home=_sched._get_hermes_home(), parent=active_cron_binding(),
+        ) as admission:
+            return _run_job_script_effect(
+                script_path, workdir, cancel_event, interpreter, admission)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as admission_error:
+        return False, f"Cron source admission refused before script process: {admission_error}"
+
+
+def _run_job_script_effect(
+    script_path: str, workdir: Optional[str] = None,
+    cancel_event: Optional[_CancelEventLike] = None, interpreter: Optional[str] = None,
+    admission: Any = None,
+) -> tuple[bool, str]:
     """Execute a cron job's script and return ``(success, output)``; on failure *output* is the
     error message for the LLM to report. Env goes through ``build_subprocess_env`` (SECURITY.md
     §2.3). ``workdir`` sets the subprocess cwd only; the Python process cwd is NEVER mutated (an
@@ -448,6 +465,7 @@ def _run_job_script(
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
+    proc = None
     try:
         argv, env_overlay, err = _script_argv(path, interpreter)
         if argv is None:
@@ -487,6 +505,8 @@ def _run_job_script(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        from cron.runtime_custody import register_script_process
+        register_script_process(proc)
         deadline = time.monotonic() + script_timeout
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
@@ -520,7 +540,7 @@ def _run_job_script(
             from agent.redact import redact_sensitive_text
             stdout = redact_sensitive_text(stdout)
             stderr = redact_sensitive_text(stderr)
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- redaction is an opaque security boundary; failed redaction must replace output.
             logger.warning("Failed to redact sensitive text from output: %s", e)
             stdout = stderr = "[REDACTED - redaction failed]"
 
@@ -532,8 +552,12 @@ def _run_job_script(
                 parts.append(f"stdout:\n{stdout}")
             return False, "\n".join(parts)
         return True, stdout
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- script launch/reader failures are returned as the established diagnostic contract.
         return False, f"Script execution failed: {exc}"
+    finally:
+        if proc is not None:
+            from cron.runtime_custody import finish_script_process
+            finish_script_process(proc)
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

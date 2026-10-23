@@ -87,15 +87,12 @@ def test_copilot_acp_hidden_when_executable_missing(monkeypatch, _no_other_copil
         "copilot-acp must stay hidden when no executable resolves"
 
 
-_ACP_CREDS = {"api_key": "copilot-acp", "base_url": "acp://copilot", "command": "copilot", "args": ["--acp", "--stdio"]}
-
-
 @pytest.fixture()
 def _fresh_acp_memo(monkeypatch):
-    monkeypatch.setattr(models, "_copilot_acp_session_memo", None)
+    monkeypatch.setattr(models, "_copilot_acp_session_memo", {})
     yield
     # Don't leak a memoized (possibly failed) probe into other tests in this process.
-    monkeypatch.setattr(models, "_copilot_acp_session_memo", None)
+    models._copilot_acp_session_memo.clear()
 
 
 @pytest.mark.parametrize(
@@ -110,35 +107,41 @@ def _fresh_acp_memo(monkeypatch):
 )
 def test_copilot_acp_catalog_prefers_authenticated_session(
         _fresh_acp_memo, session_probe, github_token, github_models, expected):
-    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
-         patch("agent.copilot_acp_client.CopilotACPClient.list_models", **session_probe) as list_models, \
+    # The external-process probe needs an explicit managed producer policy.  Mock its
+    # owned seam; an unowned picker may still use the in-process GitHub catalog.
+    policy = object()
+    probe = {"return_value": None} if "side_effect" in session_probe else session_probe
+    with patch("hermes_cli.models._fetch_external_process_models", **probe) as list_models, \
          patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=github_token), \
          patch("hermes_cli.models._fetch_github_models", return_value=github_models) as github:
-        assert provider_model_ids("copilot-acp", force_refresh=True) == expected
+        assert provider_model_ids("copilot-acp", force_refresh=True, producer_policy=policy) == expected
 
     list_models.assert_called_once()
     assert github.called is bool(github_token)
 
 
-def test_copilot_acp_session_probe_is_memoized_across_model_switch_validation(_fresh_acp_memo):
-    """``/model`` validation reads the catalog uncached on every switch; each miss spawns the CLI.
-    A run of switches must pay one probe, and a failed probe must not be retried per switch."""
+def test_copilot_acp_session_probe_is_memoized_only_for_owned_catalog_reads(_fresh_acp_memo):
+    """Managed catalog reads memoize the external probe; unowned validation cannot spawn it."""
     from hermes_cli.models_validate import validate_requested_model
 
-    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
-         patch("agent.copilot_acp_client.CopilotACPClient.list_models", return_value=["gpt-5.6-terra"]) as list_models, \
+    policy = object()
+    with patch("hermes_cli.models._fetch_external_process_models", return_value=["gpt-5.6-terra"]) as list_models, \
          patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=""), \
          patch("hermes_cli.models._fetch_github_models", return_value=[]):
         for _ in range(3):
-            verdict = validate_requested_model("gpt-5.6-terra", "copilot-acp", api_key="copilot-acp", base_url="acp://copilot")
-            assert verdict["accepted"] and verdict["recognized"]
+            assert provider_model_ids("copilot-acp", producer_policy=policy) == ["gpt-5.6-terra"]
     assert list_models.call_count == 1
 
-    models._copilot_acp_session_memo = None  # (teardown in _fresh_acp_memo restores it)
-    with patch("hermes_cli.auth.resolve_external_process_provider_credentials", return_value=_ACP_CREDS), \
-         patch("agent.copilot_acp_client.CopilotACPClient.list_models", side_effect=RuntimeError("not signed in")) as list_models, \
+    models._copilot_acp_session_memo.clear()
+    with patch("hermes_cli.models._fetch_external_process_models", return_value=None) as list_models, \
          patch("hermes_cli.models._resolve_copilot_catalog_api_key", return_value=""), \
          patch("hermes_cli.models._fetch_github_models", return_value=[]):
         for _ in range(3):
-            provider_model_ids("copilot-acp")
+            provider_model_ids("copilot-acp", producer_policy=policy)
     assert list_models.call_count == 1
+
+    with patch("hermes_cli.models._fetch_external_process_models", side_effect=AssertionError("unowned spawn")):
+        verdict = validate_requested_model(
+            "gpt-5.6-terra", "copilot-acp", api_key="copilot-acp", base_url="acp://copilot",
+        )
+    assert verdict["accepted"]

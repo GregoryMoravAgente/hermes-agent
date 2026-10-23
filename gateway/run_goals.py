@@ -52,8 +52,11 @@ class GatewayGoalsMixin:
         override alive under multiplex; a failed warm-up is a bounded stall, never a crash."""
         try:
             from hermes_cli.goals import _get_session_db as _warm_goals_db
-
-            await self._run_in_executor_with_context(_warm_goals_db)
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            from gateway.session_authorities import active_authority
+            await run_tracked_executor(
+                self, _warm_goals_db, authority=active_authority(self), kind="goal-warm",
+            )
         except Exception as exc:
             logger.warning("%s: session DB warm-up failed: %s", label, exc)
 
@@ -100,7 +103,9 @@ class GatewayGoalsMixin:
         return await self._manager_for_event(event, "heartbeat", _load)
 
     @staticmethod
-    def _synthetic_prompt_event(source: Any, text: str, *, internal: bool = False) -> MessageEvent:
+    def _synthetic_prompt_event(
+        source: Any, text: str, *, internal: bool = False, _preservation_handoff=None,
+    ) -> MessageEvent:
         """Build the TEXT event used to inject a goal/heartbeat/loop prompt into a session.
 
         The stored source's ``message_id`` is the message that registered the watch; a synthetic
@@ -110,10 +115,18 @@ class GatewayGoalsMixin:
         """
         from gateway.session_identity import replace_source
         source = replace_source(source, message_id=None) if getattr(source, "message_id", None) else source
-        return MessageEvent(
+        event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, internal=internal,
+            message_id=getattr(_preservation_handoff, "request_id", None),
+            # Keep the established command resolver active. The private handoff is custody state,
+            # never a request to reinterpret a supported slash command as agent text.
+            allow_gateway_control=True,
             inherit_channel_pin=True,
         )
+        if _preservation_handoff is not None:
+            event._preservation_handoff = _preservation_handoff
+            event._preservation_effect_started = True
+        return event
 
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
@@ -121,10 +134,16 @@ class GatewayGoalsMixin:
         if watch is None:
             watch = self._heartbeat_watch = {}
         watch[quick_key] = (source, session_id)
+        from gateway.session_authorities import active_authority
+        from gateway.session_goal_tick_custody import register_watcher
+        register_watcher(active_authority(self), quick_key, "heartbeat", session_id=session_id)
         self._start_heartbeat_poller()
 
     def _unregister_heartbeat_watch(self, quick_key: str) -> None:
         (getattr(self, "_heartbeat_watch", None) or {}).pop(quick_key, None)
+        from gateway.session_authorities import active_authority
+        from gateway.session_goal_tick_custody import unregister_watcher
+        unregister_watcher(active_authority(self), quick_key, "heartbeat")
 
     async def _heartbeat_poll_once(self, watch: dict) -> None:
         """Wake each idle watched session once; leave busy sessions' ticks unclaimed."""
@@ -189,7 +208,7 @@ class GatewayGoalsMixin:
             elif quick_key not in adapter._active_sessions:
                 mgr.abandon_fire()
 
-    def _start_heartbeat_poller(self) -> None:
+    def _start_heartbeat_poller(self, *, _i08_resume_generation: int | None = None) -> None:
         """Start the single gateway-wide heartbeat poll task (idempotent)."""
         existing = getattr(self, "_heartbeat_poll_task", None)
         if existing is not None and not existing.done():
@@ -215,6 +234,10 @@ class GatewayGoalsMixin:
             if _bg is not None:
                 _bg.add(task)
                 task.add_done_callback(_bg.discard)
+            from gateway.session_goal_tick_custody import register_runner_watcher
+            register_runner_watcher(
+                self, "heartbeat", task, resume_generation=_i08_resume_generation,
+            )
         except Exception:
             logger.debug("Failed to start heartbeat poller", exc_info=True)
 
@@ -248,7 +271,9 @@ class GatewayGoalsMixin:
                 "goal continuation: status send failed: %s", getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self, source: Any, message: str, *, on_complete=None,
+    ) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
@@ -256,13 +281,23 @@ class GatewayGoalsMixin:
         """
         adapter = self._goal_notice_adapter(source)
         if not adapter:
+            if on_complete is not None:
+                result = on_complete(False)
+                if asyncio.iscoroutine(result):
+                    await result
             return
 
         async def _deliver() -> None:
+            completed = False
             try:
                 await self._send_goal_status_notice(source, message)
+                completed = True
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
+            if on_complete is not None:
+                result = on_complete(completed)
+                if asyncio.iscoroutine(result):
+                    await result
 
         session_key = None
         with suppress(Exception):
@@ -293,7 +328,7 @@ class GatewayGoalsMixin:
         return factory(sid)
 
     async def _post_turn_goal_continuation(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority."""
@@ -304,6 +339,11 @@ class GatewayGoalsMixin:
 
         mgr = await self._post_turn_manager(session_entry, "goal continuation", "goals", _load)
         if mgr is None or not mgr.is_active():
+            return
+
+        from gateway.session_goal_tick_runtime import reserve_goal_tick, apply_goal_decision
+        _authority, goal_tick, custody_refused = reserve_goal_tick(self, session_entry, source, event)
+        if custody_refused:
             return
 
         _bg_procs, _active_deleg = None, 0
@@ -317,36 +357,27 @@ class GatewayGoalsMixin:
         # judge_goal() is a synchronous aux-LLM HTTP call (10-40 s; would block Discord heartbeats).
         # _run_in_executor_with_context carries the profile secret scope / aux runtime contextvars
         # without which aux credential resolution fails under multiplexing.
-        decision = await self._run_in_executor_with_context(
-            lambda: mgr.evaluate_after_turn(
-                final_response or "", user_initiated=True, background_processes=_bg_procs,
-                active_delegations=_active_deleg,
-            ),
-        )
+        try:
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            decision = await run_tracked_executor(
+                self,
+                lambda: mgr.evaluate_after_turn(
+                    final_response or "", user_initiated=True, background_processes=_bg_procs,
+                    active_delegations=_active_deleg,
+                ),
+                authority=_authority, kind="goal-evaluate",
+            )
+        except BaseException:
+            if goal_tick is not None:
+                from gateway.session_goal_tick_custody import mark_unknown
+                mark_unknown(goal_tick, 'join_failed')
+            raise
         msg = decision.get("message") or ""
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
-        if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
         prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
-            return
-        if getattr(source, "platform", None) == Platform.LOCAL:
-            # A local session's adapter FIFO has no reader: its turns are authority admissions.
-            # Commit the continuation there, as main's TUI chained it after the turn.
-            from gateway.session_automation import admit_route_wake
-            try:
-                await admit_route_wake(self, self._delivery_adapter_for(source), source, prompt, "goal-continuation")
-            except Exception:  # health: allow BLE001 -- best-effort like the FIFO enqueue below; traceback logged
-                logger.debug("goal continuation: local admission failed", exc_info=True)
-            return
-        # Enqueue via the adapter's FIFO so a user message already in flight preempts naturally.
-        try:
-            adapter = self._delivery_adapter_for(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                self._enqueue_fifo(_quick_key, self._synthetic_prompt_event(source, prompt), adapter)
-        except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+        if not decision.get("should_continue"):
+            prompt = ""
+        await apply_goal_decision(self, source, msg, prompt, goal_tick)
 
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
@@ -374,9 +405,15 @@ class GatewayGoalsMixin:
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation))
         for label, hook in hooks:
             try:
-                await hook(session_entry=session_entry, source=source, final_response="" if failed else final_text)
+                await hook(
+                    session_entry=session_entry, source=source,
+                    final_response="" if failed else final_text,
+                    event=event,
+                )
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
+        from gateway.session_goal_tick_runtime import register_tick_delivery_finalizer
+        register_tick_delivery_finalizer(self, source, event)
         self._publish_local_control(source, only_if_present=True)
 
     def _publish_local_control(self, source: Any, *, only_if_present: bool = False) -> None:
@@ -412,7 +449,7 @@ class GatewayGoalsMixin:
         return streamed if isinstance(streamed, str) and streamed.strip() else text
 
     async def _post_turn_loop_completion(
-        self, *, session_entry: Any, source: Any, final_response: str,
+        self, *, session_entry: Any, source: Any, final_response: str, event: Any = None,
     ) -> None:
         """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
         (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
@@ -428,10 +465,127 @@ class GatewayGoalsMixin:
         # The --until judge is a sync aux-LLM call — keep it off the event loop, but carry the
         # contextvars: a bare executor hop drops the profile HERMES_HOME override and secret scope,
         # so a served secondary's tick would be written into the DEFAULT profile's state.db.
-        decision = await self._run_in_executor_with_context(mgr.complete_tick, final_response or "")
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        try:
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            decision = await run_tracked_executor(
+                self, mgr.complete_tick, final_response or "",
+                authority=authority, kind="loop-complete",
+            )
+        except BaseException:
+            from gateway.session_goal_tick_custody import mark_unknown, view_for_handle
+            handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
+            tick = view_for_handle(active_authority(self), handle)
+            if tick is not None:
+                mark_unknown(tick, 'join_failed')
+            raise
         msg = decision.get("message") or ""
+        from gateway.session_goal_tick_custody import (
+            handle_for_admission, mark_unknown, view_for_handle,
+        )
+        handle = getattr(event, '_i08_tick_handle', None) if event is not None else None
+        if handle is None and authority is not None:
+            live = authority.sessions.get(session_entry.session_id)
+            execution = getattr(getattr(live, 'event_stream', None), 'execution', None) or {}
+            handle = handle_for_admission(authority, execution.get('admission_id'))
+        tick = view_for_handle(authority, handle)
+
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
+
+    @staticmethod
+    def _loop_custody_root(authority, entry, sid, manager, source):
+        if authority is None or entry is None:
+            return None
+        import json
+        from gateway.session_automation_custody import automation_source_identity
+        from gateway.session_goal_tick_custody import reserve_tick
+        prior = manager.state
+        next_tick = (getattr(prior, 'ticks_fired', 0) + 1) if prior is not None else 1
+        source_event = GatewayGoalsMixin._synthetic_prompt_event(source, "", internal=True)
+        request_id = json.dumps(['loop', sid, next_tick], separators=(',', ':'))
+        tick = reserve_tick(
+            authority,
+            request_id=request_id,
+            principal_id='automation:' + entry.session_key,
+            session_id=authority.logical_owner(entry.session_id),
+            # This is the same source-owned digest that admit_automation stamps into the durable
+            # descriptor.  A route label alone is not an authenticated source identity.
+            source_identity=automation_source_identity(source_event, entry.session_key),
+            kind='loop', watcher_key=entry.session_key,
+        )
+        return tick.handle if tick is not None else None
+
+    @staticmethod
+    def _loop_custody_unknown(authority, handle, reason):
+        if authority is None or handle is None:
+            return
+        from gateway.session_goal_tick_custody import mark_unknown, view_for_handle
+        tick = handle if hasattr(handle, 'handle') else view_for_handle(authority, handle)
+        if tick is not None:
+            mark_unknown(tick, reason)
+            return
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(handle, reason)
+
+    @staticmethod
+    def _loop_custody_handoff(authority, entry, handle):
+        if authority is None or entry is None or handle is None:
+            return None
+        pending = getattr(authority, "_preservation_pending_roots", {}).get(id(handle))
+        request_id = pending.get("request_id") if isinstance(pending, dict) else None
+        source_identity = pending.get("source_identity") if isinstance(pending, dict) else None
+        if (not isinstance(request_id, str) or not request_id
+                or not isinstance(source_identity, str) or not source_identity):
+            return None
+        from gateway.session_ingress import PreservedAutomationHandoff
+        return PreservedAutomationHandoff(
+            authority=authority, handle=handle, owner_class="I08_goals_loops_heartbeat",
+            request_id=request_id, principal_id="automation:" + entry.session_key,
+            session_id=authority.logical_owner(entry.session_id),
+            source_identity=source_identity,
+        )
+
+    async def _loop_deliver_wakeup(self, mgr, wakeup, adapter, source, handoff, handle, entry):
+        from gateway.session_automation import admit_route_wake
+
+        admitted = False
+        is_command = wakeup.lstrip().startswith("/")
+        if not is_command:
+            admitted = await admit_route_wake(
+                self, adapter, source, wakeup, "loop-tick", _preservation_handle=handle,
+            )
+            if admitted and handoff is not None:
+                handoff.mark_admitted()
+        if not admitted:
+            event = self._synthetic_prompt_event(
+                source, wakeup, internal=True, _preservation_handoff=handoff,
+            )
+            from gateway.session_goal_tick_custody import attach_tick_handle
+            attach_tick_handle(event, handle, 'loop')
+            if entry is not None:
+                event.metadata.update({
+                    "gateway_session_key": self._session_key_for_source(source),
+                    "gateway_session_id": entry.session_id,
+                })
+            if handoff is None:
+                await adapter.handle_message(event)
+            else:
+                await adapter.handle_message(event)
+        if is_command:
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            from gateway.session_authorities import active_authority
+            await run_tracked_executor(
+                self, mgr.complete_tick, "", authority=active_authority(self),
+                kind="loop-command-complete",
+            )
+            from gateway.session_goal_tick_custody import finish_unbound, view_for_handle
+            from gateway.session_authorities import active_authority
+            tick = view_for_handle(active_authority(self), handle)
+            if tick is not None:
+                finish_unbound(tick, success=True)
 
     async def _loop_wakeup_fire_one(
         self, sid: str, state: Any, now: float, warned_no_route: set, profile: Optional[str] = None,
@@ -488,11 +642,33 @@ class GatewayGoalsMixin:
         # this a `hermes pause` would still start agent turns. Not claiming the tick keeps it due.
         if check_paused("loop", logger):
             return
+        from gateway.session_authorities import active_authority
+        authority = active_authority(self)
+        entry = authority and self.session_store.lookup_by_session_key(session_key)
+        handle = self._loop_custody_root(authority, entry, sid, mgr, source)
         # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
         # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
         # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+        try:
+            from gateway.session_goal_tick_custody import run_tracked_executor
+            wakeup = await run_tracked_executor(
+                self, mgr.fire_tick, authority=authority, kind="loop-fire",
+            )
+        except BaseException:
+            self._loop_custody_unknown(authority, handle, 'join_failed')
+            raise
         if not wakeup:
+            if handle is not None:
+                from gateway.session_goal_tick_custody import release_unaccepted, view_for_handle
+                tick = view_for_handle(authority, handle)
+                if tick is not None:
+                    release_unaccepted(tick)
+                else:
+                    authority._preservation_release_unaccepted(handle)
+            return
+        handoff = self._loop_custody_handoff(authority, entry, handle)
+        if handle is not None and handoff is None:
+            self._loop_custody_unknown(authority, handle, "join_failed")
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless
         # surface. Persist the completion as a durable delivery row — never self-post it as a new role=user
@@ -505,23 +681,21 @@ class GatewayGoalsMixin:
                 mgr.state.ticks_fired if mgr.state else "?",
                 platform_name, source.chat_id, source.thread_id,
             )
-            from gateway.session_automation import admit_route_wake
-            # Under a session authority the tick commits to the FIFO (never a classic turn beside an
-            # admitted one); a slash-command loop is a command and keeps the command path.
-            if wakeup.lstrip().startswith("/") or not await admit_route_wake(self, adapter, source, wakeup, "loop-tick"):
-                await adapter.handle_message(self._synthetic_prompt_event(source, wakeup, internal=True))
-            # Slash-command loops dispatch through the command path and never hit the post-turn
-            # completion hook — complete the tick immediately (caps + scheduling).
-            if wakeup.lstrip().startswith("/"):
-                await self._run_in_executor_with_context(mgr.complete_tick, "")
-        except Exception as exc:
+            await self._loop_deliver_wakeup(mgr, wakeup, adapter, source, handoff, handle, entry)
+        except BaseException as exc:
+            if handoff is not None:
+                handoff.mark_unknown("join_failed")
+            else:
+                self._loop_custody_unknown(authority, handle, "join_failed")
+            if isinstance(exc, (asyncio.CancelledError, SystemExit, KeyboardInterrupt)):
+                raise
             logger.warning("loop wakeup injection failed for %s: %s", sid, exc)
-            with suppress(Exception):
-                mgr.abandon_tick()
         # Viewers swap the countdown for "running now" (or re-anchor it after a slash tick settled).
         self._publish_local_control(source)
 
-    async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
+    async def _loop_wakeup_watcher(
+        self, interval: float = 15.0, *, _i08_resume_generation: int | None = None,
+    ) -> None:
         """Fire due /loop wakeups for idle gateway sessions: a coarse ticker scans persisted loops
         (SessionDB ``loop:*`` rows) and injects each due prompt via the synthetic-message path.
         Deferrals: session running a turn (FIFO would race the live turn); active non-parked /goal
@@ -533,6 +707,11 @@ class GatewayGoalsMixin:
         and each hit is fired against that profile's adapters."""
         from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
         from gateway.run_idle_gates import profile_has_active_loop
+        from gateway.session_authorities import active_authority, authority_for_home
+        from gateway.session_goal_tick_custody import register_runner_watcher, run_tracked_executor
+        register_runner_watcher(
+            self, 'loop', asyncio.current_task(), resume_generation=_i08_resume_generation,
+        )
         await asyncio.sleep(5)  # let platforms finish connecting
         warned_no_route: set = set()
 
@@ -551,7 +730,11 @@ class GatewayGoalsMixin:
             # run the state.db init on the loop thread before the first read.
             await self._warm_goals_session_db("loop wakeup")
             # Off-loop too: the read is lock-free under WAL but convoys on the writer lock without it.
-            active_loops = await self._run_in_executor_with_context(list_active_loops)
+            active_loops = await run_tracked_executor(
+                self, list_active_loops,
+                authority=active_authority(self),
+                kind="loop-scan",
+            )
             now = time.time()
             for sid, state in active_loops:
                 await self._loop_wakeup_fire_one(sid, state, now, warned_no_route, profile_name)
@@ -563,8 +746,13 @@ class GatewayGoalsMixin:
                 for profile_name, profile_home in await _resolve_handoff_watch_scopes(self):
                     # Idle gate (run_idle_gates): skip the scope entry when the profile's store holds
                     # no active loop. The root scan (None) is unscoped and stays cheap.
-                    if profile_home is not None and not await self._run_in_executor_with_context(
-                            profile_has_active_loop, profile_home):
+                    gate_authority = (
+                        authority_for_home(self, profile_home)
+                        if profile_home is not None else active_authority(self)
+                    )
+                    if profile_home is not None and not await run_tracked_executor(
+                            self, profile_has_active_loop, profile_home,
+                            authority=gate_authority, kind="loop-gate"):
                         continue
                     async with _scope(profile_home):
                         await _scan_one_store(profile_name)

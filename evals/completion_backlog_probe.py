@@ -22,6 +22,22 @@ from unittest.mock import patch
 from urllib.request import Request, urlopen
 
 
+def _prepared_execution(delegation_id):
+    """Unmanaged prepared claim for the local completion probe's durable fixture."""
+    from gateway.status import get_process_start_time
+
+    birth = get_process_start_time(os.getpid())
+    if type(birth) is not int:
+        raise RuntimeError("owner_birth_unavailable")
+    return {
+        "handoff_id": delegation_id, "state": "prepared", "accepted": "unknown",
+        "worker_started": False, "worker_exited": False, "owner_pid": os.getpid(),
+        "owner_started_at": birth,
+        "owner_execution_id": f"probe:{os.getpid()}:{delegation_id}",
+        "owner_scope": None, "error": None, "exception": None,
+    }
+
+
 def probe(surface, scenario, directory):
     from cli import HermesCLI
     from tools import process_registry as pr
@@ -105,7 +121,8 @@ def probe(surface, scenario, directory):
                 delegation = {'type': 'async_delegation', 'delegation_id': f'deleg-{surface}',
                               'session_key': 'backlog-owner', 'goal': 'Fixture delegation',
                               'status': 'completed', 'summary': 'DELEGATION_RESULT',
-                              'dispatched_at': time.time(), 'completed_at': time.time()}
+                              'dispatched_at': time.time(), 'completed_at': time.time(),
+                              'execution': _prepared_execution(f'deleg-{surface}')}
                 ad._persist_dispatch(delegation)
                 ad._persist_completion(delegation, {'status': 'completed'})
                 watch = {'type': 'watch_match', 'session_key': 'backlog-owner',

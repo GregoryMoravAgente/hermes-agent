@@ -318,6 +318,19 @@ def _build_child_agent(
         child._delegate_parent_ref = weakref.ref(parent_agent)
     except TypeError:
         child._delegate_parent_ref = None  # non-weakref-able test doubles
+    # A gateway turn owns one opaque parent across the delegation tree.  The
+    # child is a distinct AIAgent, so register its real lineage before any
+    # worker can run.  Direct CLI/TUI builds have no gateway parent and remain
+    # on the historical unbound path.
+    try:
+        from agent.tool_worker_custody import register_tool_worker_delegate
+        register_tool_worker_delegate(child)
+    except BaseException:
+        with _quiet("delegated child custody registration failed", exc_info=True):
+            close = getattr(child, "close", None)
+            if callable(close):
+                close()
+        raise
     # Sidebar marker: subagent sessions stay out of session pickers even when a
     # parent delete orphans them (mirrors /branch's ``_branched_from``).
     if parent_sid and getattr(child, "_session_init_model_config", None) is not None:

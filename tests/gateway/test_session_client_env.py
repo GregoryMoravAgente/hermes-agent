@@ -11,6 +11,14 @@ import pytest
 _CONFIG = 'platform_toolsets: {cli: []}\nmodel: {provider: custom, default: m, base_url: http://x.invalid/v1}\n'
 
 
+@pytest.fixture
+def _without_hermes_bin_injection(monkeypatch):
+    """Keep session-client assertions independent of the PM runner's Hermes shim PATH."""
+    from tools.environments import local
+    monkeypatch.setattr(local, '_HERMES_BIN_DIR', None)
+    monkeypatch.setattr(local, '_HERMES_BIN_DIR_IS_PAYLOAD', False)
+
+
 async def _owner(home, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
@@ -306,7 +314,9 @@ async def test_a_copied_staged_receipt_is_never_judged_by_its_own_filtered_map(t
 
 
 @pytest.mark.asyncio
-async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from_the_daemon(tmp_path, monkeypatch):
+async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from_the_daemon(
+    tmp_path, monkeypatch, _without_hermes_bin_injection
+):
     """Client A exported a configured extra (``terminal.client_env_passthrough``) and auto-started the
     gateway, seeding the daemon's environment; client B's session, which did not export it, runs its tools
     without it. PATH is the documented exception (a client that sent none keeps the gateway's)."""
@@ -340,7 +350,9 @@ async def test_configured_toolchain_names_a_local_client_omitted_never_leak_from
 
 
 @pytest.mark.asyncio
-async def test_host_values_apply_only_over_a_gateway_proven_local_attach(tmp_path, monkeypatch):
+async def test_host_values_apply_only_over_a_gateway_proven_local_attach(
+    tmp_path, monkeypatch, _without_hermes_bin_injection
+):
     """Toolchain and path-valued values are the client's only when the gateway itself proves the attach is
     on its host: the connection redeemed a ticket minted over the gateway's private control socket
     (``run_api``: ``native_bootstrap``). Any other attach keeps the gateway's values and is told so;

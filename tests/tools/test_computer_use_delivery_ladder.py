@@ -335,6 +335,10 @@ def test_call_tool_restarts_a_dead_session(monkeypatch):
 
     sess = _CuaDriverSession.__new__(_CuaDriverSession)
     sess._started = False           # dead session
+    sess._managed_owner = None
+    sess._managed_retry_prepared = False
+    sess._transport_generation = 0
+    sess._lifecycle_future = None
     started = {"count": 0}
 
     def fake_start():

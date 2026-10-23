@@ -9,7 +9,7 @@ import threading
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.config import GatewayConfig, HomeChannel, Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session_authority import SessionAuthority, initialize_session_authority
@@ -50,19 +50,77 @@ def _video(source, mid, clip):
 @pytest.mark.parametrize('busy', [False, True], ids=['idle', 'busy'])
 async def test_media_then_quick_text_keep_arrival_order(tmp_path, monkeypatch, busy):
     """The adapter path: an idle video then a busy text, or both while a turn runs."""
-    import gateway.session_finite as finite
-    monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
-    gate = asyncio.Event()
+    import hermes_state
+    from gateway.run_runtime import initialize_gateway_runtime
+    from gateway.runtime_ownership import process_ownership
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
-    async def produce(authority, ref, row):
-        await gate.wait()
-        return 'ok'
-    monkeypatch.setattr(finite, 'execute_finite_admission', produce)
+    home = (tmp_path / 'profile').resolve()
+    monkeypatch.setenv('HERMES_HOME', str(home))
+    monkeypatch.setattr(hermes_state, 'DEFAULT_DB_PATH', hermes_state._IMPORT_DEFAULT_DB_PATH)
+    home_token = set_hermes_home_override(home)
+    process_ownership.reserve([home])
+    monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')
+    monkeypatch.setenv('TELEGRAM_HOME_CHANNEL', 'order-chat')
+    gate = asyncio.Event()
     entered, release = _hold_capture(monkeypatch)
-    runner = GatewayRunner(GatewayConfig())
+    config = GatewayConfig(sessions_dir=home / 'sessions')
+    config.platforms[Platform.TELEGRAM] = PlatformConfig(
+        enabled=True, home_channel=HomeChannel(Platform.TELEGRAM, 'order-chat', 'fixture-home'))
+    runner = GatewayRunner(config)
+    async def model(message, context_prompt, history, source, session_id, **turn_kwargs):
+        await gate.wait()
+        from agent.session_persistence_proof import publish_gateway_writer_proof
+        from gateway.runtime_service_custody import (
+            TurnCustodyBinding, bind_turn, current_turn_binding, reset_turn,
+        )
+        from gateway.session_classic_custody import ClassicWriterBinding
+        from tests.gateway.test_classic_writer_delivery_custody import _real_session_writer
+
+        writer_event = turn_kwargs.get('classic_writer_event')
+        explicit_binding = turn_kwargs.get('classic_writer_binding')
+        ambient_binding = current_turn_binding()
+        binding = explicit_binding if explicit_binding is not None else ambient_binding
+        assert isinstance(binding, (ClassicWriterBinding, TurnCustodyBinding))
+        token = None
+        if isinstance(binding, TurnCustodyBinding) and ambient_binding is not binding:
+            token = bind_turn(binding)
+        try:
+            writer = _real_session_writer(authority.db, session_id)
+            turn_id = f'arrival-fixture:{getattr(writer_event, "message_id", None) or message}'
+            writer._current_turn_id = turn_id
+            if isinstance(binding, ClassicWriterBinding):
+                assert writer._request_gateway_writer_proof(binding=binding) is True
+            else:
+                assert writer._request_gateway_writer_proof() is True
+            written = [
+                {'role': 'user', 'content': message},
+                {'role': 'assistant', 'content': 'ok'},
+            ]
+            assert writer._flush_messages_to_session_db(written, []) is True
+            proof = writer._managed_shell_writer_proof
+            assert proof is not None
+            handoff = publish_gateway_writer_proof(writer, written, proof, turn_id)
+            assert handoff is not None
+            assert writer._ack_gateway_writer_proof(handoff) is True
+        finally:
+            if token is not None:
+                reset_turn(token)
+        return {
+            'final_response': 'ok',
+            'messages': [*history, {'role': 'user', 'content': message},
+                         {'role': 'assistant', 'content': 'ok'}],
+            'agent_persisted': True, 'api_calls': 1, 'tools': [],
+            'history_offset': len(history), 'session_id': session_id,
+            '_classic_writer_proof': handoff,
+            '_classic_writer_event': writer_event,
+        }
+    monkeypatch.setattr(runner, '_run_agent', model)
     adapter = Adapter()
+    adapter.gateway_runner = runner
     runner.adapters = {Platform.TELEGRAM: adapter}
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='order')
+    await initialize_gateway_runtime(runner)
+    authority = runner.session_authority
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='order-chat', chat_type='dm', user_id='fixture-user')
     clip = tmp_path / 'clip.mp4'
@@ -72,6 +130,11 @@ async def test_media_then_quick_text_keep_arrival_order(tmp_path, monkeypatch, b
         if busy:
             await adapter.handle_message(MessageEvent(text='hello', source=source, message_id='h0'))
             await async_wait_until(lambda: _order(authority) == ['h0'], what='the running turn admitted')
+            await async_wait_until(
+                lambda: any(row['request_id'] == 'h0' and row['status'] == 'started'
+                            for sid in authority.sessions
+                            for row in list_session_admissions(authority.db, session_id=sid)),
+                what='the running turn claimed')
             expected.insert(0, 'h0')
         # One task per delivery, as Discord and Slack dispatch them.
         first = asyncio.create_task(adapter.handle_message(_video(source, 'v1', clip)))
@@ -89,8 +152,13 @@ async def test_media_then_quick_text_keep_arrival_order(tmp_path, monkeypatch, b
     finally:
         release.set()
         gate.set()
-        await async_wait_until(lambda: not adapter._background_tasks, what='adapter tasks done')
-        authority.db.close()
+        try:
+            await async_wait_until(lambda: not adapter._background_tasks, what='adapter tasks done')
+        finally:
+            runner.session_store.close_all_db_handles()
+            runner.close_all_session_db_handles()
+            process_ownership.close()
+            reset_hermes_home_override(home_token)
 
 
 async def _held_owner(tmp_path, monkeypatch):
@@ -103,16 +171,38 @@ async def _held_owner(tmp_path, monkeypatch):
     adapter = WhatsAppAdapter(PlatformConfig(enabled=True, extra={'session_path': str(tmp_path / 'wa')}))
     runner.adapters = {Platform.WHATSAPP: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='held')
+    runner._wire_adapter_handlers(adapter)
     clip = tmp_path / 'clip.mp4'
     clip.write_bytes(b'video-bytes' * 1000)
 
     def admit(chat, mid, media=False, ingress=False):
         """``ingress``: through the messaging ingress (``admit_message``), else ``admit_native``."""
+        from gateway.preservation_source_close import source_handoff_context
         from gateway.session_ingress import admit_message
+        from gateway.session_ingress_context import native_callback
+        from hermes_constants import get_hermes_home
         source = adapter.build_source(chat_id=chat, user_id=chat, chat_type='dm')
         event = _video(source, mid, clip) if media else MessageEvent(text='text ' + mid, source=source,
                                                                        message_id=mid)
-        return asyncio.create_task(admit_message(authority, event) if ingress else authority.admit_native(event))
+        async def admitted():
+            owner = runner._transport_owner(event.source)
+            assert owner is not None and owner[0] is adapter
+            source_adapter, source_profile = owner
+            source_close = runner._preservation_source_close
+            token = source_close.admit_source(
+                source_adapter, event, profile=source_profile, event=event, phase='native-fixture')
+            try:
+                with source_handoff_context((token,)):
+                    with native_callback(runner, event, get_hermes_home(), source_profile,
+                                         source_token=token):
+                        result = await (admit_message(authority, event) if ingress
+                                        else authority.admit_native(event))
+                source_close.mark_producer_done(token)
+                return result
+            except BaseException:  # health: allow BLE001 -- cancelled fixture admission retains its exact source lease
+                source_close.mark_unknown(token, 'native_fixture_admission_failed')
+                raise
+        return asyncio.create_task(admitted())
     route = lambda chat: runner._session_key_for_source(adapter.build_source(chat_id=chat, user_id=chat, chat_type='dm'))
     return authority, entered, release, admit, route
 

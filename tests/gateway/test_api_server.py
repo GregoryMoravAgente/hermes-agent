@@ -38,6 +38,7 @@ from gateway.platforms.api_server import (
     cors_middleware,
     security_headers_middleware,
 )
+from tests.gateway.test_api_server_custody_fixtures import make_adapter as _make_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -381,17 +382,6 @@ class TestRuntimeStatusMetrics:
 # ---------------------------------------------------------------------------
 
 
-def _make_adapter(api_key: str = "", cors_origins=None) -> APIServerAdapter:
-    """Create an adapter with optional API key."""
-    extra = {}
-    if api_key:
-        extra["key"] = api_key
-    if cors_origins is not None:
-        extra["cors_origins"] = cors_origins
-    config = PlatformConfig(enabled=True, extra=extra)
-    return APIServerAdapter(config)
-
-
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     """Create the aiohttp app from the adapter (without starting the full server)."""
     mws = [mw for mw in (cors_middleware, security_headers_middleware) if mw is not None]
@@ -434,13 +424,13 @@ class _FakeGoogleChatAdapter:
 
 
 @pytest.fixture
-def adapter():
-    return _make_adapter()
+def adapter(monkeypatch):
+    return _make_adapter(monkeypatch=monkeypatch)
 
 
 @pytest.fixture
-def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+def auth_adapter(monkeypatch):
+    return _make_adapter(api_key="sk-secret", monkeypatch=monkeypatch)
 
 
 # ---------------------------------------------------------------------------
@@ -2321,12 +2311,12 @@ class TestCORS:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("live_bot_chat", [False, True], ids=["agent_turn", "live_bot_chat"])
-    async def test_cors_headers_present_on_session_chat_stream(self, live_bot_chat):
+    async def test_cors_headers_present_on_session_chat_stream(self, live_bot_chat, monkeypatch):
         """Both session SSE writers (agent turn and live Bot Chat hand-off) must
         resolve CORS up front: the middleware can't touch headers after
         ``prepare()`` flushes them (#72892).
         """
-        adapter = _make_adapter(cors_origins=["http://localhost:3000"])
+        adapter = _make_adapter(cors_origins=["http://localhost:3000"], monkeypatch=monkeypatch)
         app = _create_app(adapter)
         admitted = (Path("unused"), {"delivery_id": "d1", "status": "queued"}) if live_bot_chat else None
         settled = {"delivery_id": "d1", "status": "settled", "reply": "ok"}

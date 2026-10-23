@@ -1,15 +1,136 @@
 """Trusted messaging admission and the existing TurnRunner invocation boundary."""
 import asyncio
 import logging
+import sqlite3
 from contextvars import ContextVar
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session_envelope import restore_native
 from hermes_state_runtime import RuntimeStoreError
 
 logger = logging.getLogger(__name__)
+
+
+class DeliveryBoundaryError(RuntimeError):
+    """A delivery exception annotated by the source-owned outbound stage."""
+
+    def __init__(self, reason: str, *, effect_state: str):
+        self.reason = reason
+        self.effect_state = effect_state
+        super().__init__(reason)
+
+
+@dataclass(frozen=True)
+class DeliveryReceipt:
+    admission_id: str
+    attempted: bool
+    delivered: bool
+    reason: str | None = None
+    # ``none`` is retryable only when the source reached a stage before any outbound adapter call.
+    # ``ambiguous`` never authorizes a whole-response resend.
+    effect_state: str = "none"
+
+
+@dataclass
+class PreservedAutomationHandoff:
+    """Private one-shot carrier for a fired loop tick entering the existing automation writer.
+
+    The carrier is process-local and object-bound.  It is not ingress metadata and does not add a
+    second ledger: the coordinator handle remains the only custody record until the normal
+    ``admit_automation`` writer binds the SQLite row.
+    """
+
+    authority: object
+    handle: object
+    owner_class: str
+    request_id: str
+    principal_id: str
+    session_id: str
+    source_identity: str
+    state: str = field(default="prepared", init=False)
+
+    def validate(self, authority, adapter, event: MessageEvent) -> None:
+        if authority is not self.authority or self.owner_class != "I08_goals_loops_heartbeat":
+            raise RuntimeStoreError("preservation_owner_mismatch")
+        handle = self.handle
+        coordinator = authority._preservation_coordinator()
+        lease_id = getattr(getattr(handle, "lease", None), "lease_id", None)
+        record = (getattr(coordinator, "_records", {}).get(lease_id)
+                  if coordinator is not None and lease_id is not None else None)
+        if (record is None or record.handle is not handle or record.state not in {"accepted", "finalizing"}
+                or getattr(handle, "owner_class", None) != self.owner_class
+                or getattr(handle, "profile_id", None) != authority.profile_id
+                or getattr(handle, "authority_epoch", None) != authority.epoch
+                or coordinator is None or coordinator._parent(handle) is None):
+            raise RuntimeStoreError("preservation_owner_unmapped")
+        expected_owner_id = authority._automation_owner_id(
+            self.owner_class, self.session_id, self.request_id,
+        )
+        if getattr(handle, "owner_id", None) != expected_owner_id:
+            raise RuntimeStoreError("preservation_owner_mismatch")
+        runner = authority.runner
+        key = runner._session_key_for_source(event.source)
+        entry = runner.session_store.lookup_by_session_key(key)
+        from gateway.session_automation_custody import automation_source_identity
+        actual_source_identity = automation_source_identity(event, key)
+        if (entry is None
+                or authority.logical_owner(entry.session_id) != self.session_id
+                or self.principal_id != "automation:" + key
+                or self.source_identity != actual_source_identity
+                or event.message_id != self.request_id
+                or not event.internal
+                or event.message_type is not MessageType.TEXT
+                or event.is_command()
+                or adapter is None
+                or runner._adapter_for_source(event.source) is not adapter):
+            raise RuntimeStoreError("preservation_owner_mismatch")
+
+    def mark_admitted(self) -> None:
+        if self.state == "unknown":
+            raise RuntimeStoreError("preservation_owner_unmapped")
+        self.state = "admitted"
+
+    def mark_unknown(self, reason: str) -> None:
+        if self.state in {"unknown", "admitted"}:
+            return
+        coordinator = self.authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(self.handle, reason)
+        self.state = "unknown"
+
+
+async def admit_preserved_automation(authority, adapter, event: MessageEvent,
+                                     handoff: PreservedAutomationHandoff):
+    """Consume one fired loop handoff through the existing durable automation admission path."""
+    event._preservation_effect_started = True
+    try:
+        handoff.validate(authority, adapter, event)
+        receipt = await authority.admit_automation(
+            adapter, event, handoff.request_id, _preservation_handle=handoff.handle,
+        )
+        handoff.mark_admitted()
+        return receipt
+    except BaseException:
+        # fire_tick already persisted the producer effect; a failed consumer must retain this exact
+        # handle unknown, including cancellation/SystemExit, instead of releasing or replacing it.
+        handoff.mark_unknown("join_failed")
+        raise
+
+
+async def admit_preserved_route(runner, authority, event: MessageEvent, source, handoff):
+    if event.get_command():
+        handoff.mark_unknown("command_path_not_custody_bound")
+        return False, None
+    if authority is None or executing_admission.get():
+        handoff.mark_unknown("runtime_custody_unavailable" if authority is None else "join_failed")
+        return True, None
+    adapter = runner._delivery_adapter_for(source)
+    if adapter is None:
+        handoff.mark_unknown("no_consumer")
+        return True, None
+    return True, await admit_preserved_automation(authority, adapter, event, handoff)
 
 admission_author = ContextVar('admission_author', default=None)
 executing_admission = ContextVar('executing_admission', default=False)
@@ -58,6 +179,9 @@ async def admit_message(authority, event):
         return QUEUE_FULL_REPLY
     finally:
         messaging_admission.reset(ingress)
+    preservation_key = getattr(event, '_preservation_operation_key', None)
+    if preservation_key is not None:
+        authority._preservation_operation_bind_admission(preservation_key, receipt.admission_id)
     if receipt.status == 'terminal':
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
@@ -79,16 +203,24 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
-        return None if status == 'terminal' else pause_notice(authority, receipt.ref, 'unknown_execution')
+        if status == 'terminal' or getattr(event, '_classic_owner_unknown', False):
+            return None
+        return pause_notice(authority, receipt.ref, 'unknown_execution')
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
         return await asyncio.shield(waiter)
     except RuntimeStoreError as exc:
+        if getattr(event, '_classic_owner_unknown', False):
+            return None
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
         if adopters.get(receipt.admission_id) is event:
-            del adopters[receipt.admission_id]
+            bridge = getattr(event, '_classic_execution_bridge', None)
+            if getattr(bridge, 'post_delivery_callback_state', None) not in {
+                'registering', 'registered', 'proof_recorded', 'settled', 'not_required',
+            }:
+                del adopters[receipt.admission_id]
 
 
 def _marker_adopters(authority):
@@ -139,6 +271,75 @@ def _registry(authority, name):
         found = {}
         setattr(authority, name, found)
     return found
+
+
+def begin_busy_preservation(adapter, event, session_key):
+    """Reserve the busy follow-up before the observer or burst timer is created."""
+    runner = getattr(adapter, 'gateway_runner', None)
+    if runner is None:
+        return None, None
+    from gateway.run_busy_custody import begin_classic_event
+    from gateway.runtime_service_custody import ServiceCustodyError
+
+    if not begin_classic_event(runner, event, session_key, 'fifo', state='queued'):
+        raise ServiceCustodyError('preservation_owner_unmapped')
+    authority = getattr(event, '_classic_custody_authority', None)
+    key = getattr(event, '_classic_custody_key', None)
+    if authority is None or not isinstance(key, str) or not key:
+        return None, None
+    return authority, key
+
+
+def finish_busy_preservation(authority, key, accepted, *, unknown=False):
+    if authority is None or key is None:
+        return
+    if not accepted:
+        try:
+            row = authority._preservation_operation_row(key)
+        except (OSError, RuntimeError, sqlite3.Error, RuntimeStoreError, TypeError, ValueError, KeyError):
+            # Exact busy admission read failure retains custody; no exception value is published.
+            authority._preservation_operation_unknown(key, 'read_failed')
+            return
+        if row is None:
+            authority._preservation_operation_release_unaccepted(key)
+        elif row.get('status') == 'terminal':
+            authority._preservation_operation_terminal(key, f'busy-refused:{key}')
+        else:
+            authority._preservation_operation_unknown(key, 'join_failed')
+    elif unknown:
+        authority._preservation_operation_unknown(key, 'join_failed')
+    else:
+        try:
+            row = authority._preservation_operation_row(key)
+        except (OSError, RuntimeError, sqlite3.Error, RuntimeStoreError, TypeError, ValueError, KeyError):
+            # Exact busy admission read failure retains custody; no exception value is published.
+            authority._preservation_operation_unknown(key, 'read_failed')
+            return
+        if row is None:
+            authority._preservation_operation_unknown(key, 'read_failed')
+        elif row.get('status') == 'terminal':
+            admission_id = row.get('admission_id')
+            from gateway.session_classic_delivery import (
+                CLASSIC_CALLBACK_NOT_REQUIRED,
+                CLASSIC_CALLBACK_UNKNOWN,
+                classic_callback_requirement,
+                classic_post_delivery_callback_settled,
+            )
+            callback_requirement = classic_callback_requirement(authority, admission_id)
+            if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
+                # A missing, stale, foreign, or unreadable callback witness remains unknown.
+                authority._preservation_operation_unknown(key, 'unmapped_writer')
+            elif (
+                callback_requirement == CLASSIC_CALLBACK_NOT_REQUIRED
+                or classic_post_delivery_callback_settled(authority, admission_id)
+            ):
+                # The callback and canonical row are settled; terminalize the I06 operation, then
+                # release only when the existing bridge carries the exact retired operation proof.
+                authority._preservation_operation_terminal(key, f'busy-delivery:{key}')
+                from gateway.session_classic_delivery import release_busy_retired_callback
+                release_busy_retired_callback(authority, key, admission_id)
+        else:
+            authority._preservation_operation_unknown(key, 'join_failed')
 
 
 def waiter_replies(authority):
@@ -223,6 +424,106 @@ def row_turn_author(policy, row):
     return forward_author(policy)
 
 
+def _managed_process_route(row):
+    """Read the producer-owned route marker without treating missing context as permission."""
+    payload = row.get('payload') or {}
+    if not isinstance(payload, dict):
+        from gateway.runtime_service_custody import ServiceCustodyError
+        raise ServiceCustodyError('producer_policy_invalid')
+    markers = []
+    for descriptor in payload.values():
+        if not isinstance(descriptor, dict):
+            continue
+        marker = descriptor.get('producer_process_mode', descriptor.get('process_route'))
+        if marker is not None:
+            if type(marker) is not str or not marker:
+                from gateway.runtime_service_custody import ServiceCustodyError
+                raise ServiceCustodyError('producer_policy_invalid')
+            markers.append(marker)
+    if len(set(markers)) > 1:
+        from gateway.runtime_service_custody import ServiceCustodyError
+        raise ServiceCustodyError('producer_policy_conflict')
+    if not markers:
+        # Legacy/direct rows retain their existing supported route.  A managed producer must
+        # stamp its mode at the actual Gateway/CLI owner; ContextVar absence is never a marker.
+        return False
+    marker = markers[0]
+    if marker == 'managed_turn':
+        return True
+    if marker in {
+        'live_profile_discovery', 'standalone_maintenance', 'injected_no_spawn', 'direct',
+        'classic_busy',
+    }:
+        return False
+    from gateway.runtime_service_custody import ServiceCustodyError
+    raise ServiceCustodyError('producer_policy_invalid')
+
+
+def _bind_process_route(authority, ref, row, *, require_managed=False):
+    from gateway.runtime_service_custody import admission_binding, bind_turn
+    if not _managed_process_route(row):
+        if require_managed:
+            from gateway.runtime_service_custody import ServiceCustodyError
+            # A legacy row has no authenticated producer route.  Current policy
+            # cannot safely infer that it was a managed producer, so refuse before
+            # the child spawn rather than silently taking the untracked path.
+            raise ServiceCustodyError('managed_producer_binding_missing')
+        return None, None
+    binding = admission_binding(authority, ref, row)
+    return binding, bind_turn(binding)
+
+
+def _reset_process_route(token) -> None:
+    if token is not None:
+        from gateway.runtime_service_custody import reset_turn
+        reset_turn(token)
+
+
+def _mark_classic_owner_unknown(authority, row, event) -> None:
+    """Carry an execution-owner loss back to the ingress event that owns its waiter.
+
+    The drain restores a fresh event from the durable row.  The live adapter waiter is still
+    attached to the original marker adopter, so marking only the restored copy makes the waiter
+    publish a pause notice even though the exact operation is already retained as unknown.
+    """
+    event._classic_owner_unknown = True
+    admission_id = row.get('admission_id') if isinstance(row, dict) else None
+    if not isinstance(admission_id, str) or not admission_id:
+        return
+    adopter = _marker_adopters(authority).get(admission_id)
+    if adopter is not None:
+        adopter._classic_owner_unknown = True
+
+
+def _bind_classic_execution_event(authority, row, event) -> None:
+    """Bind a restored direct-classic event or retain its exact operation as unknown."""
+    from gateway.session_bot_custody import bot_execution_binding_for_admission
+    if bot_execution_binding_for_admission(authority, row) is not None:
+        # Bot delivery owns an I07 root and an I06 child, but intentionally has no classic
+        # producer event or bridge. Its typed binding was authenticated above, so the classic
+        # resolver must not reinterpret the child as an ownerless classic occurrence.
+        return
+    resolver = getattr(authority, '_classic_execution_owner_for_admission', None)
+    if not callable(resolver):
+        return
+    owner, error = resolver(row)
+    if error is not None:
+        _mark_classic_owner_unknown(authority, row, event)
+        from gateway.session_managed_worker import ManagedExecutionUnknown
+        raise ManagedExecutionUnknown('classic_owner_unknown')
+    if owner is None:
+        return
+    from gateway.session_classic_custody import bind_classic_execution_event
+    if bind_classic_execution_event(owner, event, row):
+        return
+    key = getattr(owner, '_classic_custody_key', None)
+    if isinstance(key, str):
+        authority._preservation_operation_unknown(key, 'execution_owner_bind_failed')
+    _mark_classic_owner_unknown(authority, row, event)
+    from gateway.session_managed_worker import ManagedExecutionUnknown
+    raise ManagedExecutionUnknown('classic_owner_bind_failed')
+
+
 async def execute_admission(authority, ref, row):
     from gateway.session_completion_notes import note_if_unviewed
     noted = await note_if_unviewed(authority, ref, row)  # #134889 LC-7: no viewer, no turn
@@ -237,7 +538,18 @@ async def execute_admission(authority, ref, row):
     from gateway.session_managed_worker import managed_policy, admit_managed
     policy = managed_policy(authority, ref)
     if policy is not None:
-        return await admit_managed(authority, ref, row, policy)
+        # Managed workers are still I04 admissions.  Bind the exact FIFO child before
+        # the worker route can reserve I16 custody or create a process; the ordinary
+        # route below keeps its historical binding point and reset.
+        managed_binding = None
+        managed_binding_token = None
+        try:
+            managed_binding, managed_binding_token = _bind_process_route(
+                authority, ref, row, require_managed=True,
+            )
+            return await admit_managed(authority, ref, row, policy, managed_binding)
+        finally:
+            _reset_process_route(managed_binding_token)
     live = authority.sessions[ref.session_id]
     native = row['admission_id'] in authority.native_waiters
     authority.native_waiters.discard(row['admission_id'])
@@ -250,6 +562,7 @@ async def execute_admission(authority, ref, row):
         if 'local_automation_v1' in row['payload']:
             from gateway.session_automation import restore_local_automation
             event = restore_local_automation(authority, ref, row)
+    _bind_classic_execution_event(authority, row, event)
     if event.internal and 'gateway_session_id' in event.metadata:
         # Main's ownership proof (802fd5782f3): the session the pre-claim check just validated, so the
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
@@ -260,8 +573,12 @@ async def execute_admission(authority, ref, row):
     if provenance is not None:
         from gateway.session_ingress_context import restore_provenance
         home = restore_provenance(authority.runner, event.source, provenance)
+    _turn_binding, turn_binding_token = _bind_process_route(authority, ref, row)
     from gateway.config import Platform
-    from gateway.session_api_turn import api_execution, prepare_api_execution
+    from gateway.session_api_turn import (
+        api_execution, apply_api_notification_presentation, bind_api_notification_metadata,
+        prepare_api_execution,
+    )
     from gateway.session_results import execution_result
     is_api = live.source.platform == Platform.API_SERVER
     if not (event.internal or is_api or live.source.platform == Platform.LOCAL):
@@ -285,6 +602,7 @@ async def execute_admission(authority, ref, row):
                 # Committed media resolves under the owning profile's home, like admission did.
                 prepared = prepare_api_execution(authority, ref, row['payload'])
                 api_execution.set(prepared)
+                bind_api_notification_metadata(event, prepared)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
                     # ``[Image attached ...]`` hints native transports persist), not only the caption.
@@ -305,6 +623,11 @@ async def execute_admission(authority, ref, row):
                 if is_api or (row['payload'].get('finite') is True and not event.get_command()):
                     result = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
                               'error': response or 'The admitted turn failed.'}
+            if is_api:
+                # Project both real captured outcomes and no-run failures before the durable
+                # pending result is published. The helper uses the event's frozen mute snapshot
+                # when a turn ran and the canonical policy only for the no-run fallback.
+                result = apply_api_notification_presentation(event, result, captured)
             # The drain commits this under the stream lock so no viewer reads `terminal`
             # before the completion event exists in the replay ring.
             authority.pending_results[row['admission_id']] = {
@@ -333,6 +656,7 @@ async def execute_admission(authority, ref, row):
         api_execution.reset(api_token)
         admission_author.reset(author_token)
         viewer_turn.reset(viewer_token)
+        _reset_process_route(turn_binding_token)
 
 
 def _launch_body_if_launch_owner(authority):
@@ -371,13 +695,16 @@ async def _execution_scope(authority, home):
 
 
 async def deliver_settled(authority, admission_id):
-    """Send a recovered no-waiter turn's reply after its terminal outcome committed. A send
-    failure cannot rewrite that outcome; it is logged, and inference never runs again."""
+    """Deliver a recovered result and return a typed receipt for managed custody."""
+    def record_i10(receipt):
+        if admission_id in getattr(authority, '_i10_recovery_bindings', {}):
+            from gateway.session_recovery_custody import record_source_delivery_receipt
+            record_source_delivery_receipt(authority, admission_id, receipt)
+        return receipt
+
     held = _held_markers(authority).pop(admission_id, None)
     delivery = authority.pending_deliveries.get(admission_id)
     if delivery is not None and admission_id in authority.native_waiters:
-        # ``admit_message`` registered its delivery waiter after this turn started: the drain
-        # hands that waiter the reply and its adapter lifecycle sends it, so this send is not owed.
         authority.native_waiters.discard(admission_id)
         authority.pending_deliveries.pop(admission_id)
         adopter = _marker_adopters(authority).get(admission_id)
@@ -387,75 +714,435 @@ async def deliver_settled(authority, admission_id):
         delivery = None
     if delivery is None:
         if held is not None:
-            # Fenced unknown: no answer is owed, so no later boot may deliver one either.
             await _release_turn_marker(authority, held)
-        return
+        return record_i10(DeliveryReceipt(
+            admission_id, attempted=False, delivered=False, reason="no_delivery", effect_state="none",
+        ))
     adapter, event, session_key, response, home = delivery
+    managed = bool(getattr(authority, '_preservation_has_sidecar', lambda _id: False)(admission_id))
+    managed = managed or admission_id in getattr(authority, '_i10_recovery_bindings', {})
+    failed = False
+    effect_state = "ambiguous"
     try:
         with await _execution_scope(authority, home):
-            await deliver_response(adapter, event, session_key, response)
+            effect_state = await deliver_response(adapter, event, session_key, response)
+        if effect_state == "ambiguous":
+            failed = True
+            if managed:
+                _held_markers(authority)[admission_id] = held or event
+                authority._preservation_mark_unknown(admission_id, 'delivery_ambiguous')
+            else:
+                logger.warning('Delivery of settled admission %s was ambiguous', admission_id)
+            return record_i10(DeliveryReceipt(
+                admission_id, attempted=True, delivered=False, reason="delivery_ambiguous",
+                effect_state="ambiguous",
+            ))
+    except DeliveryBoundaryError as exc:
+        failed = True
+        effect_state = exc.effect_state
+        reason = "delivery_failed" if effect_state == "none" else "delivery_ambiguous"
+        if managed:
+            # Preserve both the delivery row and the adopted marker for the exact retry.
+            _held_markers(authority)[admission_id] = held or event
+            authority._preservation_mark_unknown(admission_id, reason)
+        else:
+            logger.exception('Delivery of settled admission %s failed', admission_id)
+        return record_i10(DeliveryReceipt(
+            admission_id, attempted=True, delivered=False, reason=reason, effect_state=effect_state,
+        ))
     except Exception:
-        logger.exception('Delivery of settled admission %s failed', admission_id)
+        failed = True
+        # An exception outside the source-owned pre-effect stage may have reached the platform.
+        # It is therefore sticky ambiguous custody, never the one safe resend case.
+        if managed:
+            _held_markers(authority)[admission_id] = held or event
+            authority._preservation_mark_unknown(admission_id, 'delivery_ambiguous')
+        else:
+            logger.exception('Delivery of settled admission %s failed', admission_id)
+        return record_i10(DeliveryReceipt(
+            admission_id, attempted=True, delivered=False, reason="delivery_ambiguous",
+            effect_state="ambiguous",
+        ))
     finally:
-        # Held until the send returns: an empty map means every settled reply was handed over.
-        authority.pending_deliveries.pop(admission_id, None)
-        # The ledgered send already released the marker; an empty or failed send owes no more.
-        await _release_turn_marker(authority, event)
+        if not (managed and failed):
+            authority.pending_deliveries.pop(admission_id, None)
+            await _release_turn_marker(authority, event)
+        # The authority path does not run BasePlatformAdapter's background finally.  Consume the
+        # callback here after the send/marker boundary, before the authority finalizer can release
+        # the original I06 operation.  A failed/ambiguous send still reaches the callback so its
+        # existing delivery-ledger/receipt failure path can retain UNKNOWN custody.
+        if adapter is not None and event is not None:
+            from gateway.session_classic_custody import handoff_classic_execution_receipt
+            handoff_classic_execution_receipt(
+                event, getattr(event, '_classic_terminal_event', None) or event,
+            )
+            from gateway.session_classic_delivery import fire_authority_post_delivery_callback
+            await fire_authority_post_delivery_callback(
+                authority, adapter, event, session_key, admission_id=admission_id,
+                delivery_event=event, delivery_state=effect_state, marker_event=event,
+            )
+    return record_i10(DeliveryReceipt(
+        admission_id, attempted=True, delivered=True, effect_state=effect_state,
+    ))
 
 
 async def deliver_response(adapter, event, session_key, response):
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
-    text, ttl = adapter._unwrap_ephemeral(response)
-    if not text:
-        return
-    extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
-    metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
-    results = []
-    if extracted.text_content:
-        await adapter._send_final_text(event, session_key, extracted.text_content,
-                                       metadata, ttl > 0, ttl, results.append)
-    await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
-                                       record_delivery=results.append)
+    try:
+        text, ttl = adapter._unwrap_ephemeral(response)
+        if not text:
+            return "none"
+        extracted = await adapter._extract_response_content(
+            text, event, session_key, is_ephemeral_response=ttl > 0,
+        )
+        metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
+        results = []
+        if extracted.text_content:
+            await adapter._send_final_text(event, session_key, extracted.text_content,
+                                           metadata, ttl > 0, ttl, results.append)
+        await adapter._deliver_attachments(event, extracted, metadata, anything_sent=bool(results),
+                                           record_delivery=results.append)
+    except DeliveryBoundaryError:
+        raise
+    except Exception as exc:
+        # A generic adapter exception does not prove that no outbound effect occurred. Only an
+        # explicit DeliveryBoundaryError from the source owner may authorize a pre-effect retry.
+        raise DeliveryBoundaryError("delivery_failed", effect_state="ambiguous") from exc
+    if not results:
+        return "none"
+    if all(getattr(result, "success", False) for result in results):
+        return "delivered"
+    # A false SendResult does not prove no platform effect; the ledger/adapter owns that boundary.
+    return "ambiguous"
 
 
-async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
+def _preservation_entries(authority, admission_id):
+    return [
+        entry for entry in authority._preservation_sidecars.values()
+        if entry['admission_id'] == admission_id
+    ]
+
+
+def preservation_delivery_outcome(authority, admission_id):
+    """Finish one exact service delivery and retain the original typed failure reason."""
+    entries = _preservation_entries(authority, admission_id)
+    for entry in entries:
+        if entry['terminal']:
+            continue
+        if not entry['result_durable']:
+            authority._preservation_mark_unknown(admission_id, 'delivery_before_durable_result')
+            return 'delivery_before_durable_result'
+        try:
+            service = entry['service']
+            service.complete_delivery(service.binding, entry['request'])
+            # Shell-hook services are per-invocation roots with no persistent external
+            # producer parent.  Their exact physical/request tuple is staged at tool
+            # completion and must be closed only after the terminal admission fence above.
+            # Managed ACP/app-server services have an authenticated persistent parent and
+            # retain that root for the next admission; their owner closes it separately.
+            if getattr(service, 'external_parent', None) is None:
+                service.close()
+        except Exception as exc:
+            from gateway.runtime_service_custody import ServiceCustodyError
+            if isinstance(exc, ServiceCustodyError) and isinstance(exc.code, str) and exc.code:
+                reason = exc.code
+            else:
+                reason = 'delivery_finalize_unknown'
+            logger.warning(
+                'Sidecar delivery finalization retained for %s: %s', admission_id, reason, exc_info=True,
+            )
+            authority._preservation_mark_unknown(admission_id, reason)
+            return reason
+        entry['delivery_complete'] = True
+        entry['terminal'] = True
+    return 'complete'
+
+
+_RETRYABLE_PARENT_FINALIZER_REASONS = {
+    'external_parent_reconcile_failed',
+    'external_parent_retire_failed',
+    'external_parent_registry_retire_failed',
+}
+
+
+async def retry_preservation_delivery(authority, admission_id, reason, *, effect_state=None):
+    """Perform one exact retry, limited to a source-owned pre-effect send or typed finalizer."""
+    i10_binding = admission_id in getattr(authority, '_i10_recovery_bindings', {})
+    if i10_binding:
+        if reason != 'delivery_failed' or effect_state != 'none':
+            return None
+        if authority._preservation_delivery_retries.get(admission_id, 0) >= 1:
+            return None
+        from gateway.session_recovery_custody import begin_i10_retry, finish_i10_retry
+        if not begin_i10_retry(authority, admission_id, reason, effect_state):
+            authority._preservation_mark_unknown(admission_id, 'delivery_reconcile_failed')
+            return None
+        authority._preservation_delivery_retries[admission_id] = 1
+        retry_receipt = await deliver_settled(authority, admission_id)
+        if finish_i10_retry(authority, admission_id, retry_receipt, reason, effect_state):
+            return retry_receipt
+        authority._preservation_mark_unknown(admission_id, 'delivery_reconcile_failed')
+        return None
+    if not authority._preservation_has_sidecar(admission_id):
+        return None
+    if authority._preservation_delivery_retries.get(admission_id, 0) >= 1:
+        return None
+    entries = _preservation_entries(authority, admission_id)
+    if len(entries) != 1:
+        authority._preservation_mark_unknown(admission_id, 'delivery_reconcile_failed')
+        return None
+    entry = entries[0]
+    service = entry.get('service')
+    request = entry.get('request')
+    if service is None or request is None:
+        authority._preservation_mark_unknown(admission_id, 'delivery_reconcile_failed')
+        return None
+    if reason == 'delivery_failed' and effect_state == 'none':
+        from gateway.runtime_service_custody import ServiceCustodyError
+        try:
+            service.reconcile_delivery(service.binding, request)
+        except ServiceCustodyError:
+            authority._preservation_mark_unknown(admission_id, 'delivery_reconcile_failed')
+            return None
+        authority._preservation_delivery_retries[admission_id] = 1
+        return await deliver_settled(authority, admission_id)
+    if (
+        reason == 'delivery_finalize_failed'
+        or reason in _RETRYABLE_PARENT_FINALIZER_REASONS
+    ) and entry.get('result_durable') is True:
+        authority._preservation_delivery_retries[admission_id] = 1
+        return preservation_delivery_outcome(authority, admission_id)
+    return None
+
+
+async def _retry_pre_effect_delivery_once(
+    authority, admission_id, delivery_receipt, has_sidecar, transport_delivered,
+):
+    if (
+        not has_sidecar
+        or not isinstance(delivery_receipt, DeliveryReceipt)
+        or delivery_receipt.admission_id != admission_id
+        or delivery_receipt.attempted is not True
+        or delivery_receipt.delivered is not False
+        or delivery_receipt.reason != 'delivery_failed'
+        or delivery_receipt.effect_state != 'none'
+    ):
+        return False, delivery_receipt
+    retry_receipt = await retry_preservation_delivery(
+        authority, admission_id, delivery_receipt.reason,
+        effect_state=delivery_receipt.effect_state,
+    )
+    if retry_receipt is not None and transport_delivered(retry_receipt):
+        return True, retry_receipt
+    return True, delivery_receipt
+
+
+async def _finish_preservation_sidecar_delivery(
+    authority, admission_id, delivery_receipt, physical_delivery,
+    automation_binding, pre_effect_retry_attempted, waiter_delivered,
+    transport_delivered,
+):
+    """Run the sidecar finalizer and its one bounded delivery retry."""
+    from gateway.platforms.api_server_run_completion import can_stage_api_sidecar_delivery
+    api_result_pending = (
+        not automation_binding
+        and can_stage_api_sidecar_delivery(authority, admission_id, delivery_receipt)
+    )
+    finalizer_outcome = None
+    if (physical_delivery or (not automation_binding and (
+            getattr(delivery_receipt, 'delivered', False) or waiter_delivered or api_result_pending))):
+        finalizer_outcome = preservation_delivery_outcome(authority, admission_id)
+        if finalizer_outcome == 'delivery_finalize_failed':
+            retried = await retry_preservation_delivery(
+                authority, admission_id, finalizer_outcome, effect_state='ambiguous',
+            )
+            if transport_delivered(retried):
+                delivery_receipt = retried
+                physical_delivery = True
+                finalizer_outcome = preservation_delivery_outcome(authority, admission_id)
+            elif isinstance(retried, str):
+                finalizer_outcome = retried
+            else:
+                finalizer_outcome = None
+    elif (not pre_effect_retry_attempted
+          and getattr(delivery_receipt, 'reason', None) == 'delivery_failed'):
+        retry_receipt = await retry_preservation_delivery(
+            authority, admission_id, delivery_receipt.reason,
+            effect_state=getattr(delivery_receipt, 'effect_state', None),
+        )
+        if retry_receipt is not None and transport_delivered(retry_receipt):
+            delivery_receipt = retry_receipt
+            physical_delivery = True
+            finalizer_outcome = preservation_delivery_outcome(authority, admission_id)
+    return delivery_receipt, physical_delivery, finalizer_outcome
+
+
+async def _finish_preservation_delivery_impl(authority, admission_id, delivery_receipt, waiter_delivered):
+    """Apply the delivery/finalizer fences and hold FIFO successors until terminal custody."""
+    from gateway.session_classic_delivery import (
+        CLASSIC_CALLBACK_NOT_REQUIRED,
+        CLASSIC_CALLBACK_UNKNOWN,
+        classic_callback_requirement,
+        wait_for_classic_post_delivery_callback,
+    )
+    from gateway.session_automation_custody import _AUTOMATION_OWNER_CLASSES
+    from gateway.platforms.api_server_run_completion import stage_api_finalizer_delivery, completion_for
+    completion = completion_for(authority, admission_id)
+
+    has_sidecar = authority._preservation_has_sidecar(admission_id)
+    i10_binding = admission_id in getattr(authority, '_i10_recovery_bindings', {})
+
+    def transport_delivered(receipt):
+        return (
+            isinstance(receipt, DeliveryReceipt)
+            and receipt.admission_id == admission_id
+            and receipt.attempted is True
+            and receipt.delivered is True
+            and receipt.reason is None
+            and receipt.effect_state == 'delivered'
+        )
+
+    pre_effect_retry_attempted, delivery_receipt = await _retry_pre_effect_delivery_once(
+        authority, admission_id, delivery_receipt, has_sidecar, transport_delivered,
+    )
+    physical_delivery = transport_delivered(delivery_receipt)
+
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+    automation_binding = (
+        isinstance(binding, dict)
+        and getattr(binding.get('handle'), 'owner_class', None) in _AUTOMATION_OWNER_CLASSES
+    )
+    i10_pre_effect_failure = (
+        i10_binding
+        and isinstance(delivery_receipt, DeliveryReceipt)
+        and delivery_receipt.admission_id == admission_id
+        and delivery_receipt.attempted is True
+        and delivery_receipt.delivered is False
+        and delivery_receipt.reason == 'delivery_failed'
+        and delivery_receipt.effect_state == 'none'
+    )
+
+    callback_requirement = None
+    if i10_pre_effect_failure:
+        # A concrete classic adopter/bridge remains an unresolved delivery obligation.  The
+        # recovery watcher alone is the I10 retry fence and must not block its one safe resend;
+        # the full callback classifier runs again after that resend and retains UNKNOWN then.
+        from gateway.session_classic_delivery import _callback_classic_marker_signal
+        marker_adopters = getattr(authority, 'marker_adopters', None)
+        marker = marker_adopters.get(admission_id) if isinstance(marker_adopters, dict) else None
+        if marker is not None and _callback_classic_marker_signal(authority, admission_id):
+            return False
+    elif not automation_binding:
+        callback_requirement = classic_callback_requirement(
+            authority, admission_id, delivery_receipt=delivery_receipt,
+        )
+        if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
+            return False
+
+    if not has_sidecar:
+        if i10_binding and completion is None:
+            from gateway.session_recovery_custody import finish_no_sidecar_delivery
+            return await finish_no_sidecar_delivery(
+                authority, admission_id, delivery_receipt, waiter_delivered,
+                automation_binding=automation_binding,
+                callback_requirement=callback_requirement,
+            )
+        if automation_binding:
+            # A live waiter is an API completion, not a source transport receipt.  Automation roots
+            # release only after the typed receipt reached this exact admission's transport path.
+            if not authority._preservation_accept_automation_direct_delivery(
+                    admission_id, delivery_receipt,
+                    physical_delivery=physical_delivery, waiter_delivered=waiter_delivered):
+                return False
+            callback_requirement = classic_callback_requirement(authority, admission_id)
+            if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
+                return False
+        if (callback_requirement != CLASSIC_CALLBACK_NOT_REQUIRED
+                and not await wait_for_classic_post_delivery_callback(authority, admission_id)):
+            return False
+        if completion is not None:
+            return stage_api_finalizer_delivery(
+                authority, admission_id,
+                delivery_receipt=delivery_receipt,
+                waiter_delivered=waiter_delivered,
+                finalizer_ok=True,
+            )
+        authority._preservation_release_terminal(admission_id)
+        return True
+
+    delivery_receipt, physical_delivery, finalizer_outcome = (
+        await _finish_preservation_sidecar_delivery(
+            authority, admission_id, delivery_receipt, physical_delivery,
+            automation_binding, pre_effect_retry_attempted, waiter_delivered,
+            transport_delivered,
+        )
+    )
+    if automation_binding:
+        if not physical_delivery or not authority._preservation_record_automation_terminal_witness(
+                admission_id, delivery_receipt=delivery_receipt,
+                waiter_delivered=waiter_delivered, finalizer_outcome=finalizer_outcome):
+            return False
+        callback_requirement = classic_callback_requirement(authority, admission_id)
+        if callback_requirement == CLASSIC_CALLBACK_UNKNOWN:
+            return False
+    if pre_effect_retry_attempted and not physical_delivery:
+        return False
+    finalizer_ok = finalizer_outcome == 'complete'
+    if completion is not None:
+        return stage_api_finalizer_delivery(
+            authority, admission_id,
+            delivery_receipt=delivery_receipt,
+            waiter_delivered=waiter_delivered,
+            finalizer_ok=finalizer_ok,
+            reason=finalizer_outcome,
+        )
+    authority._preservation_release_terminal(admission_id)
+    return finalizer_ok
+
+
+async def finish_preservation_delivery(authority, admission_id, delivery_receipt, waiter_delivered):
+    """Stage API finalization before its waiter, retaining UNKNOWN on any finalizer error."""
+    from gateway.platforms.api_server_run_completion import (
+        api_i02_completion_required, completion_for, fail_api_finalizer_completion,
+    )
+    completion = completion_for(authority, admission_id)
+    api_required = completion is not None or api_i02_completion_required(authority, admission_id)
+    if api_required and completion is None:
+        authority._preservation_mark_unknown(admission_id, 'finalizer_completion_registry_missing')
+        return False
+    try:
+        result = await _finish_preservation_delivery_impl(
+            authority, admission_id, delivery_receipt, waiter_delivered,
+        )
+    except BaseException:
+        if completion is not None:
+            fail_api_finalizer_completion(authority, admission_id, 'api_finalizer_error')
+        raise
+    if not result and completion is not None and completion.receipt is None:
+        fail_api_finalizer_completion(authority, admission_id, 'api_finalizer_refused')
+    return result
+
+
+async def dispatch_shared_busy(adapter, event, session_key, *, durable=False, preservation=None):
     """Serial receive loops (IRC, Signal) await this before reading their next frame, so return
-    once the follow-up is committed to the FIFO, or queued behind an earlier input of its chat still
-    capturing (its position is then fixed; acceptance still waits for the commit); a tracked
-    observer delivers its one reply. *durable*: return only once the row is committed (or the input
-    was refused, fenced or answered), never on the earlier position release: a busy burst's commit
-    task, which a command barrier (``/restart`` closing admission) waits on. Otherwise an input
-    released before its commit is held until it commits or its handler ends, and a serial reader's
-    next command waits for that too (``burst_gate``): a non-burst busy input (a second video, a voice
-    note, text outside queue mode) has no burst commit task to wait on."""
-    delivery_event = replace(event, source=replace(event.source))
+    once the follow-up is committed to the FIFO; a tracked observer delivers its one reply."""
     accepted = asyncio.get_running_loop().create_future()
     committed = asyncio.get_running_loop().create_future()
-
-    async def observe():
-        # Like the first message's lifecycle, this sender adopts the turn's crash marker and
-        # releases it only once the reply is ledgered (the marker moves onto ``event``).
-        event._turn_marker_handoff = getattr(adapter, 'gateway_runner', None) is not None
-        try:
-            response = await adapter._message_handler(event)
-            # The ledgered send releases the marker off the event it sends.
-            _move_marker(event, delivery_event)
-            delivery_event._turn_marker_handoff = event._turn_marker_handoff
-            await deliver_response(adapter, delivery_event, session_key, response)
-        except Exception as exc:
-            if not accepted.done():
-                raise  # nothing was queued: the receive loop sees the failure as before
-            logger.error('[%s] Queued busy follow-up failed: %s', adapter.name, exc, exc_info=True)
-            await adapter._notify_turn_error(delivery_event, exc)
-        finally:
-            # Clears the marker if no ledgered send did, then wakes the drain's bounded wait,
-            # which listens on the adopter (``event``).
-            await adapter._release_turn_marker(delivery_event)
-            await adapter._release_turn_marker(event)
+    authority, preservation_key = preservation or begin_busy_preservation(adapter, event, session_key)
+    delivery_event = replace(event, source=replace(event.source))
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:
-        task = asyncio.create_task(observe())
+        try:
+            from gateway.session_ingress_busy import observe_shared_busy
+            task = asyncio.create_task(observe_shared_busy(
+                adapter, event, delivery_event, session_key, authority, preservation_key,
+                accepted, finish_busy_preservation,
+            ))
+        except Exception:  # health: allow BLE001 -- observer creation failure releases only unaccepted custody
+            finish_busy_preservation(authority, preservation_key, False)
+            raise
     finally:
         busy_acceptance.reset(token)
         busy_commit.reset(commit_token)
@@ -468,6 +1155,10 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
     except asyncio.CancelledError:
         if not accepted.done():
             task.cancel()  # cancelled before commit: the input was never ACKed
+            finish_busy_preservation(authority, preservation_key, False)
+        # After the acceptance future resolves, the observer owns the exact lease until its
+        # delivery/marker cleanup. Cancelling this caller must not turn a still-running observer
+        # into an unknown operation that can never reach its natural terminal callback.
         raise
     if task.done():
         task.result()  # refused, consumed or answered inline before any durable acceptance

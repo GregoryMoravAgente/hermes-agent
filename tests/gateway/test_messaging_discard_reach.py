@@ -37,6 +37,7 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import claim_session_input, get_session_admission
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from tests.gateway.test_command_bypass_active_session import _StubAdapter
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -57,6 +58,7 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
     register_transport_home(runner, None, tmp_path)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     first = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='old')
+    bind_authority_runtime_custody(runner, first)
     first._schedule = lambda ref: None
     previous = first.register(source).session_id
     first.db.append_message(previous, 'user', 'older conversation')
@@ -71,10 +73,12 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
         # A restart fences the turn unknown; /resume moves away, a second restart, /resume back:
         # the historical conversation is the chat's route again but not in the owner's live map.
         recovered = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='mid')
+        bind_authority_runtime_custody(runner, recovered)
         recovered._schedule = lambda ref: None
         await recover_profile_native_sessions(runner, recovered)
         await runner._handle_message(MessageEvent(text='/resume ' + previous, source=source, message_id='away'))
         second = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='third')
+        bind_authority_runtime_custody(runner, second)
         second._schedule = lambda ref: None
         await recover_profile_native_sessions(runner, second)
         await runner._handle_message(MessageEvent(text='/resume ' + sid, source=source, message_id='back'))

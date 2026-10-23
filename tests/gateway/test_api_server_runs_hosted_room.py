@@ -24,8 +24,11 @@ from tools import approval_gateway_wait
 
 
 @pytest.fixture
-def auth_adapter():
-    return _make_adapter(api_key="sk-secret")
+def auth_adapter(monkeypatch):
+    # The API run custody boundary now opens a real ProcessRegistry scope before the hosted
+    # worker starts. Bind the fixture's real registry to its coordinator so this canonical
+    # in-process path exercises the same source-owned I15 proof as the managed fixture.
+    return _make_adapter(api_key="sk-secret", monkeypatch=monkeypatch)
 
 
 class TestHostedRoomRuns:

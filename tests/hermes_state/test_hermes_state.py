@@ -116,6 +116,10 @@ def _no_fts_rebuild_throttle(monkeypatch):
     monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
 
 
+@pytest.fixture()
+def _fast_auto_maintenance_holder_probe(monkeypatch):
+    monkeypatch.setattr(hermes_state._state_holders, "foreign_state_db_holders", lambda _path: [])
+
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -2044,12 +2048,10 @@ class TestAsyncDelegationsSchemaAgreement:
 
         from hermes_state_common import SCHEMA_SQL
 
-        legacy_sql = SCHEMA_SQL.replace(
-            "    origin_session_id TEXT NOT NULL DEFAULT ''\n", ""
-        ).replace(
-            "    delivery_claimed_at REAL,\n",
-            "    delivery_claimed_at REAL\n",
-        )
+        legacy_sql = (SCHEMA_SQL
+            .replace("    origin_session_id TEXT NOT NULL DEFAULT '',\n", "")
+            .replace("    execution_json TEXT\n", "")
+            .replace("    delivery_claimed_at REAL,\n", "    delivery_claimed_at REAL\n"))
         conn = sqlite3.connect(db_path)
         try:
             conn.executescript(legacy_sql)
@@ -3633,8 +3635,7 @@ class TestStateMeta:
         db.set_meta("foo", "bar")
         assert db.get_meta("foo") == "bar"
 
-
-
+@pytest.mark.usefixtures("_fast_auto_maintenance_holder_probe")
 class TestVacuum:
 
     def test_auto_maintenance_records_successful_vacuum(self, db, monkeypatch):
@@ -3835,9 +3836,6 @@ class TestVacuum:
 
 class TestOptimizeFts:
 
-
-
-
     def test_incremental_merge_bounded_commands_per_present_index(self, db):
         """Each pass issues bounded 'merge' commands, never 'optimize'."""
         db.create_session(session_id="s1", source="cli")
@@ -3897,8 +3895,7 @@ class TestOptimizeFts:
         assert calls == [500, 500]  # The tenth write is the next boundary.
         assert len(db.search_messages("needle")) == 9
 
-
-
+@pytest.mark.usefixtures("_fast_auto_maintenance_holder_probe")
 class TestAutoMaintenance:
     def _make_old_ended(self, db, sid: str, days_old: int = 100):
         """Create a session that is ended and was started `days_old` days ago."""

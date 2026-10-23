@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
+import sqlite3
 import threading
 import time
 from collections import Counter
@@ -423,6 +425,120 @@ class HostedRoomService:
                 "discussion_event_id": decision.discussion_event_id},
             authority_gateway_id=gateway_id, authority_epoch=epoch)
 
+    def _preservation_start_room_input(self, *, room_id, event_id, gateway_id, epoch):
+        """Reserve the hosted input before validation or any room-store write."""
+        authority = getattr(self, 'authority', None)
+        start = getattr(authority, '_preservation_room_input_start', None)
+        if not callable(start):
+            return None, None
+        return start(
+            room_id=room_id, event_id=event_id, gateway_id=gateway_id,
+            authority_epoch=epoch,
+        )
+
+    def _room_input_event(self, *, room_id, event_id, gateway_id, epoch):
+        """Read back the exact user event that owns a hosted input operation."""
+        try:
+            room = self._room(room_id)
+            events = self._events(room_id)
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error,
+                hosted_rooms.HostedRoomError):
+            return None
+        if room.get('authority_gateway_id') != gateway_id:
+            return None
+        for event in events:
+            if (
+                event.get('event_id') == event_id
+                and event.get('room_id') == room_id
+                and event.get('kind') == 'message.user'
+                and event.get('authority_epoch') == epoch
+                and event.get('actor') == {'kind': 'user', 'id': 'desktop'}
+            ):
+                return event
+        return None
+
+    def _room_input_complete(self, *, room_id, event_id, gateway_id, epoch) -> bool:
+        """Return true only after the input has a durable task publication or no-task decision."""
+        event = self._room_input_event(
+            room_id=room_id, event_id=event_id, gateway_id=gateway_id, epoch=epoch)
+        if event is None:
+            return False
+        tasks = [
+            task for task in driver.list_tasks(self.db_path, room_id=room_id)
+            if task.get('payload', {}).get('source_event_seq') == event.get('seq')
+        ]
+        if len(tasks) > 1:
+            return False
+        if tasks:
+            task = tasks[0]
+            status = task.get('status')
+            if status not in driver.TERMINAL_STATUSES:
+                return False
+            return self.policy_checkpoint.publication_exists(
+                room_id=room_id, task_id=task['identity'].task_id, status=status,
+                execution_generation=int(task.get('execution_generation') or 0),
+            )
+        return any(
+            candidate.get('kind') == 'room.activity'
+            and candidate.get('authority_epoch') == epoch
+            and candidate.get('payload', {}).get('discussion_event_id') == event_id
+            and candidate.get('payload', {}).get('status') in {'settled', 'bounded'}
+            for candidate in self._events(room_id)
+        )
+
+    def _reconcile_room_input_operations(self, room_id: str) -> None:
+        """Retire exact room-input handles only after durable task/publication readback."""
+        authority = getattr(self, 'authority', None)
+        records = getattr(authority, '_preservation_operations', None)
+        terminal = getattr(authority, '_preservation_room_input_terminal', None)
+        retry = getattr(authority, '_preservation_operation_retry_without_admission', None)
+        if not isinstance(records, dict) or not callable(terminal):
+            return
+        for key, record in tuple(records.items()):
+            if (
+                not isinstance(record, dict)
+                or record.get('owner_class') != 'I09_a2a_hosted_kanban'
+                or record.get('operation') != 'hosted-room-input'
+            ):
+                continue
+            try:
+                identity = json.loads(record.get('source_identity', ''))
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(identity, dict) or identity.get('room_id') != room_id:
+                continue
+            event_id = identity.get('event_id')
+            gateway_id, epoch = identity.get('gateway_id'), identity.get('authority_epoch')
+            if not isinstance(event_id, str) or not isinstance(gateway_id, str) or type(epoch) is not int:
+                continue
+            if record.get('unknown') and callable(retry):
+                try:
+                    retry(
+                        key, owner_class='I09_a2a_hosted_kanban', principal_id='desktop',
+                        session_id=f'room:{room_id}', operation='hosted-room-input',
+                        request_id=event_id, source_identity=record['source_identity'],
+                    )
+                except (RuntimeStoreError, OSError, TypeError, ValueError):
+                    continue
+            try:
+                complete = self._room_input_complete(
+                    room_id=room_id, event_id=event_id, gateway_id=gateway_id, epoch=epoch)
+            except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error,
+                    hosted_rooms.HostedRoomError):
+                authority._preservation_operation_unknown(key, 'read_failed')
+                continue
+            if not complete:
+                continue
+            try:
+                terminal(
+                    key, room_id=room_id, event_id=event_id,
+                    source_identity=record['source_identity'],
+                    finalizer_id=f'hosted-room:{room_id}:{event_id}',
+                )
+            except (RuntimeStoreError, OSError, TypeError, ValueError, sqlite3.Error):
+                # A failed exact terminalizer leaves the canonical handle UNKNOWN for retry.
+                continue
+
     def prepare_room(self, binding: HostedRoomBinding) -> None:
         with self._policy_lock:
             room = self._room(binding.room_id)
@@ -435,6 +551,7 @@ class HostedRoomService:
             if changed:
                 room = self._room(binding.room_id)
                 snapshot = self._policy_snapshot(room)
+            self._reconcile_room_input_operations(binding.room_id)
             self.policy_checkpoint.compact_completed(room_id=binding.room_id)
             driver.prune_published_terminal_tasks(
                 self.db_path, room_id=binding.room_id, clock=self.runtime.clock)
@@ -475,6 +592,9 @@ class HostedRoomService:
         self.runtime.wakeup()
 
     def create_room(self, *, room_id: str, name: str, members: Any, admit: Any = None) -> dict[str, Any]:
+        gate = getattr(getattr(self, 'authority', None), '_require_fresh_admission_open', None)
+        if callable(gate):
+            gate()
         normalized = discussion.validate_roster(members, local_profiles=self.local_profiles())
         room = hosted_rooms.create_room(
             self.db_path, room_id=room_id, name=name,
@@ -489,16 +609,39 @@ class HostedRoomService:
         return room
 
     def send(self, *, room_id: str, event_id: str, payload: Any) -> dict[str, Any]:
-        normalized = discussion.validate_user_payload(payload)
+        gate = getattr(getattr(self, 'authority', None), '_require_fresh_admission_open', None)
+        if callable(gate):
+            gate()
         gateway_id, epoch = self._owned_authority(room_id)
+        operation_key, _source_identity = self._preservation_start_room_input(
+            room_id=room_id, event_id=event_id, gateway_id=gateway_id, epoch=epoch)
+        try:
+            normalized = discussion.validate_user_payload(payload)
+        except discussion.DiscussionValidationError:
+            if operation_key is not None:
+                self.authority._preservation_operation_release_unaccepted(operation_key)
+            raise
         from gateway.session_hosted_attachments import append_user_event
-        event = append_user_event(
-            self, room_id=room_id, event_id=event_id, payload=normalized,
-            gateway_id=gateway_id, epoch=epoch)
+        try:
+            event = append_user_event(
+                self, room_id=room_id, event_id=event_id, payload=normalized,
+                gateway_id=gateway_id, epoch=epoch)
+        except BaseException:
+            if operation_key is not None and self._room_input_event(
+                    room_id=room_id, event_id=event_id, gateway_id=gateway_id, epoch=epoch) is None:
+                self.authority._preservation_operation_unknown(operation_key, 'read_failed')
+            raise
         binding = next((b for b in self.bindings() if b.room_id == room_id), None)
         if binding is None:
+            if operation_key is not None:
+                self.authority._preservation_operation_unknown(operation_key, 'read_failed')
             raise hosted_rooms.RoomNotFoundError("hosted room not found")
-        self.prepare_room(binding)
+        try:
+            self.prepare_room(binding)
+        except BaseException:
+            if operation_key is not None:
+                self.authority._preservation_operation_unknown(operation_key, 'join_failed')
+            raise
         self.runtime.wakeup()
         return event
 

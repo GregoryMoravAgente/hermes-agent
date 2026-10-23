@@ -12,6 +12,7 @@ def mount_authority(app, adapter):
         from gateway.session_authority import initialize_session_authority
         from gateway.session import SessionStore
         from hermes_constants import get_hermes_home
+        from tests.gateway.conftest import bind_authority_runtime_custody
         runner = GatewayRunner()
         # Route tests mount ONE default-profile authority with no profile reservation; a profiles/
         # directory in the test home must not flip the runner into (unreserved) multiplex mode.
@@ -21,14 +22,15 @@ def mount_authority(app, adapter):
         runner.session_store._db = SessionDB(db_path=get_hermes_home() / "state.db")
         runner._session_db = runner.session_store._db
         authority = await initialize_session_authority(runner, profile_id='default', instance_id='route-test')
+        bind_authority_runtime_custody(runner, authority)
         runner.adapters[Platform.WEBHOOK] = adapter
         runner._wire_adapter_handlers(adapter)
         # These tests inspect routing/rendering, not inference. Leave the actual
         # committed FIFO untouched; execution is covered by test_webhook_authority.
         authority._schedule = lambda ref: None
         original = authority.admit_native
-        async def capture(event):
-            receipt = await original(event)
+        async def capture(event, **kwargs):
+            receipt = await original(event, **kwargs)
             observer = adapter.__dict__.get('handle_message')
             if observer is not None:
                 await observer(event)

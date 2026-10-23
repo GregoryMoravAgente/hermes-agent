@@ -183,7 +183,7 @@ def install(args) -> None:
 
 
 def dependencies(args) -> None:
-    if args.extras is None and not args.test_environment:
+    if args.extras is None and not args.test_environment and not getattr(args, "checkout_environment", False):
         return
     import tomllib
 
@@ -200,12 +200,33 @@ def dependencies(args) -> None:
         raise ValueError(f"unknown project extras: {sorted(unknown)}")
     # Frozen sync must not turn a stale project lock into a green job.
     check_project_lock(project, explicit=True)
+    checkout_venv = None
+    if getattr(args, "checkout_environment", False):
+        # The regular test runner deliberately gives every pytest process a fresh
+        # HERMES_HOME.  A real checkout environment is therefore the only
+        # source-owned fallback the POSIX cron selector can observe there.  Build
+        # it through PM with the project installed; do not manufacture facts or
+        # link a side/test environment into the checkout.
+        from pm import build_environment
+
+        checkout_venv = project / ".venv"
+        build_environment(
+            source=project,
+            out=checkout_venv,
+            python=Path(sys.executable),
+            extras=extras,
+            groups=("dev", "test"),
+            explicit=True,
+        )
     if args.test_environment:
         from pm.testenv import ensure_testenv
 
         # CI and activation select the same side environment, never PM facts.
         python = ensure_testenv(project, extras)
         venv = python.parent.parent
+    elif checkout_venv is not None:
+        python = checkout_venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        venv = checkout_venv
     else:
         sync_venv(extras, explicit=True, plugins=Members([]))
         venv = selected_venv(project)
@@ -230,9 +251,16 @@ def main() -> None:
     parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("--extras", type=parse_extras, default="")
     parser.add_argument("--test-environment", action="store_true")
+    parser.add_argument(
+        "--checkout-environment",
+        action="store_true",
+        help="build a real project environment at checkout/.venv before any side test environment",
+    )
     parser.add_argument("--packages", type=parse_package_list, default=[], help="extra PM tools beyond the toolchain roots (e.g. ffmpeg)")
     args = parser.parse_args()
-    if args.toolchain == "node" and (args.extras is not None or args.test_environment):
+    if args.toolchain == "node" and (
+        args.extras is not None or args.test_environment or args.checkout_environment
+    ):
         parser.error("Python dependencies require the python or all toolchain")
     os.environ["HERMES_HOME"] = str(args.home.resolve())
     os.environ["HERMES_RUNTIME_DIR"] = str(args.home.resolve() / "tools")

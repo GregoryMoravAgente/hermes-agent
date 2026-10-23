@@ -54,6 +54,8 @@ async def probe(peer, target):
     from gateway.run import GatewayRunner
     from gateway.session import SessionSource
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_cli import web_server
     from gateway.run_api import start_gateway_api, stop_gateway_api
     from tools.approval import list_gateway_approvals, resolve_gateway_approval
@@ -82,10 +84,37 @@ async def probe(peer, target):
 
     runner = GatewayRunner()
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='controls')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch,
+        fence=RetirementFence())
     adapter = NativeAdapter()
     runner.adapters[Platform.TELEGRAM] = adapter
     ref = authority.register(SessionSource(platform=Platform.TELEGRAM, chat_id='controls-chat',
                                            chat_type='dm', user_id='fixture-user'))
+    original_submit = authority.submit
+
+    async def submit_with_fixture_custody(actor, request, **kwargs):
+        handle = authority._preservation_root('I02_api_session_turn',
+                                               f'fixture:{request.request_id}')
+        authority._preservation_pending_root(
+            request.request_id, handle, principal_id=actor.subject,
+            session_id=request.ref.session_id, source_identity='interactive_fixture')
+        callback = kwargs.pop('_on_committed', None)
+
+        def on_committed(row):
+            authority._preservation_bind_or_release(row, handle)
+            if callback is not None:
+                callback(row)
+
+        try:
+            return await original_submit(actor, request, _on_committed=on_committed, **kwargs)
+        except BaseException:
+            authority._preservation_reconcile_failed(
+                handle, session_id=request.ref.session_id,
+                principal_id=actor.subject, request_id=request.request_id)
+            raise
+
+    authority.submit = submit_with_fixture_custody
     api = await start_gateway_api(runner)
     port = api.socket.getsockname()[1]
     frames = []

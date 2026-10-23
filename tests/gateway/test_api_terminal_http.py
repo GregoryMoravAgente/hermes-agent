@@ -6,15 +6,14 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from gateway.config import PlatformConfig
-from gateway.platforms.api_server import APIServerAdapter
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('flag,status', [('failed', 'failed'), ('interrupted', 'cancelled')])
 @pytest.mark.parametrize('stream', [False, True])
-async def test_responses_terminal_result_is_not_success(flag, status, stream):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+async def test_responses_terminal_result_is_not_success(
+    flag, status, stream, runtime_owned_api_adapter
+):
+    adapter = runtime_owned_api_adapter
     adapter._run_agent = AsyncMock(return_value=({'final_response': 'diagnostic', flag: True,
                                                  'completed': False, 'messages': []}, {}))
     app = web.Application()
@@ -44,10 +43,12 @@ def test_chat_interruption_is_not_stop():
     ({'turn_exit_reason': 'max_iterations_reached(2/2)'}, 'length', 'iteration_budget_exhausted'),
     ({'interrupted': True}, 'cancelled', 'agent_error'),
 ])
-async def test_chat_budget_exhausted_turn_is_length_not_cancelled(stream, result, finish, code):
+async def test_chat_budget_exhausted_turn_is_length_not_cancelled(
+    stream, result, finish, code, runtime_owned_api_adapter
+):
     """A turn that ran out of iterations delivers its wrap-up as ``length`` with a distinct code; a
     broker reading "cancelled" (reserved for user interrupts) would discard a usable answer."""
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter = runtime_owned_api_adapter
     adapter._run_agent = AsyncMock(return_value=(
         {'final_response': 'wrap-up', 'completed': False, 'messages': [], **result}, {}))
     app = web.Application()
@@ -74,8 +75,10 @@ async def test_chat_budget_exhausted_turn_is_length_not_cancelled(stream, result
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('flag,status', [('failed', 'failed'), ('interrupted', 'cancelled')])
-async def test_session_chat_terminal_result_is_not_success(flag, status):
-    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+async def test_session_chat_terminal_result_is_not_success(
+    flag, status, runtime_owned_api_adapter
+):
+    adapter = runtime_owned_api_adapter
     adapter._prepare_session_chat = AsyncMock(return_value=({'gateway_session_key': None,
         'session_id': 'owned', 'run_kwargs': {}, 'runtime_request': {}, 'user_message': 'hello',
         'lock_active': False, 'body': {}}, None))

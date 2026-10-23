@@ -1,16 +1,15 @@
 """One Graph batch carrying the same no-id notification twice runs its durable job once."""
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 
-from gateway.config import GatewayConfig, Platform
+from gateway.config import Platform
 from plugins.teams_pipeline.pipeline import TeamsMeetingPipeline
 from plugins.teams_pipeline.store import TeamsPipelineStore
 
 
 @pytest.mark.anyio
-async def test_duplicate_no_id_notifications_in_one_batch_run_the_job_once(monkeypatch, tmp_path):
+async def test_duplicate_no_id_notifications_in_one_batch_run_the_job_once(monkeypatch, tmp_path, teams_gateway):
     from plugins.teams_pipeline import runtime as runtime_module
 
     class Adapter:
@@ -29,8 +28,10 @@ async def test_duplicate_no_id_notifications_in_one_batch_run_the_job_once(monke
     monkeypatch.setattr(pipeline, 'run_job', run_job)
     monkeypatch.setattr(runtime_module, 'build_pipeline_runtime', lambda gateway: pipeline)
     adapter = Adapter()
-    gateway = SimpleNamespace(adapters={Platform.MSGRAPH_WEBHOOK: adapter}, config=GatewayConfig(platforms={}),
-                              _teams_pipeline_runtime=None, _teams_pipeline_runtime_error=None)
+    gateway = teams_gateway
+    gateway.adapters[Platform.MSGRAPH_WEBHOOK] = adapter
+    gateway._teams_pipeline_runtime = None
+    gateway._teams_pipeline_runtime_error = None
     assert runtime_module.bind_gateway_runtime(gateway) is True
     notification = {'changeType': 'created', 'resource': 'communications/onlineMeetings/m1',
                     'resourceData': {'id': 'm1'}}  # Graph's notification ``id`` is optional

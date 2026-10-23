@@ -16,6 +16,7 @@ async def test_message_during_classic_wake_runs_after_it_not_inside_it(monkeypat
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
     from gateway.wake import deliver_wake
@@ -32,6 +33,7 @@ async def test_message_during_classic_wake_runs_after_it_not_inside_it(monkeypat
     adapter.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     key = runner.session_store._generate_session_key(source)
@@ -53,6 +55,11 @@ async def test_message_during_classic_wake_runs_after_it_not_inside_it(monkeypat
             captured['result'] = {'final_response': 'ok', 'messages': []}
         return 'ok'
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
+
+    # This test exercises the classic fallback slot after native wake admission declines.
+    async def no_native_wake(*args, **kwargs):
+        return False
+    monkeypatch.setattr('gateway.session_automation.admit_route_wake', no_native_wake)
 
     await runner._handle_reset_command(MessageEvent(text='/new', source=source))  # fresh route: no native row
     fallback = asyncio.create_task(deliver_wake(adapter, text=wake, source=source))

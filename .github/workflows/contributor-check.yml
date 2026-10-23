@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   check-attribution:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'ubuntu-24.04' || 'blacksmith-4vcpu-ubuntu-2404' }}
     timeout-minutes: 10
     outputs:
       review_status: ${{ steps.check-emails.outputs.review_status }}
@@ -29,12 +29,29 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          EVENT_NAME: "${{ github.event_name }}"
+          PR_BASE_SHA: "${{ github.event.pull_request.base.sha }}"
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          set -euo pipefail
+
+          # A PR's comparison base is the actual event payload SHA.  Reusable
+          # workflows retain the caller's event context; the non-PR path keeps
+          # the historical origin/main fallback for pushes and dispatches.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE_REF="$PR_BASE_SHA"
+          else
+            BASE_REF="origin/main"
+          fi
+
+          if ! BASE_SHA=$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null); then
+            echo "::error::Unknown contributor attribution base ref: ${BASE_REF}" >&2
+            exit 1
+          fi
+          echo "Contributor attribution base: ${BASE_REF} (${BASE_SHA})"
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${BASE_SHA}..HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

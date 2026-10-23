@@ -144,6 +144,61 @@ def _owner_secret_scope():
         reset_secret_scope(token)
 
 
+def _prepare_i16_source_owner(server_name: str):
+    """Reserve a served-profile MCP parent before the SDK can spawn its stdio child.
+
+    Standalone discovery has no served SessionAuthority and keeps the existing direct
+    transport path.  Once a live authority is present, resolving its profile/lock is a
+    prerequisite; failure must not fall through to an unowned child.
+    """
+    from gateway.run import _gateway_runner_ref
+    runner = _gateway_runner_ref() if callable(_gateway_runner_ref) else None
+    if runner is None:
+        return None
+    from gateway.session_authorities import active_authority, authority_for_home
+    home = _owner_scope_home()
+    authority = authority_for_home(runner, home) if home is not None else active_authority(runner)
+    if authority is None:
+        return None
+    if home is None:
+        home = Path(authority.profile_id)
+    from gateway.runtime_sidecar_sources import reserve_profile_sidecar
+    return reserve_profile_sidecar(
+        runner,
+        profile_home=Path(home),
+        family="mcp_stdio",
+        source_identity=server_name,
+        producer_key="mcp",
+    )
+
+
+def _prepare_i16_remote_source_owner(server_name: str, config: dict):
+    """Reserve the profile-owned remote parent before an HTTP/SSE SDK ingress."""
+    from gateway.run import _gateway_runner_ref
+    runner = _gateway_runner_ref() if callable(_gateway_runner_ref) else None
+    if runner is None:
+        return None
+    from gateway.runtime_sidecar_factory import factory_for_authority, factory_for_runner
+    from gateway.session_authorities import active_authority, authority_for_home
+    home = _owner_scope_home()
+    if home is None:
+        authority = active_authority(runner)
+        factory = None if authority is None else factory_for_authority(authority)
+    else:
+        authority = authority_for_home(runner, home)
+        factory = factory_for_runner(runner, home)
+    if factory is None:
+        # A served profile must have installed its factory during authority
+        # bootstrap; do not let a remote SDK connection become unowned.
+        # A legacy/direct runner without a SessionAuthorities registry keeps
+        # the existing standalone transport path.
+        if authority is None and getattr(runner, "session_authorities", None) is None:
+            return None
+        from gateway.runtime_sidecar_remote import RemoteSourceError
+        raise RemoteSourceError("mcp_factory_unregistered")
+    return factory.reserve(server_name, config)
+
+
 async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
     """Create an MCPServerTask, start it, return once ready (tear down with ``server.shutdown()``
     on the same loop). Raises on bad config, missing HTTP support or connect failure."""
@@ -160,10 +215,33 @@ async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
         # owner's fresh scope so a ref left literal before its secret source answered resolves
         # now, and refuse to send one that still does not.
         config = _config._require_rendered_remote(name, _config._interpolate_env_vars(config))
+        # Reserve the exact profile parent before either source can enter the
+        # SDK.  Stdio keeps the R2 process receipt; HTTP/SSE uses the registered
+        # remote factory and binds its real transport/session in _serve_transport.
+        server._i16_source_owner = (
+            _prepare_i16_remote_source_owner(name, config)
+            if "url" in config else _prepare_i16_source_owner(name)
+        )
         await server.start(config)
+        source_owner = getattr(server, "_i16_source_owner", None)
+        bind_task = getattr(source_owner, "bind_task", None)
+        if callable(bind_task):
+            bind_task(server._task)
     except asyncio.CancelledError:
+        source_owner = getattr(server, "_i16_source_owner", None)
+        if source_owner is not None:
+            from gateway.runtime_sidecar_sources import mark_unknown
+            mark_unknown(source_owner, "mcp_connect_cancelled")
         raise  # start() already reaps server._task; shutdown() here could swallow the cancel
     except BaseException:
+        # Reservation precedes the SDK's child construction.  A config/preflight
+        # refusal can happen before _run_stdio reaches its transport finally block;
+        # retain that exact source tuple instead of leaving an accepted I16 root
+        # apparently live without a producer result.
+        source_owner = getattr(server, "_i16_source_owner", None)
+        if source_owner is not None:
+            from gateway.runtime_sidecar_sources import mark_unknown
+            mark_unknown(source_owner, "mcp_connect_setup_unknown")
         # Discovery owns claimed tasks (recoverable park); standalone probes must reap locally.
         if claim is None:
             try:
@@ -557,6 +635,16 @@ def register_mcp_servers(servers: dict[str, dict]) -> list[str]:
 
 
 def _register_mcp_servers(servers: dict[str, dict]) -> list[str]:
+    # The selected profile factory observes the canonical rendered candidate set
+    # before connection tasks are admitted.  It stores only route names and
+    # pending state; credentials and endpoints remain in the transport path.
+    from gateway.run import _gateway_runner_ref
+    runner = _gateway_runner_ref() if callable(_gateway_runner_ref) else None
+    if runner is not None:
+        from gateway.runtime_sidecar_factory import observe_mcp_config
+        with _core._lock:
+            pending = {_key_name(key) for key in _core._server_connecting}
+        observe_mcp_config(runner, _owner_scope_home(), servers, pending=pending)
     scoped_healed = _registration.register_connected_into_current_scope(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
@@ -615,6 +703,14 @@ def discover_mcp_tools(allowed_mcp_names: Optional[list[str]] = None) -> list[st
     with _owner_secret_scope():
         servers = _config._load_mcp_config()
     if not servers:
+        # Record an authenticated empty canonical config for the profile
+        # factory.  This is the only empty-set path that may later produce a
+        # typed no-route close receipt; an unobserved registry remains unknown.
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref() if callable(_gateway_runner_ref) else None
+        if runner is not None:
+            from gateway.runtime_sidecar_factory import observe_mcp_config
+            observe_mcp_config(runner, _owner_scope_home(), {})
         logger.debug("No MCP servers configured")
         return []
     if allowed_mcp_names is not None:

@@ -28,6 +28,7 @@ async def test_route_move_after_claim(monkeypatch, case):
     from gateway.session_results import execution_result
     from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     runner = GatewayRunner(GatewayConfig())
@@ -42,6 +43,7 @@ async def test_route_move_after_claim(monkeypatch, case):
     runner.adapters = {Platform.DISCORD: adapter}
     monkeypatch.setattr(runner, '_read_user_config', lambda: {'approvals': {'destructive_slash_confirm': False}})
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     key, store, db = runner.session_store._generate_session_key(source), runner.session_store, authority.db

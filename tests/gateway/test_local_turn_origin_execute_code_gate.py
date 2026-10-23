@@ -37,6 +37,8 @@ async def test_only_the_viewers_own_turn_skips_the_whole_script_gate(tmp_path, m
     db = SessionDB(tmp_path / "state.db")
     runner.session_store._db = runner._session_db = db
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     gates = {}
 
     def gate_in_turn_thread(live):

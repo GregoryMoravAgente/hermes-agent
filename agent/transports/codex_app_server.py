@@ -13,13 +13,15 @@ import os
 import queue
 import re
 import subprocess
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Optional
 
-from agent.deadline import kill_process_tree
 from agent.transports.hermes_tools_mcp_server import HERMES_TOOLS_MCP_SERVER_NAME
 from tools.environments.local import hermes_subprocess_env
+from hermes_cli._subprocess_compat import kill_process_tree
 
 MIN_CODEX_VERSION = (0, 125, 0)
 
@@ -80,6 +82,177 @@ def _reap_snapshotted(descendants: list[Any]) -> None:
             child.kill()
 
 
+def _managed_physical(client: Any) -> bool:
+    return (
+        getattr(client, "_physical_receipt", None) is not None
+        or getattr(getattr(client, "_producer_policy", None), "parent", None) is not None
+    )
+
+
+def _close_descendants(client: Any, managed: bool) -> list[Any]:
+    if getattr(client, "_closing_descendants", None) is not None:
+        return client._closing_descendants
+    if managed or client._proc.poll() is not None:
+        descendants = []
+    else:
+        descendants = _snapshot_descendants(client._proc.pid)
+    client._closing_descendants = descendants
+    return descendants
+
+
+def _force_close_process(client: Any) -> None:
+    policy = getattr(client, "_producer_policy", None)
+    legacy_cleanup = (
+        getattr(client, "_custody", None) is None and policy is None
+    ) or (policy is not None and getattr(policy, "legacy_tree_kill_allowed", False) is True)
+    if legacy_cleanup:
+        kill_process_tree(client._proc)
+    else:
+        client._proc.kill()
+    client._proc.wait(timeout=1.0)
+
+
+def _settle_physical_receipt(client: Any, timeout: float) -> None:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    receipt = getattr(client, "_physical_receipt", None)
+    transaction = getattr(receipt, "transaction", None)
+    if transaction is not None:
+        if transaction.process is not client._proc or not transaction.drain_after_process_exit(timeout):
+            receipt.mark_unknown("native_job_nonempty" if transaction.scope_observation == "nonempty"
+                                 else "native_job_state_unknown")
+            raise CodexAppServerTransportError(
+                code=_TRANSPORT_LOST_CODE, message="codex app-server native Job did not settle",
+            )
+    reader = getattr(client, "_reader", None)
+    stderr_reader = getattr(client, "_stderr_reader", None)
+    if reader is not None:
+        reader.join(timeout=max(0.0, min(deadline - time.monotonic(), 1.0)))
+    if stderr_reader is not None:
+        stderr_reader.join(timeout=max(0.0, min(deadline - time.monotonic(), 1.0)))
+    if receipt is None:
+        return
+    if reader is None or stderr_reader is None or reader.is_alive() or stderr_reader.is_alive():
+        receipt.mark_unknown("reader_join_failed")
+        raise CodexAppServerTransportError(
+            code=_TRANSPORT_LOST_CODE, message="codex app-server reader finalizer did not settle",
+        )
+    receipt.reader_joined("stdout", reader)
+    receipt.reader_joined("stderr", stderr_reader)
+    if receipt.close_after_delivery() is not True:
+        raise CodexAppServerTransportError(
+            code=_TRANSPORT_LOST_CODE, message="codex app-server physical custody did not settle",
+        )
+
+
+def _launch_managed_process(client: Any, cmd: list[str], spawn_env: dict[str, str], hide_flags: int) -> None:
+    client._physical_receipt = client._custody.reserve_physical()
+    try:
+        if sys.platform == "win32":
+            from tools.process_registry_windows import begin_windows_launch
+            client._launch_transaction = begin_windows_launch(client._physical_receipt)
+            if (
+                client._physical_receipt is None
+                or client._physical_receipt.retain_launch_transaction(client._launch_transaction) is not True
+            ):
+                raise RuntimeError("Codex launch transaction could not be retained")
+            client._proc = client._launch_transaction.launch(
+                cmd, text=False, env=spawn_env, cwd=client._cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding=None, errors=None, bufsize=0, start_new_session=True,
+                creationflags=hide_flags,
+            )
+            client._custody.bind_physical_launch(client._proc, client._launch_transaction)
+        else:
+            client._proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, env=spawn_env, cwd=client._cwd, creationflags=hide_flags,
+            )
+            if not client._physical_receipt.bind_process(client._proc.pid, None, "posix_direct", "posix_direct"):
+                client._physical_receipt.mark_unknown("process_identity_rejected")
+                raise RuntimeError("posix process identity rejected")
+            client._custody.bind_physical_launch(client._proc)
+    except FileNotFoundError:
+        if client._launch_transaction is not None and client._launch_transaction.release_before_effect():
+            client._physical_receipt = None
+        raise
+    except BaseException:
+        receipt = client._physical_receipt
+        transaction = client._launch_transaction
+        process = getattr(client, "_proc", None)
+        if process is None and transaction is not None:
+            process = getattr(transaction, "process", None)
+        if receipt is not None:
+            receipt.retain_partial_launch(process, transaction, reason="partial_launch")
+        raise
+
+
+def _launch_external_process(client: Any, cmd: list[str], spawn_env: dict[str, str], hide_flags: int) -> None:
+    from gateway.runtime_service_operations import bind_physical, bind_windows_launch, release_before_effect, reserve_physical
+    parent = client._producer_policy.parent
+    client._physical_receipt = reserve_physical(parent)
+    try:
+        if sys.platform == "win32":
+            from tools.process_registry_windows import begin_windows_launch
+            client._launch_transaction = begin_windows_launch(client._physical_receipt)
+            if (
+                client._physical_receipt is None
+                or client._physical_receipt.retain_launch_transaction(client._launch_transaction) is not True
+            ):
+                raise RuntimeError("Codex launch transaction could not be retained")
+            client._proc = client._launch_transaction.launch(
+                cmd, text=False, env=spawn_env, cwd=client._cwd,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                encoding=None, errors=None, bufsize=0, start_new_session=True,
+                creationflags=hide_flags,
+            )
+            if client._proc is False or client._proc is None:
+                raise RuntimeError("external process launch did not return a process")
+            bind_windows_launch(parent, client._launch_transaction, client._proc)
+        else:
+            client._proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                bufsize=0, env=spawn_env, cwd=client._cwd, creationflags=hide_flags,
+            )
+            bind_physical(
+                parent, None, client._proc, pid=client._proc.pid, process_started_at=None,
+                scope="posix_direct", scope_identity="posix_direct",
+            )
+    except FileNotFoundError:
+        if (
+            (client._launch_transaction is not None and client._launch_transaction.release_before_effect())
+            or release_before_effect(parent)
+        ):
+            client._physical_receipt = None
+        raise
+    except BaseException:
+        receipt = client._physical_receipt
+        transaction = client._launch_transaction
+        process = getattr(client, "_proc", None)
+        if process is None and transaction is not None:
+            process = getattr(transaction, "process", None)
+        if receipt is not None:
+            receipt.retain_partial_launch(process, transaction, reason="partial_launch")
+        raise
+
+
+def _validate_process_policy(policy: Any) -> None:
+    if policy is not None:
+        from gateway.runtime_service_operations import validate_producer_policy
+        validate_producer_policy(policy, spawning=True)
+
+
+def _launch_process(client: Any, cmd: list[str], spawn_env: dict[str, str], hide_flags: int) -> None:
+    if client._custody is not None:
+        _launch_managed_process(client, cmd, spawn_env, hide_flags)
+    elif client._producer_policy is not None:
+        _launch_external_process(client, cmd, spawn_env, hide_flags)
+    else:
+        client._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0, env=spawn_env, cwd=client._cwd, creationflags=hide_flags,
+        )
+
+
 class CodexAppServerClient:
     """Minimal synchronous JSON-RPC 2.0 client for ``codex app-server`` over stdio.
 
@@ -91,8 +264,22 @@ class CodexAppServerClient:
     def __init__(
         self, codex_bin: str = "codex", codex_home: Optional[str] = None,
         extra_args: Optional[list[str]] = None, env: Optional[dict[str, str]] = None,
+        cwd: Optional[str] = None, custody: Any = None, require_custody: bool = False,
+        producer_policy: Any = None,
     ) -> None:
         self._codex_bin = codex_bin
+        self._cwd = cwd or os.getcwd()
+        self._custody = custody
+        self._require_custody = require_custody
+        self._producer_policy = producer_policy
+        self._physical_receipt = None
+        self._launch_transaction = None
+        if self._require_custody and self._custody is None:
+            from gateway.runtime_service_custody import ServiceCustodyError
+            raise ServiceCustodyError("preservation_owner_unmapped")
+        if self._producer_policy is not None:
+            from gateway.runtime_service_operations import validate_producer_policy
+            validate_producer_policy(self._producer_policy, spawning=True)
         # codex needs LLM provider creds but must not receive Tier-1 Hermes secrets (gateway/GitHub/infra tokens).
         # codex app-server is a model-driving CLI executor: it runs a model-chosen agentic loop that
         # executes shell commands, so it legitimately needs LLM provider credentials
@@ -143,10 +330,8 @@ class CodexAppServerClient:
         # See #56747.
         from hermes_cli._subprocess_compat import windows_hide_flags
 
-        self._proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            bufsize=0, env=spawn_env, creationflags=windows_hide_flags(),
-        )
+        _validate_process_policy(self._producer_policy)
+        _launch_process(self, cmd, spawn_env, windows_hide_flags())
         self._next_id = 1
         self._pending: dict[int, queue.Queue] = {}  # request id -> single-slot reply queue
         self._pending_lock = threading.Lock()
@@ -155,12 +340,31 @@ class CodexAppServerClient:
         self._stderr_lines: list[str] = []
         self._stderr_lock = threading.Lock()
         self._closed = False
+        self._close_lock = threading.Lock()
+        self._close_complete = False
+        self._closing_descendants = None
         self._initialized = False
 
-        self._reader = threading.Thread(target=self._read_stdout, daemon=True)
-        self._stderr_reader = threading.Thread(target=self._read_stderr, daemon=True)
+        from agent.memory_provider import spawn_context_thread
+        self._reader = spawn_context_thread(
+            self._read_stdout, name="codex-app-server-stdout",
+        )
+        self._stderr_reader = spawn_context_thread(
+            self._read_stderr, name="codex-app-server-stderr",
+        )
+        if self._physical_receipt is not None:
+            self._physical_receipt.bind_reader("stdout", self._reader)
+            self._physical_receipt.bind_reader("stderr", self._stderr_reader)
         self._reader.start()
+        if self._physical_receipt is not None and not self._physical_receipt.reader_started(
+            "stdout", self._reader,
+        ):
+            raise RuntimeError("Codex stdout reader start was not authenticated")
         self._stderr_reader.start()
+        if self._physical_receipt is not None and not self._physical_receipt.reader_started(
+            "stderr", self._stderr_reader,
+        ):
+            raise RuntimeError("Codex stderr reader start was not authenticated")
 
     def initialize(
         self, client_name: str = "hermes", client_title: str = "Hermes Agent",
@@ -179,29 +383,42 @@ class CodexAppServerClient:
         return result
 
     def close(self, timeout: float = 3.0) -> None:
-        """Close stdin and wait for the subprocess TREE to exit, escalating to kill.
+        """Confirm root subprocess exit, then best-effort reap snapshotted descendants.
 
         Codex app-server owns stdio MCP descendants that may sit in their own process
         groups (``setsid``). Once the root exits they reparent and a parent walk can no
         longer find them, so descendants are snapshotted BEFORE the root is retired and
         the proven identities (PID + create time) are swept afterwards."""
-        if self._closed:
-            return
-        self._closed = True
-        self._fail_pending_requests("codex app-server client is closing")
-        descendants = _snapshot_descendants(self._proc.pid)
-        with contextlib.suppress(Exception):
-            if self._proc.stdin and not self._proc.stdin.closed:
-                self._proc.stdin.close()
+        close_lock = getattr(self, "_close_lock", None) or threading.Lock()
+        self._close_lock = close_lock
+        if not close_lock.acquire(timeout=30):
+            raise TimeoutError("codex app-server close is still in progress")
         try:
-            self._proc.terminate()
-            self._proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
+            if getattr(self, "_close_complete", False):
+                return
+            self._closed = True  # reject new requests, even if termination needs a retry
+            deadline = time.monotonic() + max(0.0, float(timeout))
+            self._fail_pending_requests("codex app-server client is closing")
+            managed_physical = _managed_physical(self)
+            descendants = _close_descendants(self, managed_physical)
             with contextlib.suppress(Exception):
-                kill_process_tree(self._proc.pid)
-                self._proc.wait(timeout=1.0)
+                if self._proc.stdin and not self._proc.stdin.closed:
+                    self._proc.stdin.close()
+            try:
+                if self._proc.poll() is None:
+                    self._proc.terminate()
+                self._proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                # Popen retains the child identity and guards signaling after exit. Do not
+                # rediscover a process tree from a PID that may have been recycled on retry.
+                _force_close_process(self)
+            finally:
+                if not managed_physical:
+                    _reap_snapshotted(descendants)
+            _settle_physical_receipt(self, max(0.0, deadline - time.monotonic()))
+            self._close_complete = True
         finally:
-            _reap_snapshotted(descendants)
+            close_lock.release()
 
     def _fail_pending_requests(self, reason: str) -> None:
         """Unblock every thread currently sitting in request() instead of
@@ -210,9 +427,15 @@ class CodexAppServerClient:
         Mirrors _read_stdout's own pop-then-deliver dispatch under the same
         lock, so a reply that lands at the exact same moment still wins the
         race cleanly instead of being dropped or double-delivered."""
-        with self._pending_lock:
-            pending_items = list(self._pending.items())
-            self._pending.clear()
+        pending_lock = getattr(self, "_pending_lock", None)
+        pending = getattr(self, "_pending", {})
+        if pending_lock is None:
+            pending_items = list(pending.items())
+            pending.clear()
+        else:
+            with pending_lock:
+                pending_items = list(pending.items())
+                pending.clear()
         if not pending_items:
             return
         synthetic = {"error": {"code": _TRANSPORT_LOST_CODE, "message": reason}, "transportLost": True}
@@ -310,7 +533,10 @@ class CodexAppServerClient:
                 self._stderr_lines = self._stderr_lines[-500:]
 
     def _read_stdout(self) -> None:
+        receipt = getattr(self, "_physical_receipt", None)
         if self._proc.stdout is None:
+            if receipt is not None:
+                receipt.reader_failed("stdout_pipe_missing")
             return
         try:
             for line in iter(self._proc.stdout.readline, b""):
@@ -325,8 +551,12 @@ class CodexAppServerClient:
                     continue
                 self._dispatch(msg)
         except Exception as exc:
+            if receipt is not None:
+                receipt.reader_failed("stdout_reader_error")
             self._append_stderr(f"<stdout reader error> {exc}")
         finally:
+            if receipt is not None and receipt.reader_error is None:
+                receipt.reader_eof("stdout", getattr(self, "_reader", None))
             # EOF (codex died) or a reader failure: nobody will ever answer the
             # requests still waiting, so fail them now instead of letting each
             # ride out its per-call timeout.
@@ -343,11 +573,21 @@ class CodexAppServerClient:
             (self._server_requests if "id" in msg else self._notifications).put(msg)
 
     def _read_stderr(self) -> None:
+        receipt = getattr(self, "_physical_receipt", None)
         if self._proc.stderr is None:
+            if receipt is not None:
+                receipt.reader_failed("stderr_pipe_missing")
             return
-        with contextlib.suppress(Exception):  # pragma: no cover
+        try:
             for line in iter(self._proc.stderr.readline, b""):
                 self._append_stderr(line.decode("utf-8", "replace").rstrip())
+        except Exception:
+            if receipt is not None:
+                receipt.reader_failed("stderr_reader_error")
+            raise
+        finally:
+            if receipt is not None and receipt.reader_error is None:
+                receipt.reader_eof("stderr", getattr(self, "_stderr_reader", None))
 
 
 def parse_codex_version(output: str) -> Optional[tuple[int, int, int]]:

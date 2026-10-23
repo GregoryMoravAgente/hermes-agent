@@ -75,6 +75,8 @@ async def _cold(tmp_path, multiplex=None, profile_name=None):
     from gateway.session_contract import Principal
     runner = _Runner(tmp_path, multiplex)
     authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='cold')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     if profile_name is not None:
         runner.session_authorities = SessionAuthorities(tmp_path / 'launch', multiplexed=True)
         runner.session_authorities.add('fixture', authority, name=profile_name)

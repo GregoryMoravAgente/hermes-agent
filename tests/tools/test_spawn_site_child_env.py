@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.tools._child_env_fixtures import child_env
+pytest_plugins = ("tests.tools._child_env_fixtures",)
 
 _TIER1 = ("TELEGRAM_BOT_TOKEN", "GATEWAY_RELAY_SECRET")
 _PROVIDER = "OPENAI_API_KEY"
@@ -31,8 +31,29 @@ def _probe_script(path: Path, out: Path, names) -> Path:
 def _compute_host_seen(child_env, monkeypatch, names):
     from tui_gateway.host_supervisor import HostSupervisor
 
-    hello = ("import json, os, sys; print(json.dumps({'type': 'hello', 'seen': "
-             f"{{n: os.environ.get(n) for n in {names!r}}}}}), flush=True); sys.stdin.readline()")
+    # HostSupervisor authenticates the public hello with the private startup record. Keep this
+    # lightweight environment probe compatible with that source-owned handshake instead of
+    # weakening the production gate for a test stand-in.
+    hello = (
+        "import json, os, sys, uuid\n"
+        "from tui_gateway.windows_producer_identity import build_producer_startup_record\n"
+        "raw_fd = os.environ.pop('HERMES_COMPUTE_HOST_PRODUCER_COMPLETION_FD', '')\n"
+        "if not raw_fd:\n"
+        "    raise SystemExit('missing producer startup fd')\n"
+        "if os.name == 'nt':\n"
+        "    import msvcrt\n"
+        "    fd = msvcrt.open_osfhandle(int(raw_fd), os.O_WRONLY | os.O_BINARY)\n"
+        "else:\n"
+        "    fd = int(raw_fd)\n"
+        "boot_id = uuid.uuid4().hex\n"
+        "record = (json.dumps(build_producer_startup_record(pid=os.getpid(), boot_id=boot_id), "
+        "separators=(',', ':')) + '\\n').encode()\n"
+        "os.write(fd, record)\n"
+        "os.close(fd)\n"
+        f"print(json.dumps({{'type': 'hello', 'host_pid': os.getpid(), 'boot_id': boot_id, "
+        f"'seen': {{n: os.environ.get(n) for n in {names!r}}}}}), flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
     sup = HostSupervisor(registry_path=child_env / "host.json", argv=[sys.executable, "-c", hello],
                          cwd=child_env, expected_build_sha="unknown", autostart=False)
     try:
@@ -42,12 +63,16 @@ def _compute_host_seen(child_env, monkeypatch, names):
         sup.shutdown()
 
 
-def test_compute_host_is_hermes_and_keeps_its_full_environment(child_env, monkeypatch):
-    # It runs agent turns for the dashboard, so it needs what the turn needs: keys set only in the
-    # process env (Docker -e, systemd) are not in any .env for it to reload (#65895).
+def test_compute_host_keeps_provider_credentials_without_tier1_secrets(child_env, monkeypatch):
+    # It runs agent turns for the dashboard, so provider keys set only in the process env (Docker -e,
+    # systemd) must survive; gateway and bot credentials remain sealed by the child policy.
     _plant(monkeypatch)
     names = [*_TIER1, _PROVIDER]
-    assert _compute_host_seen(child_env, monkeypatch, names) == {n: f"fake-{n.lower()}" for n in names}
+    assert _compute_host_seen(child_env, monkeypatch, names) == {
+        "TELEGRAM_BOT_TOKEN": None,
+        "GATEWAY_RELAY_SECRET": None,
+        _PROVIDER: "fake-openai_api_key",
+    }
 
 
 @pytest.mark.platforms("posix")  # the stand-in binaries are shebang scripts

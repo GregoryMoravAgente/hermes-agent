@@ -16,6 +16,9 @@ inputs:
   test-environment:
     description: 'Build an isolated interpreter with the dev and test groups; never publish these to the runtime environment.'
     default: 'false'
+  checkout-environment:
+    description: 'Build the locked project with its source installed at checkout/.venv before any side test environment.'
+    default: 'false'
   cache:
     description: Cache the verified PM tool store.
     default: 'true'
@@ -148,7 +151,7 @@ runs:
 
     - name: Cache uv dependency downloads and builds
       id: python-cache
-      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && (inputs.extras != '' || inputs.test-environment == 'true')
+      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'true' && (inputs.extras != '' || inputs.test-environment == 'true' || inputs.checkout-environment == 'true')
       uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.uv-cache-path }}
@@ -163,7 +166,7 @@ runs:
 
     - name: Restore uv dependency downloads and builds
       id: python-cache-restore
-      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'false' && (inputs.extras != '' || inputs.test-environment == 'true')
+      if: inputs.toolchain != 'node' && inputs.cache-python == 'true' && inputs.save-python-cache == 'false' && (inputs.extras != '' || inputs.test-environment == 'true' || inputs.checkout-environment == 'true')
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ steps.install.outputs.uv-cache-path }}
@@ -210,16 +213,18 @@ runs:
 
     - name: Install the requested Python dependencies through PM
       id: dependencies
-      if: inputs.extras != '' || inputs.test-environment == 'true'
+      if: inputs.extras != '' || inputs.test-environment == 'true' || inputs.checkout-environment == 'true'
       shell: bash
       env:
         _PM_ACTION: ${{ github.action_path }}
         _PM_TOOLCHAIN: ${{ inputs.toolchain }}
         _PM_EXTRAS: ${{ inputs.extras }}
         _PM_TEST_ENVIRONMENT: ${{ inputs.test-environment }}
+        _PM_CHECKOUT_ENVIRONMENT: ${{ inputs.checkout-environment }}
       run: |
         args=()
         if [ "$_PM_TEST_ENVIRONMENT" = true ]; then args+=(--test-environment); fi
+        if [ "$_PM_CHECKOUT_ENVIRONMENT" = true ]; then args+=(--checkout-environment); fi
         "$HERMES_PYTHON" -S "$_PM_ACTION/../../../scripts/ci/setup_toolchain.py" dependencies \
           --toolchain "$_PM_TOOLCHAIN" --extras "$_PM_EXTRAS" --home "$HERMES_HOME" "${args[@]}"
 

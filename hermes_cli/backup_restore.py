@@ -7,6 +7,12 @@ helpers used by ``hermes import`` and ``/snapshot restore``.  Backup
 which composes these helpers.
 """
 
+# A pre-handoff updater can import this consumer before config/managed_scope
+# has healed its cached root utils module. Use the same narrow compatibility gate.
+from hermes_cli.stale_modules import drop_stale_root_modules
+
+drop_stale_root_modules()
+
 import json
 import logging
 import os

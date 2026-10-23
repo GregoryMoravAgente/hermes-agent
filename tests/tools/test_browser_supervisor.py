@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -55,11 +57,208 @@ pytestmark = [
 
 
 def _find_chrome() -> str:
+    from hermes_cli.browser_runtime import chromium_executable
+
+    configured = chromium_executable()
+    if configured:
+        return configured
     for candidate in ("google-chrome", "chromium", "chromium-browser"):
         path = shutil.which(candidate)
         if path:
             return path
     pytest.skip("no Chrome binary found")
+
+
+def _file_identity(path: str | Path | None) -> dict[str, object]:
+    """Return bounded, non-path identity data for a local test artifact."""
+    if not path:
+        return {"name": None, "bytes": None, "sha256": None}
+    try:
+        candidate = Path(path)
+        digest = hashlib.sha256()
+        size = 0
+        with candidate.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                size += len(chunk)
+                digest.update(chunk)
+        return {"name": candidate.name, "bytes": size, "sha256": digest.hexdigest()}
+    except Exception as exc:
+        return {"name": Path(path).name, "bytes": None, "sha256": None,
+                "error_type": type(exc).__name__}
+
+
+def _stderr_identity(stderr) -> dict[str, object]:
+    if stderr is None:
+        return {"bytes": None, "sha256": None}
+    try:
+        stderr.flush()
+        stderr.seek(0)
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in iter(lambda: stderr.read(1024 * 1024), b""):
+            size += len(chunk)
+            digest.update(chunk)
+        return {"bytes": size, "sha256": digest.hexdigest()}
+    except Exception as exc:
+        return {"bytes": None, "sha256": None, "error_type": type(exc).__name__}
+
+
+
+def _redact_sample_output(payload: str, *, pid: int) -> list[str]:
+    safe_lines = []
+    for raw_line in payload.splitlines()[:512]:
+        line = raw_line.strip()
+        if not line or any(token in line.lower() for token in ("environment", "command line", "http://", "https://")):
+            continue
+        line = re.sub(r"/(?:Users|private|var|tmp|home|Volumes|Applications|opt|Library)/\S+", "<PATH>", line)
+        line = re.sub(rf"\b{pid}\b", "<PID>", line)
+        line = re.sub(r"\b0x[0-9a-fA-F]+\b", "<ADDR>", line)
+        if line.startswith(("Sampling process", "Call graph", "Thread ")) or line[:1].isdigit():
+            safe_lines.append(line[:512])
+    return safe_lines[:128]
+
+
+def _profile_startup_state(profile: str | None) -> dict[str, object]:
+    if not profile:
+        return {"state": "no-profile"}
+    port_path = Path(profile) / "DevToolsActivePort"
+    try:
+        with port_path.open("rb") as stream:
+            payload = stream.read(4097)
+    except OSError as exc:
+        return {"state": "missing", "error_type": type(exc).__name__}
+    lines = payload.splitlines()
+    first = lines[0].decode("utf-8", errors="replace") if lines else ""
+    return {
+        "state": "truncated" if len(payload) > 4096 else "present",
+        "bytes": len(payload),
+        "sha256": hashlib.sha256(payload[:4096]).hexdigest(),
+        "line_count": len(lines),
+        "first_line_numeric": first.isdigit(),
+    }
+
+
+def _native_startup_diagnostic(*, proc, executable: str | None, profile: str | None,
+                               stage: str, port: int | None, last_error_type: str | None,
+                               popen_started_ns: int | None) -> dict[str, object]:
+    result = {
+        "stage": stage,
+        "last_error_type": last_error_type,
+        "pid": proc.pid if proc is not None else None,
+        "popen_started_monotonic_ns": popen_started_ns,
+        "executable": _file_identity(executable),
+        "profile_devtools": _profile_startup_state(profile),
+        "port": port,
+        "sample": {"status": "not-attempted"},
+    }
+    if proc is None:
+        result["sample"] = {"status": "no-popen"}
+        return result
+    result["returncode_before_sample"] = proc.poll()
+    if result["returncode_before_sample"] is not None:
+        result["sample"] = {"status": "owned-process-not-alive"}
+        return result
+    sample_bin = Path("/usr/bin/sample")
+    if not sample_bin.is_file() or not os.access(sample_bin, os.X_OK):
+        result["sample"] = {"status": "unavailable"}
+        return result
+    raw_path = Path(profile) / ".hermes-chrome-startup.sample" if profile else None
+    try:
+        if raw_path is None:
+            result["sample"] = {"status": "no-profile"}
+            return result
+        completed = subprocess.run(
+            [str(sample_bin), str(proc.pid), "1", "1", "-mayDie", "-file", str(raw_path)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+            check=False,
+        )
+        if raw_path.exists():
+            with raw_path.open("rb") as stream:
+                payload = stream.read(262145)
+        else:
+            payload = b""
+        returncode_after_sample = proc.poll()
+        sample_info = {
+            "status": "captured" if raw_path.exists() else "no-output",
+            "returncode": completed.returncode,
+            "bytes_captured": min(len(payload), 262144),
+            "truncated": len(payload) > 262144,
+            "sha256_captured": hashlib.sha256(payload[:262144]).hexdigest(),
+            "stderr": "discarded",
+            "redacted_frames": [],
+        }
+        if returncode_after_sample is None:
+            sample_info["redacted_frames"] = _redact_sample_output(
+                payload[:262144].decode("utf-8", errors="replace"), pid=proc.pid
+            )
+        else:
+            # Do not expose a stack if the owned process exited while sample ran;
+            # the PID could have been reused before the readback completed.
+            sample_info["status"] = "process-exited-during-sample"
+        result["sample"] = sample_info
+    except subprocess.TimeoutExpired:
+        result["sample"] = {"status": "timeout"}
+    except (OSError, ValueError) as exc:
+        result["sample"] = {"status": "error", "error_type": type(exc).__name__}
+    finally:
+        if raw_path is not None:
+            try:
+                raw_path.unlink()
+            except OSError:
+                pass
+    result["returncode_after_sample"] = proc.poll()
+    return result
+
+def _failure_diagnostic(*, stage: str, executable: str | None, proc, profile: str | None,
+                        stderr, port: int | None, last_error_type: str | None,
+                        native_startup: dict[str, object] | None = None) -> str:
+    active_port = None
+    if profile:
+        active_port_path = Path(profile) / "DevToolsActivePort"
+        try:
+            active_port = {"exists": active_port_path.exists(), "port": port}
+        except OSError as exc:
+            active_port = {"exists": None, "port": port, "error_type": type(exc).__name__}
+    return json.dumps({
+        "stage": stage,
+        "executable": _file_identity(executable),
+        "pid": proc.pid if proc is not None else None,
+        "returncode": proc.poll() if proc is not None else None,
+        "devtools_active_port": active_port,
+        "last_error_type": last_error_type,
+        "stderr": _stderr_identity(stderr),
+        "native_startup": native_startup,
+    }, sort_keys=True)
+
+
+def _cleanup_chrome(*, proc, profile: str | None, stderr, wait_timeout: float) -> None:
+    """Reap only this fixture's process and remove only its profile/diagnostic file."""
+    if proc is not None:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=wait_timeout)
+        except (subprocess.TimeoutExpired, AssertionError, Exception):
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=2)
+            except (AssertionError, Exception):
+                pass
+    if profile is not None:
+        shutil.rmtree(profile, ignore_errors=True)
+    if stderr is not None:
+        try:
+            stderr.close()
+        except Exception:
+            pass
 
 
 @pytest.fixture
@@ -72,85 +271,80 @@ def chrome_cdp(tmp_path):
     Always launches with ``--site-per-process`` so cross-origin iframes
     become real OOPIFs (needed by the iframe interaction tests).
     """
-    profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
-    stderr = (tmp_path / "chrome.stderr").open("w+b")
-    proc = subprocess.Popen(
-        [
-            _find_chrome(),
-            "--remote-debugging-port=0",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--headless=new",
-            "--disable-gpu",
-            "--site-per-process",  # force OOPIFs for cross-origin iframes
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=stderr,
-    )
-
+    profile = None
+    stderr = None
+    proc = None
+    executable = None
     ws_url = None
     port = None
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            break
-        try:
-            port = int((Path(profile) / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()[0])
-            import urllib.request
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/version", timeout=1
-            ) as r:
-                info = json.loads(r.read().decode())
+    stage = "allocate-profile"
+    last_error_type = None
+    yielded = False
+    popen_started_ns = None
+    try:
+        profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
+        stage = "open-stderr"
+        stderr = (tmp_path / "chrome.stderr").open("w+b")
+        stage = "resolve-executable"
+        executable = _find_chrome()
+        stage = "launch"
+        proc = subprocess.Popen(
+            [
+                executable,
+                "--remote-debugging-port=0",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--headless=new",
+                "--disable-gpu",
+                "--site-per-process",  # force OOPIFs for cross-origin iframes
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=stderr,
+        )
+        popen_started_ns = time.monotonic_ns()
+
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                stage = "chrome-exited-before-cdp"
+                last_error_type = "ProcessExited"
+                break
+            try:
+                stage = "read-devtools-active-port"
+                port = int((Path(profile) / "DevToolsActivePort").read_text(encoding="utf-8").splitlines()[0])
+                import urllib.request
+                stage = "fetch-cdp-version"
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/json/version", timeout=1
+                ) as r:
+                    payload = r.read()
+                stage = "parse-cdp-version"
+                info = json.loads(payload.decode())
                 ws_url = info["webSocketDebuggerUrl"]
                 break
-        except Exception:
-            time.sleep(0.25)
-    if ws_url is None:
-        try:
-            proc.terminate()
-            proc.wait(timeout=5)
-        except (subprocess.TimeoutExpired, AssertionError, Exception):
-            try:
-                proc.kill()
-            except Exception:
-                pass
-            try:
-                proc.wait(timeout=2)
-            except (AssertionError, Exception):
-                pass
-        shutil.rmtree(profile, ignore_errors=True)
-        stderr.seek(0)
-        diagnostic = stderr.read().decode("utf-8", errors="replace")
-        stderr.close()
-        pytest.fail(f"Chrome didn't expose CDP in time: {diagnostic}")
+            except Exception as exc:
+                last_error_type = type(exc).__name__
+                time.sleep(0.25)
+        if ws_url is None:
+            native_startup = _native_startup_diagnostic(
+                proc=proc, executable=executable, profile=profile, stage=stage,
+                port=port, last_error_type=last_error_type, popen_started_ns=popen_started_ns,
+            )
+            diagnostic = _failure_diagnostic(
+                stage=stage, executable=executable, proc=proc, profile=profile,
+                stderr=stderr, port=port, last_error_type=last_error_type,
+                native_startup=native_startup,
+            )
+            pytest.fail(f"Chrome didn't expose CDP in time: {diagnostic}")
 
-    yield ws_url, port
-
-    # Tear down Chrome. The stdlib `subprocess._wait()` POSIX implementation
-    # has a known race (https://bugs.python.org/issue38630): when SIGCHLD
-    # arrives concurrently with `proc.wait()`, `_try_wait(WNOHANG)` can
-    # return a foreign pid and the `assert pid == self.pid or pid == 0`
-    # fires. We saw this in CI on slice 1 after this fixture's teardown
-    # (PR #33661 follow-up). Swallow the stdlib race + force-kill if wait
-    # hangs, then always reap so we don't leak a zombie.
-    try:
-        proc.terminate()
-    except Exception:
-        pass
-    try:
-        proc.wait(timeout=3)
-    except (subprocess.TimeoutExpired, AssertionError, Exception):
-        try:
-            proc.kill()
-        except Exception:
-            pass
-        try:
-            proc.wait(timeout=2)
-        except (AssertionError, Exception):
-            pass
-    shutil.rmtree(profile, ignore_errors=True)
-    stderr.close()
+        yielded = True
+        yield ws_url, port
+    finally:
+        # The stdlib subprocess._wait() POSIX implementation has a known race
+        # (https://bugs.python.org/issue38630); cleanup remains owned by this fixture
+        # and force-kills only its process if the bounded wait does not reap it.
+        _cleanup_chrome(proc=proc, profile=profile, stderr=stderr, wait_timeout=3 if yielded else 5)
 
 
 def _test_page_url() -> str:

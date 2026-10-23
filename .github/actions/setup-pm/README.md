@@ -24,6 +24,16 @@ then select runtime features in that interpreter. PM checks `uv.lock`, installs
 the requested dependencies, and validates the environment. Only non-test installs
 publish an application selection. It does not enable plugins.
 
+Set `checkout-environment: 'true'` only for a lane whose source-installed project
+must be exercised by a canonical child process. PM then builds the locked project
+into the fresh checkout-local `.venv` with the requested `extras` plus the `dev`
+and `test` groups, before building the independent side test environment. The
+project is installed into that environment; no facts record or symlink is
+fabricated. The option is opt-in and refuses an existing `.venv`, so it is suited
+to a clean CI checkout. It provides the POSIX source-checkout fallback used by
+managed cron tests; it does not qualify Windows' committed-generation overlay,
+which requires a separate native proof.
+
 Subsequent steps get `python`, `python3`, `node`, `npm` and `npx`
 for the selected toolchain on PATH. The pinned npm precedes Node's bundled npm.
 On Windows, PM selects the host architecture even if the bootstrap interpreter
@@ -53,7 +63,7 @@ The official, SHA-pinned `actions/cache` transports three independent caches:
 All restores use the exact primary key, without fallback prefixes, matching
 setup-uv and setup-node's npm behavior. Successful jobs save at teardown;
 exact hits are not saved again. Only dependency-carrying callers
-(`extras` set or `test-environment: 'true'`) auto-save the uv cache: a tool-only job never runs a
+(`extras` set, `test-environment: 'true'`, or `checkout-environment: 'true'`) auto-save the uv cache: a tool-only job never runs a
 dependency operation, so letting it save would freeze an empty cache under
 the production key, where an immutable exact hit blocks real saves forever.
 PM re-verifies restored tools before use.

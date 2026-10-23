@@ -3,6 +3,7 @@
 Reuse the private native route envelope and FIFO, retaining nonhuman turn semantics.
 A producer ACK means committed input, not successful inference or outbound delivery.
 """
+import asyncio
 from copy import deepcopy
 from datetime import UTC, datetime
 import json
@@ -11,6 +12,10 @@ import logging
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session_contract import SessionRef
+from gateway.session_automation_custody import (
+    _AUTOMATION_OWNER_CLASSES, _automation_descriptor_complete,
+    automation_source_identity, kanban_occurrence_metadata, route_wake_identity,
+)
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, list_session_admissions
 
 logger = logging.getLogger(__name__)
@@ -308,7 +313,8 @@ def automation_display_metadata(metadata):
 # proof at execution from the target the pre-claim check validated, and the turn's resolver reads it.
 _AUTOMATION_METADATA = frozenset({'gateway_session_key', 'gateway_session_id', 'automation_identities',
     'turn_author', 'notification_origin', 'original_trigger_message_id', 'notification_category',
-    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick'})
+    'display_kind', 'display_text', 'gateway_proven_session_id', 'gateway_completion_ids', 'heartbeat_tick',
+    'kanban_occurrence'})
 
 
 def admission_display(payload):
@@ -350,7 +356,7 @@ def snapshot_automation(authority, adapter, event, identity):
             or set(event.metadata) - _AUTOMATION_METADATA):
         raise RuntimeStoreError('invalid_params')
     notification = (automation_notification_metadata(event.metadata) | automation_display_metadata(event.metadata)
-                    | _tick_metadata(event.metadata))
+                    | kanban_occurrence_metadata(event.metadata) | _tick_metadata(event.metadata))
     entry = _owner(runner, event, authority)
     if event.source.platform == Platform.LOCAL:
         return snapshot_local_automation(authority, adapter, event, identity, entry)
@@ -416,6 +422,7 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
                   'route': entry.session_key, 'target': entry.session_id}
     descriptor.update(automation_notification_metadata(event.metadata))
     descriptor.update(automation_display_metadata(event.metadata))
+    descriptor.update(kanban_occurrence_metadata(event.metadata))
     descriptor.update(_tick_metadata(event.metadata))
     if event.metadata.get('turn_author') is not None:
         from agent.turn_author import parse_turn_author
@@ -430,6 +437,8 @@ def snapshot_local_automation(authority, adapter, event, identity, entry):
 
 
 def check_local_automation(authority, ref, row, *, route=None):
+    if '_automation_custody_v1' in (row.get('payload') or {}):
+        return check_i09_automation(authority, ref, row)
     live = authority.sessions.get(ref.session_id)
     route = route or (live.route if live is not None else None)
     payload = row['payload']
@@ -445,6 +454,135 @@ def check_local_automation(authority, ref, row, *, route=None):
         raise RuntimeStoreError('admission_conflict')
 
 
+def check_i09_automation(authority, ref, row):
+    """Validate the private source-owned A2A/Kanban row before its local claim."""
+    payload = row.get('payload') if isinstance(row, dict) else None
+    descriptor = authority._preservation_automation_row_descriptor(row)
+    kanban_card = payload.get('kanban_card_v1') if isinstance(payload, dict) else None
+    allowed = ({'text', '_automation_custody_v1'},
+               {'text', 'finite', '_automation_custody_v1'},
+               {'text', 'kanban_card_v1', '_automation_custody_v1'},
+               {'text', 'finite', 'kanban_card_v1', '_automation_custody_v1'})
+    card_valid = kanban_card is None
+    if kanban_card is not None:
+        # The dispatcher marker is source-owned and must remain the exact task/run tuple that
+        # generated this request.  A client cannot write this carrier (the public submit allowlist
+        # rejects it), but a durable row can still be corrupted or copied across attempts.
+        expected = None
+        request_id = row.get('request_id') if isinstance(row, dict) else None
+        if isinstance(request_id, str) and request_id.startswith('kanban:'):
+            try:
+                parts = json.loads(request_id[len('kanban:'):])
+                if (isinstance(parts, list) and len(parts) == 3
+                        and isinstance(parts[0], str) and isinstance(parts[1], str)
+                        and type(parts[2]) is int):
+                    expected = {'board': parts[0], 'task_id': parts[1], 'run_id': parts[2]}
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        card_valid = (expected is not None and kanban_card == expected)
+    if (not isinstance(payload, dict)
+            or set(payload) not in allowed
+            or not card_valid
+            or not isinstance(descriptor, dict)
+            or descriptor.get('owner_class') != 'I09_a2a_hosted_kanban'
+            or row.get('target_session_id') != ref.session_id
+            or row.get('principal_id') != descriptor.get('principal_id')
+            or row.get('request_id') != descriptor.get('request_id')):
+        raise RuntimeStoreError('permission_denied')
+    authority._preservation_validate_i09_descriptor(
+        descriptor, handle=authority._preservation_handles.get(row.get('admission_id')),
+        request_id=row.get('request_id'), principal_id=row.get('principal_id'),
+        session_id=ref.session_id, source_identity=descriptor.get('source_identity'),
+        delivery_id=descriptor.get('delivery_id'))
+    handle = authority._preservation_handles.get(row.get('admission_id'))
+    if handle is None or not authority._preservation_automation_row_matches(row, handle):
+        raise RuntimeStoreError('preservation_owner_unmapped')
+
+
+def callback_record_for_automation(authority, row, admission_id, handle):
+    """Return the complete source-owned terminal candidate for an automation root.
+
+    Automation roots are intentionally retained in the handle/binding maps rather than duplicated in
+    ``_preservation_operations``.  Callback classification may consume that existing binding only
+    after the canonical terminal row, exact opaque handle, and descriptor all agree.  A cancelled
+    queued row has a separate no-execution witness and is accepted only while that exact root remains
+    bound and no I04 child was reserved.
+    """
+    if (
+        not isinstance(row, dict)
+        or row.get('admission_id') != admission_id
+        or row.get('status') != 'terminal'
+        or handle is None
+    ):
+        return None
+    preclaim_cancel = (row.get('outcome') == 'cancelled' and row.get('generation') is None)
+    if not preclaim_cancel and (type(row.get('generation')) is not int or row.get('generation') < 1):
+        return None
+    owner_class = getattr(handle, 'owner_class', None)
+    if owner_class not in _AUTOMATION_OWNER_CLASSES:
+        return None
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    binding = bindings.get(admission_id) if isinstance(bindings, dict) else None
+    if (
+        not isinstance(binding, dict)
+        or binding.get('handle') is not handle
+        or not isinstance(binding.get('descriptor'), dict)
+    ):
+        return None
+    descriptor = authority._preservation_automation_row_descriptor(row)
+    # Recovery deliberately keeps the predecessor producer descriptor while the
+    # current owner holds a new opaque handle. Reuse the same exact-row successor
+    # contract that admitted and rebound that handle, rather than equating epochs.
+    if (
+        not _automation_descriptor_complete(descriptor)
+        or descriptor != binding.get('descriptor')
+        or not authority._preservation_automation_row_matches(
+            row, handle, allow_terminal=True, allow_preclaim_cancel=preclaim_cancel)
+    ):
+        return None
+    bound_row = binding.get('row')
+    if isinstance(bound_row, dict):
+        if any(
+            row.get(field) != bound_row.get(field)
+            for field in ('admission_id', 'target_session_id', 'principal_id', 'request_id')
+        ):
+            return None
+        if (
+            bound_row.get('owner_epoch') is not None
+            and row.get('owner_epoch') != bound_row.get('owner_epoch')
+        ):
+            return None
+        if (
+            bound_row.get('generation') is not None
+            and row.get('generation') != bound_row.get('generation')
+        ):
+            return None
+    handles = getattr(authority, '_preservation_handles', None)
+    children = getattr(authority, '_preservation_children', None)
+    if not (
+        isinstance(handles, dict)
+        and handles.get(admission_id) is handle
+    ) and not (
+        isinstance(children, dict)
+        and children.get(admission_id) is handle
+    ):
+        return None
+    return {
+        'handle': handle,
+        'owner_class': owner_class,
+        'profile_id': getattr(handle, 'profile_id', None),
+        'authority_epoch': getattr(handle, 'authority_epoch', None),
+        'session_id': row.get('target_session_id'),
+        'principal_id': row.get('principal_id'),
+        'admission_id': admission_id,
+        'request_id': row.get('request_id'),
+        'generation': row.get('generation'),
+        'preclaim_cancelled': preclaim_cancel,
+        'source_identity': descriptor.get('source_identity'),
+        'parent_handle': None,
+    }
+
+
 def restore_local_automation(authority, ref, row):
     check_local_automation(authority, ref, row)
     live = authority.sessions[ref.session_id]
@@ -455,6 +593,7 @@ def restore_local_automation(authority, ref, row):
             'gateway_session_id': entry.session_id})
     event.metadata.update(automation_notification_metadata(descriptor))
     event.metadata.update(automation_display_metadata(descriptor))
+    event.metadata.update(kanban_occurrence_metadata(descriptor))
     if descriptor.get('turn_author') is not None:
         event.metadata['turn_author'] = deepcopy(descriptor['turn_author'])
     if descriptor.get('heartbeat'):
@@ -462,29 +601,142 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None):
+def _reconcile_automation_failure(authority, event, handle, principal_id, session_id, identity):
+    if handle is None:
+        return
+    if getattr(event, '_preservation_effect_started', False):
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(handle, 'join_failed')
+        return
+    authority._preservation_reconcile_failed(
+        handle, principal_id=principal_id, session_id=session_id, request_id=identity)
+
+
+async def admit_automation(authority, adapter, event, identity, replaces=None, *,
+                           _preservation_handle=None, _preservation_child_key=None,
+                           _on_committed=None):
     """``replaces``: a queued automation row of the same session this input supersedes (a liveness
     tick carrying the output of the one still waiting). Its cancellation commits in this admission's
     own transaction, so neither lands without the other."""
+    # Resolve the authoritative custody contract before snapshotting or writing the
+    # automation payload. A managed authority without its coordinator is a typed refusal.
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
     authority._require_admission_open()
     payload, entry = snapshot_automation(authority, adapter, event, identity)
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
-    authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
+    principal_id = 'automation:' + entry.session_key
+    source_identity = automation_source_identity(event, entry.session_key)
+    handle = _preservation_handle
+    try:
+        if handle is None:
+            root = getattr(authority, '_preservation_automation_root', None)
+            if coordinator is not None and not callable(root):
+                raise RuntimeStoreError('runtime_custody_unavailable')
+            if coordinator is not None:
+                handle = root(
+                    request_id=identity, principal_id=principal_id, session_id=ref.session_id,
+                    source_identity=source_identity,
+                )
+        elif getattr(handle, 'owner_class', None) in {
+            'I07_automation_route_wakes', 'I08_goals_loops_heartbeat', 'I09_a2a_hosted_kanban',
+        }:
+            authority._preservation_pending_root(
+                identity, handle, principal_id=principal_id, session_id=ref.session_id,
+                source_identity=source_identity,
+            )
+        if handle is not None:
+            pending = authority._preservation_pending_roots.get(id(handle), {})
+            delivery_id = pending.get('delivery_id')
+            descriptor = authority._preservation_automation_descriptor(
+                handle, request_id=identity, principal_id=principal_id, session_id=ref.session_id,
+                source_identity=source_identity, delivery_id=delivery_id,
+            )
+            automation = payload.get('local_automation_v1')
+            if automation is None:
+                automation = payload['native_text_v1']['automation']
+            automation['custody'] = descriptor
+            authority._route_wake_inbound_seen |= handle.owner_class == 'I07_automation_route_wakes'
+        authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
+    except BaseException:
+        _reconcile_automation_failure(authority, event, handle, principal_id, ref.session_id, identity)
+        raise
     from functools import partial
     from gateway.session_runtime_workers import tracked_write
     admitted, replaced = partial(authority._admitted, ref, event), []
+    if handle is not None:
+        callback = admitted
+        def admitted(row, callback=callback):
+            authority._preservation_bind_or_release(row, handle)
+            if (row is not None and row.get('status') != 'terminal'
+                    and getattr(handle, 'owner_class', None) in {
+                        'I08_goals_loops_heartbeat', 'I09_a2a_hosted_kanban',
+                    }):
+                authority._preservation_record_automation_binding(row, handle)
+            # Bind the I06 child in the same ordered writer callback that binds the I07 root,
+            # before ``after=_schedule_admitted`` can let the FIFO claim the row.  Binding after
+            # this await is racy: a fast Bot/automation drain can claim, settle and run its
+            # finalizer before the producer has attached the child to the durable admission.
+            if (_preservation_child_key is not None
+                    and row is not None
+                    and row.get('status') != 'terminal'
+                    and authority._preservation_handles.get(row.get('admission_id')) is handle):
+                authority._preservation_bind_automation_child(
+                    row['admission_id'], _preservation_child_key,
+                )
+            return callback(row)
+    if _on_committed is not None:
+        callback = admitted
+        def admitted(row, callback=callback):
+            # This source-owned producer handoff runs before the FIFO scheduling callback.  The
+            # enclosing ordered admission operation keeps the per-authority write gate through
+            # this callback, so a drain cannot claim the newly committed row first.
+            _on_committed(row)
+            return callback(row)
     if replaces is not None:
         def admitted(row, admitted=admitted):
             if replaced:  # the guard ran in the committed write; an exact replay runs no guard
                 authority._settle_cancelled(ref, replaces)
             return admitted(row)
-    return await tracked_write(authority, partial(
-        admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
-        session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced))),
-        then=admitted, ordered=True, after=partial(authority._schedule_admitted, ref))
+
+    def reconcile_failure():
+        _reconcile_automation_failure(authority, event, handle, principal_id, ref.session_id, identity)
+
+    try:
+        write = partial(
+            admit_session_input, authority.db, epoch=authority.epoch, principal_id=principal_id,
+            session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
+            _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, ref.session_id, replaced)))
+        if _on_committed is None:
+            return await tracked_write(
+                authority, write, then=admitted, ordered=True,
+                after=partial(authority._schedule_admitted, ref))
+
+        async def ordered_commit():
+            # ``tracked_write(ordered=True)`` serializes only its worker-thread write; its ``then``
+            # callback runs after that lock is released.  Hold the same canonical gate around both
+            # the durable INSERT and this source-owned handoff, while claim writes use the gate too.
+            order = getattr(authority, '_ordered_writes', None)
+            if order is None:
+                order = authority._ordered_writes = asyncio.Lock()
+            async with order:
+                return await tracked_write(
+                    authority, write, then=admitted, ordered=False,
+                    after=partial(authority._schedule_admitted, ref))
+
+        from gateway.session_runtime_workers import track_mutation
+        # Shield the gate-holding operation so caller cancellation cannot release it before the
+        # canonical callback has either bound custody or retained the row as unknown.
+        return await asyncio.shield(track_mutation(authority, ordered_commit()))
+    except asyncio.CancelledError:
+        reconcile_failure()
+        raise
+    except BaseException:
+        reconcile_failure()
+        raise
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
@@ -498,8 +750,12 @@ async def move_route_wakes(runner, session_key, old_session_id):
     #55578), nor anything behind an ``unknown`` head (the operator's to resume)."""
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
-    entry = runner.session_store.lookup_by_session_key(session_key) if authority is not None else None
-    if entry is None or not old_session_id:
+    if authority is None or not old_session_id:
+        return
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
+    entry = runner.session_store.lookup_by_session_key(session_key)
+    if entry is None:
         return
     import asyncio
     from functools import partial
@@ -521,18 +777,54 @@ async def move_route_wakes(runner, session_key, old_session_id):
         if (row['status'] != 'queued' or row['principal_id'] != 'automation:' + session_key
                 or not isinstance(identity, list) or identity[:1] not in ([p] for p in _ROUTE_WAKE_PRODUCERS)):
             continue
+        rehome = None
+        handle = None
+        if coordinator is not None:
+            try:
+                rehome = authority._preservation_prepare_automation_rehome(
+                    row['admission_id'], row, new.session_id,
+                )
+                handle = rehome['handle']
+            except RuntimeStoreError:
+                # A queued row without its exact source-owned root is not safe to copy. Leave it
+                # on the old route for explicit recovery instead of minting a request-id successor.
+                continue
         try:
             await authority.cancel_queued(actor, old, row['admission_id'])
         except RuntimeStoreError:
+            if rehome is not None:
+                authority._preservation_abort_automation_rehome(row['admission_id'])
             continue  # claimed meanwhile: it runs where it is
         payload = deepcopy(row['payload'])
         payload['native_text_v1']['automation']['owner'] = new.session_id
+        if handle is not None:
+            descriptor = authority._preservation_automation_descriptor(
+                handle,
+                request_id=row['request_id'],
+                principal_id=row['principal_id'],
+                session_id=new.session_id,
+                source_identity=rehome['source_identity'],
+                delivery_id=rehome['delivery_id'],
+            )
+            payload['native_text_v1']['automation']['custody'] = descriptor
         authority.sessions.setdefault(new.session_id, LiveSession(authority.sessions[old.session_id].source, session_key))
-        await tracked_write(authority, partial(
-            admit_session_input, authority.db, epoch=authority.epoch, principal_id=row['principal_id'],
-            session_id=new.session_id, request_id=row['request_id'], payload=payload,
-            _authorize_write=authority._admission_gate()), then=partial(authority._admitted, new, None),
-            ordered=True, after=partial(authority._schedule_admitted, new))
+        def admitted(moved, handle=handle):
+            if handle is not None:
+                authority._preservation_bind_or_release(moved, handle)
+            return authority._admitted(new, None, moved)
+        try:
+            await tracked_write(authority, partial(
+                admit_session_input, authority.db, epoch=authority.epoch, principal_id=row['principal_id'],
+                session_id=new.session_id, request_id=row['request_id'], payload=payload,
+                _authorize_write=authority._admission_gate()), then=admitted,
+                ordered=True, after=partial(authority._schedule_admitted, new))
+        except BaseException:
+            if handle is not None:
+                authority._preservation_reconcile_failed(
+                    handle, principal_id=row['principal_id'], session_id=new.session_id,
+                    request_id=row['request_id'],
+                )
+            raise
 
 
 def _local_owner(authority, session_key):
@@ -652,7 +944,8 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *,
+                           _preservation_handle=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
@@ -664,8 +957,7 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     entry = runner.session_store.lookup_by_session_key(key) if authority is not None else None
     if authority is None or entry is None:
         return False
-    import uuid
-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
+    identity = route_wake_identity(producer, key, text, metadata)
     if source.platform == Platform.LOCAL:
         # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
         # the live session's own source object (``snapshot_local_automation`` checks identity).
@@ -676,7 +968,8 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                              message_id=identity, metadata={'gateway_session_key': key,
                                                             'gateway_session_id': entry.session_id,
                                                             **(metadata or {})})
-        await authority.admit_automation(adapter, event, identity)
+        await authority.admit_automation(
+            adapter, event, identity, _preservation_handle=_preservation_handle)
         return True
     from gateway.session_envelope import restore_native
     envelope = committed_route_envelope(authority, entry)
@@ -689,5 +982,6 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                          message_id=identity, metadata={'gateway_session_key': key,
                                                         'gateway_session_id': entry.session_id,
                                                         **(metadata or {})})
-    await authority.admit_automation(adapter, event, identity)
+    await authority.admit_automation(
+        adapter, event, identity, _preservation_handle=_preservation_handle)
     return True

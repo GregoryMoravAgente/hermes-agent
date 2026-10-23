@@ -1282,9 +1282,9 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
         return new_env
 
 
-def _yield_kwargs(command: str, **ctx) -> dict:
+def _yield_kwargs(command: str, *, yield_handler=None, **ctx) -> dict:
     """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
-    handler = yield_to_background_handler(command=command, **ctx)
+    handler = yield_handler if yield_handler is not None else yield_to_background_handler(command=command, **ctx)
     return {"yield_handler": handler} if handler is not None else {}
 
 
@@ -1292,13 +1292,16 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
-    metered: bool = True,
+    metered: bool = True, tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None, run_generation: Optional[int] = None,
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``)."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
+    command_cwd = None
+    yield_handler = None
 
     # Clean interrupt slate for an approved command, ONCE before the retry
     # loop: drop a stale bit that landed during the approval-wait so it
@@ -1311,21 +1314,38 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
-            command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
-                mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
-                env=env,
-            )
+            if command_cwd is None:
+                command_cwd = _resolve_command_cwd(
+                    workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+                    mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
+                    env=env,
+                )
+                yield_handler = yield_to_background_handler(
+                    command=command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
+                    task_id=task_id, session_key=session_key, session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id, run_generation=run_generation,
+                )
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
             result = env.execute(
                 command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
-                                task_id=task_id, session_key=session_key),
+                **_yield_kwargs(
+                    command, yield_handler=yield_handler, env_type=env_type, cwd=command_cwd,
+                    effective_task_id=eff, task_id=task_id, session_key=session_key,
+                    session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
+                    run_generation=run_generation,
+                ),
             )
             break
         except Exception as e:
+            disposition = getattr(yield_handler, "_retry_disposition", lambda: "retry")()
+            if disposition != "retry":
+                return _error_json(
+                    "Command execution refused because its process custody is still accepted or unknown",
+                    exit_code=1,
+                )
             # A backend exception (e.g. an SSH connect timeout) never reached an exit status, so it
             # is not a terminal outcome; Hermes' own deadline arrives as ``hermes_timed_out``.
             if "timeout" in str(e).lower():
@@ -1347,13 +1367,23 @@ def _run_foreground(
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True, "note": _YIELDED_NOTE,
         }, ensure_ascii=False)
+    try:
+        finalized = finalize_foreground_result(
+            command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
+            task_id=task_id, session_id=session_id, session_key=session_key, workdir=workdir,
+            command_cwd=command_cwd, approval_note=approval_note,
+        )
+    except BaseException:
+        retain_custody = getattr(yield_handler, "_retain_foreground_finalization_failure", None)
+        if callable(retain_custody):
+            retain_custody(result=result)
+        raise
+    finalize_custody = getattr(yield_handler, "_finalize_foreground", None)
+    if callable(finalize_custody):
+        finalize_custody(result, finalized_result=finalized)
     if metered:
         record_terminal_outcome(command, env_type, result)
-    return finalize_foreground_result(
-        command=command, result=result, env=env, env_type=env_type, effective_task_id=eff,
-        task_id=task_id, session_id=session_id, session_key=session_key, workdir=workdir,
-        command_cwd=command_cwd, approval_note=approval_note,
-    )
+    return finalized
 
 
 # Floor for the pre-exec guard's share of the command deadline: a short command timeout
@@ -1432,6 +1462,9 @@ def terminal_tool(
     _completion_output_chars: int = 0,
     heartbeat: int = 0,
     persist_on_release: bool = False,
+    tool_call_id: Optional[str] = None,
+    turn_id: Optional[str] = None,
+    run_generation: Optional[int] = None,
 ) -> str:
     """Execute *command* in the configured terminal environment; returns a JSON string.
 
@@ -1535,7 +1568,8 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-            metered=not _host_local,
+            metered=not _host_local, tool_call_id=tool_call_id, turn_id=turn_id,
+            run_generation=run_generation,
         ))
     except _Rejected as r:
         return r.result_json
@@ -1690,6 +1724,9 @@ def _handle_terminal(args, **kw):
         watch_patterns=watch_patterns,
         heartbeat=heartbeat,
         persist_on_release=persist_on_release,
+        tool_call_id=kw.get("tool_call_id"),
+        turn_id=kw.get("turn_id"),
+        run_generation=kw.get("run_generation"),
     )
 
 

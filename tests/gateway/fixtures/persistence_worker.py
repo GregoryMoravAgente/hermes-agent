@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-import psutil
+from gateway.status import get_process_start_time
 
 
 def writable_fds(home):
@@ -45,7 +45,7 @@ for line in sys.stdin:
             transport = module.WorkerRPC(home)
             scope = {'profile_id': str(home), 'session_id': command['session_id'],
                      'execution_id': 'owned-worker', 'generation': 0,
-                     'pid': os.getpid(), 'birth': psutil.Process().create_time(), 'secret': 'private-worker-secret'}
+                     'pid': os.getpid(), 'birth': get_process_start_time(os.getpid()), 'secret': 'private-worker-secret'}
             registration = transport('worker.register', **scope, kind='compute')
             assert reason(lambda: transport('session.create', request_id='forbidden-worker-create', source='cli')) == 'permission_denied'
             scope['epoch'] = registration['owner_epoch']

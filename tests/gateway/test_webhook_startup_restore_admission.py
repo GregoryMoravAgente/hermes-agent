@@ -43,17 +43,24 @@ async def test_admitted_webhook_runs_through_startup_restore_gate(monkeypatch):
         authority = runner.session_authority
         admission_id = authority.db._read_one('SELECT admission_id FROM session_admissions')['admission_id']
         row = get_session_admission(authority.db, admission_id=admission_id)
+        ref = SessionRef(authority.profile_id, row['target_session_id'])
+        # Scheduling is held by the route fixture. Claim through the real authority boundary
+        # before invoking execution, so its generation and I04 lease belong to this admission.
+        row, _first = await authority._claim_next(ref, authority.sessions[ref.session_id])
+        assert row['admission_id'] == admission_id
+        assert row['status'] == 'started'
+        assert authority._preservation_children[admission_id].owner_class == 'I04_fifo_turn_execution'
 
         turns = []
 
         async def turn_ran(event, source, _key):
-            # First seam past the gate. This pins the gate decision only: claim, settlement,
+            # First seam past the gate. This pins the gate decision only: settlement,
             # webhook finalisation and delivery are not exercised here.
             turns.append(event.text)
             return 'answered'
 
         monkeypatch.setattr(runner, '_hm_pending_reply_intercepts', turn_ran)
-        result = await execute_admission(authority, SessionRef(authority.profile_id, row['target_session_id']), row)
+        result = await execute_admission(authority, ref, row)
 
         assert runner._startup_restore_queue == [], 'the gate parked an admission it does not own'
         assert turns == ['during restore']

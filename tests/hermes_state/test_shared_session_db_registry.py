@@ -37,12 +37,14 @@ def _clean_registry():
     registry._opening.clear()
     registry._tearing_down.clear()
     registry._path_lifecycle_locks.clear()
+    registry._teardown_failure_count = 0
     yield
     registry.close_all()
     registry._generations.clear()
     registry._retired.clear()
     registry._opening.clear()
     registry._tearing_down.clear()
+    registry._teardown_failure_count = 0
 
 
 def _replace_file_preserving_schema(src: Path, dst: Path) -> None:
@@ -487,6 +489,42 @@ class TestAcquireSingleFlight:
         assert len(opened) >= 1
         registry.release(results[0])
         registry.release(results[1])
+
+
+class TestCheckedCloseReceipt:
+    def test_checked_close_reports_every_generation(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        db = registry.acquire(db_path)
+
+        receipt = registry.close_all_checked()
+
+        assert receipt.verified
+        assert receipt.attempted == 1
+        assert receipt.succeeded == 1
+        assert receipt.failed == 0
+        assert db._conn is None
+
+    def test_checked_close_reports_a_suppressed_physical_failure(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "state.db"
+        db = registry.acquire(db_path)
+        original_close = db.close
+
+        def _fail_close():
+            raise RuntimeError("synthetic close failure")
+
+        monkeypatch.setattr(db, "close", _fail_close)
+        receipt = registry.close_all_checked()
+
+        assert receipt.verified is False
+        assert receipt.attempted == 1
+        assert receipt.succeeded == 0
+        assert receipt.failed >= 1
+
+        # The checked sweep removed the generation even though the physical handle remained open;
+        # release the fake-owned connection explicitly so this test cannot leak it into the process.
+        monkeypatch.setattr(db, "close", original_close)
+        db._shared_registry_owned = False
+        db.close()
 
 
 class TestMultiGenerationTeardownBarrier:

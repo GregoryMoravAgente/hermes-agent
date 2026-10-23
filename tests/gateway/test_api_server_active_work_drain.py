@@ -68,6 +68,36 @@ def _make_admission_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+@pytest.fixture(autouse=True)
+def _install_api_run_custody(monkeypatch):
+    """Give locally constructed adapters the same runtime identity as the gateway fixture."""
+    import tools.process_registry as process_registry_module
+    original_init = APIServerAdapter.__init__
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from hermes_cli.backend_retirement import RetirementFence
+    from tools.process_registry import ProcessRegistry
+
+    coordinator = RuntimeCustodyCoordinator(
+        process_instance="test-api-drain", authority_epoch=1, fence=RetirementFence())
+    registry = ProcessRegistry()
+    registry.bind_runtime_custody(coordinator)
+    profile_id = registry._process_profile_id()
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+
+    def init(adapter, *args, **kwargs):
+        original_init(adapter, *args, **kwargs)
+        adapter.gateway_runner = SimpleNamespace(
+            runtime_custody=coordinator,
+            session_runtime_descriptor={
+                "instance_id": "test-api-drain", "authority_epoch": 1,
+                "profile_id": profile_id, "served_profiles": [profile_id]},
+            session_authority=None,
+        )
+        adapter._fixture_process_registry = registry
+
+    monkeypatch.setattr(APIServerAdapter, "__init__", init)
+
+
 class TestActiveApiRunCount:
     def test_zero_when_no_api_adapter(self):
         runner, _adapter = make_restart_runner()
@@ -723,3 +753,14 @@ async def test_failed_executor_submission_releases_the_worker_count():
     with pytest.raises(RuntimeError, match="Executor shutdown"):
         _api_runs._submit_api_worker(_ShutExecutorLoop(), lambda: None)
     assert _api_runs.api_worker_live_count() == baseline
+
+
+def test_active_work_count_includes_retained_api_run_custody():
+    from types import SimpleNamespace
+
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    adapter._run_custody["run-unknown"] = SimpleNamespace(released=False, unknown_reason="read_failed")
+    adapter._inflight_agent_runs = 0
+    adapter._active_run_tasks = {}
+    adapter._pending_agent_requests = 0
+    assert adapter.active_agent_work_count() == 1

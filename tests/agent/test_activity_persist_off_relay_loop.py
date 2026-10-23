@@ -72,7 +72,17 @@ def relay_turn(tmp_path, monkeypatch):
 def worker_agent(tmp_path, monkeypatch):
     owner = _OwnerReplies()
     monkeypatch.setattr(WorkerRPC, "_connection", lambda self: owner)
-    store = RuntimeSessionStore(WorkerRPC(tmp_path / "home"), {"session_id": SESSION}, tmp_path / "outbox")
+    import os
+    from gateway.status import get_process_start_time
+
+    birth = get_process_start_time(os.getpid())
+    assert type(birth) is int
+    scope = {
+        "pid": os.getpid(), "birth": birth, "session_id": SESSION,
+        "profile_id": str(tmp_path), "execution_id": "activity-test",
+        "generation": 0, "epoch": 1,
+    }
+    store = RuntimeSessionStore(WorkerRPC(tmp_path / "home"), scope, tmp_path / "outbox")
     agent = SimpleNamespace(
         session_id=SESSION, _session_db=store, _last_activity_ts=0.0, _last_activity_desc="",
         _last_activity_provenance=ActivityProvenance.UNKNOWN, _session_activity_last_persist_mono=0.0,
@@ -231,7 +241,13 @@ def test_async_delegation_ledger_writes_inside_relay_tool_persist_off_relay_loop
     def tool(args):
         assert asyncio.get_running_loop() is not None
         async_delegation._persist_dispatch({"delegation_id": "d-1", "parent_session_id": SESSION,
-                                            "goal": "g", "dispatched_at": 1.0})
+                                            "goal": "g", "dispatched_at": 1.0,
+                                            "execution": {
+                                                "handoff_id": "d-1", "state": "prepared",
+                                                "accepted": "unknown", "worker_started": False,
+                                                "worker_exited": False, "error": None,
+                                                "exception": None,
+                                            }})
         ledger.unscheduled("d-1")
         return {"ok": True}
 

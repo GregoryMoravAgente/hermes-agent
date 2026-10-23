@@ -285,7 +285,8 @@ def test_headed_chromium_spawn_asks_the_screen_to_start_but_the_env_builder_neve
     class _Done:
         returncode = 0
         def wait(self, timeout=None): return 0
-    def _fake_popen(argv, env, socket_dir, tag, stdin_payload=None):
+    def _fake_popen(argv, env, socket_dir, tag, stdin_payload=None, custody=None):
+        assert custody is None  # This fixture exercises the unmanaged desktop-start route.
         for slot in ("stdout", "stderr"):
             Path(socket_dir, f"_{slot}_{tag}").write_text("{}" if slot == "stdout" else "", encoding="utf-8")
         return _Done()
@@ -305,7 +306,11 @@ def test_janitor_keeps_the_shared_browser_alive_while_a_human_holds_the_lease(mo
     holder = {"human": True}
     monkeypatch.setattr(lease, "human_holds", lambda *a, **k: holder["human"])
     reaped: list = []
-    monkeypatch.setattr(lifecycle, "cleanup_browser", lambda task_id: reaped.append(task_id))
+    def cleanup_successfully(task_id):
+        reaped.append(task_id)
+        return True
+
+    monkeypatch.setattr(lifecycle, "cleanup_browser", cleanup_successfully)
     monkeypatch.setattr(lifecycle._bt, "BROWSER_SESSION_INACTIVITY_TIMEOUT", 1)
     monkeypatch.setattr(lifecycle._bt, "_active_sessions", {
         "bot": {"session_name": "h_bot", "features": {"local": True}},
@@ -353,6 +358,7 @@ def test_a_headless_shell_pin_is_replaced_while_a_screen_is_up(tmp_path, monkeyp
     monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path / "bot-desktop")
     monkeypatch.setattr(browser, "_managed_executable", lambda: str(headed))
     monkeypatch.delenv("AGENT_BROWSER_PROFILE", raising=False)
+    monkeypatch.delenv("AGENT_BROWSER_EXECUTABLE_PATH", raising=False)
     # Unpinned, the ubuntu runner (non-root, userns-restricted) flips executable() to
     # its own /usr/bin/google-chrome; host policy is not the subject here.
     monkeypatch.setattr(browser, "_userns_restricted", lambda: False)

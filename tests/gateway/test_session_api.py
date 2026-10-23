@@ -15,7 +15,12 @@ from hermes_state import SessionDB
 
 
 @pytest.fixture
-def session_db(tmp_path):
+def session_db(tmp_path, monkeypatch):
+    # The process-registry scope fence authenticates the actual profile home.  Keep this
+    # legacy fixture on its temporary profile so the real I03 process-custody path can open
+    # and close the same scope; this is the supported pre-authority test topology, not a
+    # synthetic owner flag.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     db = SessionDB(tmp_path / "state.db")
     try:
         yield db
@@ -29,6 +34,7 @@ def session_db(tmp_path):
 def adapter(session_db):
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = session_db
+    _bind_session_adapter_runtime(adapter, session_db)
     return adapter
 
 
@@ -36,7 +42,53 @@ def adapter(session_db):
 def auth_adapter(session_db):
     adapter = APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-test"}))
     adapter._session_db = session_db
+    _bind_session_adapter_runtime(adapter, session_db)
     return adapter
+
+
+def _bind_session_adapter_runtime(adapter, session_db):
+    """Give the bare endpoint adapter the real profile authority/custody seam."""
+    from types import SimpleNamespace
+
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionStore
+    from gateway.session_authority import SessionAuthority
+    from hermes_state_runtime import begin_runtime_epoch
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    from tools.process_registry import process_registry
+
+    store = SessionStore(session_db.db_path.parent / "sessions", GatewayConfig())
+    store._db = session_db
+    runner = SimpleNamespace(
+        _draining=False,
+        session_store=store,
+        _session_db=session_db,
+        adapters={Platform.API_SERVER: adapter},
+        _cached_agent_for=lambda _route: None,
+        _evict_cached_agent=lambda _route: None,
+        _handle_message=None,
+    )
+    authority = SessionAuthority(
+        runner,
+        profile_id=str(session_db.db_path.parent.resolve()),
+        instance_id="first",
+        db=session_db,
+        epoch=begin_runtime_epoch(session_db, instance_id="first"),
+    )
+    runner.session_authority = authority
+    runner._adapter_for_source = lambda _source: adapter
+    coordinator = bind_authority_runtime_custody(runner, authority)
+    # Full gateway bootstrap binds the singleton process registry to this same coordinator;
+    # retain that production seam for the explicit legacy fixture after authority routing is
+    # cleared below.
+    process_registry.bind_runtime_custody(coordinator)
+    # These endpoint tests exercise the supported pre-authority legacy adapter path. Keep the
+    # real descriptor/coordinator installed, then clear only authority routing as the production
+    # legacy fixture does; canonical authority behavior is covered by the dedicated runtime-owned
+    # authority tests.
+    runner.session_authority = None
+    adapter.gateway_runner = runner
+    return runner
 
 
 def _create_session_app(adapter: APIServerAdapter) -> web.Application:
@@ -614,6 +666,7 @@ async def test_session_chat_resolves_stored_model_route_alias(session_db, monkey
         )
     )
     adapter._session_db = session_db
+    _bind_session_adapter_runtime(adapter, session_db)
     session_id = session_db.create_session("route-pinned-session", "api_server", model="alias")
 
     mock_run = AsyncMock(return_value=({"final_response": "ok", "session_id": session_id}, {"total_tokens": 1}))
@@ -641,6 +694,7 @@ async def test_session_chat_treats_pre_existing_poisoned_row_as_no_model(session
     alias-leak)."""
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = session_db
+    _bind_session_adapter_runtime(adapter, session_db)
     session_id = session_db.create_session(
         "poisoned-session", "api_server", model=adapter._model_name
     )
@@ -665,6 +719,7 @@ async def test_session_chat_stream_treats_pre_existing_poisoned_row_as_no_model(
     guard against a pre-existing poisoned session row."""
     adapter = APIServerAdapter(PlatformConfig(enabled=True))
     adapter._session_db = session_db
+    _bind_session_adapter_runtime(adapter, session_db)
     session_id = session_db.create_session(
         "poisoned-stream-session", "api_server", model=adapter._model_name
     )

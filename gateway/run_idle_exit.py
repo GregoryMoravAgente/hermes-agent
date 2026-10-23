@@ -177,6 +177,12 @@ def busy_reason(runner, *, window: float) -> str | None:
 
 def _begin_idle_exit(runner, window: float) -> None:
     """Withdraw admission synchronously (no await between the last idle check and here), then stop."""
+    from gateway.lifecycle_custody import admit_lifecycle
+    from gateway.runtime_custody import CustodyRefusal
+    _lifecycle = admit_lifecycle(runner, "idle", owner_id="gateway:idle-exit")
+    if isinstance(_lifecycle, CustodyRefusal):
+        logger.warning("Idle exit refused by lifecycle custody: %s", _lifecycle.code)
+        return
     runner._draining = True
     runner.session_runtime_descriptor.update(state="draining", capabilities=[], drain_reason=IDLE_EXIT_REASON)
     runner._exit_reason = f"{IDLE_EXIT_STOP_PREFIX} for {window:.0f}s (gateway.unmanaged_idle_exit_seconds)"

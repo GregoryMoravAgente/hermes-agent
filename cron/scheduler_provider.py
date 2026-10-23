@@ -21,6 +21,14 @@ _EMFILE_BACKOFF_MAX_SECONDS = 15 * 60
 DEFAULT_MISFIRE_GRACE_MINUTES = 10
 
 
+def _create_provider_execution(create_execution, job_id: str, source: str, binding, admission=None):
+    """Preserve unmanaged providers' historical call shape while binding managed receipts."""
+    if binding is None:
+        return create_execution(job_id, source=source, admission=admission)
+    return create_execution(
+        job_id, source=source, execution_id=binding.owner_id, admission=admission)
+
+
 # Cap for the exponential tick backoff applied while consecutive ticks fail with fd exhaustion
 # (EMFILE/ENFILE, #87644). Base is the tick interval (60s by default); each consecutive EMFILE failure
 # doubles the wait, capped here so a still-alive-but-exhausted gateway never sleeps longer than this between
@@ -197,33 +205,70 @@ class CronScheduler(ABC):
             return False
         return self.fire_claimed(claimed_job, adapters=adapters, loop=loop)
 
-    def claim_fire(self, job_id: str, *, force: bool = False, manual: bool = False) -> dict | None:
-        """Durably claim one fire + create its audit attempt. Transports call this synchronously
-        before acknowledging, then pass the exact snapshot to ``fire_claimed`` off-thread."""
+    def claim_fire(
+        self, job_id: str, *, force: bool = False, manual: bool = False,
+        custody_parent: Any = None,
+    ) -> dict | None:
+        """Durably claim one fire + create its audit attempt.
+
+        When the managed gateway has a custody parent, the exact execution id is reserved before
+        this ledger transaction and carried through the returned snapshot.  Legacy direct callers
+        keep the additive no-coordinator path; authenticated detached API callers set the context
+        requirement and refuse a provider that does not return this receipt.
+        """
         from cron.executions import create_execution, finish_execution, set_execution_occurrence
         from cron.jobs import claim_job_for_fire
+        from cron.runtime_custody import (
+            admit_cron_source, custody_parent as current_custody_parent,
+            custody_required, reserve_execution)
+        from hermes_constants import get_hermes_home
 
-        execution = create_execution(job_id, source=self.name)
-        claim_kwargs = {"return_job": True}
-        if force:
-            claim_kwargs["force"] = True
-        if manual:
-            claim_kwargs["manual"] = True
+        parent = custody_parent if custody_parent is not None else current_custody_parent()
         try:
-            claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
-            if isinstance(claimed_job, dict):
-                set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
-        except BaseException as exc:
-            finish_execution(
-                execution["id"], success=False,
-                error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
-            )
-            raise
-        if not isinstance(claimed_job, dict):
-            finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+            admission = admit_cron_source(
+                "provider_claim", home=get_hermes_home(), parent=parent)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+            logger.warning("Cron provider claim refused before durable admission: %s", exc)
             return None
-        claimed_job["execution_id"] = execution["id"]
-        return claimed_job
+        with admission:
+            binding = reserve_execution(
+                owner_class="I12_cron_fire", job_id=job_id, source=self.name, parent=parent,
+                required=custody_required())
+            try:
+                execution = _create_provider_execution(
+                    create_execution, job_id, self.name, binding, admission=admission)
+                if binding is not None:
+                    binding.bind_execution_record(execution)
+            except BaseException:
+                if binding is not None:
+                    binding.mark_unknown("read_failed")
+                raise
+            claim_kwargs = {"return_job": True}
+            if force:
+                claim_kwargs["force"] = True
+            if manual:
+                claim_kwargs["manual"] = True
+            try:
+                claimed_job = claim_job_for_fire(job_id, **claim_kwargs)
+                if isinstance(claimed_job, dict):
+                    set_execution_occurrence(execution["id"], claimed_job.get("_scheduled_instant"))
+            except BaseException as exc:
+                finish_execution(
+                    execution["id"], success=False,
+                    error=f"Fire claim failed before dispatch: {type(exc).__name__}: {exc}",
+                )
+                if binding is not None:
+                    binding.observe_terminal()
+                raise
+            if not isinstance(claimed_job, dict):
+                finish_execution(execution["id"], success=False, error="Fire claim was not acquired")
+                if binding is not None:
+                    binding.observe_terminal()
+                return None
+            claimed_job["execution_id"] = execution["id"]
+            if binding is not None:
+                claimed_job["_cron_custody"] = binding
+            return claimed_job
 
     def fire_claimed(
         self, claimed_job: dict, *, adapters: Any = None, loop: Any = None,
@@ -566,6 +611,15 @@ class InProcessCronScheduler(CronScheduler):
                 return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
             return tick_adapters
 
+        def tick_profile(profile_name, home):
+            with _profile_cron_scope(home):
+                from cron.runtime_custody import admit_cron_source
+                with admit_cron_source("ticker", home=home):
+                    return cron_tick(
+                        verbose=False, adapters=tick_adapters_for(profile_name), loop=loop,
+                        sync=False, can_dispatch=can_dispatch,
+                    )
+
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
@@ -618,11 +672,7 @@ class InProcessCronScheduler(CronScheduler):
                 else:
                     for _pname, home in cycle_homes:
                         try:
-                            with _profile_cron_scope(home):
-                                cron_tick(
-                                    verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
-                                    sync=False, can_dispatch=can_dispatch,
-                                )
+                            tick_profile(_pname, home)
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)

@@ -72,6 +72,26 @@ class TestHandleFunctionCall:
             assert kwargs_by_hook[hook_name]["error_type"] == "tool_error"
             assert kwargs_by_hook[hook_name]["error_message"] == "exit 1"
 
+    def test_terminal_receives_hidden_parent_binding_ids(self, monkeypatch):
+        seen = {}
+
+        def dispatch(name, args, **kwargs):
+            seen.update(kwargs)
+            return '{"ok":true}'
+
+        monkeypatch.setattr("model_tools.registry.dispatch", dispatch)
+        result = handle_function_call(
+            "terminal", {"command": "true"}, task_id="task-parent",
+            session_id="session-parent", tool_call_id="call-parent", turn_id="turn-parent",
+            run_generation=17,
+        )
+        assert json.loads(result) == {"ok": True}
+        assert seen["task_id"] == "task-parent"
+        assert seen["session_id"] == "session-parent"
+        assert seen["tool_call_id"] == "call-parent"
+        assert seen["turn_id"] == "turn-parent"
+        assert seen["run_generation"] == 17
+
 
     def test_tool_request_and_execution_middleware_wrap_registry_dispatch(self, monkeypatch):
         seen = {}

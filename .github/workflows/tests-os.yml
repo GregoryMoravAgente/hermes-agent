@@ -85,23 +85,23 @@ jobs:
           # Two slices: on the old free standard runner (3 cores, 3 workers) one lane ran
           # ~7.5 min and became the slowest required job once the Linux suite split.
           - name: macOS-only tests (1/2)
-            runner: blacksmith-12vcpu-macos-latest
+            runner: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'macos-15' || 'blacksmith-12vcpu-macos-latest' }}
             marker: macos
             slice: 1/2
           - name: macOS-only tests (2/2)
-            runner: blacksmith-12vcpu-macos-latest
+            runner: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'macos-15' || 'blacksmith-12vcpu-macos-latest' }}
             marker: macos
             slice: 2/2
           - name: Windows-only tests
-            runner: blacksmith-32vcpu-windows-2025
+            runner: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'windows-2025' || 'blacksmith-32vcpu-windows-2025' }}
             marker: windows
           - name: Windows-only tests (arm64, 1/2)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'windows-11-arm' || 'windows-latest-32-arm-core' }}
             marker: windows
             timeout: 60
             slice: 1/2
           - name: Windows-only tests (arm64, 2/2)
-            runner: windows-latest-32-arm-core
+            runner: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'windows-11-arm' || 'windows-latest-32-arm-core' }}
             marker: windows
             timeout: 60
             slice: 2/2
@@ -119,6 +119,8 @@ jobs:
       - name: Set up locked Python and test dependencies
         uses: ./.github/actions/setup-pm
         with:
+          toolchain: all
+          node-cache-dependency-path: scripts/whatsapp-bridge/package-lock.json
           # Installer stage tests inherit setup-pm's HERMES_RUNTIME_DIR. Prepare
           # the verified Git pin once, before per-file parallelism; otherwise
           # each isolated PowerShell stage races to download/extract the archive.
@@ -126,6 +128,9 @@ jobs:
           extras: '["all", "telegram", "anthropic", "mistral", "fal", "modal", "daytona", "parallel-web"]'
           test-environment: 'true'
           prune-python-cache: true
+
+      - name: Install locked WhatsApp queue consumer dependencies
+        run: npm ci --prefix scripts/whatsapp-bridge --ignore-scripts --no-audit --no-fund
 
       - name: Run ${{ matrix.marker }} tests
         # scripts/run_tests.sh — the canonical runner, same as every other
@@ -199,7 +204,7 @@ jobs:
         env:
           # These files spawn nested PowerShell trees. CPU-count parallelism
           # starves cold child startup before the fixture's idle deadline.
-          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (runner.arch == 'ARM64' && '16' || '16') || '' }}
+          HERMES_TEST_WORKERS: ${{ matrix.marker == 'windows' && (github.repository == 'GregoryMoravAgente/hermes-agent' && '2' || '16') || '' }}
           HERMES_TEST_SLICE: ${{ matrix.slice || '' }}
           # Belt-and-suspenders with tests/conftest.py's env blanking: no
           # test may reach a real provider API.
@@ -244,7 +249,7 @@ jobs:
     # 32-core like os-tests' Windows row: seven files run in parallel and each spawns
     # process trees; on the 4-vCPU image the suite step took 153-171 s (job 4.7-5.6 min),
     # here 124 s (job 3.1 min), with headroom against scheduling-starved timeouts.
-    runs-on: blacksmith-32vcpu-windows-2025
+    runs-on: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'windows-2025' || 'blacksmith-32vcpu-windows-2025' }}
     timeout-minutes: 25
     steps:
       - name: Checkout code

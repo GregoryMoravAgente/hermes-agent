@@ -26,6 +26,7 @@ async def test_keyless_injection_from_a_cli_session_turn_lands_in_that_session(t
     from gateway.session_local import create_local_session
     from gateway.session_policy import _ACTIVE_POLICY
     from hermes_state import SessionDB
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)
@@ -34,6 +35,7 @@ async def test_keyless_injection_from_a_cli_session_turn_lands_in_that_session(t
     runner.session_store._db = db
     runner._session_db = db
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner", db=db)
+    bind_authority_runtime_custody(runner, authority)
     try:
         actor = Principal("test-owner", "default", frozenset({"session:create", "session:submit", "session:read"}),
                           "fixture")
@@ -64,12 +66,14 @@ async def test_keyed_local_injection_stays_inside_the_plugins_own_profile(tmp_pa
     up front (``False``, reason in gateway.log) and admits nothing."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner, _profile_runtime_scope
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_authorities import SessionAuthorities
     from gateway.session_authority import SessionAuthority
     from gateway.session_context import set_session_vars
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from gateway.session_policy import _ACTIVE_POLICY
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_state import SessionDB
     from hermes_state_runtime import begin_runtime_epoch
 
@@ -91,6 +95,9 @@ async def test_keyed_local_injection_stays_inside_the_plugins_own_profile(tmp_pa
         runner.session_authorities.add(home, authorities[name], name=name)
     runner.session_authority = authorities["default"]
     runner.session_store._db = runner._session_db = authorities["default"].db
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance="owner", authority_epoch=authorities["default"].epoch,
+        fence=RetirementFence())
     try:
         for name, home in (("default", launch), ("beta", beta)):
             authority = authorities[name]

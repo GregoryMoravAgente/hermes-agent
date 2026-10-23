@@ -373,6 +373,7 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
     simulate owner death, recover — the recovered completion event must carry
     scope_id/user_id, and the reconstructed SessionSource must prime them."""
     import tools.async_delegation as ad
+    from tests.gateway.test_completion_admission import prepared_execution
     from gateway.session_context import clear_session_vars, set_session_vars
 
     ad._reset_for_tests()
@@ -395,6 +396,7 @@ def test_durable_dispatch_persists_and_recovers_scope_id(tmp_path, monkeypatch):
             "parent_session_id": "sess-p",
             "goal": "scoped goal",
             "dispatched_at": 100.0,
+            "execution": prepared_execution("d-scope-1"),
             **ad._capture_routing_origin(),
         }
         assert record.get("scope_id") == "G777", (

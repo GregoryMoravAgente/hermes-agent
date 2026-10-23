@@ -34,7 +34,9 @@ async def native(monkeypatch):
 
     monkeypatch.setattr(adapter, "send", send)
     runner.adapters = {Platform.DISCORD: adapter}
+    from tests.gateway.conftest import bind_authority_runtime_custody
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="fixture")
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id="42", chat_type="dm", user_id="42")
     try:
@@ -222,8 +224,8 @@ async def test_admission_reserved_on_the_old_route_commits_on_the_fresh_session(
     old = admitted[0][1].ref
     reserve_real, held, release = authority._reserve_route, [], threading.Event()
 
-    def held_reserve(src):
-        answer = reserve_real(src)
+    def held_reserve(src, **kwargs):
+        answer = reserve_real(src, **kwargs)
         loop.call_soon_threadsafe(held.append, answer)
         assert release.wait(10)
         return answer

@@ -15,11 +15,14 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
+
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from agent.acp_openai_bridge import (
+    MixedToolEnvelopeError,
     StreamChunks,
     completion_to_stream_chunks,
     extract_tool_calls_from_text,
@@ -112,10 +115,20 @@ def test_bare_json_is_a_fallback_only_when_no_block_matched():
     assert [c.id for c in calls] == ["c9"]
     assert cleaned == "before\nafter"
 
-    # With a real block present the bare-JSON scan must not double-count.
-    both = f'<tool_call>{bare}</tool_call> and {bare}'
-    calls, _ = extract_tool_calls_from_text(both)
+    # A bare-looking object inside the XML wrapper is the same XML call, not a second envelope.
+    calls, _ = extract_tool_calls_from_text(f'<tool_call>{bare}</tool_call>')
     assert len(calls) == 1
+
+
+def test_mixed_xml_and_bare_tool_envelopes_fail_closed_without_payload_echo():
+    bare = '{"id": "c9", "type": "function", "function": {"name": "memory", "arguments": "{}"}}'
+    both = f'<tool_call>{bare}</tool_call> and {bare}'
+
+    with pytest.raises(MixedToolEnvelopeError) as exc_info:
+        extract_tool_calls_from_text(both)
+
+    assert exc_info.value.code == "mixed_tool_envelope"
+    assert "c9" not in str(exc_info.value)
 
 
 def test_malformed_and_empty_input_never_raises():

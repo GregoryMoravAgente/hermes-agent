@@ -235,7 +235,7 @@ async def run_gateway_chat(args, emitter=None):
         view.unattended = isinstance(oneshot_prompt, str)
         view.resume_footer = oneshot and not quiet
         if (getattr(args, "resume", None) or title or latest) and not quiet:
-            from agent.context_compressor import MODEL_ONLY_DISPLAY_METADATA_KEY
+            from agent.compression_marker import MODEL_ONLY_DISPLAY_METADATA_KEY
             for row in snapshot.get("messages", []):
                 # A micro-compaction merge (model_only) is not printed: its original prompts are.
                 metadata = row.get("display_metadata")

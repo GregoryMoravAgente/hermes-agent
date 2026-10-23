@@ -172,6 +172,11 @@ class ManagedWorker:
         self.stderr_drain = None
         # Exact secrets this worker was handed; the stderr sink scrubs them besides the patterns.
         self.secrets = []
+        # Optional I16 source receipt.  The default worker path stays byte-for-byte
+        # compatible; the managed producer adapter installs these only after its
+        # physical receipt is reserved and before any reader starts.
+        self._managed_worker_receipt = None
+        self._managed_worker_native_terminate = None
 
     def _write_controls(self):
         try:
@@ -186,20 +191,52 @@ class ManagedWorker:
 
     def _read_frames(self, loop):
         """Reader thread body. It owns ``stdout``: no other thread closes it under a blocked read."""
+        observed_eof = False
+        reader_failed = False
         try:
             while self._demand.acquire() and not self.closed.is_set():
                 try:
                     item = read_frame(self.process.stdout)
                 except (EOFError, ValueError, OSError, RecursionError) as exc:
+                    observed_eof = isinstance(exc, EOFError)
+                    reader_failed = not observed_eof
+                    if reader_failed:
+                        receipt = self._managed_worker_receipt
+                        if receipt is not None:
+                            receipt.reader_failed('reader_failed')
                     item = exc  # EOF / invalid or oversized frame / closed pipe: the owner raises it
+                except BaseException:  # health: allow BLE001 -- opaque reader faults retain the native receipt
+                    # A reader body is an accepted native worker operation.  An
+                    # opaque BaseException must become an owner-visible failure,
+                    # not an unobserved thread death that later looks joined.
+                    reader_failed = True
+                    receipt = self._managed_worker_receipt
+                    if receipt is not None:
+                        receipt.reader_failed('reader_failed')
+                    item = RuntimeStoreError('managed_worker_reader_failed')
                 try:
                     loop.call_soon_threadsafe(self._deliver, item)
                 except RuntimeError:
+                    reader_failed = True
                     return  # the owner loop has closed; nobody is left to read for
                 if isinstance(item, Exception):
                     return
         finally:
-            self.process.stdout.close()
+            receipt = self._managed_worker_receipt
+            reader = self.reader
+            if receipt is not None and observed_eof:
+                try:
+                    receipt.reader_eof('stdout', reader)
+                except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                    receipt.mark_unknown('reader_state_unknown')
+            elif receipt is not None and reader_failed:
+                receipt.reader_failed('reader_failed')
+            try:
+                self.process.stdout.close()
+            except BaseException:  # health: allow BLE001 -- a reader close fault retains native custody
+                if receipt is not None:
+                    receipt.reader_error = 'reader_close_failed'
+                    receipt.mark_unknown('reader_close_failed')
 
     def _deliver(self, item):
         self._frames.append(item)
@@ -220,9 +257,38 @@ class ManagedWorker:
         bounded, redacted, private log instead of discarding it."""
         from agent.memory_provider import spawn_context_thread
         from gateway.session_managed_worker_log import drain_worker_stderr
-        self.stderr_drain = spawn_context_thread(drain_worker_stderr, name='managed-stderr-drain',
-                                                 args=(self.process.stderr, path, self.process.pid, lambda: self.secrets))
-        self.stderr_drain.start()
+        def drain():
+            observed_eof = False
+            try:
+                drain_worker_stderr(self.process.stderr, path, self.process.pid, lambda: self.secrets)
+                observed_eof = True
+            except BaseException:  # health: allow BLE001 -- opaque stderr faults retain the native receipt
+                receipt = self._managed_worker_receipt
+                if receipt is not None:
+                    receipt.reader_failed('reader_failed')
+                raise
+            finally:
+                receipt = self._managed_worker_receipt
+                if receipt is not None and observed_eof:
+                    reader = threading.current_thread()
+                    try:
+                        receipt.reader_eof('stderr', reader)
+                    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+                        receipt.mark_unknown('reader_state_unknown')
+
+        self.stderr_drain = spawn_context_thread(drain, name='managed-stderr-drain')
+        receipt = self._managed_worker_receipt
+        if receipt is not None:
+            receipt.bind_reader('stderr', self.stderr_drain)
+            if not receipt.reader_started('stderr', self.stderr_drain):
+                raise RuntimeStoreError('reader_start_unknown')
+        try:
+            self.stderr_drain.start()
+        except BaseException:  # health: allow BLE001 -- opaque reader start retains the native receipt
+            receipt = self._managed_worker_receipt
+            if receipt is not None:
+                receipt.reader_start_failed('stderr', self.stderr_drain, 'reader_start_unknown')
+            raise
 
     def control(self, frame):
         if self.closed.is_set():
@@ -251,7 +317,18 @@ class ManagedWorker:
             from agent.memory_provider import spawn_context_thread
             self.reader = spawn_context_thread(self._read_frames, name='managed-frame-reader',
                                                args=(asyncio.get_running_loop(),))
-            self.reader.start()
+            receipt = self._managed_worker_receipt
+            if receipt is not None:
+                receipt.bind_reader('stdout', self.reader)
+                if not receipt.reader_started('stdout', self.reader):
+                    raise RuntimeStoreError('reader_start_unknown')
+            try:
+                self.reader.start()
+            except BaseException:  # health: allow BLE001 -- opaque reader start retains the native receipt
+                receipt = self._managed_worker_receipt
+                if receipt is not None:
+                    receipt.reader_start_failed('stdout', self.reader, 'reader_start_unknown')
+                raise
         if not self._frames and not self._requested:
             self._requested = True
             self._demand.release()
@@ -293,16 +370,20 @@ class ManagedWorker:
             return
         try:
             proc = psutil.Process(self.worker[0])
-            from hermes_cli.process_identity import process_birth
-            if process_birth(proc) == self.worker[1]:
-                (proc.kill if kill else proc.terminate)()
-        except psutil.Error:
+            from gateway.session_worker import _canonical_worker_birth
+            _canonical_worker_birth(self.worker[0], self.worker[1])
+            (proc.kill if kill else proc.terminate)()
+        except (RuntimeError, RuntimeStoreError, psutil.Error):
             pass
 
     def _signal_group(self, kill):
         """POSIX: signal the worker's whole process group (it leads one, WORKER_POPEN), so the tool
         children a killed worker never reaps with _die_with_owner go too. Only while the leader is
         unreaped and still leads its group; otherwise (Windows, gone) the handle alone."""
+        native_terminate = self._managed_worker_native_terminate
+        if callable(native_terminate):
+            native_terminate(kill)
+            return
         if os.name != 'nt' and self.process.poll() is None:
             import signal
             try:
@@ -313,7 +394,21 @@ class ManagedWorker:
                 pass
         (self.process.kill if kill else self.process.terminate)()
 
+    def _managed_cleanup_failure(self, reason):
+        receipt = self._managed_worker_receipt
+        if receipt is not None:
+            receipt.mark_unknown(reason)
+        self.closed.set()
+        self._demand.release()
+
     def close(self):
+        receipt = self._managed_worker_receipt
+        if receipt is not None:
+            from gateway.session_managed_worker_custody import close_managed_worker
+
+            close_managed_worker(self, receipt)
+            return
+
         self.closed.set()
         self._demand.release()  # a reader parked between frames exits; one mid-read ends at EOF
         if self.process.poll() is None:
@@ -324,7 +419,6 @@ class ManagedWorker:
         except subprocess.TimeoutExpired:
             self._signal_worker(kill=True)
             self._signal_group(kill=True)
-            # Still unreaped after SIGKILL (a launcher's handle): the teardown below must still run.
             with suppress(subprocess.TimeoutExpired):
                 self.process.wait(timeout=5)
         else:
@@ -337,7 +431,7 @@ class ManagedWorker:
         else:
             self.reader.join(timeout=5)
         if self.stderr_drain is not None:
-            self.stderr_drain.join(timeout=5)  # EOF once the child is gone; the thread closes it
+            self.stderr_drain.join(timeout=5)
         elif self.process.stderr is not None:
             self.process.stderr.close()
 
@@ -545,7 +639,7 @@ def _stopped_before_spawn(authority, ref, row):
     return True
 
 
-async def _spawn_registered_worker(authority, ref, row):
+async def _spawn_registered_worker(authority, ref, row, custody=None):
     """Spawn the turn's child and register it for Stops: ``(worker, process)``, or None when the spawn was cancelled (the
     interrupted result is already recorded). The generation stays marked spawning until registration."""
     spawning = _mark_spawning(authority, ref, row)
@@ -556,20 +650,73 @@ async def _spawn_registered_worker(authority, ref, row):
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
         log_path = worker_log_path(authority.profile_id)
-        process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
-            cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
+        if custody is not None:
+            custody.configure_streams({'stdout'} if log_path is None else {'stdout', 'stderr'})
+            if sys.platform == 'win32':
+                def spawn_windows(*args, **kwargs):
+                    kwargs = dict(kwargs)
+                    kwargs.setdefault('text', False)
+                    kwargs.setdefault('encoding', None)
+                    kwargs.setdefault('errors', None)
+                    kwargs.setdefault('bufsize', -1)
+                    kwargs.setdefault('creationflags', 0)
+                    return custody.launch_windows(*args, **kwargs)
+
+                process = await acquire_process(
+                    spawn_windows,
+                    [sys.executable, '-m', 'agent.managed_worker'],
+                    cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE,
+                    cleanup=custody.cleanup_spawned_process, **WORKER_POPEN,
+                )
+            else:
+                process = await acquire_process(
+                    subprocess.Popen,
+                    [sys.executable, '-m', 'agent.managed_worker'],
+                    cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE,
+                    cleanup=custody.cleanup_spawned_process, **WORKER_POPEN,
+                )
+        else:
+            process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
+                cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
     except asyncio.CancelledError:
         # acquire_process owns late-child cleanup; no bootstrap or reservation was sent.
         spawning.pop(ref.session_id, None)
         _interrupted_before_bootstrap(authority, row, _latched_stop_cause(authority, ref.session_id, generation))
         return None
-    except BaseException:
+    except BaseException:  # health: allow BLE001 -- spawn faults retain the exact admission boundary
         spawning.pop(ref.session_id, None)
         raise
-    worker = ManagedWorker(process)
+    try:
+        worker = ManagedWorker(process)
+    except BaseException:  # health: allow BLE001 -- an opaque constructor fault retains the exact native child
+        spawning.pop(ref.session_id, None)
+        if custody is not None:
+            custody.cleanup_spawned_process(process)
+        raise
+    if custody is not None:
+        try:
+            if sys.platform == 'win32':
+                custody.bind_windows_transaction(custody.physical.transaction, process)
+            else:
+                custody.bind_process(process)
+            custody.attach_worker(worker)
+        except BaseException:  # health: allow BLE001 -- bind faults retain the exact native child
+            # Keep the exact worker/process/receipt reachable for the owner-side
+            # UNKNOWN path; never replace it with a fresh Popen.
+            spawning.pop(ref.session_id, None)
+            custody.cleanup_spawned_process(process)
+            raise
     if log_path is not None:
-        worker.drain_stderr(log_path)
+        try:
+            worker.drain_stderr(log_path)
+        except BaseException:  # health: allow BLE001 -- reader construction/start faults retain native custody
+            spawning.pop(ref.session_id, None)
+            if custody is not None:
+                custody.cleanup_spawned_process(process)
+            raise
     workers = getattr(authority, '_managed_workers', None)
     if workers is None:
         workers = authority._managed_workers = {}
@@ -579,36 +726,67 @@ async def _spawn_registered_worker(authority, ref, row):
     return worker, process
 
 
-async def admit_managed(authority, ref, row, policy):
+async def admit_managed(authority, ref, row, policy, binding=None):
     """The ingress route into a managed worker. A removed folder is refused before a worker exists,
     like the in-process runner: a worker failing in its policy scope reads as a LOST execution
     (``unknown``) and parks every follower behind it."""
+    if binding is None:
+        # A managed child is an I04->I16 producer.  There is no safe legacy
+        # untracked fallback once the managed policy has selected this route.
+        from gateway.runtime_service_custody import ServiceCustodyError
+        raise ServiceCustodyError('preservation_owner_unmapped')
     from gateway.session_policy import workspace_ready, workspace_unavailable_result
     if not workspace_ready(policy):
         result = workspace_unavailable_result(policy)
         authority.pending_results[row['admission_id']] = {'result': result, 'usage': {}}
         return result['final_response']
-    return await execute_managed(authority, ref, row, policy)
+    return await execute_managed(authority, ref, row, policy, binding)
 
 
-async def execute_managed(authority, ref, row, policy):
-    from gateway.run_turn_progress import publish_worker_tool_event
-    # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
+async def _prepare_managed_execution(authority, ref, row, policy):
+    """Run pre-spawn work and return an early response or the child text."""
     from gateway.session_context_refs import managed_turn_text, refused_turn_result
+
     _mark_spawning(authority, ref, row)
     try:
         text, refusal = await managed_turn_text(authority, row, policy)
-    except BaseException:
+    except BaseException:  # health: allow BLE001 -- pre-spawn faults retain the exact admission boundary
         authority._managed_spawning.pop(ref.session_id, None)
         raise
     if refusal is not None:
         authority._managed_spawning.pop(ref.session_id, None)
-        authority.pending_results[row['admission_id']] = {'result': refused_turn_result(row, refusal), 'usage': {}}
-        return refusal
+        authority.pending_results[row['admission_id']] = {
+            'result': refused_turn_result(row, refusal), 'usage': {},
+        }
+        return refusal, None
     if _stopped_before_spawn(authority, ref, row):
-        return ''
-    spawned = await _spawn_registered_worker(authority, ref, row)
+        return '', None
+    return None, text
+
+
+async def execute_managed(authority, ref, row, policy, binding=None):
+    if binding is None:
+        # Keep direct/internal callers fail-closed too; the public ingress normally
+        # rejects this earlier, but no caller may reach preflight or Popen without
+        # the authenticated I04 binding.
+        from gateway.runtime_service_custody import ServiceCustodyError
+        raise ServiceCustodyError('preservation_owner_unmapped')
+    from gateway.run_turn_progress import publish_worker_tool_event
+    early_response, text = await _prepare_managed_execution(authority, ref, row, policy)
+    if early_response is not None:
+        return early_response
+    custody = None
+    worker = None
+    process = None
+    worker_closed = False
+    from gateway.session_managed_worker_custody import (
+        attach_bootstrap_metadata, retain_after_failure, reserve_execution_custody,
+        settle_managed_worker,
+    )
+    custody = reserve_execution_custody(authority, binding)
+    spawned = await _spawn_registered_worker(authority, ref, row, custody)
     if spawned is None:
+        retain_after_failure(custody, None)
         return ''
     worker, process = spawned
     workers = authority._managed_workers
@@ -631,6 +809,7 @@ async def execute_managed(authority, ref, row, policy):
         worker.worker = (scope['pid'], scope['birth'])
         # The child reads nothing else until the exact reservation has committed.
         frame = await asyncio.to_thread(_bootstrap, authority, ref, row, policy, scope, text)
+        attach_bootstrap_metadata(custody, frame, process, scope)
         worker.secrets.extend(v for v in (frame['api_key'], scope['secret']) if isinstance(v, str) and v)
         await asyncio.to_thread(worker.send, frame)
         worker.writer.start()
@@ -660,11 +839,17 @@ async def execute_managed(authority, ref, row, policy):
                 authority.sessions[ref.session_id].controls.snapshot(ref.session_id, None)
                 await asyncio.to_thread(worker.send, {'type': 'finish'})
                 continue
-            if frame == {'type': 'finished'} and accepted is not None:
+            if (kind == 'finished'
+                    and set(frame).issubset({'type', 'managed_durable_proof'})
+                    and accepted is not None):
                 # 'finished' follows the worker's durable execution.finish: the turn is complete.
                 # A slow or non-zero interpreter exit after it is close()'s cleanup, not a loss.
-                with suppress(subprocess.TimeoutExpired):
-                    await asyncio.to_thread(process.wait, 10)
+                proof = frame.get('managed_durable_proof') if isinstance(frame, dict) else None
+                # The receipt remains attached to the same process/readers until
+                # native scope close is observable.  The authority finalizer later
+                # performs complete_delivery after I04 terminalization.
+                await settle_managed_worker(worker, process, custody, proof)
+                worker_closed = True
                 accepted = _with_stop_cause(accepted, worker)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
                 authority.pending_results[row['admission_id']] = {
@@ -677,12 +862,17 @@ async def execute_managed(authority, ref, row, policy):
         logging.getLogger(__name__).warning('Managed worker lost: %s',
             exc.reason if isinstance(exc, RuntimeStoreError) else type(exc).__name__)
         if scope is None:
+            retain_after_failure(custody, scope)
             if isinstance(exc, asyncio.CancelledError) or (
                     isinstance(exc, RuntimeStoreError) and exc.reason == 'managed_worker_stopped'):
                 # Stopped before the child ever received its bootstrap: nothing executed, so
                 # this settles like an ordinary interrupted turn (the finally kills the child).
                 return _interrupted_before_bootstrap(authority, row, worker.stop_cause)
             raise
+        # The I04 row may already have accepted the managed effect.  Any
+        # bootstrap/reader/result failure after that boundary retains the
+        # exact I16 objects as UNKNOWN before the ordinary worker finalizer.
+        retain_after_failure(custody, scope)
         from gateway.session_worker_reservation import lose_admission_worker
         from gateway.session_runtime_workers import tracked_write
         await tracked_write(authority, partial(lose_admission_worker, authority, row, scope))
@@ -701,4 +891,5 @@ async def execute_managed(authority, ref, row, policy):
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
         workers.pop(ref.session_id, None)
-        await asyncio.to_thread(worker.close)
+        if worker is not None and not worker_closed:
+            await asyncio.to_thread(worker.close)

@@ -55,6 +55,8 @@ async def test_close_after_a_subscribed_session_was_deleted_releases_every_membe
         runner = SimpleNamespace(_draining=False, session_store=store, _evict_cached_agent=lambda route: None)
         authority = SessionAuthority(runner, profile_id='test', instance_id='test', db=db, epoch=epoch)
         runner.session_authority = authority  # the runtime owns this authority, so its delete passes the guard
+        from tests.gateway.conftest import bind_authority_runtime_custody
+        bind_authority_runtime_custody(runner, authority)
         for sid in ('doomed', 'kept'):
             authority.sessions[sid] = LiveSession(None, sid + '-route')
         viewer = AuthorityConnection(authority, object(), {'user_id': 'human'})

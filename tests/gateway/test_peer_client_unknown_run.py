@@ -6,7 +6,7 @@ import asyncio
 import pytest
 
 from tests.gateway.test_api_unknown_resolution import (
-    _AUTH_HEADERS, _close_fixture, _restarted_api_runs)
+    _AUTH_HEADERS, _PROFILE_NAME, _close_fixture, _profile_path, _restarted_api_runs)
 from tui_gateway.hosted_room_peer_http import PeerRunsHTTPClient, PeerRunsHTTPError
 
 
@@ -18,7 +18,8 @@ async def test_peer_poll_resolves_unknown_member_run(tmp_path, monkeypatch):
 
     def forward(path, *, method="GET", body=None, headers=None, room_grant=None):
         async def call():
-            response = await client.request(method, path, json=body, headers=_AUTH_HEADERS)
+            response = await client.request(
+                method, _profile_path(_PROFILE_NAME, path), json=body, headers=_AUTH_HEADERS)
             payload = await response.json()
             if response.status >= 400:
                 raise PeerRunsHTTPError(str(payload), status_code=response.status)

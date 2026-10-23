@@ -194,12 +194,21 @@ class RunIdempotencyStore:
                 self._conn.execute(_EXTEND_RETENTION_BY_RUN, (retention_until, scope, run_id))
                 self._conn.commit()
             row = self._conn.execute(
-                "SELECT status_json, owner_pid, owner_started, updated_at "
+                "SELECT scope, idempotency_key, fingerprint, status_json, owner_pid, owner_started, updated_at "
                 "FROM run_idempotency WHERE scope=? AND run_id=?",
                 (scope, run_id)).fetchone()
         if row is None:
             return None
-        return {k: v for k, v in _record(None, *row).items() if k != "run_id"}
+        row_scope, key, fingerprint, status_json, owner_pid, owner_started, updated_at = row
+        return {
+            "scope": row_scope,
+            "idempotency_key": key,
+            "fingerprint": fingerprint,
+            "status": json.loads(status_json),
+            "owner_pid": int(owner_pid or 0),
+            "owner_started": int(owner_started or 0),
+            "updated_at": float(updated_at or 0),
+        }
 
     def extend_retention(self, scope: str, run_id: str, until: float) -> bool:
         """Persist the latest verified recovery horizon for an active grant."""
@@ -218,11 +227,105 @@ class RunIdempotencyStore:
         return row is not None
 
     def update_status(self, run_id: str, status: dict[str, Any]) -> None:
+        """Persist one status projection using the original compatibility API.
+
+        Callers that need to prove the write owns the exact reservation use
+        :meth:`update_status_receipt`.  Keep this method's historical ``None`` return value so
+        unrelated store consumers do not silently acquire a weaker boolean contract.
+        """
         with self._lock:
             self._conn.execute(
                 "UPDATE run_idempotency SET status_json=?, updated_at=? WHERE run_id=?",
                 (_encode_status(status), time.time(), run_id))
             self._conn.commit()
+
+    def update_status_receipt(
+        self,
+        run_id: str,
+        status: dict[str, Any],
+        *,
+        expected_scope: str | None = None,
+        expected_idempotency_key: str | None = None,
+        expected_fingerprint: str | None = None,
+        expected_owner_pid: int | None = None,
+        expected_owner_started: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Commit a status update against one exact reservation and return its row receipt.
+
+        The receipt is intentionally produced by the store, rather than reconstructed from the
+        adapter's in-memory projection.  One ``BEGIN IMMEDIATE`` covers the identity read and
+        conditional write, so the SELECT cannot be separated from its exact update by a competing
+        writer.  The SELECT must find exactly one row, every supplied
+        identity expectation must match, and the conditional UPDATE must affect exactly one row
+        before the transaction commits.  Missing, mismatched, zero/multiple-row and exception
+        paths return no receipt or re-raise so the custody consumer can retain ``unknown``.
+        """
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = self._conn.execute(
+                    "SELECT scope, idempotency_key, fingerprint, owner_pid, owner_started "
+                    "FROM run_idempotency WHERE run_id=?", (run_id,)).fetchall()
+                if len(rows) != 1:
+                    self._conn.rollback()
+                    return None
+                scope, key, fingerprint, owner_pid, owner_started = rows[0]
+                expected = (
+                    (expected_scope, scope),
+                    (expected_idempotency_key, key),
+                    (expected_fingerprint, fingerprint),
+                    (expected_owner_pid, int(owner_pid or 0)),
+                    (expected_owner_started, int(owner_started or 0)),
+                )
+                if any(value is not None and value != actual for value, actual in expected):
+                    self._conn.rollback()
+                    return None
+                encoded = _encode_status(status)
+                cursor = self._conn.execute(
+                    "UPDATE run_idempotency SET status_json=?, updated_at=? "
+                    "WHERE run_id=? AND scope=? AND idempotency_key=? AND fingerprint=? "
+                    "AND owner_pid=? AND owner_started=?",
+                    (encoded, time.time(), run_id, scope, key, fingerprint,
+                     int(owner_pid or 0), int(owner_started or 0)),
+                )
+                changed = cursor.rowcount
+                if changed != 1:
+                    self._conn.rollback()
+                    return None
+                self._conn.commit()
+                readback = self._conn.execute(
+                    "SELECT scope, idempotency_key, fingerprint, run_id, status_json, owner_pid, owner_started "
+                    "FROM run_idempotency WHERE run_id=?", (run_id,)).fetchall()
+                if len(readback) != 1:
+                    raise RuntimeError("status receipt readback missing")
+                (
+                    read_scope, read_key, read_fingerprint, read_run_id, read_status,
+                    read_owner_pid, read_owner_started,
+                ) = readback[0]
+                if (
+                    (read_scope, read_key, read_fingerprint, read_run_id) !=
+                    (scope, key, fingerprint, run_id)
+                    or read_status != encoded
+                    or int(read_owner_pid or 0) != int(owner_pid or 0)
+                    or int(read_owner_started or 0) != int(owner_started or 0)
+                ):
+                    raise RuntimeError("status receipt readback mismatch")
+            except Exception:
+                self._conn.rollback()
+                raise
+        return {
+            "committed": True,
+            "storage": "run_idempotency",
+            "rowcount": changed,
+            "scope": scope,
+            "idempotency_key": key,
+            "fingerprint": fingerprint,
+            "run_id": run_id,
+            "owner_pid": int(owner_pid or 0),
+            "owner_started": int(owner_started or 0),
+            "readback": True,
+            "status": json.loads(encoded),
+        }
 
     def forget(self, scope: str, key: str) -> None:
         """Release a reservation whose run was refused before it existed."""

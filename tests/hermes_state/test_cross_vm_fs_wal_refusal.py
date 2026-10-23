@@ -29,6 +29,7 @@ SPACE_VIRTIOFS = "615 25 0:55 / /mnt/my\\040share rw,relatime - virtiofs share r
 
 
 class TestDetectCrossVmFs:
+    @pytest.mark.platforms("linux")  # mountinfo parsing runs only on Linux
     @pytest.mark.parametrize("path,expected", [
         ("/data/agent", True),          # fuse.virtiofs bind mount
         ("/mnt/host/db", True),         # 9p bind mount

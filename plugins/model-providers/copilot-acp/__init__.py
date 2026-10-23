@@ -6,10 +6,14 @@ An out-of-tree ACP provider (``~/.hermes/plugins/model-providers/`` or a pip ent
 uses the same three lines without touching core.
 """
 
+import logging
 from typing import Any
 
 from providers import register_provider
 from providers.base import ProviderProfile
+
+
+logger = logging.getLogger(__name__)
 
 
 class CopilotACPProfile(ProviderProfile):
@@ -22,7 +26,8 @@ class CopilotACPProfile(ProviderProfile):
         return CopilotACPClient(**client_kwargs)
 
     def fetch_models(
-        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 15.0
+        self, *, api_key: str | None = None, base_url: str | None = None, timeout: float = 15.0,
+        producer_policy: Any = None,
     ) -> list[str] | None:
         """Enabled models advertised by a short-lived signed-in ACP session (``session/new``).
 
@@ -39,11 +44,19 @@ class CopilotACPProfile(ProviderProfile):
                 return None
             client = self.create_client(
                 api_key=creds.get("api_key"), base_url=creds.get("base_url"),
-                command=creds.get("command"), args=creds.get("args"))
-            return client.list_models(timeout_seconds=timeout) or None
+                command=creds.get("command"), args=creds.get("args"), producer_policy=producer_policy)
+            return client.list_models(timeout_seconds=timeout)
         except Exception:
+            logger.debug("Copilot ACP model discovery failed", exc_info=True)
             # Missing CLI (AuthError), refused --acp / failed spawn (RuntimeError), probe
             # timeout — the base fetch_models contract is "None if the fetch failed".
+            parent = getattr(getattr(producer_policy, "parent", None), "_physical", None)
+            if parent is not None:
+                try:
+                    from gateway.runtime_service_operations import mark_unknown
+                    mark_unknown(producer_policy.parent, "catalog_discovery_failed")
+                except Exception:
+                    logger.debug("Copilot ACP custody marking failed", exc_info=True)
             return None
 
 

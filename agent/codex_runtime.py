@@ -5,6 +5,7 @@ AIAgent first: ``run_codex_app_server_turn`` drives one ``codex app-server`` sub
 from __future__ import annotations
 
 import contextvars
+from dataclasses import replace
 import functools
 import json
 import logging
@@ -475,10 +476,34 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
 
 
 def _close_codex_session(agent) -> None:
-    """Drop the session so the next turn respawns codex instead of reusing a dead client."""
-    with suppress(Exception):
-        agent._codex_session.close()
-    agent._codex_session = None
+    """Close through the shared writer lifecycle and retain an uncertain custody session."""
+    session = getattr(agent, "_codex_session", None)
+    if session is None:
+        return
+    from agent.codex_lifecycle import close_codex_session
+    close_error = None
+    cleanup_error = None
+    try:
+        close_codex_session(agent)
+    except BaseException as exc:
+        close_error = exc
+        logger.debug("codex session close failed before owner cleanup", exc_info=True)
+    finally:
+        # A failed legacy close must not leave a stale session object in the agent.  A
+        # retained managed owner is the one deliberate exception: it remains reachable
+        # for exact same-handle reconciliation and retry.
+        if getattr(session, "custody_retained", False) is not True and getattr(agent, "_codex_session", None) is session:
+            agent._codex_session = None
+            from gateway.runtime_service_operations import release_agent_process_parent
+            try:
+                release_agent_process_parent(agent)
+            except BaseException as exc:
+                cleanup_error = exc
+                logger.exception("codex external owner cleanup failed")
+    if close_error is not None:
+        raise close_error
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
@@ -596,7 +621,9 @@ def _codex_turn_service_tier(agent) -> str | None:
     return CODEX_TIER_WORDS.get(effective_request_overrides(agent).get("service_tier"))
 
 
-def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -> None:
+def _ensure_codex_session(
+    agent, messages: list[dict[str, Any]] | None = None, *, custody_binding=None, producer_policy=None,
+) -> None:
     """Lazily spawn one CodexAppServerSession per AIAgent (reused across turns, closed by the _cleanup hook).
     A live session whose thread was started with a different prompt composition (TUI/Desktop ``/personality``
     or a prompt mirror mutate the agent in place) is retired first so the new thread carries the current one.
@@ -610,10 +637,14 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         # The provider is fixed per thread (turn/start can switch the model, not the provider), so an
         # in-place switch to or from a named custom provider retires the thread too.
         recorded = getattr(agent, "_codex_session_prompt", None)
-        if recorded is None or (recorded == developer_instructions
-                                and getattr(agent, "_codex_session_model_provider", None) == model_provider):
+        if getattr(agent._codex_session, "_closed", False) is not True and (recorded is None or (
+                recorded == developer_instructions
+                and getattr(agent, "_codex_session_model_provider", None) == model_provider)):
             return
         _close_codex_session(agent)
+        if getattr(agent, "_codex_session", None) is not None:
+            from gateway.runtime_service_custody import ServiceCustodyError
+            raise ServiceCustodyError("custody_unknown")
     resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent)
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
@@ -659,17 +690,18 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         on_event=make_codex_app_server_event_bridge(agent),
         developer_instructions=developer_instructions or None,
         model=_codex_wire_model(agent, model_provider), model_provider=model_provider,
-        resume_thread_id=resume_thread_id, history_seed=history_seed,
+        resume_thread_id=resume_thread_id, history_seed=history_seed, custody_binding=custody_binding,
+        require_custody=custody_binding is not None, producer_policy=producer_policy,
     )
 
 
-def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> bool:
-    """Splice the projected messages into ``messages`` and flush them to the session DB; True when the
-    rows are durable in the session DB (the codex thread binding may then be published).
+def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]):
+    """Splice projected messages and return a typed proof for managed custody.
 
-    Bypasses conversation_loop's per-step _persist_session(); the flush dedups via _DB_PERSISTED_MARKER so
-    only the new codex rows are written. The agent stays the sole persister (agent_persisted=True): a
-    gateway re-write would re-INSERT the user turn."""
+    The legacy unmanaged path keeps its bool result. Managed Codex custody calls the additive
+    proof entrypoint, which invokes the same legacy writer once and reads the exact committed rows
+    back; a truthy legacy result alone never settles a managed child.
+    """
     if not turn.projected_messages:
         return False
     from agent.message_metadata import append_message
@@ -683,18 +715,118 @@ def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> 
         projected_messages = projected_messages[1:]
     for projected_message in projected_messages:
         append_message(messages, projected_message)
+    managed = bool(getattr(getattr(agent, "_codex_session", None), "_require_custody", False))
     if getattr(agent, "_session_db", None) is None:
-        return False
-    flush_ok = False
+        # These legacy callers own no durable SessionDB.  Their existing public
+        # contract is a successful in-memory handoff; managed custody still fails
+        # closed because it cannot manufacture a writer witness.
+        return None if managed else True
     try:
+        if managed:
+            proof = agent._flush_messages_to_session_db_with_proof(messages)
+            if proof is None:
+                logger.warning("codex app-server managed projected-message proof failed (session=%s)",
+                               getattr(agent, "session_id", None))
+            return proof
         flush_ok = agent._flush_messages_to_session_db(messages)
     except Exception:
         logger.warning("codex app-server projected-message flush failed", exc_info=True)
+        return None if managed else False
     if flush_ok is False:
         # Output already streamed and agent_persisted cannot flip to False: surface the gap loudly.
         logger.warning("codex app-server turn was delivered but could NOT be persisted to the session DB "
                        "(session=%s) — this turn will be missing after restart/resume", getattr(agent, "session_id", None))
     return flush_ok is True
+
+
+def _managed_result_row_ids(messages: list[dict[str, Any]], user_message: Any,
+                            proof) -> tuple[int, ...]:
+    """Bind the writer witness to the canonical suffix that settlement will store.
+
+    ``compact_result`` drops the current user row and all prior history.  The
+    result witness therefore records the exact row-id sequence after the
+    current user anchor, read from the same live message projection that was
+    handed to the managed turn.  A missing or foreign row id fails closed.
+    """
+    try:
+        from agent.turn_context import reanchor_current_turn_user_idx
+        anchor = reanchor_current_turn_user_idx(messages, user_message)
+    except (TypeError, ValueError):
+        return ()
+    if type(anchor) is not int or anchor < 0 or anchor >= len(messages):
+        return ()
+    suffix = messages[anchor + 1:]
+    row_ids: list[int] = []
+    for message in suffix:
+        if not isinstance(message, dict) or type(message.get("_row_id")) is not int:
+            return ()
+        row_id = message["_row_id"]
+        if row_id <= 0 or row_id not in proof.row_ids:
+            return ()
+        row_ids.append(row_id)
+    return tuple(row_ids) if row_ids else ()
+
+
+def _resolve_codex_custody(agent):
+    """Return the current managed binding or one explicit nonmanaged producer policy."""
+    from gateway.runtime_service_custody import ServiceCustodyError, current_turn_binding
+    from gateway.runtime_service_operations import (
+        ExternalProcessOperationError, ensure_agent_process_policy, policy_without_spawn,
+    )
+    binding = current_turn_binding()
+    if binding is not None:
+        return binding, None
+    try:
+        policy = (
+            policy_without_spawn() if getattr(agent, "_codex_session", None) is not None
+            else ensure_agent_process_policy(agent, producer_key="codex")
+        )
+    except ExternalProcessOperationError as exc:
+        raise ServiceCustodyError(exc.code) from exc
+    return None, policy
+
+
+def _managed_codex_durable_proof(agent, messages, user_message, projected_persisted):
+    """Build the typed managed result witness from the actual writer proof."""
+    from agent.session_persistence_proof import SessionDBWriteProof
+    from gateway.runtime_service_custody import DurableResultProof
+    if not isinstance(projected_persisted, SessionDBWriteProof):
+        return None
+    active = getattr(agent._codex_session, "_active_custody_binding", None)
+    if active is None:
+        return None
+    result_row_ids = _managed_result_row_ids(messages, user_message, projected_persisted)
+    if result_row_ids:
+        projected_persisted = replace(projected_persisted, result_row_ids=result_row_ids)
+    return DurableResultProof(
+        store_path=projected_persisted.store_path, session_id=projected_persisted.session_id,
+        admission_id=active.admission_id, execution_generation=active.execution_generation,
+        row_ids=projected_persisted.row_ids, row_snapshots=projected_persisted.row_snapshots,
+        row_sessions=projected_persisted.row_sessions, row_roles=projected_persisted.row_roles,
+        payload_digest=projected_persisted.payload_digest,
+        result_row_ids=projected_persisted.result_row_ids,
+    )
+
+
+def _publish_external_codex_result(policy, turn, projected_persisted) -> None:
+    """Publish a nonmanaged Codex result only with the exact parent and durable writer proof."""
+    if policy is None or policy.parent is None:
+        return
+    from gateway.runtime_service_operations import ExternalPublicationProof, mark_unknown, publish_catalog
+    parent = policy.parent
+    if (turn.error is not None or getattr(turn, "should_retire", False)
+            or not turn.thread_id or not turn.turn_id or not projected_persisted):
+        mark_unknown(parent, "durable_publication_unknown")
+        return
+    publish_catalog(
+        parent,
+        ExternalPublicationProof(
+            operation_id=parent.operation_id, profile_id=parent.profile_id,
+            process_instance=parent.process_instance, authority_epoch=parent.authority_epoch,
+            source_identity=parent.source_identity, result_identity=f"{turn.thread_id}:{turn.turn_id}",
+            durable_result=True, payload_digest=getattr(projected_persisted, "payload_digest", None),
+        ),
+    )
 
 
 def _finish_codex_turn(agent, turn, messages: list[dict[str, Any]], *, original_user_message: Any,
@@ -732,7 +864,15 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         from agent.conversation_compression_checkpoint import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
-    _ensure_codex_session(agent, messages)
+    custody_binding, producer_policy = _resolve_codex_custody(agent)
+    _ensure_codex_session(
+        agent, messages, custody_binding=custody_binding, producer_policy=producer_policy,
+    )
+    if custody_binding is not None:
+        agent._codex_session.begin_turn(custody_binding)
+    from agent.codex_lifecycle import wait_for_codex_writer
+    # A failed retirement must not drop the exact unstarted resume candidate.
+    wait_for_codex_writer(agent)
     try:
         _start_codex_thread(agent)
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
@@ -755,15 +895,27 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         _close_codex_session(agent)
     # The binding is published only once the transcript it belongs to is durable, and never for a
     # retired thread (the next agent would only resume into the same wedge).
-    if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
+    projected_persisted = _persist_projected_messages(agent, turn, messages)
+    if projected_persisted and not getattr(turn, "should_retire", False):
         _store_codex_thread_id(agent, turn.thread_id)
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    if custody_binding is not None:
+        durable_proof = _managed_codex_durable_proof(
+            agent, messages, user_message, projected_persisted,
+        )
+        managed_durable = durable_proof is not None and not getattr(turn, "should_retire", False)
+        agent._codex_session.finish_turn(durable=managed_durable, proof=durable_proof)
+    else:
+        _publish_external_codex_result(producer_policy, turn, projected_persisted)
     return _turn_result(
         interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
-        final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
+        # The typed proof is consumed above by finish_turn; the public result keeps the
+        # legacy JSON-safe boolean contract so settlement never serializes the proof object.
+        final_response=turn.final_text, agent_persisted=bool(projected_persisted),
+        codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
     )
 

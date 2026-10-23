@@ -24,7 +24,10 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
     admit is visible to the drain. ``fail_admit`` makes that admit refuse (``admission_conflict``).
     """
     from gateway.session_authority import initialize_session_authority
+    from gateway.session_authorities import SessionAuthorities
+    from gateway.runtime_ownership import process_ownership
     from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.conftest import bind_authority_runtime_custody
     from tests.waiting import async_wait_until
 
     monkeypatch.setenv("DISCORD_ALLOWED_USERS", "42")
@@ -43,27 +46,33 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
         return "heard this", []
 
     monkeypatch.setattr(GatewayRunner, "_transcribe_and_echo_pending_voice", transcribed)
+    monkeypatch.setattr(
+        GatewayRunner,
+        "_resolve_session_agent_runtime",
+        lambda self, **kwargs: ("fixture-model", {
+            "provider": "custom", "base_url": "http://127.0.0.1", "api_key": "fixture-key",
+        }),
+    )
     adapter.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: adapter}
-    await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    from pathlib import Path
+    home = Path(authority.db.db_path).resolve().parent
+    process_ownership.reserve([home])
+    authorities = SessionAuthorities(home)
+    authorities.add(home, authority)
+    runner.session_authorities = authorities
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id="42", chat_type="dm", user_id="42")
     event.source = source
     seen = []
+    interrupt_message = [None]
     release = threading.Event()
     agent_ready = threading.Event()
     first = {"open": True}
 
-    class Agent:
-        def __init__(self):
-            self._interrupt_message = None
-
-        def interrupt(self, message=None, *args, **kwargs):
-            self._interrupt_message = message
-
-    agent = Agent()
-
-    def run_sync(self):
+    def run_conversation_with_approval(self, agent, *args, **kwargs):
         message = self._ctx.message
         seen.append(message)
         if first["open"]:
@@ -71,16 +80,17 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
             self._runner._session_state(self._ctx.session_key).turn.agent = agent
             agent_ready.set()
             held = release.wait(10)
+            interrupt_message[0] = agent._interrupt_message if held else None
             result = {
-                "final_response": "", "messages": [], "completed": False, "interrupted": True,
+                "final_response": "interrupting", "messages": [], "completed": False, "interrupted": True,
                 "interrupt_message": agent._interrupt_message if held else None,
+                "agent_persisted": False,
             }
         else:
-            result = {"final_response": "ok", "messages": [], "completed": True}
-        self._ctx.result_holder[0] = result
+            result = {"final_response": "ok", "messages": [], "completed": True, "agent_persisted": False}
         return result
 
-    monkeypatch.setattr(TurnRunner, "run_sync", run_sync)
+    monkeypatch.setattr(TurnRunner, "_run_conversation_with_approval", run_conversation_with_approval)
     import asyncio
     opening = asyncio.create_task(adapter.handle_message(MessageEvent(text="A", source=source, message_id="A")))
     key = runner.session_store._generate_session_key(source)
@@ -103,7 +113,8 @@ async def _followup_while_running(monkeypatch, event, marker, *, fail_admit=Fals
     await opening
     await async_wait_until(lambda: len(seen) >= 1 + (not fail_admit) and not runner._is_session_running(key)
                            and not adapter._background_tasks, what="the follow-up to finish")
-    return seen[1:], agent._interrupt_message, sent
+    process_ownership.close()
+    return seen[1:], interrupt_message[0], sent
 
 
 def _photo(tmp_path):

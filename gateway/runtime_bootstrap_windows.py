@@ -123,6 +123,17 @@ def _pipe_server_session(handle) -> int | None:
     return session.value if get(handle, ctypes.byref(session)) else None
 
 
+def _pipe_server_pid(handle) -> int:
+    """The native server PID for a connected control-pipe instance."""
+    k = ctypes.WinDLL('kernel32', use_last_error=True)
+    pid = wintypes.ULONG()
+    get = _api(k, 'GetNamedPipeServerProcessId', wintypes.BOOL,
+               [wintypes.HANDLE, ctypes.POINTER(wintypes.ULONG)])
+    if not get(handle, ctypes.byref(pid)) or not pid.value:
+        raise PermissionError('cannot identify named-pipe server process')
+    return int(pid.value)
+
+
 class _ImpersonationLeak(RuntimeError):
     """RevertToSelf failed: this thread may still carry the client's identity. Deliberately not an
     OSError, so the serving loop does not swallow it and the worker stops instead."""
@@ -296,6 +307,48 @@ def query_runtime_control(home: Path, request: bytes, timeout: float) -> bytes:
         _peer_subject(handle, server=True)
         _write(handle, request.rstrip(b'\n') + b'\n', deadline)
         return _read_line(handle, deadline, 512 * 1024) + b'\n'
+    finally:
+        win.CloseHandle(handle)
+
+
+def probe_runtime_control_peer(home: Path, timeout: float = 2.0) -> dict[str, int | str]:
+    """Authenticate and return the current named-pipe server PID for lifecycle peer binding.
+
+    This intentionally opens a short-lived native pipe instance without sending a request.  The
+    caller uses it as the endpoint half of a pre/post identify observation; the existing SID,
+    elevation, session and DACL checks remain the authority for whether the peer is reachable.
+    """
+    from gateway.control_socket import windows_pipe_name
+
+    win = _native()
+    deadline = time.monotonic() + timeout
+    name = windows_pipe_name(home)
+    _remaining_ms(deadline)
+    while True:
+        try:
+            handle = win.CreateFile(name, 0xC0000000, 0, win.NULL, win.OPEN_EXISTING,
+                                    win.FILE_FLAG_OVERLAPPED | _PIPE_CLIENT_SQOS, win.NULL)
+            break
+        except OSError as exc:
+            if exc.winerror == 2:
+                raise FileNotFoundError('runtime control pipe absent') from None
+            if exc.winerror == 5:
+                raise PermissionError('runtime control pipe inaccessible') from None
+            if exc.winerror != 231:
+                raise
+            try:
+                win.WaitNamedPipe(name, _remaining_ms(deadline))
+            except OSError as wait_error:
+                if wait_error.winerror == 121:
+                    raise TimeoutError('runtime control deadline exceeded') from None
+                raise
+    try:
+        pid = _pipe_server_pid(handle)
+        # Retain the authenticated subject alongside the native PID.  A pre/post
+        # endpoint observation must bind both: a recycled PID under a different
+        # token is not the same gateway peer.
+        subject = _peer_subject(handle, server=True)
+        return {"peer_pid": pid, "peer_subject": subject}
     finally:
         win.CloseHandle(handle)
 

@@ -22,6 +22,8 @@ async def test_relayed_modal_admitted_only_with_reader_proof(tmp_path, monkeypat
     from gateway.platforms.base import SendResult
     from gateway.relay.adapter import RelayAdapter
     from gateway.relay.ws_transport import WebSocketRelayTransport, _passthrough_from_wire
+    from pathlib import Path
+    from gateway.runtime_custody import install_runtime_custody
     from gateway.session_authority import initialize_session_authority
     from tests.gateway.relay.test_relay_passthrough import _desc
     from tests.waiting import async_wait_until
@@ -38,6 +40,14 @@ async def test_relayed_modal_admitted_only_with_reader_proof(tmp_path, monkeypat
     runner.adapters = {Platform.RELAY: adapter}
     adapter.gateway_runner = runner
     authority = await initialize_session_authority(runner, profile_id="default", instance_id="t")
+    runner.session_runtime_descriptor = {
+        "instance_id": authority.instance_id,
+        "authority_epoch": authority.epoch,
+        "profile_id": authority.profile_id,
+        "served_profiles": [{"profile_id": authority.profile_id,
+                              "home": str(Path(authority.db.db_path).resolve().parent)}],
+    }
+    install_runtime_custody(runner)
     runner._wire_adapter_handlers(adapter)
     transport.set_passthrough_handler(adapter._on_passthrough)
     calls = []

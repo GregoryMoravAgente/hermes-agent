@@ -6,6 +6,8 @@ The done callback retains the watch's profile ContextVars and manager claim.
 """
 import logging
 
+from hermes_state_runtime import RuntimeStoreError
+
 logger = logging.getLogger("gateway.run")
 
 
@@ -19,7 +21,13 @@ async def resolve_heartbeat_owner(runner, event, entry):
         def compression_tip():
             return runner.session_store._db_for_key(entry.session_key).get_compression_tip(expected)
 
-        tip = await runner._run_in_executor_with_context(compression_tip)
+        from gateway.session_goal_tick_custody import run_tracked_executor
+        from gateway.session_authorities import active_authority
+        tip = await run_tracked_executor(
+            runner, compression_tip,
+            authority=active_authority(runner),
+            kind="heartbeat-compression",
+        )
         if tip != resolved:
             return False
     # Keep a value, not the mutable routing entry: preparation and hooks can yield
@@ -52,9 +60,12 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     from hermes_state_runtime import list_session_admissions
 
     from gateway.session_authorities import active_authority
+    from gateway.session_goal_tick_custody import reserve_tick, release_unaccepted
     authority = active_authority(runner)
     if authority is None:
         return
+    require_coordinator = getattr(authority, '_require_preservation_coordinator', None)
+    coordinator = require_coordinator() if callable(require_coordinator) else None
     # Admissions live on the route's logical owner (the compression root), not its transcript tip;
     # a LOCAL route's heartbeat rides local_automation_v1.
     pending = list_session_admissions(authority.db, session_id=authority.logical_owner(session_id))
@@ -62,17 +73,38 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
            or row['payload'].get('local_automation_v1', {}).get('heartbeat') for row in pending):
         return
     manager = HeartbeatManager(session_id)
+    state = manager.state
+    if state is None:
+        return
+    owner = authority.logical_owner(session_id)
+    identity = json.dumps(
+        ['heartbeat', session_id, state.created_at, state.fire_count + 1], separators=(',', ':'))
+    principal_id = 'automation:' + route
+    if coordinator is not None and not callable(getattr(authority, '_preservation_automation_root', None)):
+        raise RuntimeStoreError('runtime_custody_unavailable')
+    tick = (reserve_tick(
+        authority, request_id=identity, principal_id=principal_id, session_id=owner,
+        source_identity='heartbeat:' + route, kind='heartbeat', watcher_key=route,
+    ) if coordinator is not None else None)
+    handle = tick.handle if tick is not None else None
     prompt = manager.due_prompt()
     if prompt is None:
+        if tick is not None:
+            release_unaccepted(tick)
         return
-    state = manager.state
-    identity = json.dumps(['heartbeat', session_id, state.created_at, state.fire_count], separators=(',', ':'))
     event = MessageEvent(text=prompt, source=source, internal=True, message_id=identity,
         metadata={'gateway_session_key': route, 'gateway_session_id': session_id})
     event._heartbeat_session_id = session_id
+    from gateway.session_goal_tick_custody import attach_tick_handle
+    attach_tick_handle(event, handle, 'heartbeat')
+    event._preservation_effect_started = True
     try:
-        await authority.admit_automation(adapter, event, identity)
+        await authority.admit_automation(
+            adapter, event, identity, _preservation_handle=handle)
     except BaseException:
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(handle, 'join_failed')
         # Readiness is not a delivery attempt, and cancellation before commit is not ACK.
         if getattr(event, '_gateway_accepted', False) is not True:
             manager.abandon_fire()

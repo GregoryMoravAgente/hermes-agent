@@ -68,6 +68,13 @@ def _result_flags(result: Any) -> tuple:
             bool(result.get("failed")), result.get("error"))
 
 
+def _safe_response_header_text(value: Any, *, limit: int | None = None) -> str:
+    """Redact and remove HTTP-forbidden controls from a response header value."""
+    from gateway.platforms.api_server import _redact_api_error_text
+    redacted = _redact_api_error_text(value, limit=limit)
+    return re.sub(r'[\x00-\x1f\x7f]', ' ', redacted)
+
+
 def _budget_exhausted(result: Any) -> bool:
     """The turn ran out of its iteration budget; its final text is the agent's own wrap-up."""
     reason = str(result.get("turn_exit_reason") or "") if isinstance(result, dict) else ""
@@ -1018,7 +1025,7 @@ class OpenAICompatRoutesMixin:
             response_headers["X-Hermes-Completed"] = "false"
             response_headers["X-Hermes-Partial"] = "true" if is_partial else "false"
             if err_msg and not presentation_muted:
-                response_headers["X-Hermes-Error"] = _redact_api_error_text(err_msg, limit=200)
+                response_headers["X-Hermes-Error"] = _safe_response_header_text(err_msg, limit=200)
         return web.json_response(response_data, headers=response_headers)
 
     def _chat_request_id(self, request: web.Request) -> Optional[str]:

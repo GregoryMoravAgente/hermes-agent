@@ -47,6 +47,11 @@ async def test_a_deleted_chain_continues_on_a_new_generation(api, owner, path, c
         owner.runner.session_authority = SessionAuthority(
             owner.runner, profile_id='default', instance_id='later', db=owner.db,
             epoch=begin_runtime_epoch(owner.db, instance_id='later'))
+        # A new authority generation also owns the process custody descriptor.  Keep this
+        # fixture's simulated successor aligned with the runtime identity fence instead of
+        # allowing the API route to observe the old process instance/epoch.
+        from tests.gateway.conftest import bind_authority_runtime_custody
+        bind_authority_runtime_custody(owner.runner, owner.runner.session_authority)
         target = response_id if continuation == 'previous_response_id' else 'project'
         resumed = await client.post(path, json={'input': 'what number?', continuation: target},
                                     headers={**_AUTH, 'Idempotency-Key': 'fresh'})

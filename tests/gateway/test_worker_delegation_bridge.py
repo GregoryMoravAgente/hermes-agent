@@ -16,7 +16,7 @@ import pytest
 from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch, register_worker_execution
 from gateway.session_contract import SessionRef
-from gateway.session_worker import _claim
+from gateway.session_worker import _canonical_worker_birth, _claim
 from tools.async_delegation import _initialize_schema
 
 
@@ -37,13 +37,24 @@ def test_bridge_publishes_committed_completion_and_rejects_another_principal(tmp
         actor = SimpleNamespace(profile_id='profile', subject='alice', capabilities={'worker:adopt'})
         connection = SimpleNamespace(authority=authority, actor=actor)
         ref = SessionRef('profile', 'parent')
+        raw_birth = psutil.Process(worker.pid).create_time()
         scope = dict(profile_id='profile', session_id='parent', execution_id='worker', generation=0,
-                     pid=worker.pid, birth=psutil.Process(worker.pid).create_time(), secret='private-worker-secret')
+                     pid=worker.pid, birth=raw_birth, secret='private-worker-secret')
+        canonical_birth = _canonical_worker_birth(worker.pid, raw_birth)
         claim = _claim(connection, ref, scope)
         register_worker_execution(db, epoch=epoch, execution_id='worker', session_id='parent', generation=0,
                                   kind='compute', adoption_secret=claim)
         payload = dict(delegation_id='deleg_owned', task={'goal': 'inert'}, dispatched_at=time.time(),
                        parent_session_id='parent', session_key='', origin_ui_session_id='', origin_session_id='')
+        payload['execution'] = {
+            'handoff_id': 'deleg_owned', 'state': 'queued', 'accepted': 'yes',
+            'worker_started': False, 'worker_exited': False,
+            'owner_pid': worker.pid, 'owner_started_at': canonical_birth,
+            'owner_execution_id': 'worker',
+            'owner_scope': {'profile_id': 'profile', 'session_id': 'parent',
+                            'generation': 0, 'epoch': epoch},
+            'error': None, 'exception': None,
+        }
         params = scope | dict(epoch=epoch, sequence=1, operation='delegation.dispatch', payload=payload)
         asyncio.run(worker_delegation_request(connection, ref, params))
         event = dict(type='async_delegation', delegation_id='deleg_owned', parent_session_id='parent',

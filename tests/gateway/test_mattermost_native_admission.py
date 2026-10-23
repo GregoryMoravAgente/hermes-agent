@@ -36,6 +36,8 @@ async def test_real_mattermost_posts_run_a_turn_through_native_admission(tmp_pat
     adapter._bot_user_id, adapter._bot_username = 'bot_user_id', 'hermes-bot'
     adapter.gateway_runner, runner.adapters = runner, {Platform.MATTERMOST: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='mm')
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     image_path = await cache_image_from_bytes_async(PNG_BYTES, '.png')
     sent, turns = [], []

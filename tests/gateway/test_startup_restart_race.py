@@ -200,12 +200,17 @@ async def test_start_gateway_does_not_start_cron_after_aborted_startup(tmp_path,
             self._draining = False
             self.config = config
             self.adapters = {}
+            self._failed_platforms = {}
             self._running = False
             self.should_exit_cleanly = True
             self.should_exit_with_failure = False
             self.exit_reason = None
             self.exit_code = GATEWAY_SERVICE_RESTART_EXIT_CODE
             self._gateway_health_export_runtime = ExportRuntime()
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             return True
@@ -252,6 +257,7 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
             self._draining = False
             self.config = config
             self.adapters = {}
+            self._failed_platforms = {}
             self._running = False
             self._restart_requested = True
             self._restart_via_service = True
@@ -259,6 +265,10 @@ async def test_start_gateway_preserves_service_restart_fallback_after_aborted_st
             self.should_exit_with_failure = False
             self.exit_reason = None
             self.exit_code = None
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             return True
@@ -312,6 +322,7 @@ async def test_start_gateway_classifies_startup_signal_exit(
             self._draining = False
             self.config = config
             self.adapters = {}
+            self._failed_platforms = {}
             self._running = False
             self._restart_requested = False
             self._restart_via_service = False
@@ -319,6 +330,10 @@ async def test_start_gateway_classifies_startup_signal_exit(
             self.should_exit_with_failure = False
             self.exit_reason = None
             self.exit_code = None
+
+        def register_i10_source(self, authority):
+            from gateway.run_adapters_recovery import register_i10_source
+            return register_i10_source(self, authority)
 
         async def start(self):
             if unexpected_signal:

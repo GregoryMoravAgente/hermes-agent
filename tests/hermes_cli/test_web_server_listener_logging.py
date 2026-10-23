@@ -42,7 +42,8 @@ def _isolated_logging():
 
 
 def _gateway_listener(_monkeypatch):
-    return build_listener_server(lambda scope, receive, send: None, "127.0.0.1", 0, auth_required=False)
+    return build_listener_server(lambda scope, receive, send: None, "127.0.0.1", 0,
+                                 auth_required=False, inherit_logging=True)
 
 
 def _dashboard_listener(monkeypatch):

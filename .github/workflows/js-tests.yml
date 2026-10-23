@@ -19,7 +19,7 @@ jobs:
     #
     # One larger runner installs one time. vitest, tsc and eslint each size
     # their own worker pool from the core count.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && 'ubuntu-24.04' || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     steps:
       - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
@@ -94,7 +94,9 @@ jobs:
       # not an empty run, because an empty run reports green after it checks
       # nothing.
       - name: Run all workspace checks
-        run: node .github/scripts/run-workspace-checks.mjs
+        # The controlled fork uses a smaller hosted runner. Keep the same checks and
+        # test deadlines while avoiding competing workspace worker pools on that host.
+        run: node .github/scripts/run-workspace-checks.mjs ${{ github.repository == 'GregoryMoravAgente/hermes-agent' && '--concurrency 1' || '' }}
       - name: Check the checkout is clean
         # Last step of every job (tests/ci/test_clean_worktree_check.py): a test or CI step that
         # leaves an untracked or modified file in the checkout is reported here. Runs only when

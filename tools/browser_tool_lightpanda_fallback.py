@@ -159,24 +159,51 @@ def _run_chrome_fallback_command(task_id: str, command: str, args: list[str], ti
     browser_env = _session.windows_headless_browser_options(browser_env)
 
     def _run_tmp(cmd: str, cmd_args: list[str]) -> dict[str, Any]:
-        proc = _session._popen_agent_browser(base_args + [cmd] + cmd_args, browser_env, task_socket_dir, cmd)
+        from gateway.runtime_sidecar_browser import (
+            begin_browser_command, fail_browser_command, finish_browser_command,
+        )
+        owner = begin_browser_command(task_id, {"session_name": tmp_session, "features": {"local": True}})
         stdout_path = os.path.join(task_socket_dir, f"_stdout_{cmd}")
         stderr_path = os.path.join(task_socket_dir, f"_stderr_{cmd}")
         try:
+            proc = _session._popen_agent_browser(
+                base_args + [cmd] + cmd_args, browser_env, task_socket_dir, cmd, custody=owner,
+            )
+            if owner is not None:
+                owner.bind_process(
+                    proc, stdout_path, stderr_path,
+                    transaction=getattr(proc, "_hermes_browser_launch_transaction", None),
+                )
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+            if owner is not None:
+                owner.wait_for_output()
+                fail_browser_command(owner, "browser_fallback_command_timeout")
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
+        except Exception:
+            if owner is not None:
+                fail_browser_command(owner, "browser_fallback_launch_failed")
+            raise
         try:
             with open(stdout_path, encoding="utf-8-sig") as f:
                 stdout = f.read().strip()
             if stdout:
-                return json.loads(stdout.split("\n")[-1])
+                result = json.loads(stdout.split("\n")[-1])
+                if owner is not None:
+                    finish_browser_command(owner, cmd, result)
+                return result
         except Exception as exc:
             _bt.logger.debug("Chrome fallback tmp cmd '%s' error: %s", cmd, exc)
+            if owner is not None:
+                fail_browser_command(owner, "browser_fallback_readback_failed")
         finally:
+            if owner is not None and not owner._finished:
+                fail_browser_command(owner, "browser_fallback_command_unsettled")
             _session._unlink_command_output_files(stdout_path, stderr_path)
+        if owner is not None and not owner._finished:
+            fail_browser_command(owner, "browser_fallback_result_missing")
         return {"success": False, "error": f"Chrome fallback '{cmd}' failed"}
 
     try:

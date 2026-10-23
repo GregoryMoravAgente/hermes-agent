@@ -27,13 +27,19 @@ def test_declared_key_is_durable_and_cannot_rebind(api, owner):
 
 
 @pytest.mark.asyncio
-async def test_structured_content_bypasses_text_parser_without_losing_parts(api, owner, monkeypatch):
+async def test_structured_content_bypasses_text_parser_without_losing_parts(
+    runtime_owned_api_owner, monkeypatch
+):
+    api, owner = runtime_owned_api_owner
     from gateway.session_ingress import execute_admission
     from gateway.run_turn_runner import TurnRunner
     from gateway.session_results import execution_result
     content = [{'type': 'text', 'text': '/literal prompt'},
                {'type': 'image_url', 'image_url': {'url': 'https://example.com/image.png', 'detail': 'high'}}]
     _, ref, row = admit_api_turn(api, session_id='image', user_message=content, conversation_history=[])
+    live = owner.sessions[ref.session_id]
+    row, first = await owner._claim_next(ref, live)
+    assert row and first and row['admission_id'] == first['admission_id']
     async def handle(event):
         assert isinstance(event.text, str)
         assert event.get_command() is None
@@ -142,3 +148,34 @@ def test_compressed_api_conversation_keeps_its_root_queue_and_follows_the_tip(ap
     assert {r['target_session_id'] for r in list_session_admissions(owner.db, session_id=ref.session_id,
                                                                      pending_only=False)} == {ref.session_id}
     assert first['target_session_id'] == ref.session_id
+
+
+
+def test_compression_root_admission_rejects_noncompression_stale_tip_and_fork(api, owner):
+    """Only a live continuation tip can reopen an ended compression root."""
+    from gateway.session_api_turn import _admit_target
+    from hermes_state_runtime import RuntimeStoreError
+
+    def reject(session_id, request_id):
+        def write(conn):
+            _admit_target(session_id, request_id, {}, conn, client_key=False, db=owner.db)
+        with pytest.raises(RuntimeStoreError, match='admission_conflict'):
+            owner.db._execute_write(write)
+
+    owner.db.create_session('ended-normal', source='api_server')
+    owner.db.end_session('ended-normal', 'user_close')
+    reject('ended-normal', 'reject-normal')
+
+    owner.db.create_session('stale-root', source='api_server')
+    owner.db.publish_compression_child(
+        parent_session_id='stale-root', child_session_id='stale-child', source='api_server',
+        messages=[{'role': 'user', 'content': 'summary'}], require_compression_lease=False)
+    owner.db.end_session('stale-child', 'user_close')
+    reject('stale-root', 'reject-stale-tip')
+
+    owner.db.create_session('fork-root', source='api_server')
+    owner.db.end_session('fork-root', 'compression')
+    owner.db.create_session(
+        'fork-child', source='api_server', parent_session_id='fork-root',
+        model_config={'_reset_from': 'fork-root'})
+    reject('fork-root', 'reject-fork-tip')

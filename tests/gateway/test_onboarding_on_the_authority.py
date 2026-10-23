@@ -55,6 +55,8 @@ async def _desktop(tmp_path, monkeypatch, turns):
                              _cached_agent_for=lambda route: None, _peek_session_state=lambda key: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = await initialize_session_authority(runner, profile_id=str(home), instance_id="owner")
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
     transport = _Transport()
     identity = {"user_id": "uid:1", "provider": "local", "profile_id": str(home), "instance_id": "owner",
                 "native_bootstrap": True}
@@ -196,7 +198,10 @@ async def _settled(desktop, session_id):
     """The opening turn's lease released: a delete is not refused as a write in flight."""
     def idle():
         with desktop.db._read_ctx() as conn:
-            return not desktop.db._guarded_ids(conn, [session_id])
+            guarded = desktop.db._guarded_ids(conn, [session_id])
+        live = desktop.authority.sessions.get(session_id)
+        execution = getattr(getattr(live, "event_stream", None), "execution", None) or {}
+        return not guarded and not execution
     await async_wait_until(idle, timeout=10)
 
 

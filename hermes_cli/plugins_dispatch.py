@@ -253,6 +253,19 @@ class PluginDispatchMixin:
         """
         return resolve_plugin_command_result(callback(**cls._hook_callback_kwargs(callback, payload)))
 
+    @classmethod
+    def _invoke_hook_callback_scoped(
+        cls, hook_name: str, callback: Callable, payload: dict[str, Any],
+    ) -> Any:
+        """Carry the already-authenticated owner through one callback boundary."""
+        from agent.shell_hook_scope import hook_invocation_scope
+
+        with hook_invocation_scope(hook_name) as parent:
+            result = cls._invoke_hook_callback(callback, payload)
+            if parent is not None and parent.consumer is not None:
+                parent.consumer.stage(parent.invocation_id, result)
+            return result
+
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> list[Any]:
         """Call all callbacks for *hook_name*; return their non-``None`` results.
 
@@ -280,14 +293,18 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
                     if ret is _HOOK_SKIPPED:
+                        from agent.shell_hook_scope import mark_current_hook_unknown
+                        mark_current_hook_unknown("hook_callback_abandoned")
                         if fail_closed:  # policy hook: fail closed with a block directive
                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
                 else:
-                    ret = self._invoke_hook_callback(cb, kwargs)
+                    ret = self._invoke_hook_callback_scoped(hook_name, cb, kwargs)
                 if ret is not None:
                     results.append(ret)
             except (Exception, SystemExit) as exc:
+                from agent.shell_hook_scope import mark_current_hook_unknown
+                mark_current_hook_unknown("hook_callback_failed")
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
                 if fail_closed:  # a guard that raised made no decision: same veto as a timeout
                     results.append(_policy_error_block_directive(hook_name, cb, exc))
@@ -372,7 +389,9 @@ class PluginDispatchMixin:
 
         def _runner() -> None:
             try:
-                outcome["value"] = context.run(self._invoke_hook_callback, cb, kwargs)
+                outcome["value"] = context.run(
+                    self._invoke_hook_callback_scoped, hook_name, cb, kwargs,
+                )
             except BaseException as exc:
                 failure["exc"] = exc
             finally:
@@ -400,6 +419,8 @@ class PluginDispatchMixin:
                     self._hook_abandoned.setdefault(suppression_key, set()).add(gate_key)
             logger.warning(
                 "Hook '%s' callback %s timed out after %gs — skipping", hook_name, callback_name, timeout)
+            from agent.shell_hook_scope import mark_current_hook_unknown
+            mark_current_hook_unknown("hook_callback_timeout")
             return _HOOK_SKIPPED
         if "exc" in failure:
             raise failure["exc"]
@@ -462,10 +483,23 @@ class PluginDispatchMixin:
                 self._event_pending_by_generation[generation] = pending - 1
             self._event_idle.notify_all()
 
+    @staticmethod
+    def _mark_queued_event_unknown(item: Any, reason: str) -> None:
+        """Retain the enqueuing owner when an event never reaches its callback."""
+        context = getattr(item, "context", None)
+        if not isinstance(context, contextvars.Context):
+            return
+        try:
+            from agent.shell_hook_scope import mark_current_hook_unknown
+            context.copy().run(mark_current_hook_unknown, reason)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            logger.debug("queued hook custody marker failed", exc_info=True)
+
     def _deliver_event(self, item: _QueuedPluginEvent) -> None:
         """Deliver one queued event on the host-owned worker thread."""
         with self._event_lock:
             if item.generation != self._event_generation:
+                self._mark_queued_event_unknown(item, "hook_event_generation_stale")
                 return
         previous_depth = getattr(self._emit_depth, "value", 0)
         self._emit_depth.value = item.depth
@@ -473,16 +507,29 @@ class PluginDispatchMixin:
             for subscription in item.subscriptions:
                 with self._event_lock:
                     if item.generation != self._event_generation:
+                        self._mark_queued_event_unknown(item, "hook_event_generation_stale")
                         break
                     # Owner unload may have removed this entry after the event was queued.
                     if not any(cur is subscription for cur in self._subscriptions.get(item.event, [])):
+                        self._mark_queued_event_unknown(item, "hook_event_subscription_drop")
                         continue
                 callback = subscription.callback
                 try:
                     # Fresh deep copy per subscriber: no callback can mutate what the next sees.
-                    resolve_plugin_command_result(
-                        item.context.copy().run(callback, **copy.deepcopy(item.payload)))
+                    from agent.shell_hook_scope import hook_invocation_scope, managed_hook_route
+                    payload = copy.deepcopy(item.payload)
+
+                    def _deliver() -> Any:
+                        with managed_hook_route(), hook_invocation_scope(item.event) as parent:
+                            result = resolve_plugin_command_result(callback(**payload))
+                            if parent is not None and parent.consumer is not None:
+                                parent.consumer.stage(parent.invocation_id, result)
+                            return result
+
+                    item.context.copy().run(_deliver)
                 except (Exception, SystemExit) as exc:
+                    from agent.shell_hook_scope import mark_current_hook_unknown
+                    mark_current_hook_unknown("hook_event_delivery_failed")
                     # A subscriber that fails identically on every emit is reported once (#111922).
                     self._report_hook_failure(item.event, callback, item.payload, exc, surface="Event")
         finally:
@@ -503,6 +550,8 @@ class PluginDispatchMixin:
             logger.warning(
                 "Event bus recursion cap (%d) exceeded while dispatching '%s' "
                 "— dropping this emit to prevent an infinite loop", _EVENT_EMIT_DEPTH_CAP, event)
+            from agent.shell_hook_scope import mark_current_hook_unknown
+            mark_current_hook_unknown("hook_event_recursion_drop")
             return 0
         budget_msg = "Event bus pending budget (%d) exhausted while dispatching '%s' — dropping this emit"
         with self._event_lock:
@@ -513,6 +562,8 @@ class PluginDispatchMixin:
             pending = self._event_pending_by_generation.get(generation, 0)
             if pending >= _EVENT_PENDING_CAP:
                 logger.warning(budget_msg, _EVENT_PENDING_CAP, event)
+                from agent.shell_hook_scope import mark_current_hook_unknown
+                mark_current_hook_unknown("hook_event_queue_drop")
                 return 0
             item = _QueuedPluginEvent(
                 event=event, payload=dict(payload), subscriptions=subscriptions, depth=depth + 1,
@@ -521,6 +572,7 @@ class PluginDispatchMixin:
                 self._event_queue.put_nowait(item)
             except queue.Full:
                 logger.warning(budget_msg, _EVENT_PENDING_CAP, event)
+                self._mark_queued_event_unknown(item, "hook_event_queue_drop")
                 return 0
             self._event_pending_by_generation[generation] = pending + 1
             self._ensure_event_worker_locked()
@@ -555,16 +607,24 @@ class PluginDispatchMixin:
         for cb in self._hooks.get(hook_name, []):
             callback_name = getattr(cb, "__name__", repr(cb))
             try:
-                ret = cb(**self._hook_callback_kwargs(cb, kwargs))
-                if inspect.isawaitable(ret):
-                    ret = await (asyncio.wait_for(ret, timeout) if use_timeout else ret)
+                from agent.shell_hook_scope import hook_invocation_scope
+                with hook_invocation_scope(hook_name) as parent:
+                    ret = cb(**self._hook_callback_kwargs(cb, kwargs))
+                    if inspect.isawaitable(ret):
+                        ret = await (asyncio.wait_for(ret, timeout) if use_timeout else ret)
+                    if parent is not None and parent.consumer is not None:
+                        parent.consumer.stage(parent.invocation_id, ret)
                 if ret is not None:
                     results.append(ret)
             except TimeoutError:
                 logger.warning("Hook '%s' callback %s timed out after %.0fs", hook_name, callback_name, timeout)
+                from agent.shell_hook_scope import mark_current_hook_unknown
+                mark_current_hook_unknown("hook_callback_timeout")
                 if fail_closed:  # policy hook: fail closed with a block directive
                     results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
             except (Exception, SystemExit) as exc:
+                from agent.shell_hook_scope import mark_current_hook_unknown
+                mark_current_hook_unknown("hook_callback_failed")
                 # Same isolation + failure contract as the sync path (#111922 warn-once, #109624
                 # a raising policy guard fails closed).
                 self._report_hook_failure(hook_name, cb, kwargs, exc)

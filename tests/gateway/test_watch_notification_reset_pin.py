@@ -19,6 +19,7 @@ async def _gateway(monkeypatch):
     from gateway.session_results import execution_result
     from gateway.session_authority import SessionAuthority, initialize_session_authority
     from plugins.platforms.discord.adapter import DiscordAdapter
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
     runner = GatewayRunner(GatewayConfig())
@@ -26,6 +27,7 @@ async def _gateway(monkeypatch):
     adapter.gateway_runner = runner
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
 
     async def send(chat_id, content, reply_to=None, metadata=None):
@@ -209,8 +211,10 @@ async def _run_async_watcher(runner, monkeypatch, clock, *, ticks):
 def _persist_delegation(entry, pinned, delegation_id):
     import time
     from tools import async_delegation as delegation
+    from tests.gateway.test_completion_admission import prepared_execution
     evt = dict(_notice(entry, pinned, 'async_delegation'), delegation_id=delegation_id,
-               summary='review findings', status='completed', dispatched_at=time.time())
+               summary='review findings', status='completed', dispatched_at=time.time(),
+               execution=prepared_execution(delegation_id))
     delegation._persist_dispatch(evt)
     delegation._persist_completion(evt, {'status': 'completed', 'summary': 'review findings'})
     return evt

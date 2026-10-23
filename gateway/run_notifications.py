@@ -30,6 +30,21 @@ from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixi
 logger = logging.getLogger("gateway.run")
 
 
+def initialize_i10_source_indexes(runner) -> None:
+    from gateway.run_notifications_recovery import initialize_i10_source_indexes as initialize
+    return initialize(runner)
+
+
+def i10_source_snapshot(authority):
+    from gateway.run_notifications_recovery import i10_source_snapshot as snapshot
+    return snapshot(authority)
+
+
+def register_i10_source(authority):
+    from gateway.run_notifications_recovery import register_i10_source as register
+    return register(authority)
+
+
 def _served_notice_target_key(profile: Optional[str], platform_value: str, chat_id, thread_id) -> tuple:
     """Notice-dedupe key for one SERVED profile's home channel.
 
@@ -1706,6 +1721,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return {
             "type": "completion",
             "session_id": session_id,
+            **({"delivery_token": getattr(getattr(session, "custody", None), "delivery_token", "")}
+               if getattr(getattr(session, "custody", None), "delivery_token", "") else {}),
             **{k: watcher.get(k, "") for k in _WATCHER_ROUTE_FIELDS},
             "owner_task_id": getattr(session, "owner_task_id", "") or "",
             "task_id": getattr(session, "task_id", "") or "",
@@ -1801,6 +1818,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
+                    process_registry.acknowledge_completion_delivery(
+                        getattr(getattr(session, "custody", None), "delivery_token", ""))
                     break
                 continue
             current_output_len = len(session.output_buffer)
@@ -1828,6 +1847,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         )):
                             message_text = self._format_process_final_message(session_id, session, "concise")
                             await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
+                        process_registry.acknowledge_completion_delivery(
+                            getattr(getattr(session, "custody", None), "delivery_token", ""))
                         break
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
@@ -1850,6 +1871,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                                          exc_info=True)
                             committed = False
                         if committed:
+                            process_registry.acknowledge_completion_delivery(
+                                getattr(getattr(session, "custody", None), "delivery_token", ""))
                             break  # The last refusal was a lost ACK: the turn is committed.
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "
@@ -1862,6 +1885,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
+                    process_registry.acknowledge_completion_delivery(
+                        getattr(getattr(session, "custody", None), "delivery_token", ""))
                     break
                 if notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and session.exit_code not in {0, None}
@@ -1873,6 +1898,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         await present_notification(
                             lambda: self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher),
                             platform=platform_name, diagnostic=session.exit_code not in {0, None})
+                    process_registry.acknowledge_completion_delivery(
+                        getattr(getattr(session, "custody", None), "delivery_token", ""))
                 break
             elif has_new_output and notify_mode == "all" and not agent_notify:
                 # New output — deliver a status update (only in "all" mode; agent_notify watchers
@@ -1880,4 +1907,19 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 await self._send_watcher_message(
                     platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
                 )
+        from gateway.session_recovery_custody import observe_consumer_rows
+        authority = getattr(self, 'session_authority', None)
+        if (
+            authority is not None
+            and isinstance(getattr(authority, 'instance_id', None), str)
+            and isinstance(getattr(authority, 'profile_id', None), str)
+            and isinstance(getattr(authority, 'epoch', None), int)
+            and hasattr(authority, 'db')
+        ):
+            from hermes_state_runtime import list_session_admissions
+            rows = list_session_admissions(authority.db, session_id=session_id, pending_only=False)
+            observe_consumer_rows(
+                authority, 'completion_notification', rows=rows,
+                reason='completion watcher found no accepted admission',
+            )
         logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)

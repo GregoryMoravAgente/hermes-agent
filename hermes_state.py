@@ -562,22 +562,33 @@ class SessionDB(
                         data["_branched_from"] = value.strip()
         return data
 
-    @staticmethod
-    def _close_connection_quietly(conn: Optional[sqlite3.Connection]) -> None:
-        """Close a partially initialized connection without masking its error."""
+    def _close_connection_quietly(self, conn: Optional[sqlite3.Connection]) -> bool:
+        """Close a connection without masking its error, returning a native receipt.
+
+        The legacy callers intentionally ignore this return value.  Checked lifecycle
+        custody uses the per-handle marker as well as the return value because a subclass
+        or test seam may wrap this method and omit its return.
+        """
         if conn is None:
-            return
+            self._last_native_close_succeeded = True
+            return True
         try:
             conn.close()
         except Exception:
+            self._last_native_close_succeeded = False
             logger.debug("Could not close a SessionDB connection", exc_info=True)
+            return False
+        self._last_native_close_succeeded = True
+        return True
 
-    def _close_conn_logged(self, conn, label: str) -> None:
+    def _close_conn_logged(self, conn, label: str) -> bool:
         """Close *conn*; a failing close leaks a tracked fd: logged at WARNING, never swallowed."""
         try:
             conn.close()
         except Exception as exc:
             logger.warning("%s close failed for %s: %s", label, self.db_path, exc)
+            return False
+        return True
 
     def __init__(self, db_path: Path | None = None, read_only: bool = False):
         self.db_path = db_path or _default_db_path()
@@ -600,6 +611,10 @@ class SessionDB(
         # never queue behind writer flushes on self._lock (see _read_ctx); unbounded
         # per-thread connections pinned fds for the process lifetime and hit EMFILE.
         self._read_pool: queue.LifoQueue[sqlite3.Connection] = queue.LifoQueue(maxsize=_READ_POOL_MAX)
+        # A read connection whose native close failed remains attached to this exact handle for
+        # the next checked retry.  Dropping it after releasing its permit would make an empty pool
+        # look like physical closure while the descriptor still lived.
+        self._failed_read_conns: list[sqlite3.Connection] = []
         # Permits bound PEAK descriptors (the pool bounds only the idle set), shared per
         # DATABASE PATH; acquired non-blocking so a permitless reader degrades to the writer lock.
         # One permit per live read connection, held from before the open in _get_read_conn() until after the
@@ -611,6 +626,13 @@ class SessionDB(
         self._read_budget = _read_budget_for(self.db_path)
         self._read_permits = self._read_budget.permits
         self._read_conns_lock = threading.Lock()
+        # WAL readers do not hold self._lock.  Count contexts that have checked out a native
+        # read connection so a checked close cannot certify while one is still using it.
+        self._active_read_contexts = 0
+        # Count read-only opens after admission and before the native connection is either
+        # returned or closed.  This closes the gap where a checked sweep could certify between
+        # the pre-open closed check and the actual sqlite3.connect call.
+        self._read_open_inflight = 0
         # Set when close() begins; an in-flight reader then closes its own connection
         # instead of re-populating a pool nobody will drain again.
         self._read_conns_closed = False
@@ -637,6 +659,9 @@ class SessionDB(
         # is queryable AND not marked stale.
         self._fts_cjk_loaded = self._fts_cjk_available = self._fts_unavailable_warned = False
         self._conn = None
+        # ``None`` means no checked native close has settled on the current close attempt.  This is
+        # reset by close() before it calls any overridable teardown seam.
+        self._last_native_close_succeeded: Optional[bool] = None
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.
         self._token_queue: deque = deque()
         self._token_queue_cond = threading.Condition(threading.Lock())
@@ -872,8 +897,21 @@ class SessionDB(
             backing_off = failed_at and time.monotonic() - failed_at < _READ_OPEN_RETRY_SECONDS
             if self._read_conns_closed or backing_off:
                 return None
+            self._read_open_inflight += 1
+        open_counted = True
+
+        def finish_open() -> bool:
+            nonlocal open_counted
+            if not open_counted:
+                return False
+            with self._read_conns_lock:
+                open_counted = False
+                self._read_open_inflight -= 1
+                return self._read_conns_closed
+
         # Permit BEFORE the open: openers race for permits, not descriptors.
         if not self._read_budget.acquire(self):
+            finish_open()
             logger.debug(
                 "read pool at capacity (%d) for %s; serving this read from the "
                 "locked writer connection", _READ_POOL_MAX, self.db_path,
@@ -881,6 +919,12 @@ class SessionDB(
             return None
         conn = None  # bound before the try so the handlers can close a half-open one
         try:
+            with self._read_conns_lock:
+                closed_before_open = self._read_conns_closed
+            if closed_before_open:
+                finish_open()
+                self._read_budget.release()
+                return None
             conn = self._connect_read_only(timeout=_READ_BUSY_TIMEOUT_S)
             apply_database_pragmas(conn, db_label="state.db")
             if self._fts_cjk_loaded:  # registers in the connection, not the file: ro is fine
@@ -892,11 +936,18 @@ class SessionDB(
             if conn is not None:
                 self._close_conn_logged(conn, "partially-opened read conn")
             self._read_budget.release()
+            finish_open()
             if not isinstance(exc, sqlite3.Error):
                 raise
             with self._read_conns_lock:
                 self._read_open_failed_at = time.monotonic()
             logger.debug("read-only connection open failed for %s", self.db_path, exc_info=True)
+            return None
+        closed_during_open = finish_open()
+        if closed_during_open:
+            # The close fence owns this connection now.  Use the same retention path as a
+            # pooled reader so a native close failure remains attached to the exact handle.
+            self._close_read_conn(conn)
             return None
         return conn
 
@@ -913,9 +964,61 @@ class SessionDB(
         """Close a pooled read connection and release its permit even when the close fails (withholding
         it would narrow the read path forever). Over-releasing the BoundedSemaphore raises ValueError."""
         try:
-            self._close_conn_logged(conn, "read-conn")
+            closed = self._close_conn_logged(conn, "read-conn")
+            if not closed:
+                with self._read_conns_lock:
+                    if not any(existing is conn for existing in self._failed_read_conns):
+                        self._failed_read_conns.append(conn)
         finally:
             self._read_budget.release()
+
+    def _retry_failed_read_conns(self) -> None:
+        """Retry native close for read connections retained after a previous failure."""
+        with self._read_conns_lock:
+            failed = list(self._failed_read_conns)
+            self._failed_read_conns.clear()
+        remaining = []
+        for conn in failed:
+            if not self._close_conn_logged(conn, "read-conn retry"):
+                remaining.append(conn)
+        if remaining:
+            with self._read_conns_lock:
+                for conn in remaining:
+                    if not any(existing is conn for existing in self._failed_read_conns):
+                        self._failed_read_conns.append(conn)
+
+    def _checked_close_proven(self) -> bool:
+        """Return true only when every native SessionDB resource has settled.
+
+        ``SessionDB.close()`` is intentionally a legacy ``None``-returning API.  This
+        predicate is the source-owned receipt used by the registry after that API returns;
+        it rejects a retained WAL connection, a pinned lost-generation handle, a live token
+        writer, a queued token batch, a pooled/failed read connection, or an unknown native
+        close outcome.
+        """
+        if self._last_native_close_succeeded is not True:
+            return False
+        if self._conn is not None or self._connection_pinned:
+            return False
+        with self._read_conns_lock:
+            if (
+                not self._read_conns_closed
+                or self._active_read_contexts
+                or self._read_open_inflight
+                or self._read_pool.qsize() != 0
+                or self._failed_read_conns
+            ):
+                return False
+        with self._token_queue_cond:
+            thread = self._token_writer_thread
+            if (
+                self._token_writer_stop is not True
+                or (thread is not None and thread.is_alive())
+                or self._token_writer_busy
+                or self._token_queue
+            ):
+                return False
+        return True
 
     def _checkout_read_conn(self) -> Optional[sqlite3.Connection]:
         """Borrow a read connection, opening on a miss; None when the read path is unavailable.
@@ -935,41 +1038,49 @@ class SessionDB(
         degradation: slower beats EMFILE, which the supervisor cannot see.
         ``reopen=False``: a read after ``close()`` raises instead of reopening the
         writer (an optional reader must not hold a home that is being deleted)."""
-        conn = self._checkout_read_conn()
-        if conn is not None:
-            try:
-                yield conn
-            finally:
-                returned = False
-                with self._read_conns_lock:
-                    if not self._read_conns_closed:
-                        try:
-                            self._read_pool.put_nowait(conn)
-                            returned = True
-                        except queue.Full:
-                            pass
-                if not returned:
-                    # close() drained the pool (or queue.Full: unreachable while
-                    # permits == maxsize, load-bearing if they drift): surplus.
-                    self._close_read_conn(conn)
-            return
-        with self._lock:
-            if self._conn is None:  # close() raced a still-unwinding reader
-                if not reopen:
-                    raise sqlite3.ProgrammingError(f"SessionDB for {self.db_path} is closed")
-                self._reopen_after_close_locked(context="read")
-            conn = cast(sqlite3.Connection, self._conn)
-            if self._wal_active or self.read_only:  # WAL: no SHARED-lock wait; ro: opened with the read budget
-                yield conn
+        with self._read_conns_lock:
+            # Admit the whole read context before checking/opening a native reader.  A checked
+            # close that races the open must remain pending until this context unwinds.
+            self._active_read_contexts += 1
+        try:
+            conn = self._checkout_read_conn()
+            if conn is not None:
+                try:
+                    yield conn
+                finally:
+                    returned = False
+                    with self._read_conns_lock:
+                        if not self._read_conns_closed:
+                            try:
+                                self._read_pool.put_nowait(conn)
+                                returned = True
+                            except queue.Full:
+                                pass
+                    if not returned:
+                        # close() drained the pool (or queue.Full: unreachable while
+                        # permits == maxsize, load-bearing if they drift): surplus.
+                        self._close_read_conn(conn)
                 return
-            # DELETE-mode writer connection: wait out a sibling's commit like a pooled reader would.
-            previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-            conn.execute(f"PRAGMA busy_timeout={int(_READ_BUSY_TIMEOUT_S * 1000)}")
-            try:
-                yield conn
-            finally:
-                with suppress(sqlite3.Error):
-                    conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
+            with self._lock:
+                if self._conn is None:  # close() raced a still-unwinding reader
+                    if not reopen:
+                        raise sqlite3.ProgrammingError(f"SessionDB for {self.db_path} is closed")
+                    self._reopen_after_close_locked(context="read")
+                conn = cast(sqlite3.Connection, self._conn)
+                if self._wal_active or self.read_only:  # WAL: no SHARED-lock wait; ro: opened with the read budget
+                    yield conn
+                    return
+                # DELETE-mode writer connection: wait out a sibling's commit like a pooled reader would.
+                previous_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+                conn.execute(f"PRAGMA busy_timeout={int(_READ_BUSY_TIMEOUT_S * 1000)}")
+                try:
+                    yield conn
+                finally:
+                    with suppress(sqlite3.Error):
+                        conn.execute(f"PRAGMA busy_timeout={int(previous_ms)}")
+        finally:
+            with self._read_conns_lock:
+                self._active_read_contexts -= 1
 
     def _reopen_after_close_locked(self, context: str = "write") -> None:
         """Reopen the writer after ``close()`` raced a live caller (a teardown owner
@@ -1535,7 +1646,22 @@ class SessionDB(
             from hermes_state_registry import release
             release(self)
             return
+        self._last_native_close_succeeded = True if self._conn is None else None
         self._stop_token_writer()
+        # A checked teardown must retain the exact native connection until an accepted token
+        # batch has finished.  The legacy stop helper has a bounded join and may return while
+        # its writer is still inside _apply_token_batch; closing here would trigger the
+        # teardown/worker reopen race and lose the original native-handle custody proof.
+        if (
+            self.__dict__.get("_registry_checked_teardown_required") is True
+            and not self._token_writer_quiescent()
+        ):
+            self._last_native_close_succeeded = False
+            logger.warning(
+                "Deferring checked SessionDB close for %s until token writer work is quiescent",
+                self.db_path,
+            )
+            return
         hook, self._token_atexit_hook = self._token_atexit_hook, None
         if hook is not None:
             atexit.unregister(hook)
@@ -1544,6 +1670,7 @@ class SessionDB(
             self._read_conns_closed = True
         while self._evict_one_idle_read_conn():
             pass
+        self._retry_failed_read_conns()
         with self._lock:
             if self._conn:
                 generation_lost = not self.read_only and (
@@ -1576,17 +1703,28 @@ class SessionDB(
                     self._pin_connection(self._conn)
                     self._conn = None
                 else:
-                    conn, self._conn = self._conn, None
+                    conn = self._conn
                     self._close_connection_quietly(conn)
-                    # Only a clean close ends the generation; retain the recorded
-                    # identity when retiring an unsafe handle.
-                    self._db_sidecar_identity = {}
+                    if self._last_native_close_succeeded is True:
+                        self._conn = None
+                        # Only a clean close ends the generation; retain the recorded
+                        # identity when retiring an unsafe handle.
+                        self._db_sidecar_identity = {}
+                    else:
+                        # Keep the exact native connection for a later checked retry. The
+                        # guard was released before the attempted close; re-arm it while the
+                        # connection remains open so a sibling cannot unlink its generation.
+                        with suppress(Exception):
+                            self._wal_lock_guard = _lockguard.hold(self.db_path, self._wal_lock_guard)
         self._read_budget.unregister(self)  # idempotent: a never-registered (failed-init) handle is a no-op
 
     def __del__(self) -> None:
         """Safety net: close() if the caller forgot. Attribute access stays
         guarded: module teardown order is undefined."""
-        if self.__dict__.get("_conn") is not None:
+        if (
+            self.__dict__.get("_conn") is not None
+            or self.__dict__.get("_failed_read_conns")
+        ):
             try:
                 self.close()
             except Exception:

@@ -3,7 +3,8 @@
 An ordinary ``python -m gateway.run`` in a disposable HERMES_HOME with a loopback
 model must, on Linux, macOS and native Windows alike: publish discovery + tickets;
 attach WebSockets; admit/execute/receipt prompts; keep two clients FIFO on one
-session; survive an owner hard-kill (``gateway.status.terminate_pid``) with the
+session; survive an owner hard-kill (the retained native Job on Windows,
+``gateway.status.terminate_pid`` elsewhere) with the
 committed queued admission executed exactly once; branch/delete with retryable
 receipts; run the safe-mode CLI turn in an out-of-process managed worker that
 opens no writable canonical SQLite; refuse a second owner while the first holds
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 import pytest
@@ -132,8 +134,62 @@ def process_start_time(pid):
     return get_process_start_time(pid)
 
 
+_NATIVE_JOB_ATTR = "_hermes_windows_job"
+
+
+def _process_handle_ref(proc):
+    handle = getattr(proc, "_handle", None)
+    if handle is None:
+        raise AssertionError("native daemon process handle is unavailable")
+    return SimpleNamespace(raw_handle=handle)
+
+
+def _wait_owned_job_empty(job, deadline):
+    from tests.waiting import wait_until
+    return wait_until(
+        lambda: job.empty() is True,
+        timeout=max(0.0, deadline - time.monotonic()),
+        what="the retained gateway Job to become empty",
+    )
+
+
+def _close_owned_job(job, deadline):
+    """Close only the same Job after exact emptiness; retry its handle, never replace it."""
+    _wait_owned_job_empty(job, deadline)
+    try:
+        job.close()
+    except OSError:
+        # A close failure retains the exact native object. Retry that same handle once within the
+        # fixture's existing cleanup budget; never fall back to taskkill or a replacement Job.
+        if time.monotonic() >= deadline:
+            raise
+        job.close()
+
+
+def _cleanup_owned_daemon(proc, job):
+    deadline = time.monotonic() + 20
+    if proc.poll() is None:
+        job.terminate()
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+    process_ref = _process_handle_ref(proc)
+    assert job.contains_process_handle(process_ref) is True
+    _close_owned_job(job, deadline)
+
+
 def hard_kill(proc):
-    """Owner death without cleanup: identity-guarded force kill, never a raw SIGKILL."""
+    """Owner death without cleanup: use the retained native Job on Windows, never taskkill."""
+    if os.name == "nt":
+        job = getattr(proc, _NATIVE_JOB_ATTR, None)
+        if job is None:
+            raise AssertionError("Windows daemon has no retained native Job")
+        process_ref = _process_handle_ref(proc)
+        assert job.contains_process_handle(process_ref) is True
+        deadline = time.monotonic() + 30
+        job.terminate()
+        proc.wait(timeout=max(0.0, deadline - time.monotonic()))
+        assert job.contains_process_handle(process_ref) is True
+        _wait_owned_job_empty(job, deadline)
+        return
     from gateway.status import terminate_pid
     terminate_pid(proc.pid, force=True, expected_start_time=process_start_time(proc.pid))
     proc.wait(timeout=30)
@@ -161,11 +217,38 @@ def planned_stop(home, proc, desc):
                               (home / '.gateway-planned-stop.json').exists(), detail))
 
 
+def _capture_native_fixture_logs(home, log_name):
+    """Retain synthetic daemon diagnostics next to this exact native JUnit receipt."""
+    junit_arg = next((value for value in sys.argv if value.startswith("--junitxml=")), None)
+    if junit_arg is None:
+        return
+    target = Path(junit_arg.split("=", 1)[1]).parent / "gateway-daemon-logs"
+    target.mkdir(parents=True, exist_ok=True)
+    for source in (home.parent / log_name, home / "logs" / "gateway.log", home / "logs" / "stacks.txt"):
+        if source.is_file():
+            name = f"{home.parent.name}--{log_name}--{source.name}"
+            (target / name).write_text(source.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+
+
 @contextmanager
 def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
     command = [sys.executable, str(ROOT / 'tests/gateway/fixtures' / fixture)] if fixture else [sys.executable, '-m', 'gateway.run']
     with (home.parent / log_name).open('w+', encoding='utf-8', errors='replace') as log:
-        proc = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
+        native_job = None
+        if os.name == "nt":
+            from hermes_cli.local_runtime.processes import spawn_server
+            proc, native_job = spawn_server(
+                command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+            )
+            if native_job is None:
+                raise AssertionError("Windows daemon spawn did not return its native Job")
+            setattr(proc, _NATIVE_JOB_ATTR, native_job)
+        else:
+            proc = subprocess.Popen(
+                command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
+            )
         try:
             desc = {}
             deadline = time.monotonic() + 180
@@ -191,9 +274,12 @@ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
                 assert desc.get('state') == 'ready', (json.dumps(desc, default=str), proc.poll(), log.read()[-3000:], detail)
             yield proc, desc, log
         finally:
-            if proc.poll() is None:
+            if os.name == "nt":
+                _cleanup_owned_daemon(proc, native_job)
+            elif proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=20)
+            _capture_native_fixture_logs(home, log_name)
 
 
 def query(home, sql, args=()):

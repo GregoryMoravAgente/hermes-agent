@@ -311,6 +311,14 @@ def _db_flush_write(agent, batch_rows: list[dict[str, Any]], batch_msgs: list[di
         # the live transcript so forks/compaction built from memory carry one checkpoint too. Markers stay:
         # the rows are durable exactly as the dicts now read.
         drop_shadowed_checkpoints(messages)
+    # The managed proof path opts into this capture only for the one canonical writer call.
+    # Copy both writer-issued rows and the live message identity after the transaction has committed;
+    # the proof helper then reads the actual stored rows back and hashes those values.
+    if getattr(agent, "_managed_proof_capture", False):
+        agent._managed_proof_batch = tuple(
+            (id(message), dict(row), dict(message))
+            for row, message in zip(batch_rows, batch_msgs)
+        )
 
 
 def _db_flush_adopt_compression_tip(agent) -> bool:
@@ -417,6 +425,283 @@ def _db_flush_failed(agent, e: Exception, batch_rows: list[dict[str, Any]], adop
     return None
 
 
+_GATEWAY_WRITER_FALLTHROUGH = object()
+
+
+def _gateway_writer_reuse_unknown(agent: Any, acp: Any) -> bool:
+    """Stop before a second writer when a managed physical witness no longer matches."""
+    from agent.session_persistence_proof import mark_gateway_writer_proof_unknown
+    mark_gateway_writer_proof_unknown(agent, acp)
+    agent._managed_persistence_failed = True
+    if acp is not None:
+        agent._mark_managed_persistence_unknown(acp)
+    return False
+
+
+def _finish_gateway_writer_request(
+    agent: Any, messages: list[dict], conversation_history: Optional[list[dict]],
+    requested_binding: Any, explicit_binding: bool, previous_proof: Any, reused: Any,
+    acp: Any, flush_managed, flush_plain, staged, forget_proof, remember_proof,
+    mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+) -> bool:
+    from agent.session_persistence_proof import (
+        _GATEWAY_WRITER_PREFIX_REPAIR, gateway_writer_proof_extends_prefix,
+    )
+
+    continue_with_proof = reused is _GATEWAY_WRITER_PREFIX_REPAIR
+    if reused is not None and not continue_with_proof:
+        agent._managed_shell_writer_proof = reused
+        return True
+    if not continue_with_proof:
+        forget_proof(agent)
+    writer = flush_managed if (staged(messages) or continue_with_proof) else flush_plain
+    try:
+        proof = writer(agent, messages, conversation_history)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        proof = None
+    if proof is None:
+        # The authenticated prefix remains available for the same-owner retry, but it never
+        # stands in for a terminal suffix that this attempt did not prove.
+        agent._managed_shell_writer_proof = previous_proof if continue_with_proof else None
+        agent._managed_persistence_failed = True
+        mark_gateway_writer_proof_unknown(agent, acp)
+        return False
+    if continue_with_proof and not gateway_writer_proof_extends_prefix(previous_proof, proof):
+        agent._managed_shell_writer_proof = previous_proof
+        agent._managed_persistence_failed = True
+        mark_gateway_writer_proof_unknown(agent, acp)
+        return False
+    agent._managed_shell_writer_proof = proof
+    remembered = remember_proof(agent, proof, requested_binding, explicit_binding)
+    if acp is not None and remembered is not True:
+        if continue_with_proof:
+            agent._managed_shell_writer_proof = previous_proof
+            mark_gateway_writer_proof_unknown(agent, acp)
+        else:
+            retain_gateway_writer_proof_unknown(
+                agent, proof, requested=requested_binding, explicit=explicit_binding,
+            )
+        agent._managed_persistence_failed = True
+        if acp is not None:
+            agent._mark_managed_persistence_unknown(acp)
+        return False
+    if remembered is not True and continue_with_proof:
+        agent._managed_shell_writer_proof = previous_proof
+        mark_gateway_writer_proof_unknown(agent, acp)
+        agent._managed_persistence_failed = True
+        return False
+    return True
+
+
+def _flush_gateway_writer_request(
+    agent: Any, messages: list[dict], conversation_history: Optional[list[dict]],
+    requested_binding: Any, explicit_binding: bool,
+    flush_managed, flush_plain, staged, forget_proof, remember_proof, reuse_proof,
+):
+    """Run the optional direct writer proof without replacing the managed ACP branch."""
+    from agent.session_persistence_proof import _GATEWAY_WRITER_UNKNOWN
+    from agent.session_persistence_proof import (
+        mark_gateway_writer_proof_unknown,
+        retain_gateway_writer_proof_unknown,
+    )
+    if explicit_binding and requested_binding is None:
+        forget_proof(agent)
+        agent._managed_persistence_failed = True
+        return False
+    acp = getattr(agent, "_managed_acp_client", None)
+    if explicit_binding:
+        if acp is not None and acp.has_pending_managed_witness():
+            agent._managed_persistence_failed = True
+            agent._mark_managed_persistence_unknown(acp)
+            return False
+        previous_proof = getattr(agent, "_managed_shell_writer_proof", None)
+        reused = reuse_proof(
+            agent, messages, previous_proof, requested_binding, explicit_binding,
+        ) if previous_proof is not None else None
+        if reused is _GATEWAY_WRITER_UNKNOWN:
+            return _gateway_writer_reuse_unknown(agent, acp)
+        return _finish_gateway_writer_request(
+            agent, messages, conversation_history, requested_binding, explicit_binding,
+            previous_proof, reused, acp, flush_managed, flush_plain, staged, forget_proof,
+            remember_proof, mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+        )
+    if acp is not None and acp.has_pending_managed_witness():
+        return _GATEWAY_WRITER_FALLTHROUGH
+    previous_proof = getattr(agent, "_managed_shell_writer_proof", None)
+    reused = reuse_proof(
+        agent, messages, previous_proof, requested_binding, explicit_binding,
+    ) if previous_proof is not None else None
+    if reused is _GATEWAY_WRITER_UNKNOWN:
+        return _gateway_writer_reuse_unknown(agent, acp)
+    return _finish_gateway_writer_request(
+        agent, messages, conversation_history, requested_binding, explicit_binding,
+        previous_proof, reused, acp, flush_managed, flush_plain, staged, forget_proof,
+        remember_proof, mark_gateway_writer_proof_unknown, retain_gateway_writer_proof_unknown,
+    )
+
+
+
+def _retry_managed_post_commit_proof(agent: Any, acp: Any, messages: list[dict]) -> bool:
+    """Retry only the retained same-owner receipt without admitting another writer."""
+    # The finalizer may have discarded only the one-use request.  A retained
+    # managed proof still blocks every fallback writer.  First give the same
+    # authenticated owner one strict post-commit witness/readback recovery; this
+    # clears only the writer marker and never admits a child or writes another row.
+    agent._managed_persistence_failed = True
+    if acp is not None:
+        parent = getattr(getattr(acp, "_producer_policy", None), "parent", None)
+        service = getattr(parent, "_service", None)
+        binding = getattr(parent, "turn_binding", None)
+        request = (
+            (getattr(service, "requests", {}) or {}).get(getattr(binding, "admission_id", None))
+            if service is not None and binding is not None else None
+        )
+        recover = getattr(acp, "_retry_managed_writer_proof", None)
+        recovered = False
+        if callable(recover) and parent is not None and service is not None and binding is not None and request is not None:
+            try:
+                recovered = recover(agent, parent, service, binding, request, messages) is True
+            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                logger.warning("managed post-commit proof recovery refused", exc_info=True)
+        if recovered:
+            return True
+        agent._mark_managed_persistence_unknown(acp)
+    return False
+
+
+def _flush_managed_intermediate_terminal(
+    agent: Any, acp: Any, intermediate_fence: Any,
+    messages: list[dict], conversation_history: Optional[list[dict]],
+) -> bool:
+    """Extend the existing child's receipt after the finalizer shapes the canonical tail."""
+    from agent.session_persistence_proof import (
+        flush_messages_with_managed_current_turn_proof, flush_messages_with_proof,
+        managed_current_turn_is_staged, mark_managed_intermediate_writer_fence_unknown,
+    )
+    terminal_proof = (
+        flush_messages_with_managed_current_turn_proof(agent, messages, conversation_history)
+        if managed_current_turn_is_staged(messages)
+        else flush_messages_with_proof(agent, messages, conversation_history)
+    )
+    commit_terminal = getattr(acp, "_commit_managed_intermediate_terminal_proof", None)
+    if callable(commit_terminal):
+        if commit_terminal(agent, intermediate_fence, terminal_proof, messages) is True:
+            # A retry may have no new intended rows; the helper then
+            # consumed the exact retained terminal proof from the fence.
+            agent._managed_shell_writer_proof = (
+                terminal_proof
+                if terminal_proof is not None
+                else getattr(intermediate_fence, "writer_proof", None)
+            )
+            return True
+    mark_managed_intermediate_writer_fence_unknown(
+        agent, acp, "managed_intermediate_terminal_without_child",
+    )
+    agent._managed_persistence_failed = True
+    return False
+
+
+def _flush_pending_managed_child(
+    agent: Any, acp: Any, messages: list[dict], conversation_history: Optional[list[dict]],
+    gateway_requested: bool, requested_binding: Any, explicit_binding: bool,
+) -> bool:
+    """Commit a pending child's rows and retain its exact physical handoff evidence."""
+    from agent.session_persistence_proof import (
+        consume_managed_intermediate_writer_fence, flush_messages_with_managed_current_turn_proof,
+        flush_messages_with_proof, forget_gateway_writer_proof, managed_current_turn_is_staged,
+        mark_gateway_writer_proof_unknown, mark_managed_intermediate_writer_fence_unknown,
+        remember_gateway_writer_proof, retain_gateway_writer_proof_unknown,
+        retain_managed_intermediate_writer_fence,
+    )
+    from agent.session_persistence_proof import SessionDBWriteProof
+    physical_witness = None
+    proof = None
+    previous_proof = getattr(agent, "_managed_shell_writer_proof", None)
+    durable_committed = False
+    intermediate = (
+        not getattr(agent, '_managed_finalize_shell_turn', False)
+        and callable(getattr(acp, '_managed_intermediate_message', None))
+        and acp._managed_intermediate_message(messages) is not None
+    )
+    try:
+        proof = (
+            flush_messages_with_managed_current_turn_proof(agent, messages, conversation_history)
+            if managed_current_turn_is_staged(messages)
+            else flush_messages_with_proof(agent, messages, conversation_history)
+        )
+        if not intermediate and type(proof) is SessionDBWriteProof:
+            # Shell-hook children use the managed ACP writer's exact SessionDB proof even when
+            # this API route has no separate Gateway writer request.  Keep the proof only while
+            # an operation is live; the finalizer consumes it through commit_turn_result, which
+            # still validates the complete assistant/tool suffix before releasing each sidecar.
+            if gateway_requested or bool(getattr(agent, "_shell_hook_custody_operations", None)):
+                agent._managed_shell_writer_proof = proof
+        commit_writer = (acp._commit_managed_intermediate_writer_proof if intermediate
+                         else acp._commit_managed_writer_proof)
+        committed = proof is not None and commit_writer(
+            agent, proof, messages,
+        ) is True
+        # The bool writer API is insufficient custody evidence by itself: the
+        # exact readback proof must still be attached to this admission's
+        # physical receipt before finalization can observe success.
+        committed = committed and acp.has_managed_durable_receipt(
+            getattr(proof, "session_id", ""),
+        )
+        durable_committed = committed
+        capture_witness = getattr(acp, "capture_managed_durable_receipt_witness", None)
+        if committed and callable(capture_witness):
+            physical_witness = capture_witness(agent, proof)
+            committed = physical_witness is not None
+        elif committed and getattr(acp, "_producer_policy", None) is not None:
+            # A real managed ACP client must supply the exact receipt/provider witness;
+            # a helper-only bool cannot cross the production custody fence.
+            committed = False
+        if committed and gateway_requested and not intermediate:
+            committed = remember_gateway_writer_proof(
+                agent, proof, requested_binding, explicit_binding, physical_witness,
+            ) is True
+        if committed and intermediate:
+            # The child keeps its typed durable proof and physical custody. A tool
+            # envelope is not the final writer handoff for the enclosing I04 turn.
+            forget_gateway_writer_proof(agent)
+            committed = retain_managed_intermediate_writer_fence(
+                agent, acp, proof, physical_witness,
+            ) is True
+        elif committed and not intermediate:
+            # Consume the prefix only after the next proof is a strict same-receipt
+            # SessionDB/readback extension; the final handoff remains below.
+            fence_result = consume_managed_intermediate_writer_fence(
+                agent, acp, proof, physical_witness, messages,
+            )
+            if fence_result is False:
+                committed = False
+                mark_managed_intermediate_writer_fence_unknown(
+                    agent, acp, "managed_intermediate_terminal_mismatch",
+                )
+    except Exception:
+        logger.warning("managed ACP durable handoff raised; retaining unknown custody", exc_info=True)
+        committed = False
+    if not committed:
+        retained_proof = proof if type(proof) is SessionDBWriteProof else previous_proof
+        retained = retain_gateway_writer_proof_unknown(
+            agent, retained_proof, physical_witness,
+            requested=requested_binding, explicit=explicit_binding,
+        )
+        agent._managed_persistence_failed = True
+        # A post-commit witness/capture failure keeps the exact durable receipt and
+        # physical owner usable for the authenticated same-client proof recovery.  The
+        # writer marker remains sticky below, so no later call can create a second
+        # writer while that narrow recovery is pending.  Pre-commit failures retain
+        # the existing service-level unknown transition.
+        if not durable_committed:
+            agent._mark_managed_persistence_unknown(acp)
+        if not retained:
+            # No typed post-effect proof was available to retain.  Keep the
+            # owner fail-closed; never turn this into an ordinary writer.
+            mark_gateway_writer_proof_unknown(agent, acp)
+        return False
+    return True
+
 
 class SessionPersistenceMixin:
     """Session DB flush and trajectory persistence (see module docstring)."""
@@ -440,6 +725,23 @@ class SessionPersistenceMixin:
         if platform_id is not None:  # load-bearing for restart drain-window recovery dedup (has_platform_message_id)
             msg["platform_message_id"] = platform_id
 
+    def _request_gateway_writer_proof(self, *args, **kwargs) -> bool:
+        """Request one exact writer proof, preserving the no-argument I04 fallback."""
+        from agent.session_persistence_proof import request_gateway_writer_proof
+        if "binding" in kwargs:
+            return request_gateway_writer_proof(self, kwargs["binding"])
+        if args:
+            return request_gateway_writer_proof(self, args[0])
+        return request_gateway_writer_proof(self)
+
+    def _peek_gateway_writer_proof(self):
+        from agent.session_persistence_proof import peek_gateway_writer_proof
+        return peek_gateway_writer_proof(self)
+
+    def _ack_gateway_writer_proof(self, handoff) -> bool:
+        from agent.session_persistence_proof import acknowledge_gateway_writer_proof
+        return acknowledge_gateway_writer_proof(self, handoff)
+
     def _persist_session(self, messages: list[dict], conversation_history: list[dict] | None = None):
         """Save to SQLite on any exit path. Trailing empty-response scaffolding is dropped from
         the live list; the persist override is applied to the DB row only.
@@ -455,11 +757,14 @@ class SessionPersistenceMixin:
             # the reason to record.
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
-            self._flush_messages_to_session_db(messages, conversation_history)
+            persisted = self._flush_messages_to_session_db(messages, conversation_history)
+            if persisted is False and getattr(self, "_managed_persistence_failed", False):
+                return False
             # Drain async token-accounting deltas at every persist point; cheap no-op when nothing queued.
             if self._session_db is not None:
                 self._session_db.flush_token_counts()
             note_turn_persisted(self)
+            return persisted
 
     def _drop_trailing_empty_response_scaffolding(self, messages: list[dict]) -> None:
         """Pop empty-response retry scaffolding from the tail. The
@@ -474,10 +779,98 @@ class SessionPersistenceMixin:
 
     _repair_message_sequence = _forward("agent.agent_runtime_helpers", "repair_message_sequence")
 
+    @staticmethod
+    def _mark_managed_persistence_unknown(acp: Any) -> None:
+        parent = getattr(getattr(acp, "_producer_policy", None), "parent", None)
+        try:
+            if parent is not None:
+                from gateway.runtime_service_operations import mark_unknown
+                mark_unknown(parent, "managed_durable_handoff_failed")
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            # The caller still records the local false/unknown outcome; no permissive retry is allowed.
+            logger.warning("managed ACP custody unknown marker failed", exc_info=True)
+
     def _flush_messages_to_session_db(self, messages: list[dict], conversation_history: Optional[list[dict]] = None):
-        """Serialize direct and turn-boundary session flushes per agent."""
+        """Serialize canonical writes and prove managed ACP results from the same transaction."""
         with _persist_lock(self):
+            if getattr(self, "_managed_proof_capture", False):
+                return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            from agent.session_persistence_proof import (
+                _GATEWAY_WRITER_PROOF_UNKNOWN,
+                _GATEWAY_WRITER_UNKNOWN,
+                _requested_gateway_binding,
+                forget_gateway_writer_proof,
+                flush_messages_with_managed_current_turn_proof,
+                flush_messages_with_proof,
+                gateway_writer_proof_requested,
+                managed_intermediate_writer_fence,
+                mark_managed_intermediate_writer_fence_unknown,
+                recover_managed_intermediate_writer_fence,
+                managed_current_turn_is_staged,
+                remember_gateway_writer_proof,
+                reuse_gateway_writer_proof,
+            )
+            acp = getattr(self, "_managed_acp_client", None)
+            # Inspect the fence independently of the current client.  A cleared, swapped, or
+            # late-cleaned client must make the retained token UNKNOWN, never invisible.
+            intermediate_fence = managed_intermediate_writer_fence(self, acp)
+            if intermediate_fence is _GATEWAY_WRITER_UNKNOWN:
+                self._managed_persistence_failed = True
+                mark_managed_intermediate_writer_fence_unknown(
+                    self, acp, "managed_intermediate_owner_mismatch", mark_parent=True,
+                )
+                if acp is not None:
+                    self._mark_managed_persistence_unknown(acp)
+                return False
+            if intermediate_fence is not None and getattr(intermediate_fence, "state", None) == "unknown":
+                recovered = False
+                if acp is not None:
+                    try:
+                        recovered = recover_managed_intermediate_writer_fence(self, acp)
+                    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                        logger.warning("managed intermediate fence recovery refused", exc_info=True)
+                if not recovered:
+                    self._managed_persistence_failed = True
+                    return False
+                intermediate_fence = managed_intermediate_writer_fence(self, acp)
+            if getattr(self, _GATEWAY_WRITER_PROOF_UNKNOWN, False) is True and intermediate_fence is None:
+                return _retry_managed_post_commit_proof(self, acp, messages)
+            gateway_requested = gateway_writer_proof_requested(self)
+            requested_binding, explicit_binding = _requested_gateway_binding(self)
+            if gateway_requested and intermediate_fence is None:
+                gateway_result = _flush_gateway_writer_request(
+                    self, messages, conversation_history, requested_binding, explicit_binding,
+                    flush_messages_with_managed_current_turn_proof, flush_messages_with_proof,
+                    managed_current_turn_is_staged, forget_gateway_writer_proof,
+                    remember_gateway_writer_proof, reuse_gateway_writer_proof,
+                )
+                if gateway_result is not _GATEWAY_WRITER_FALLTHROUGH:
+                    return gateway_result
+            if acp is not None and acp.has_pending_managed_witness():
+                return _flush_pending_managed_child(
+                    self, acp, messages, conversation_history,
+                    gateway_requested, requested_binding, explicit_binding,
+                )
+            if intermediate_fence is not None:
+                # A finalizer-shaped no-next-child tail still has a supported terminal path:
+                # write the exact rows, extend the existing child proof on the same receipt,
+                # verify native close, and leave publication to the existing Gateway handoff.
+                if getattr(self, "_managed_finalize_shell_turn", False) and acp is not None:
+                    return _flush_managed_intermediate_terminal(
+                        self, acp, intermediate_fence, messages, conversation_history,
+                    )
+                # Intermediate tool checkpoints remain canonical SessionDB checkpoints, but
+                # they never become final Gateway proof by themselves.
+                return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
             return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+
+    def _flush_messages_to_session_db_with_proof(
+        self, messages: list[dict], conversation_history: Optional[list[dict]] = None,
+    ):
+        """Return a typed committed-row witness for managed custody; preserve the bool API above."""
+        from agent.session_persistence_proof import flush_messages_with_proof
+        with _persist_lock(self):
+            return flush_messages_with_proof(self, messages, conversation_history)
 
     def _flush_messages_to_session_db_unlocked(
         self, messages: list[dict], conversation_history: Optional[list[dict]] = None, _adoption_budget: int = 1,

@@ -45,17 +45,19 @@ def emit_terminal_post_tool_call(
     """Emit the one terminal ``post_tool_call`` hook for a tool_call_id (best-effort)."""
     try:
         from model_tools import _emit_post_tool_call_hook
-        _emit_post_tool_call_hook(
-            function_name=function_name,
-            function_args=function_args,
-            result=result,
-            **tool_hook_ids(agent, effective_task_id, tool_call_id),
-            duration_ms=duration_ms,
-            status=status,
-            error_type=error_type,
-            error_message=error_message,
-            middleware_trace=list(middleware_trace or []),
-        )
+        from agent.shell_hook_custody import tool_dispatch
+        with tool_dispatch(agent, effective_task_id, tool_call_id):
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                **tool_hook_ids(agent, effective_task_id, tool_call_id),
+                duration_ms=duration_ms,
+                status=status,
+                error_type=error_type,
+                error_message=error_message,
+                middleware_trace=list(middleware_trace or []),
+            )
     except Exception:
         pass
 

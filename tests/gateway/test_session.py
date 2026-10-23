@@ -26,6 +26,35 @@ from gateway.session import (
 normalize_whatsapp_identifier = canonical_whatsapp_identifier
 
 
+class _TranscriptDbDouble:
+    """Small DB double honoring SessionDB's append-id/exact-readback contract."""
+
+    def __init__(self, *, readback_available=True):
+        self.readback_available = readback_available
+        self.rows = []
+        self._next_id = 0
+
+    def append_message(self, **kwargs):
+        from hermes_state_messages import _MESSAGE_WRITE_COLUMNS
+
+        self._next_id += 1
+        row = {column: None for column in _MESSAGE_WRITE_COLUMNS}
+        row.update({"id": self._next_id, "active": 1, "compacted": 0})
+        row.update(kwargs)
+        self.rows.append(row)
+        return self._next_id
+
+    def _read_one(self, _sql, params=()):
+        if not self.readback_available:
+            return None
+        session_id, row_id = params
+        return next(
+            (row for row in self.rows
+             if row["session_id"] == session_id and row["id"] == int(row_id)),
+            None,
+        )
+
+
 class TestSessionSourceRoundtrip:
     def test_full_roundtrip(self):
         source = SessionSource(
@@ -1447,7 +1476,6 @@ class TestGatewaySessionDbRecovery:
         toward the same ERROR escalation and, once the session is stalled, the backlog is spooled
         to disk (long before the 200-message cap) and replayed in order on recovery."""
         import threading
-        from types import SimpleNamespace
         import hermes_constants
 
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -1469,11 +1497,51 @@ class TestGatewaySessionDbRecovery:
         assert spooled == [f"m{i}" for i in range(threshold)]  # durable before the cap
         assert "s-dead" not in store._dirty_transcripts
 
-        rows = []
-        store._db = SimpleNamespace(append_message=lambda **kw: rows.append(kw["content"]))
+        store._db = _TranscriptDbDouble()
         store.append_to_transcript("s-dead", {"role": "assistant", "content": "recovered"})
-        assert rows == [f"m{i}" for i in range(threshold)] + ["recovered"]  # replayed in order
+        assert [row["content"] for row in store._db.rows] == [
+            f"m{i}" for i in range(threshold)
+        ] + ["recovered"]  # replayed in order
         assert list((tmp_path / "pending_messages").glob("pending-*.json")) == []
+
+    def test_unknown_transcript_commit_does_not_retry_or_overtake_backlog(
+        self, caplog, tmp_path, monkeypatch
+    ):
+        """Unavailable exact readback retains unknown custody and stops the FIFO drain."""
+        import threading
+        import hermes_constants
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: tmp_path)
+        store = object.__new__(SessionStore)
+        store._db = _TranscriptDbDouble(readback_available=False)
+        store._transcript_retry_lock = threading.Lock()
+        store._dirty_transcripts = {
+            "s-unknown": [
+                {"role": "user", "content": "m0"},
+                {"role": "assistant", "content": "m1"},
+            ]
+        }
+        store._transcript_append_failures = {}
+        store._fts_rebuild_last_attempt_at = time.monotonic()
+
+        with caplog.at_level(logging.ERROR, logger="gateway.session"):
+            proof = store.append_to_transcript(
+                "s-unknown", {"role": "assistant", "content": "m2"}
+            )
+
+        assert proof is None
+        assert [row["content"] for row in store._db.rows] == ["m0"]
+        assert [message["content"] for message in store._dirty_transcripts["s-unknown"]] == [
+            "m1", "m2"
+        ]
+        assert store._transcript_append_failures == {}
+        assert list((tmp_path / "pending_messages").glob("pending-*.json")) == []
+        assert any(
+            "readback unavailable" in record.getMessage()
+            and "retaining unknown custody" in record.getMessage()
+            for record in caplog.records
+        )
 
 
 

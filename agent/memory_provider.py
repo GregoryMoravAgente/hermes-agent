@@ -167,6 +167,41 @@ class MemoryProvider(ABC):
     def shutdown(self) -> None:
         """Clean shutdown — flush queues, close connections."""
 
+    def retirement_receipt(self) -> dict[str, str]:
+        """Optional hard-retirement identity owned by this initialized provider instance.
+
+        Legacy providers remain valid and simply do not participate in hard retirement.  A
+        provider that implements this hook must return exactly ``provider``, ``home_id`` and
+        ``incarnation``; Core passes that identity back unchanged to :meth:`retire`.
+        """
+        raise NotImplementedError
+
+    def retire(self, receipt: dict[str, str]) -> dict[str, Any]:
+        """Optionally flush and close this exact provider instance for its owned home.
+
+        ``unknown`` is the only valid answer when work, close custody, or identity cannot be
+        settled.  Core retains the provider object and retries the same receipt; it never
+        substitutes a freshly loaded provider or imports the plugin at retirement time.
+        """
+        raise NotImplementedError
+
+    def prepare_retirement(self, receipt: dict[str, str]) -> dict[str, Any]:
+        """Optionally fence this exact provider without closing its stores or connections.
+
+        A two-phase provider returns the exact receipt, an opaque source-owned lease and either
+        ``prepared`` or ``unknown``.  Legacy providers remain loadable and simply do not
+        participate in reversible global maintenance retirement.
+        """
+        raise NotImplementedError
+
+    def resume_retirement(self, lease: Any) -> bool:
+        """Reopen one exact reversible retirement lease before irreversible commit."""
+        raise NotImplementedError
+
+    def commit_retirement(self, lease: Any) -> dict[str, Any]:
+        """Irreversibly retire one exact prepared lease and return the normal result shape."""
+        raise NotImplementedError
+
     # -- Optional hooks (override to opt in) ---------------------------------
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:

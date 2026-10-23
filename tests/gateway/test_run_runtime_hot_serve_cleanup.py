@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import run_runtime
-from gateway.session_authority import LiveSession
+from gateway.session_authority import LiveSession, SessionAuthority
 from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, begin_runtime_epoch
 from tools.bot_live_delivery import _locked, _write
@@ -18,15 +18,36 @@ from tools.bot_live_delivery import _locked, _write
 class _Registry:
     def __init__(self):
         self.removed = []
+        self.authorities = {}
+
+    def __iter__(self):
+        return iter(self.authorities.values())
+
+    def add(self, home, authority):
+        self.authorities[Path(home).resolve()] = authority
 
     def for_home(self, home):
-        return None
+        return self.authorities.get(Path(home).resolve())
 
     def profile_name(self, authority):
         return "cold"
 
     def remove(self, home):
-        self.removed.append(Path(home).resolve())
+        key = Path(home).resolve()
+        self.removed.append(key)
+        return self.authorities.pop(key, None)
+
+
+def _register_recovery_source(runner):
+    from gateway.run_adapters_recovery import register_i10_source
+
+    # These runners bypass bootstrap, which creates the canonical adapter indexes
+    # before installing the recovery hook. Keep that hook real in the cleanup tests.
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    runner.register_i10_source = lambda authority: register_i10_source(runner, authority)
 
 
 @pytest.mark.asyncio
@@ -37,6 +58,7 @@ async def test_failed_hot_serve_retires_session_and_bot_recovery_tasks(monkeypat
         session_authorities=registry,
         session_control_server=object(),
     )
+    _register_recovery_source(runner)
 
     db = SessionDB(home / "state.db")
     db.create_session("s", source="gui")
@@ -51,15 +73,10 @@ async def test_failed_hot_serve_retires_session_and_bot_recovery_tasks(monkeypat
     )
 
     live = LiveSession(SimpleNamespace(platform=None, user_id='owner'), 'route')
-    authority = SimpleNamespace(
-        runner=runner,
-        db=db,
-        profile_id="default",
-        sessions={"s": live},
-        waiters={},
-        native_waiters=set(),
-        hosted_room_service=None,
+    authority = SessionAuthority(
+        runner, db=db, profile_id=str(home), instance_id="hot-serve", epoch=epoch,
     )
+    authority.sessions["s"] = live
 
     with _locked(home) as root:
         _write(
@@ -81,10 +98,12 @@ async def test_failed_hot_serve_retires_session_and_bot_recovery_tasks(monkeypat
     watcher = None
 
     async def build(*args, **kwargs):
+        registry.add(home, authority)
         return authority
 
-    def recover_local(_authority, schedule):
+    def recover_local(_authority, schedule, *, allow_legacy):
         assert schedule is True
+        assert allow_legacy is False
 
         async def background():
             pump_started.set()
@@ -187,6 +206,7 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
         _live_resource_claims=lambda active: {}, _record_served_profiles=lambda active, homes: None)
     runner.served_profile_names = lambda: sorted(runner._served_profile_homes)
     runner._serve_profile_runtime = GatewayProfileReconcileMixin._serve_profile_runtime.__get__(runner)
+    _register_recovery_source(runner)
 
     async def start_adapters(name, home, claimed):
         started.append(name)
@@ -197,11 +217,18 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
 
     runner._start_one_profile_adapters, runner._after_profiles_added = start_adapters, after_added
 
-    async def build(runner_, name, home, *, register):
+    databases = []
+
+    async def build(runner_, name, home, *, register, defer_local_recovery=False):
         live = SimpleNamespace(task=writer if name == "beta" else None, route=name,
                                event_stream=SimpleNamespace(execution={"execution_generation": 1}))
-        authority = SimpleNamespace(runner=runner_, profile_id=str(home), sessions={"s": live},
-                                    pending_stops={}, adopted={}, retiring=False, hosted_room_service=None)
+        db = SessionDB(home / "state.db")
+        databases.append(db)
+        epoch = begin_runtime_epoch(db, instance_id="hot-serve")
+        authority = SessionAuthority(
+            runner_, db=db, profile_id=str(home), instance_id="hot-serve", epoch=epoch,
+        )
+        authority.sessions["s"] = live
         registry.add(home, authority, name=name)
         return authority
 
@@ -216,7 +243,10 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
     monkeypatch.setattr(run_runtime, "TURN_SETTLE_SECONDS", 0.05)
     monkeypatch.setattr(run_runtime, "_record_parked_profiles", lambda value: parked.update(value))
     monkeypatch.setattr("gateway.session_bot.recover_bot_deliveries", recover_bot)
-    monkeypatch.setattr("gateway.session_local_recovery.recover_local_sessions", lambda a, schedule: None)
+    monkeypatch.setattr("gateway.session_local_adoption.adopt_local_compressions",
+                        lambda authority: asyncio.sleep(0))
+    monkeypatch.setattr("gateway.session_local_recovery.recover_local_sessions",
+                        lambda a, schedule, *, allow_legacy: None)
     monkeypatch.setattr("gateway.platforms.webhook_ingress.recover_webhook_finalizations", no_webhooks)
     monkeypatch.setattr("gateway.session_cron.unbind_owner", lambda authority: None)
     monkeypatch.setattr("hermes_cli.profiles.profiles_to_serve", lambda **kw: list(homes.items()))
@@ -234,5 +264,7 @@ async def test_failed_hot_serve_with_a_live_writer_parks_without_aborting_or_re_
     finally:
         writer.cancel()
         await asyncio.gather(writer, return_exceptions=True)
+        for db in databases:
+            db.close()
         for home in homes.values():
             process_ownership.release(home)

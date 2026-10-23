@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
-from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -29,11 +28,15 @@ from gateway.restart import (
 )
 from gateway.run_common import _UNSET
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
+from gateway.run_shutdown_lifecycle import GatewayLifecycleMixin, WINDOWS_RESTART_WATCHER
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+
+# Kept as a compatibility name for the focused Windows watcher tests and downstream imports.
+_WINDOWS_RESTART_WATCHER = WINDOWS_RESTART_WATCHER
 
 
 def _exit_with_failure_verdict(runner) -> bool:
@@ -66,56 +69,6 @@ def _resolve_gateway_exit_verdict(runner, signal_initiated_shutdown: bool) -> bo
         )
         raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
     return True
-
-# Windows has no bash/setsid chain: a tiny detached Python watcher waits for the gateway PID to
-# exit (bounded), then spawns ``hermes gateway restart``.
-_WINDOWS_RESTART_WATCHER = """
-import os, subprocess, sys, time
-from hermes_cli._subprocess_compat import windows_detach_flags_without_breakaway
-pid = int(sys.argv[1])
-restart_after_s = float(sys.argv[2])
-cmd = sys.argv[3:]
-deadline = time.monotonic() + restart_after_s
-
-def _alive(p):
-    # On Windows, os.kill(pid, 0) is NOT a no-op — it maps to
-    # GenerateConsoleCtrlEvent(0, pid) (bpo-14484). Use the
-    # Win32 handle-based existence check instead.
-    if os.name == 'nt':
-        import ctypes
-        k32 = ctypes.windll.kernel32
-        k32.OpenProcess.restype = ctypes.c_void_p
-        k32.WaitForSingleObject.restype = ctypes.c_uint
-        k32.GetLastError.restype = ctypes.c_uint
-        h = k32.OpenProcess(0x1000 | 0x100000, False, int(p))
-        if not h:
-            return k32.GetLastError() != 87
-        try:
-            return k32.WaitForSingleObject(h, 0) == 0x102
-        finally:
-            k32.CloseHandle(h)
-    try:
-        os.kill(int(p), 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-
-while time.monotonic() < deadline:
-    if not _alive(pid):
-        break
-    time.sleep(0.2)
-subprocess.Popen(
-    cmd,
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-    creationflags=windows_detach_flags_without_breakaway(),
-)
-""".strip()
-
 
 @contextmanager
 def _log_suppressed(level: int, msg: str, *args, exc_info: bool = False):
@@ -170,7 +123,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewayLifecycleMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -185,6 +138,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # API-server runs still live when the adapters were released; the adapter map is empty by the
         # time the SessionDB close gate runs, so the count has to be taken before ``adapters.clear()``.
         api_live: int = 0
+        # The native lifecycle receipt is emitted only after this phase succeeds.  ``_stop_task``
+        # completion alone is an orchestration fact and never sets this flag.
+        db_close_succeeded: bool = False
+        # A boolean without checked per-handle evidence is not lifecycle proof.
+        db_close_receipt: object | None = None
+        # This opaque token is minted only by the actual stop implementation.  Lifecycle custody
+        # binds close/native receipts to the exact context object and token, so a receipt-shaped
+        # test/double or a later stop cannot certify this stop.
+        source_token: object = dataclasses.field(default_factory=object, repr=False, compare=False)
 
         def elapsed(self) -> float:
             return time.monotonic() - self.started_at
@@ -700,57 +662,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         except Exception:
             logger.debug("scale-to-zero: redial hold toggle failed", exc_info=True)
             return False
-
-    # External drain control: the dashboard writes/removes ``.drain_request.json`` (gateway/drain_control.py);
-    # the watcher flips between accepting and refusing NEW turns WITHOUT exiting (reversible).
-    def _enter_external_drain(self) -> None:
-        """Begin external drain: refuse NEW turns (in-flight ones are NOT interrupted). Idempotent."""
-        if self._external_drain_active:
-            return
-        self._external_drain_active = True
-        logger.info(
-            "External drain ENGAGED (.drain_request.json present) — refusing "
-            "new turns; %d in-flight turn(s) will finish. Process stays up.", self._active_work_count(),
-        )
-        # Persist "draining" so /api/status tracks it; active_agents is read-merged, only state changes.
-        self._update_runtime_status("draining")
-
-    def _exit_external_drain(self) -> None:
-        """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
-        if not self._external_drain_active:
-            return
-        self._external_drain_active = False
-        if self._draining or not self._running:
-            logger.info(
-                "External drain marker cleared during shutdown — not reverting "
-                "to running (shutdown takes precedence)."
-            )
-            return
-        logger.info(
-            "External drain RELEASED (.drain_request.json removed) — "
-            "re-accepting new turns; gateway_state -> %s.", self._serving_state(),
-        )
-        self._update_runtime_status(self._serving_state())
-
-    async def _drain_control_watcher(self, interval: float = 1.0) -> None:
-        """Poll ``.drain_request.json`` at 1s: present -> enter drain, absent -> exit; a stale epoch = absent."""
-        from gateway.drain_control import drain_requested
-        while self._running:
-            try:
-                # Off-thread: a synchronous marker read at 1s cadence can stall 30s+ under host I/O
-                # pressure and take every platform heartbeat down.
-                if await asyncio.to_thread(drain_requested):
-                    self._enter_external_drain()
-                    # API and cron work live outside messaging's _running_agents map; refresh the
-                    # aggregate while an external caller polls this reversible drain state.
-                    self._persist_active_agents()
-                else:
-                    self._exit_external_drain()
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.debug("Drain-control watcher tick error: %s", exc, exc_info=True)
-            await asyncio.sleep(interval)
 
     def _update_platform_runtime_status(
         self, platform: str, *, platform_state: Optional[str] = None,
@@ -1405,12 +1316,27 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return watcher_env
 
     @staticmethod
-    def _spawn_windows_restart_watcher(hermes_cmd: list, current_pid: int, restart_after_s: float) -> None:
+    def _spawn_windows_restart_watcher(
+        hermes_cmd: list, current_pid: int, restart_after_s: float,
+        current_start_time=None, current_birth=None,
+    ):
         """Spawn the detached Windows watcher (``python -c``), retrying once without job breakaway."""
         import subprocess
         from hermes_cli._subprocess_compat import (
             windows_detach_flags_without_breakaway, windows_detach_popen_kwargs
         )
+        if current_start_time is None:
+            from gateway.status import get_process_start_time
+            current_start_time = get_process_start_time(current_pid)
+        if current_birth is None:
+            from hermes_cli.process_identity import _process_create_time
+            current_birth = _process_create_time(current_pid)
+        if current_start_time is None or current_birth is None:
+            logger.warning(
+                "Detached restart watcher was not started because the gateway process start "
+                "fingerprint was unavailable."
+            )
+            return None
         watcher_env = GatewayShutdownMixin._restart_watcher_env()
         # host_gateway_child_env does not copy the parent dotenv. The watcher
         # still has to run inside the venv this process is using, or the
@@ -1427,17 +1353,18 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # See #54220, #56747.
         from hermes_cli._launchers import runtime_command
         watcher_argv = runtime_command(project_root,
-            [str(current_pid), str(restart_after_s), *hermes_cmd, "gateway", "restart"],
+            [str(current_pid), str(current_start_time), str(current_birth), str(restart_after_s), *hermes_cmd,
+             "gateway", "restart"],
             code=_WINDOWS_RESTART_WATCHER)
         watcher_python = watcher_argv[0]
         popen_kwargs = dict(stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=watcher_env)
         # Break away from the parent CLI's job object or be reaped when the CLI exits; a job without
         # BREAKAWAY_OK rejects CREATE_BREAKAWAY_FROM_JOB (OSError) — retry once without the bit.
         try:
-            subprocess.Popen(watcher_argv, **popen_kwargs, **windows_detach_popen_kwargs())
+            return subprocess.Popen(watcher_argv, **popen_kwargs, **windows_detach_popen_kwargs())
         except OSError:
             try:
-                subprocess.Popen(
+                return subprocess.Popen(
                     watcher_argv, **popen_kwargs, creationflags=windows_detach_flags_without_breakaway(),
                 )
             except OSError as exc:
@@ -1451,35 +1378,46 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                     "winerror" if winerror is not None else "errno",
                     winerror if winerror is not None else exc.errno,
                 )
+                return None
 
-    async def _launch_detached_restart_command(self) -> None:
+    async def _launch_detached_restart_command(self):
         from gateway.run import _resolve_hermes_bin
         import shutil
         import subprocess
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             logger.error("Could not locate hermes binary for detached /restart")
-            return
+            return None
         if self._detached_restart_helper_started:
-            return
+            return None
         self._detached_restart_helper_started = True
         current_pid = os.getpid()
         restart_after_s = max(float(getattr(self, "_restart_drain_timeout", 0.0) or 0.0) + 5.0, 5.0)
         if sys.platform == "win32":
-            GatewayShutdownMixin._spawn_windows_restart_watcher(hermes_cmd, current_pid, restart_after_s)
-            return
-        cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
-        shell_cmd = (
-            f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
-            f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
-            f"{cmd} gateway restart"
-        )
-        setsid_bin = shutil.which("setsid")
-        argv = [setsid_bin, "bash", "-lc", shell_cmd] if setsid_bin else ["bash", "-lc", shell_cmd]
-        subprocess.Popen(  # noqa: ASYNC220 -- fire-and-forget spawn; Popen returns immediately and callers need the Popen object
-            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=GatewayShutdownMixin._restart_watcher_env(), start_new_session=True,
-        )
+            from gateway.status import get_process_start_time
+            from hermes_cli.process_identity import _process_create_time
+            current_start_time = get_process_start_time(current_pid)
+            current_birth = _process_create_time(current_pid)
+            helper = GatewayShutdownMixin._spawn_windows_restart_watcher(
+                hermes_cmd, current_pid, restart_after_s, current_start_time, current_birth,
+            )
+        else:
+            cmd = " ".join(shlex.quote(part) for part in hermes_cmd)
+            shell_cmd = (
+                f"deadline=$(( $(date +%s) + {int(restart_after_s)} )); "
+                f"while kill -0 {current_pid} 2>/dev/null && [ $(date +%s) -lt $deadline ]; do sleep 0.2; done; "
+                f"{cmd} gateway restart"
+            )
+            setsid_bin = shutil.which("setsid")
+            argv = [setsid_bin, "bash", "-lc", shell_cmd] if setsid_bin else ["bash", "-lc", shell_cmd]
+            helper = subprocess.Popen(  # noqa: ASYNC220 -- fire-and-forget spawn; receipt is retained by I19
+                argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=GatewayShutdownMixin._restart_watcher_env(), start_new_session=True,
+            )
+        lifecycle = getattr(self, "lifecycle_custody", None)
+        if lifecycle is not None and helper is not None:
+            lifecycle.record_restart_helper(helper)
+        return helper
 
     def _wedged_agent_count(self) -> int:
         """Work units the restart wait may skip: chat agents idle past ``agent.gateway_timeout`` and
@@ -1671,40 +1609,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
         return True
 
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
-        if self._restart_task_started:
-            return False
-        self._restart_requested = True
-        self._restart_detached = detached
-        self._restart_via_service = via_service
-        self._restart_task_started = True
-        # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
-        from gateway.drain_control import open_restart_wait
-        open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
-        # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
-        # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
-        self._mark_api_runs_shutdown_requested()
-
-        async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
-            # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-            if detached:
-                with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
-                    await self._launch_detached_restart_command()
-            await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
-
-        # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
-        # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in
-        # self._restart_task: a bare asyncio.create_task() keeps only a weak reference, so the event loop
-        # may garbage-collect a still-pending task mid-flight. The cancel loop in _stop_impl explicitly
-        # skips _restart_task for the same reason it skips _stop_task.
-        # Empty Context: /restart is handled inside the requester's profile scope, and a copied context
-        # would run the HOST restart as that profile (watcher HERMES_HOME, stop()'s flushes).
-        self._restart_task = Context().run(lambda: asyncio.create_task(_run_restart()))
-        return True
-
     def _start_systemd_watchdog(self) -> bool:
         """Start sd_notify only after a configured gateway is truly running."""
         if not self._running or self.config.systemd_watchdog_seconds <= 0:
@@ -1793,12 +1697,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             from tools.terminal_tool_lifecycle import cleanup_all_environments
             cleanup_all_environments()
 
-        def _cleanup_browsers() -> None:
-            from tools.browser_tool_lifecycle import cleanup_all_browsers
-            cleanup_all_browsers()
-
+        from tools.browser_tool_lifecycle import cleanup_browsers_for_shutdown
         _step("cleanup_all_environments", _cleanup_environments)
-        _step("cleanup_all_browsers", _cleanup_browsers)
+        _step("cleanup_all_browsers", lambda: cleanup_browsers_for_shutdown(phase, logger))
         return _marked_cron_jobs
 
     @staticmethod
@@ -1946,8 +1847,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         if self._restart_requested and self._restart_detached:
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
+        self._api_server_hook("active_agent_work_count")
         await self._finalize_shutdown_agents(ctx.active_agents)
-        # Idle cached agents too: their MemoryProviders may never have seen on_session_end().
         _cache_lock = getattr(self, "_agent_cache_lock", None)
         _cache = getattr(self, "_agent_cache", None)
         if _cache_lock is not None and _cache is not None:
@@ -2030,6 +1931,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     def _stop_quiesce_and_close_session_dbs(self, timeout: float, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Quiesce the executor, then close SessionDB handles only if no worker is still live."""
         from gateway.run import GatewayRunner, _EXECUTOR_QUIESCE_TIMEOUT
+        from hermes_state_registry import SessionDbCloseReceipt, close_all_checked, release_or_close_checked
+        ctx.db_close_succeeded = False
         # Quiesce the thread pool BEFORE closing session DBs: a late executor write after
         # SessionDB.close() checkpointed the WAL reopens the handle and splits the WAL generation
         # (close-time corruption). Clamped to the remaining watchdog leash minus 1s for the close.
@@ -2078,7 +1981,22 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 _cron_live, _api_live, _api_worker_live, _deferred_live,
             )
             return
-        _step = GatewayShutdownMixin._quiet_step
+        strict_lifecycle = getattr(self, "lifecycle_custody", None) is not None
+        receipts: list[SessionDbCloseReceipt] = []
+        def _close_step(label: str, fn: Callable[[], Any]) -> bool:
+            try:
+                result = fn()
+            except Exception as exc:  # health: allow BLE001 -- DB close is opaque; close_ok retains custody
+                logger.debug("%s: %s", label, exc)
+                return False
+            if isinstance(result, SessionDbCloseReceipt):
+                receipts.append(result)
+                return result.verified
+            if strict_lifecycle:
+                logger.debug("%s: missing checked SessionDB close receipt", label)
+                return False
+            return True
+        close_ok = True
         # Close SQLite session DBs so --replace's new gateway does not hit 'database is locked'.
         # ``_session_db`` is an AsyncSessionDB facade — unwrap; ``session_store`` holds ``_db``.
         _self_db = getattr(self, "_session_db", None)
@@ -2086,24 +2004,42 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         store = getattr(self, "session_store", None)
         for _db in (_self_db, getattr(store, "_db", None)):
             if _db is not None and hasattr(_db, "close"):
-                _step("SessionDB close error", _db.close)
+                close_ok = _close_step(
+                    "SessionDB close error",
+                    lambda _db=_db: release_or_close_checked(_db),
+                ) and close_ok
         # Multiplexed session_store caches one SessionDB per profile; sweep the secondary WAL locks too.
         _sweep = getattr(store, "close_all_db_handles", None)
         if _sweep is not None:
-            _step("SessionDB handle sweep error", _sweep)
+            close_ok = _close_step("SessionDB handle sweep error", _sweep) and close_ok
+        elif strict_lifecycle:
+            close_ok = False
         # Same sweep for the runner's own per-profile session_search handles.
-        _step("Runner SessionDB handle sweep error", lambda: GatewayRunner.close_all_session_db_handles(self))
-
-        def _close_shared() -> None:
-            # Shared SessionDB instances still held by the process-wide registry (tools, cron, mirror).
-            # This is the safety net that guarantees no WAL write lock survives past gateway shutdown
-            # (#90837).
-            from hermes_state_registry import close_all
-            closed = close_all()
-            if closed:
-                logger.debug("Closed %d shared SessionDB instance(s) at shutdown", closed)
-
-        _step("Shared SessionDB close error", _close_shared)
+        close_ok = _close_step(
+            "Runner SessionDB handle sweep error", lambda: GatewayRunner.close_all_session_db_handles(self)
+        ) and close_ok
+        close_ok = _close_step("Shared SessionDB close error", close_all_checked) and close_ok
+        ctx.db_close_receipt = SessionDbCloseReceipt.combine(
+            "gateway.run_shutdown:_stop_quiesce_and_close_session_dbs", receipts,
+        )
+        ctx.db_close_succeeded = close_ok and ctx.db_close_receipt.verified
+        _lifecycle_custody = getattr(self, "lifecycle_custody", None)
+        if _lifecycle_custody is not None:
+            _lifecycle = None
+            for _action in ("restart", "idle", "stop"):
+                _candidate = _lifecycle_custody.active_lease(_action)
+                if _candidate is not None:
+                    _lifecycle = _candidate
+                    break
+            if _lifecycle is not None:
+                # The preservation receiver supplies its own close generation when it consumes
+                # this source receipt.  A normal lifecycle root is admitted before that close,
+                # so its coordinator generation (often zero) must never be copied into the later
+                # preservation receipt.
+                if close_ok:
+                    _lifecycle_custody.record_global_close(
+                        ctx, close_generation=_lifecycle.close_generation,
+                    )
         logger.info("Shutdown phase: SessionDB close done at +%.2fs", ctx.elapsed())
 
     async def _stop_persist_exit_state(self, ctx: GatewayShutdownMixin._StopContext) -> None:
@@ -2198,6 +2134,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         ctx = GatewayShutdownMixin._StopContext(
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
         )
+        self._lifecycle_stop_context = ctx
+        self._lifecycle_stop_context_token = ctx.source_token
         if not os.environ.get("PYTEST_CURRENT_TEST"):
             arm_shutdown_watchdog(
                 _effective_watchdog_leash(self), done_event=_watchdog_done,
@@ -2221,7 +2159,17 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)
             await GatewayRunner._stop_persist_exit_state(self, ctx)
+            _lifecycle_custody = getattr(self, "lifecycle_custody", None)
+            if _lifecycle_custody is not None:
+                _action = "restart" if self._restart_requested else (
+                    "idle" if _lifecycle_custody.active_lease("idle") is not None else "stop"
+                )
+                from gateway.lifecycle_handoff import record_restart_native_handoff
+                record_restart_native_handoff(self, _lifecycle_custody, ctx, _action)
         finally:
+            if getattr(self, "_lifecycle_stop_context", None) is ctx:
+                self._lifecycle_stop_context = None
+                self._lifecycle_stop_context_token = None
             _watchdog_done.set()
 
     async def stop(
@@ -2229,20 +2177,44 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
     ) -> None:
         """Stop the gateway and disconnect all adapters."""
         from gateway.run import GatewayRunner
+        from gateway.lifecycle_custody import admit_lifecycle
+        from gateway.runtime_custody import CustodyRefusal
         # getattr-guard: shutdown-path tests build bare runners via object.__new__ that lack the
         # liveness-guard machinery.
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
+        _lifecycle_custody = getattr(self, "lifecycle_custody", None)
+        _idle_lease = (
+            _lifecycle_custody.active_lease("idle")
+            if _lifecycle_custody is not None else None
+        )
+        _action = (
+            "restart" if restart or getattr(self, "_restart_requested", False)
+            else "idle" if _idle_lease is not None
+            else "stop"
+        )
+        _lifecycle = admit_lifecycle(self, _action, owner_id=f"gateway:{_action}")
+        if isinstance(_lifecycle, CustodyRefusal):
+            logger.warning("Gateway stop refused by lifecycle custody: %s", _lifecycle.code)
+            return
         if restart:
             self._restart_requested = True
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart
         if self._stop_task is not None:
             await self._stop_task
+            if _lifecycle is not None and _action in {"stop", "idle"}:
+                _result = _lifecycle.complete()
+                if isinstance(_result, CustodyRefusal):
+                    logger.warning("Gateway stop lifecycle receipt remained unresolved: %s", _result.code)
             return
         self._stop_task = asyncio.create_task(GatewayRunner._stop_impl(self))
         await self._stop_task
+        if _lifecycle is not None and _action in {"stop", "idle"}:
+            _result = _lifecycle.complete()
+            if isinstance(_result, CustodyRefusal):
+                logger.warning("Gateway stop lifecycle receipt remained unresolved: %s", _result.code)
 
     async def wait_for_shutdown(self) -> None:
         """Wait for shutdown signal."""

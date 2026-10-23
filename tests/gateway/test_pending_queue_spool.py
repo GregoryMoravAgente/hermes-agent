@@ -31,16 +31,31 @@ def _make_store(db):
 
 
 class BrokenThenHealedDb:
-    """append_message fails while ``broken`` is True, then records rows."""
+    """Small DB double with the same append-id/exact-readback contract as SessionDB."""
 
     def __init__(self):
         self.broken = True
         self.rows = []
+        self._next_id = 0
 
     def append_message(self, **kwargs):
         if self.broken:
             raise RuntimeError("db unavailable")
-        self.rows.append(kwargs)
+        from hermes_state_messages import _MESSAGE_WRITE_COLUMNS
+        self._next_id += 1
+        row = {column: None for column in _MESSAGE_WRITE_COLUMNS}
+        row.update({"id": self._next_id, "active": 1, "compacted": 0})
+        row.update(kwargs)
+        self.rows.append(row)
+        return self._next_id
+
+    def _read_one(self, _sql, params=()):
+        session_id, row_id = params
+        return next(
+            (row for row in self.rows
+             if row["session_id"] == session_id and row["id"] == int(row_id)),
+            None,
+        )
 
 
 @pytest.fixture()
@@ -187,7 +202,7 @@ class TestSpoolOnDrop:
             def append_message(self, **kwargs):
                 if kwargs["content"] in ("m0", "m1", "m2"):
                     raise RuntimeError("still broken for replays")
-                self.rows.append(kwargs)
+                return super().append_message(**kwargs)
 
         flaky = FlakyDb()
         flaky.broken = False

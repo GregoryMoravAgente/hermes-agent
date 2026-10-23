@@ -1,6 +1,7 @@
 """Authority-local async serialization; file locks cover only short synchronous mailbox I/O."""
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from tools.bot_live_delivery import _locked, _read, _write
 
@@ -148,7 +149,60 @@ async def scan_receipts(home, pins=None):
     return await _mailbox_io(_scan_receipts, home, pins)
 
 
+def i10_source_snapshot(authority):
+    """Read the canonical Bot Chat mailbox while holding its source lock."""
+    from gateway.session_bot import _is_pre_admission_pin, _record_admission_id, _record_shape_error
+    from tools.bot_live_delivery import _root, has_mailbox
+
+    home = Path(authority.db.db_path).parent.resolve()
+    if not has_mailbox(home):
+        return {"pending_ids": (), "registry": {"mailbox": "absent"}}
+    pending = set()
+    files = []
+    with _locked(home) as root:
+        for path in sorted(root.glob("*.json")):
+            files.append(path.name)
+            record = _read(path)
+            if record is None:
+                raise RuntimeError(f"mailbox receipt disappeared: {path.name}")
+            problem = _record_shape_error(path, record)
+            if problem is not None:
+                raise RuntimeError(f"malformed mailbox receipt: {path.name}: {problem}")
+            if record.get("profile_home") and record["profile_home"] != str(home):
+                raise RuntimeError("mailbox receipt belongs to another profile")
+            status = record.get("status")
+            if (
+                status in {"canonical", "queued", "claimed"}
+                or _is_pre_admission_pin(path, record)
+                or (status == "ambiguous" and _record_admission_id(record))
+            ):
+                pending.add(path.stem)
+    return {
+        "pending_ids": tuple(sorted(pending)),
+        "registry": {"mailbox": str(_root(home)), "files": tuple(files)},
+    }
+
+
+def register_i10_source(authority):
+    """Install Bot Chat mailbox's canonical close-time probe for the profile authority."""
+    from gateway.session_recovery_custody import register_i10_consumer_source
+    return register_i10_consumer_source(authority, "bot_mailbox", i10_source_snapshot)
+
+
 def remember_receipt(authority, home, record):
+    from gateway.session_recovery_custody import observe_consumer_rows
+    admission_id = record.get('admission_id') if isinstance(record, dict) else None
+    rows = []
+    if admission_id and authority is not None:
+        from hermes_state_runtime import get_session_admission
+        row = get_session_admission(authority.db, admission_id=admission_id)
+        if row is not None:
+            rows.append(row)
+    if authority is not None:
+        observe_consumer_rows(
+            authority, 'bot_mailbox', rows=rows,
+            reason='bot mailbox receipt had no accepted admission',
+        )
     index = getattr(authority, '_bot_receipt_index', None)
     if index is None:
         index = authority._bot_receipt_index = {}

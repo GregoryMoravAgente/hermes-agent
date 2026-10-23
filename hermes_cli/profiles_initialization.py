@@ -1,11 +1,36 @@
 """Initial profile files, written on the staging tree before publication."""
 import contextlib
+import os
 from pathlib import Path
+import shutil
 from typing import Optional
 
+from hermes_cli.profile_provenance_bootstrap import ExclusiveDirectoryBirth
 
-def finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: bool,
-                           description: Optional[str], soul: Optional[str] = None) -> None:
+
+def create_profile_staging_dir(profile_dir: Path) -> tuple[Path, ExclusiveDirectoryBirth]:
+    """Create the private native directory whose identity anchors a new profile origin."""
+    staging = profile_dir.parent / f".{profile_dir.name}.staging-{os.getpid()}"
+    profile_dir.parent.mkdir(parents=True, exist_ok=True)
+    if staging.is_symlink() or staging.is_file():
+        staging.unlink()
+    elif staging.is_dir():
+        shutil.rmtree(staging, ignore_errors=True)
+    from hermes_cli.profile_provenance_bootstrap import create_exclusive_directory_birth
+
+    try:
+        birth = create_exclusive_directory_birth(staging)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
+    return staging, birth
+
+
+def finish_profile_layout(
+    profile_dir: Path, *, no_skills: bool, clone_all: bool, description: Optional[str],
+    soul: Optional[str] = None, profile_name: Optional[str] = None,
+    publish_target: Optional[Path] = None, origin_birth: Optional[ExclusiveDirectoryBirth] = None,
+) -> None:
     """Seed files a fresh profile owns from day one; runs on the staging tree before publish."""
     from hermes_cli.profiles import (
         _seed_file_if_missing, _PLACEHOLDER_ENV, NO_BUNDLED_SKILLS_MARKER,
@@ -39,6 +64,24 @@ def finish_profile_layout(profile_dir: Path, *, no_skills: bool, clone_all: bool
     # explicit runtime/history stripping above.
     if not clone_all:
         _migrate_profile_config_if_outdated(profile_dir)
+
+    # A clone may have carried the source's runtime marker/lock. The staging directory was born
+    # exclusively for this profile, so discard those copied bytes only after rechecking its native
+    # identity, then issue a fresh origin receipt before the publish rename. A copied source marker
+    # can never authenticate a different home.
+    if profile_name is not None:
+        from hermes_cli.profile_provenance import (
+            discard_copied_runtime_origin, publish_new_profile_origin,
+        )
+        if publish_target is None or origin_birth is None:
+            raise RuntimeError("profile origin publication requires private staging evidence")
+        discard_copied_runtime_origin(
+            profile_dir, birth=origin_birth, publish_target=publish_target,
+        )
+        publish_new_profile_origin(
+            profile_dir, profile_kind="named", profile_name=profile_name,
+            birth=origin_birth, publish_target=publish_target, retain_birth=True,
+        )
 
     # Description last, so a partial-create failure doesn't strand a description file.
     if description and description.strip():

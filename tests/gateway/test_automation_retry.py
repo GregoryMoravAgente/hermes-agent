@@ -11,7 +11,9 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_ingress_context import native_callback
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_state_runtime import list_session_admissions
     from tests.gateway.test_completion_admission import pending
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -23,6 +25,8 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='before')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     monkeypatch.setenv('DISCORD_ALLOWED_USERS', '42')
@@ -42,6 +46,8 @@ async def test_coalesced_siblings_survive_lost_ack_and_owner_restart(tmp_path, m
         delegation._persist_completion(event, {'status': 'completed', 'summary': event['summary']})
     runner._completion_deliveries_delivered.clear()
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='after')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     duplicate = deepcopy(events[1])
     assert await runner._deliver_async_delegation_group([duplicate]) is True
     rows_after = list_session_admissions(authority.db, session_id=sid, pending_only=False)
@@ -62,7 +68,9 @@ async def test_unowned_completion_refunds_every_sibling_without_consuming_budget
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_ingress_context import native_callback
+    from hermes_cli.backend_retirement import RetirementFence
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
     from tests.gateway.test_completion_admission import pending
@@ -75,6 +83,8 @@ async def test_unowned_completion_refunds_every_sibling_without_consuming_budget
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='guards')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     event = MessageEvent(text='human', source=source, message_id='human')

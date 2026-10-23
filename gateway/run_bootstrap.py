@@ -27,6 +27,22 @@ def _start_deferred_state_db_integrity_check(evidence: dict) -> None:
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
 
+
+async def _attest_successor_before_public_ready(runner: Any, home: Path) -> None:
+    """Authenticate a prepared successor while its descriptor is still private/starting.
+
+    This is a production bootstrap seam rather than a test-only ordering helper: a refused
+    control/lineage/peer observation raises before ``publish_gateway_runtime_ready`` can expose
+    the public admission state.
+    """
+    import asyncio
+
+    from gateway.lifecycle_handoff import verify_successor_ready
+    if not await asyncio.to_thread(verify_successor_ready, runner, home):
+        raise RuntimeError("gateway successor READY control roundtrip was not authenticated")
+    from gateway.run_runtime import publish_gateway_runtime_ready
+    publish_gateway_runtime_ready(runner)
+
 async def _start_gateway_replace_existing_instance(existing_pid: int, replace: bool) -> bool:
     """Handle a live gateway PID under this HERMES_HOME: replace it (``--replace``) or refuse.
     Returns False when startup must abort (refused, permission denied, target still alive)."""
@@ -294,7 +310,9 @@ async def _start_gateway_start_control_socket(runner):
             payload = build_identify_payload()
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+                "served_profiles", "parked_profiles", "capabilities", "handoff_id",
+                "handoff_lineage", "handoff_attempt_id", "handoff_predecessor_instance")
+                           if key in descriptor})
             if getattr(runner, '_draining', False):
                 payload.update(state='draining')
                 # The restart's after-turn wait still owns its turns: clients reach it to answer a
@@ -351,6 +369,40 @@ async def _start_gateway_start_control_socket(runner):
                 result = {"pending": True, "served_profiles": runner.served_profile_names()}
             return {"multiplex": bool(getattr(runner.config, "multiplex_profiles", False)), **result}
 
+        def _private_preservation_handler(operation):
+            """Marshal an authenticated private request to the gateway loop.
+
+            The socket executor never mutates runtime state.  A long local preservation phase may
+            outlive the two-second socket response budget; in that case the exact receipt remains
+            owned by the loop and the caller receives a typed pending result to poll.
+            """
+            def handler(params, peer_subject):
+                future = asyncio.run_coroutine_threadsafe(
+                    operation(runner, params, peer_subject), _main_loop)
+                try:
+                    return future.result(timeout=1.5)
+                except concurrent.futures.TimeoutError:
+                    if operation.__name__ == 'acknowledge_preservation_native':
+                        try:
+                            from gateway.run_runtime_native_cleanup import pending_wire
+                            retained = pending_wire(runner, params)
+                        except Exception:  # health: allow BLE001 -- lookup failure must retain the pending custody response
+                            retained = None
+                        if retained is not None:
+                            return retained
+                    return {"status": "pending", "operation": operation.__name__}
+                except Exception:  # health: allow BLE001 -- authenticated preservation operation callback is opaque; constant refusal retains receipt and custody without exposing exception values
+                    if operation.__name__ == 'acknowledge_preservation_native':
+                        try:
+                            from gateway.run_runtime_native_cleanup import pending_wire
+                            retained = pending_wire(runner, params)
+                        except Exception:  # health: allow BLE001 -- lookup failure must retain the refusal custody response
+                            retained = None
+                        if retained is not None:
+                            return retained
+                    return {"status": "refused", "reason": "runtime_draining"}
+            return handler
+
         _control_server = GatewayControlServer(
             verb_handlers={"pause-for-update": _pause_for_update_handler, "identify": _identify_runtime,
                            "rescan-profiles": _rescan_profiles_handler,
@@ -363,6 +415,20 @@ async def _start_gateway_start_control_socket(runner):
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+        from gateway.run_runtime import (
+            acknowledge_preservation_native,
+            abort_preservation_drain,
+            begin_preservation_drain,
+            prepare_preservation_handoff,
+            preservation_drain_status,
+        )
+        _control_server.private_handlers.update({
+            "preservation-drain-begin": _private_preservation_handler(begin_preservation_drain),
+            "preservation-drain-prepare": _private_preservation_handler(prepare_preservation_handoff),
+            "preservation-drain-abort": _private_preservation_handler(abort_preservation_drain),
+            "preservation-drain-native-ack": _private_preservation_handler(acknowledge_preservation_native),
+            "preservation-drain-status": _private_preservation_handler(preservation_drain_status),
+        })
         _control_server.ticket_store = runner.session_ticket_store
         if not await _control_server.start():
             _control_server = None
@@ -417,14 +483,21 @@ def _start_gateway_start_cron_and_housekeeping(runner):
             "Cron scheduler will tick %d profile(s): %s", len(cron_profile_homes),
             [p[0] if isinstance(p, tuple) else p for p in cron_profile_homes])
 
-    # Only the in-process ticker polls local due jobs, so only it gets the external-drain dispatch gate.
+    # Only the in-process ticker polls local due jobs, so only it gets the reversible-drain dispatch gate.
     if isinstance(cron_provider, InProcessCronScheduler):
         cron_start_kwargs["can_dispatch"] = lambda: not (
-            runner._draining or runner._external_drain_active)
+            runner._draining or runner._external_drain_active
+            or getattr(runner, "_preservation_drain_active", False))
     # Supervised: a ticker that dies without a stop request is respawned by housekeeping (#111010).
     from cron.scheduler_thread import SupervisedTickerThread
     cron_thread = SupervisedTickerThread(
         cron_provider.start, args=(cron_stop,), kwargs=cron_start_kwargs, stop_event=cron_stop)
+    # Publish the exact provider and ticker object before either can admit work.  The source
+    # registry uses these identities when sealing a zero-work preservation graph.
+    from gateway.runtime_cron_source_registry import bind_cron_scheduler_runtime
+    coordinator = getattr(runner, "runtime_custody", None)
+    if coordinator is not None:
+        bind_cron_scheduler_runtime(runner, coordinator, cron_provider, cron_thread)
     from gateway.runtime_ownership import process_ownership
     process_ownership.start_writer(cron_thread)
 
@@ -785,7 +858,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             and not await _start_gateway_replace_existing_instance(existing_pid, replace)):
         return False
 
-    from gateway.status import remove_pid_file, release_gateway_runtime_lock
+    from gateway.status import remove_pid_file_checked, release_gateway_runtime_lock
     if not _start_gateway_reserve_profiles(profile_homes):
         return False
     # Freeze discovery: later profile additions must restart and reserve before opening stores.
@@ -880,6 +953,14 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             start_nous_auth_keepalive()
 
         _unclean_exit = _best_effort(_lifecycle_record_startup, "Lifecycle ledger startup record failed: %s")
+        # A prepared/released journal handoff is adopted only after this process owns every
+        # canonical profile lock and has opened each profile's real runtime epoch.  Ordinary boots
+        # with no active handoff keep their historical startup path.
+        from gateway.lifecycle_handoff import adopt_successor_or_refuse
+        from gateway.status import _get_process_hermes_home
+        _handoff_home = _get_process_hermes_home()
+        if not adopt_successor_or_refuse(runner, _handoff_home):
+            raise RuntimeError("gateway successor handoff could not be authenticated")
         _best_effort(_start_keepalive, "Nous auth keepalive did not start: %s")
         _ensure_windows_gateway_venv_imports()
 
@@ -893,10 +974,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _start_gateway_start_cron_and_housekeeping(runner))
         # From here every exit (a READY publication that raises included) runs the shutdown tail,
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
-        from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
+        from gateway.run_runtime import wait_gateway_runtime
         try:
-            # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
-            publish_gateway_runtime_ready(runner)
+            # The control identify runs off-loop because the local server is owned by this same
+            # event loop.  A refusal therefore never exposes READY to clients.
+            await _attest_successor_before_public_ready(runner, _handoff_home)
             runner._start_systemd_watchdog()
             if idle_exit:
                 from gateway.run_idle_exit import arm_unmanaged_idle_exit
@@ -933,5 +1015,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
                 _planned_stop_watcher_stop.set()
             if _control_server is not None:
                 await _control_server.stop()
-            remove_pid_file()
-            release_gateway_runtime_lock()
+            from gateway.status import _get_process_hermes_home, remove_pid_file_checked, release_gateway_runtime_lock
+            from gateway.lifecycle_handoff import release_predecessor_at_shutdown
+            _process_home = _get_process_hermes_home()
+            release_predecessor_at_shutdown(
+                _process_home, release_gateway_runtime_lock, remove_pid_file_checked,
+            )

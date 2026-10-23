@@ -167,7 +167,44 @@ def _lockless_gateway_holder(path: Path) -> str | None:
     multiplexer serves named profiles without reserving their per-profile lock, so the lock alone
     misses it. Only holders whose command line is a Hermes ``gateway`` run count; plain readers
     (Desktop, sibling browses, CLI reads) are not owners. Returns a description, else None."""
-    from hermes_state_holders import _looks_like_hermes, _read_proc_argv, describe_holder_pid, foreign_state_db_holders
+    from hermes_state_holders import (
+        _argv_scoped_to_other_home, _looks_like_hermes, _read_proc_argv, _sqlite_family,
+        canonical_sqlite_path, describe_holder_pid, foreign_state_db_holders,
+    )
+
+    # On macOS, psutil's ``process_iter(['pid', 'open_files'])`` asks launchd for every process's
+    # descriptors and can take several seconds on a developer machine. This caller only accepts
+    # Hermes processes as legacy owners, so first select those cheaply by argv and inspect files
+    # for that small set. The general holder scan remains the fallback for other platforms and
+    # environments without psutil.
+    import sys
+    if sys.platform == 'darwin':
+        try:
+            import psutil
+        except ImportError:
+            psutil = None
+        if psutil is not None:
+            watched = {
+                canonical_sqlite_path(os.path.realpath(candidate))
+                for candidate in _sqlite_family(os.path.realpath(os.fspath(path)))
+            }
+            for process in psutil.process_iter(['pid', 'cmdline']):
+                try:
+                    pid = int(process.info['pid'])
+                    argv = process.info.get('cmdline')
+                    if (pid == os.getpid() or not argv or not _looks_like_hermes(argv)
+                            or _argv_scoped_to_other_home(argv, path)):
+                        continue
+                    opened = process.open_files() or ()
+                except (KeyError, OSError, TypeError, ValueError, psutil.Error):
+                    continue
+                if any(
+                    canonical_sqlite_path(os.path.realpath(getattr(item, 'path', ''))) in watched
+                    for item in opened
+                ):
+                    return describe_holder_pid(pid)
+            return None
+
     for pid, _target in foreign_state_db_holders(path):
         if pid <= 0:
             continue
@@ -229,31 +266,43 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     from hermes_state_schema import apply_declared_schema, schema_read_probe_statements
 
     budget = budget or _Budget(BROWSE_RECONCILE_BUDGET_S)
-    budget.check()
-    with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
-                                 isolation_level=None)) as conn:
+    conn = None
+    try:
+        conn = connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
+                                isolation_level=None)
+        budget.check()
         _reapply_durability_barriers(conn)
+        budget.check()
         budget.arm(conn)
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
-        try:
-            cursor = conn.cursor()
-            apply_declared_schema(cursor)
-            # Postcondition, still inside the transaction: every declared table/column resolves.
-            for statement in schema_read_probe_statements():
-                try:
-                    cursor.execute(statement).fetchone()
-                except sqlite3.OperationalError as exc:
-                    if _schema_not_built(exc):
-                        raise DeclarativeDriftError(str(exc)) from exc
-                    raise
-            budget.check()
-            conn.execute('COMMIT')
-        except BaseException as exc:
+        budget.check()
+        cursor = conn.cursor()
+        apply_declared_schema(cursor)
+        # Postcondition, still inside the transaction: every declared table/column resolves.
+        for statement in schema_read_probe_statements():
+            try:
+                cursor.execute(statement).fetchone()
+            except sqlite3.OperationalError as exc:
+                if _schema_not_built(exc):
+                    raise DeclarativeDriftError(str(exc)) from exc
+                raise
+        budget.check()
+        conn.execute('COMMIT')
+    except BaseException as exc:
+        if conn is not None:
             with contextlib.suppress(sqlite3.Error):
                 conn.execute('ROLLBACK')
-            if budget.expired and isinstance(exc, sqlite3.OperationalError):
-                raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
-            raise
+        if (
+            budget.expired
+            and isinstance(exc, sqlite3.OperationalError)
+            and str(exc).strip().lower() == 'interrupted'
+        ):
+            raise BrowseBudgetExceeded('browse schema catch-up exceeded its time budget') from exc
+        raise
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 BROWSE_RECONCILE_PURPOSE = 'browse_schema_reconcile'
@@ -442,11 +491,11 @@ def reconcile_drift_for_browse(path: Path) -> bool:
     except OwnershipConflict as exc:
         if live_runtime_owner(home) is not None:
             raise owned(reason) from exc
-    if holder := _lockless_gateway_holder(path):
-        raise owned(reason, holder)
-    with _path_scan_lock(path):  # one scan per store per process; concurrent polls wait for it
+    with _path_scan_lock(path):  # serialize one expensive holder scan and integrity scan per store
         if schema_drift_reason(path) is None:
             return False
+        if holder := _lockless_gateway_holder(path):  # legacy gateway started after the lock probe
+            raise owned(reason, holder)
         signature = _verify_clean_before_lock(path, too_slow)
         try:
             with _reserve_for_ddl(home, path, owned) as current:

@@ -34,6 +34,11 @@ from cron.env_settings import cron_env_setting
 from cron.jobs_invariants import _validate_job_mode_invariants
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron import store_health
+from cron.export_writers import (
+    _bound_writer_custody,
+    writer_custody as _writer_custody,
+)
+from hermes_cron_export_custody import CronCustodyRefused
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -102,6 +107,9 @@ TICKER_INTERVAL_SECONDS = 60
 # In-process lock for load_jobs→modify→save_jobs cycles; without it, parallel tick threads'
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
+# The lock is re-entrant per profile, not merely per thread.  A multiplexed gateway can enter
+# profile B while profile A's store is still active on the same thread; sharing one thread-local
+# depth would make B inherit A's cross-process lock proof.
 _jobs_lock_state = threading.local()
 _fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
@@ -124,6 +132,15 @@ class _CronStorePaths:
     @classmethod
     def for_dir(cls, cron_dir: Path) -> "_CronStorePaths":
         return cls(cron_dir, cron_dir / "jobs.json", cron_dir / "output")
+
+
+class CronJobsLockUnavailable(RuntimeError):
+    """The cross-process jobs lock could not be acquired for a protected mutation.
+
+    Ordinary cron store operations intentionally retain their historical bounded degradation
+    behaviour.  Claim/admission paths use this typed refusal so a sibling process can never be
+    mistaken for an in-process-only owner.
+    """
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -181,6 +198,18 @@ def _current_cron_store() -> _CronStorePaths:
     if home == HERMES_DIR:
         return live_constants
     return _CronStorePaths.for_dir(home / "cron")
+
+
+def _writer_owner_home() -> Path:
+    """Resolve custody from the active jobs store, including ``use_cron_store`` overrides."""
+    return _current_cron_store().cron_dir.parent
+
+
+@contextlib.contextmanager
+def _writer_custody_context():
+    """Hold one source-owned shared lease across a jobs-store mutation."""
+    with _bound_writer_custody(_writer_owner_home):
+        yield
 
 
 @contextlib.contextmanager
@@ -286,37 +315,77 @@ def _release_flock(lock_fd) -> None:
         lock_fd.close()
 
 
+def _release_flock_checked(lock_fd) -> bool:
+    """Release a retained jobs fence without discarding it on an unlock/close failure."""
+    released = True
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        elif msvcrt is not None:
+            msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
+    except OSError:
+        released = False
+    if released:
+        try:
+            lock_fd.close()
+        except OSError:
+            released = False
+    return released
+
+
+def _jobs_lock_key() -> str:
+    """Return the canonical identity for the current profile's jobs lock."""
+    return str(_jobs_lock_file().resolve())
+
+
+def _jobs_lock_states() -> dict[str, dict[str, Any]]:
+    states = getattr(_jobs_lock_state, "by_key", None)
+    if states is None:
+        states = {}
+        _jobs_lock_state.by_key = states
+    return states
+
+
 @contextlib.contextmanager
-def _jobs_lock():
-    """Serialize a load_jobs→modify→save_jobs critical section: in-process RLock (parallel tick
-    threads) plus a cross-process flock on ``<cron dir>/.jobs.lock`` (gateway vs. CLI writes —
-    otherwise a `cron pause` could be clobbered and keep firing). Nested calls in one thread
-    reuse the held lock. Without a flock backend, or on flock timeout (logged loudly), it
-    degrades to in-process-only locking: a briefly torn cross-process write beats a dead
-    scheduler."""
-    depth = getattr(_jobs_lock_state, "depth", 0)
+@_writer_custody
+def _jobs_lock(*, strict: bool = False):
+    """Serialize load/modify/save with the RLock and bounded cross-process flock; nested calls
+    reuse the held lock, and unavailable/slow flock degrades to in-process locking."""
+    key = _jobs_lock_key()
+    states = _jobs_lock_states()
+    state = states.get(key)
+    depth = int(state.get("depth", 0)) if state is not None else 0
     if depth:
-        _jobs_lock_state.depth = depth + 1
+        if strict and not state.get("cross_process_acquired", False):
+            raise CronJobsLockUnavailable("cron_jobs_lock_unavailable")
+        state["depth"] = depth + 1
         try:
             yield
         finally:
-            _jobs_lock_state.depth -= 1
+            state["depth"] -= 1
         return
 
     with _jobs_file_lock:
-        _jobs_lock_state.depth = 1
+        state = {"depth": 1, "cross_process_acquired": False, "load_stamp": None}
+        states[key] = state
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
         # stamps from unlocked loads or prior sections can never suppress a needed merge.
         # See #80703.
-        _jobs_lock_state.load_stamp = None
+        state["load_stamp"] = None
         lock_fd = None
         try:
             try:
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is not True:
+                    if strict:
+                        with contextlib.suppress(OSError):
+                            lock_fd.close()
+                        lock_fd = None
+                        raise CronJobsLockUnavailable("cron_jobs_lock_unavailable")
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
@@ -326,18 +395,23 @@ def _jobs_lock():
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
+                    state["cross_process_acquired"] = False
+                else:
+                    state["cross_process_acquired"] = True
             except OSError as e:
+                if strict:
+                    raise CronJobsLockUnavailable("cron_jobs_lock_unavailable") from e
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
+                state["cross_process_acquired"] = False
             try:
                 yield
             finally:
                 if lock_fd is not None:
                     _release_flock(lock_fd)
         finally:
-            _jobs_lock_state.depth = 0
-            _jobs_lock_state.load_stamp = None
+            states.pop(key, None)
 
 
 @contextlib.contextmanager
@@ -1051,12 +1125,13 @@ def _append_telemetry_record(filename: str, entry: dict[str, Any], recent: list)
     recent.append(entry)
     del recent[:-_TELEMETRY_RECENT_HISTORY]
     try:
-        path = _current_cron_store().cron_dir / filename
-        _ensure_cron_dir(path.parent)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(entry) + "\n")
+        with _writer_custody_context():
+            path = _current_cron_store().cron_dir / filename
+            _ensure_cron_dir(path.parent)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(entry) + "\n")
     except Exception as exc:
-        logger.debug("Could not append %s record: %s", filename, exc)
+        logger.debug("Could not append %s record: %s", filename, exc, exc_info=True)
 
 
 def _record_persisted_error_recovery(job: dict[str, Any], previous_next_run: str) -> None:
@@ -1235,14 +1310,19 @@ def compute_next_run(schedule: dict[str, Any], last_run_at: Optional[str] = None
 
 # --- Ticker heartbeat (liveness signal for `hermes cron status`) ---
 
+def _write_marker_unlocked(name: str, text: str, tmp_prefix: str) -> None:
+    ensure_dirs()
+    atomic_write_text(_current_cron_store().cron_dir / name, text, tmp_prefix=tmp_prefix, mode=0o600)
+
+
 def _write_marker(name: str, text: str, tmp_prefix: str) -> None:
     """Atomic (never torn) best-effort marker write; failures swallowed so markers never break the
     tick."""
     try:
-        ensure_dirs()
-        atomic_write_text(_current_cron_store().cron_dir / name, text, tmp_prefix=tmp_prefix, mode=0o600)
-    except Exception:
-        pass
+        with _writer_custody_context():
+            _write_marker_unlocked(name, text, tmp_prefix)
+    except (CronCustodyRefused, OSError, TypeError, ValueError) as exc:
+        logger.debug("Could not write marker %s: %s", name, exc, exc_info=True)
 
 
 def record_ticker_heartbeat(success: bool = False) -> None:
@@ -1259,9 +1339,13 @@ def record_ticker_heartbeat(success: bool = False) -> None:
     """
     # ``<epoch> <pid>``: a killed ticker's last stamp reads fresh for ~3 minutes, so a reader with no
     # other proof of the scheduler (the in-process serve/Desktop ticker) checks the writer is alive.
-    _write_marker("ticker_heartbeat", f"{time.time()} {os.getpid()}", ".hb_")
-    if success:
-        _write_marker("ticker_last_success", str(time.time()), ".hb_")
+    try:
+        with _writer_custody_context():
+            _write_marker_unlocked("ticker_heartbeat", f"{time.time()} {os.getpid()}", ".hb_")
+            if success:
+                _write_marker_unlocked("ticker_last_success", str(time.time()), ".hb_")
+    except (CronCustodyRefused, OSError, TypeError, ValueError) as exc:
+        logger.debug("Could not write ticker heartbeat: %s", exc, exc_info=True)
 
 
 def _read_marker_fields(name: str) -> list[str]:
@@ -1319,8 +1403,11 @@ def record_ticker_error(message: str) -> None:
 
 def clear_ticker_error() -> None:
     """Remove the last-tick-error marker after a successful tick. Best-effort."""
-    with contextlib.suppress(OSError):
-        (_current_cron_store().cron_dir / "ticker_last_error").unlink()
+    try:
+        with _writer_custody_context():
+            (_current_cron_store().cron_dir / "ticker_last_error").unlink()
+    except (CronCustodyRefused, OSError, TypeError, ValueError) as exc:
+        logger.debug("Could not clear ticker error: %s", exc, exc_info=True)
 
 
 def get_ticker_last_error() -> Optional[str]:
@@ -1421,7 +1508,7 @@ def load_jobs() -> list[dict[str, Any]]:
             repair = repair or "invalid repeat.completed normalized"
     # Persist even an empty result, or an all-junk store repeats the repair on every tick.
     if repair:
-        if not getattr(_jobs_lock_state, "depth", 0):
+        if not any(int(item.get("depth", 0)) for item in _jobs_lock_states().values()):
             # An unlocked snapshot may predate a locked writer's update to a job it already holds
             # (the shrink-merge only restores missing ids), so re-read and repair under the lock.
             with _jobs_lock():
@@ -1475,8 +1562,11 @@ def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
     Stamping after the read would let that sibling's write be certified as "seen" without being in the
     loaded payload, wrongly suppressing the recovery. See #80703.
     """
-    if getattr(_jobs_lock_state, "depth", 0):
-        _jobs_lock_state.load_stamp = stamp
+    states = _jobs_lock_states()
+    key = _jobs_lock_key()
+    state = states.get(key)
+    if state is not None and int(state.get("depth", 0)):
+        state["load_stamp"] = stamp
 
 
 def _unmerged_disk_jobs(
@@ -1485,7 +1575,8 @@ def _unmerged_disk_jobs(
     """On-disk jobs missing from *jobs* and not intentionally removed. Stamp match => nothing
     landed, return without parsing; unreadable store => raise RuntimeError (fail closed: writing
     over an unknown baseline would silently drop every job in it)."""
-    stamp = getattr(_jobs_lock_state, "load_stamp", None)
+    state = _jobs_lock_states().get(_jobs_lock_key())
+    stamp = state.get("load_stamp") if state is not None else None
     if stamp is not None and _jobs_file_stamp(_current_cron_store().jobs_file) == stamp:
         return []
     disk_jobs = _peek_jobs_unlocked()
@@ -1608,11 +1699,12 @@ _MISSING = object()
 
 
 def _with_job(
-    job_id: Any, fn: Callable[[list[dict[str, Any]], int, dict[str, Any]], Any], missing: Any = None
+    job_id: Any, fn: Callable[[list[dict[str, Any]], int, dict[str, Any]], Any], missing: Any = None,
+    *, strict_lock: bool = False,
 ) -> Any:
     """Run ``fn(jobs, i, job)`` on the first match under ``_jobs_lock()``; ``fn`` saves. *missing*
     if none."""
-    with _jobs_lock():
+    with _jobs_lock(strict=strict_lock):
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job.get("id") == job_id:
@@ -1913,8 +2005,16 @@ def create_job(
         if value is not None:
             job[key] = value
 
-    with _jobs_lock():
-        save_jobs(load_jobs() + [job])
+    try:
+        with _jobs_lock():
+            save_jobs(load_jobs() + [job])
+    except CronCustodyRefused as exc:
+        # Preserve the public first-writer contract for a deleted named profile.  The custody
+        # adapter fails closed before the old ``_ensure_cron_dir`` path can recreate it.
+        owner_home = _current_cron_store().cron_dir.parent
+        if _is_named_profile_path(owner_home) and not owner_home.exists():
+            raise FileNotFoundError(owner_home / "cron") from exc
+        raise
     return job
 
 
@@ -2780,7 +2880,12 @@ def claim_job_for_fire(
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
-    return _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    try:
+        return _under_fire_fence(
+            job_id, lambda: _with_job(job_id, apply, False, strict_lock=True))
+    except CronJobsLockUnavailable:
+        logger.error("Refusing cron fire %s because the cross-process jobs lock is unavailable", job_id)
+        return False
 
 
 def heartbeat_fire_claim(job_id: str, *, expected_owner: str) -> bool:
@@ -3381,6 +3486,7 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
+@_writer_custody
 def save_job_output(job_id: str, output: str):
     """Save job output to file."""
     ensure_dirs()

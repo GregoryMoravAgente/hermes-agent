@@ -1,0 +1,286 @@
+"""Private child fixture for the compute-host owner-custody tests.
+
+The parent starts this file through HostSupervisor. The fixture imports the production
+ComputeHost and calls production ``compute_host.run_host(stdout=...)`` after capturing
+the real wire stream. It only installs the same
+neutral synthetic-agent seams used by ``test_compute_host_turn_protocol.py`` so the
+real server turn pipeline can finish without a provider, network, or credential.
+
+In descendant mode the wrapper still calls the production ``ComputeHost._run_real_turn``.
+It starts one test-owned helper that inherits stdout, waits until the real turn has
+emitted its terminal, writes one adversarial matching frame, and stays alive until the
+parent releases it. That matching frame is deliberately not the normal producer path.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+import types
+
+
+# This fixture is launched as a script. Put the checkout root on sys.path before
+# either the descendant branch or production imports so the bounded wait helper is
+# available even when the host process disappears before its normal branch starts.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_REPO_ROOT))
+
+# Preserve the real HostSupervisor stdout pipe before importing tui_gateway.server;
+# that module intentionally redirects process stdout to stderr for its own logging.
+_WIRE_STDOUT = sys.stdout
+
+from tests.waiting import wait_until
+
+def _descendant_main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--descendant", action="store_true")
+    parser.add_argument("--release", required=True)
+    parser.add_argument("--terminal-signal", required=True)
+    parser.add_argument("--ready", required=True)
+    parser.add_argument("--exit-ack", required=True)
+    parser.add_argument("--payload", required=True)
+    args = parser.parse_args(argv)
+    release = Path(args.release)
+    terminal_signal = Path(args.terminal_signal)
+    ready = Path(args.ready)
+    exit_ack = Path(args.exit_ack)
+    payload = json.loads(args.payload)
+    try:
+        # This helper is outside the host's process group. Its own deadline is the
+        # last-resort leak bound if the parent host disappears before test cleanup.
+        wait_until(
+            lambda: release.exists() or terminal_signal.exists(),
+            timeout=30,
+            what="descendant release or real terminal signal",
+        )
+        if release.exists() and not terminal_signal.exists():
+            return 0
+        if not release.exists() and not ready.exists():
+            try:
+                sys.stdout.write(json.dumps(payload, separators=(",", ":")) + "\n")
+                sys.stdout.flush()
+            except Exception:
+                pass
+            ready.write_text("ready", encoding="utf-8")
+        wait_until(
+            release.exists,
+            timeout=30,
+            what="descendant release marker",
+        )
+        return 0
+    finally:
+        # Always leave a finite cleanup receipt, including when either wait deadline
+        # expires because the parent has vanished.
+        exit_ack.write_text("exiting", encoding="utf-8")
+
+
+if "--descendant" in sys.argv:
+    raise SystemExit(_descendant_main(sys.argv[1:]))
+
+from tui_gateway import compute_host, server
+from tui_gateway.compute_host import ComputeHost
+
+_SID = "compute-owner-sid"
+_SESSION_KEY = "compute-owner-session"
+
+
+def _agent(*, rpc_profile: str = "", rpc_owner_profile: str = "") -> types.SimpleNamespace:
+    def run_conversation(prompt, *, conversation_history=None, stream_callback=None, **_kwargs):
+        if rpc_profile:
+            # Exercise the production child RPC dispatcher over the real host transport.  The
+            # parent bridge owns admission/settlement; this fixture only supplies a real long
+            # handler request from the agent turn and leaves the response on the host pipe.
+            from tui_gateway import server
+
+            transport = next(iter(server._live_transports), None)
+            marker = Path(rpc_profile) / "i17-rpc-dispatch.marker"
+            marker.write_text("entered", encoding="utf-8")
+            server._methods["i17.bridge.probe"] = (
+                lambda request_id, _params: {
+                    "jsonrpc": "2.0", "id": request_id,
+                    "result": {"status": "child-bridge-admitted"},
+                }
+            )
+            server._LONG_HANDLERS = server._LONG_HANDLERS | {"i17.bridge.probe"}
+            response = server.dispatch({
+                "jsonrpc": "2.0",
+                "id": "i17-child-rpc",
+                "method": "i17.bridge.probe",
+                "params": {"owner": {
+                    "profile_id": rpc_owner_profile or rpc_profile,
+                }},
+            }, transport=transport)
+            marker.write_text(
+                f"returned:{type(response).__name__}:transport={type(transport).__name__}",
+                encoding="utf-8",
+            )
+            # A foreign bridge refusal happens before queue admission and is returned inline;
+            # accepted requests are written by the real RPC-pool worker above.
+            if response is not None and transport is not None:
+                transport.write(response)
+        if stream_callback is not None:
+            stream_callback("synthetic terminal")
+        return {
+            "final_response": "synthetic terminal",
+            "messages": [
+                *(conversation_history or []),
+                {"role": "user", "content": prompt},
+                {"role": "assistant", "content": "synthetic terminal"},
+            ],
+        }
+
+    return types.SimpleNamespace(
+        session_id=_SESSION_KEY,
+        run_conversation=run_conversation,
+        clear_interrupt=lambda: None,
+        hard_interrupt=lambda *args, **kwargs: None,
+    )
+
+
+def _session(*, rpc_profile: str = "", rpc_owner_profile: str = "") -> dict:
+    return {
+        "agent": _agent(rpc_profile=rpc_profile, rpc_owner_profile=rpc_owner_profile),
+        "session_key": _SESSION_KEY,
+        "profile_home": "",
+        "history": [],
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cols": 80,
+        "slash_worker": None,
+        "show_reasoning": False,
+        "tool_progress_mode": "all",
+        "inflight_turn": None,
+        # Let the real child admission path claim and release its temporary slot;
+        # an inert object would make teardown call a nonexistent release method.
+        "active_session_lease": None,
+    }
+
+
+def _install_neutral_turn_seams() -> None:
+    """Mirror the neutral seams from test_compute_host_turn_protocol.py."""
+    server._wire_callbacks = lambda _sid: None
+    server._sync_agent_model_with_config = lambda _sid, _session: None
+    server._session_cwd = lambda session: str(session.get("cwd") or _REPO_ROOT)
+    server._register_session_cwd = lambda _session: None
+    server._tts_stream_begin = lambda: None
+    server._sync_session_key_after_compress = lambda *args, **kwargs: None
+    server._get_usage = lambda _agent: {}
+
+
+def _install_inherited_writer(paths: argparse.Namespace) -> None:
+    original = ComputeHost._run_real_turn
+
+    def run_with_inherited_writer(self: ComputeHost, frame: dict) -> None:
+        payload = {
+            "type": "turn.end",
+            "sid": str(frame.get("sid") or ""),
+            "request_id": str(frame.get("request_id") or ""),
+            "turn_id": str(frame.get("turn_id") or frame.get("request_id") or ""),
+            "session_key": _SESSION_KEY,
+            "profile_home": str(frame.get("profile_home") or ""),
+            "host_boot_id": self._boot_id,
+            "origin_session_key": _SESSION_KEY,
+        }
+        descendant = subprocess.Popen(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--descendant",
+                "--release",
+                paths.descendant_release,
+                "--terminal-signal",
+                paths.real_terminal_returned,
+                "--ready",
+                paths.descendant_ready,
+                "--exit-ack",
+                paths.descendant_exit_ack,
+                "--payload",
+                json.dumps(payload, separators=(",", ":")),
+            ],
+            stdin=subprocess.DEVNULL,
+            # stdout is intentionally inherited from the real compute host. This is
+            # the physical descendant-writer counterexample under test.
+            stderr=subprocess.DEVNULL,
+        )
+
+        def reap_descendant() -> None:
+            try:
+                returncode = descendant.wait(timeout=75)
+            except subprocess.TimeoutExpired:
+                Path(paths.descendant_reap_error).write_text(
+                    "timeout", encoding="utf-8"
+                )
+            except Exception as exc:
+                Path(paths.descendant_reap_error).write_text(
+                    f"{type(exc).__name__}: {exc}", encoding="utf-8"
+                )
+            else:
+                Path(paths.descendant_reaped).write_text(
+                    str(returncode), encoding="utf-8"
+                )
+
+        # Keep this non-daemon: the real host must retain the exact Popen owner
+        # until it has reaped the inherited writer or recorded a bounded failure.
+        threading.Thread(
+            target=reap_descendant,
+            name="compute-owner-descendant-reaper",
+            daemon=False,
+        ).start()
+        Path(paths.descendant_pid).write_text(str(descendant.pid), encoding="utf-8")
+        # The production method emits turn.end before returning. Only then may the
+        # inherited writer emit its matching frame.
+        original(self, frame)
+        Path(paths.real_terminal_returned).write_text("production-returned", encoding="utf-8")
+
+    ComputeHost._run_real_turn = run_with_inherited_writer
+
+
+def _main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=("normal", "descendant"), required=True)
+    parser.add_argument("--rpc-profile", default="")
+    parser.add_argument("--rpc-owner-profile", default="")
+    parser.add_argument("--descendant-release", default="")
+    parser.add_argument("--descendant-ready", default="")
+    parser.add_argument("--descendant-exit-ack", default="")
+    parser.add_argument("--descendant-pid", default="")
+    parser.add_argument("--descendant-reaped", default="")
+    parser.add_argument("--descendant-reap-error", default="")
+    parser.add_argument("--real-terminal-returned", default="")
+    args = parser.parse_args(argv)
+
+    _install_neutral_turn_seams()
+    server._sessions[_SID] = _session(
+        rpc_profile=args.rpc_profile,
+        rpc_owner_profile=args.rpc_owner_profile,
+    )
+    if args.mode == "descendant":
+        required = (
+            args.descendant_release,
+            args.descendant_ready,
+            args.descendant_exit_ack,
+            args.descendant_pid,
+            args.descendant_reaped,
+            args.descendant_reap_error,
+            args.real_terminal_returned,
+        )
+        if not all(required):
+            raise SystemExit("descendant mode requires all synchronization paths")
+        _install_inherited_writer(args)
+    os.environ["HERMES_COMPUTE_HOST_CHILD"] = "1"
+    # main() only parses argv then calls run_host() without an explicit stream. Pass
+    # the captured pipe explicitly so server's logging redirect cannot move the wire.
+    compute_host.run_host(stdout=_WIRE_STDOUT)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))

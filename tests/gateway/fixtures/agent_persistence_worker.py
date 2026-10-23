@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import sys
 
-import psutil
+from gateway.status import get_process_start_time
 
 from agent.runtime_session_store import RuntimeSessionStore, WorkerRPC
 
@@ -36,7 +36,7 @@ def main():
     rpc = WorkerRPC(home)
     scope = dict(profile_id=str(home), session_id=command['session_id'],
                  execution_id='agent-worker', generation=0, pid=os.getpid(),
-                 birth=psutil.Process().create_time(), secret='private-agent-worker')
+                 birth=get_process_start_time(os.getpid()), secret='private-agent-worker')
     registered = rpc('worker.register', **scope, kind='compute')
     scope['epoch'] = registered['owner_epoch']
     store = RuntimeSessionStore(rpc, scope, home / 'worker-outboxes' / 'agent-worker')

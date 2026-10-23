@@ -4,6 +4,7 @@
 (owner-thread close vs stranger-thread abort), credential rotation and route-derived headers.
 """
 import logging
+import os
 import threading
 import time
 from contextlib import suppress
@@ -100,6 +101,40 @@ def _swap_fallback_clients(agent, fb_client, fb_provider: str, fb_model: str, fb
         agent._replace_primary_openai_client(reason="fallback_timeout_apply")
 
 
+def cleanup_task_resources(agent, task_id: str, *, persistent_env_checker=None, runtime_getter=None) -> None:
+    """Release per-turn VM/browser resources through the client lifecycle owner."""
+    if runtime_getter is None:
+        def runtime_getter():
+            import run_agent
+            return run_agent
+
+    if persistent_env_checker is None:
+        from tools.terminal_tool_lifecycle import is_persistent_env as persistent_env_checker
+
+    def _headed() -> bool:
+        try:
+            from tools.browser_tool_cloud import _is_headed_mode
+            return _is_headed_mode()
+        except Exception:
+            logger.exception("Unable to determine headed browser mode; using environment fallback")
+            return bool(os.environ.get("AGENT_BROWSER_HEADED"))
+
+    for label, skip, skip_what, cleanup in (
+        ("VM", persistent_env_checker, "cleanup_vm for persistent env", lambda: runtime_getter().cleanup_vm(task_id)),
+        ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: runtime_getter().cleanup_browser(task_id)),
+    ):
+        try:
+            if skip(task_id):
+                if agent.verbose_logging:
+                    logging.debug(f"Skipping per-turn {skip_what} {task_id}; idle reaper will handle it.")
+            else:
+                if cleanup() is False:
+                    logger.warning("Retaining unresolved %s for task %s", label, task_id)
+        except Exception as exc:
+            if agent.verbose_logging:
+                logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, exc, exc_info=True)
+
+
 class ClientLifecycleMixin:
     def _close_task_resources(self, task_id: str) -> None:
         """Release task resources without treating a shared environment as process ownership."""
@@ -134,7 +169,11 @@ class ClientLifecycleMixin:
                 if owner and owner != task_id:
                     clear_file_ops_cache(owner)
 
-        for step in (kill_processes, lambda: cleanup_vm(task_id), lambda: cleanup_browser(task_id),
+        def cleanup_browser_checked() -> None:
+            if cleanup_browser(task_id) is False:
+                logger.warning("Retaining unresolved browser session for task %s", task_id)
+
+        for step in (kill_processes, lambda: cleanup_vm(task_id), cleanup_browser_checked,
                      release_computer_use, forget_file_state):
             _quietly(step)
 
@@ -267,7 +306,9 @@ class ClientLifecycleMixin:
                 logger.debug("Abandoned-worker drain: %s client abort failed", label, exc_info=True)
         # Codex app-server session watches a private interrupt event.
         try:
-            request_interrupt = getattr(getattr(self, "_codex_session", None), "request_interrupt", None)
+            codex_session = getattr(self, "_codex_session", None)
+            self._mark_codex_custody_unknown(codex_session)
+            request_interrupt = getattr(codex_session, "request_interrupt", None)
             if callable(request_interrupt):
                 request_interrupt()
         except Exception:
@@ -284,6 +325,12 @@ class ClientLifecycleMixin:
             reason, drained, self._client_log_context(),
         )
         return drained
+
+    @staticmethod
+    def _mark_codex_custody_unknown(codex_session) -> None:
+        mark_unknown = getattr(codex_session, "mark_custody_unknown", None)
+        if callable(mark_unknown):
+            mark_unknown("join_failed")
 
     def _replace_primary_openai_client(self, *, reason: str) -> bool:
         with self._openai_client_lock():
@@ -385,12 +432,69 @@ class ClientLifecycleMixin:
                 cache.update(client=client, key=key, poisoned=False, in_use=True)
             # else: a concurrent call holds the slot — hand this client out untracked (fully closed later).
 
+    def _managed_acp_request_slot_recoverable(
+        self, slot_attr: str, client: Any, cache: dict, reason: str,
+    ) -> bool:
+        """Keep one authenticated managed ACP client for same-owner custody retry."""
+        if (
+            slot_attr != _OPENAI_SLOT
+            or reason != "request_error_cleanup"
+            or cache.get("client") is not client
+            or cache.get("in_use") is not True
+            or cache.get("poisoned") is True
+            or getattr(self, "_managed_acp_client", None) is not client
+            or self._is_openai_client_closed(client)
+        ):
+            return False
+        from agent.copilot_acp_client import CopilotACPClient
+        if not isinstance(client, CopilotACPClient):
+            return False
+        policy = getattr(client, "_producer_policy", None)
+        parent = getattr(policy, "parent", None)
+        service = getattr(parent, "_service", None)
+        receipt = getattr(parent, "_physical", None)
+        binding = getattr(parent, "turn_binding", None)
+        request = getattr(parent, "_request", None)
+        witness = getattr(receipt, "managed_witness", None)
+        try:
+            pending = client.has_pending_managed_custody()
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return False
+        return bool(
+            pending
+            and getattr(parent, "mode", None) == "managed_turn"
+            and getattr(parent, "_owner_agent", None) is self
+            and getattr(parent, "_catalog_client", None) is client
+            and getattr(parent, "_service", None) is service
+            and getattr(parent, "_physical", None) is receipt
+            and service is not None
+            and getattr(service, "external_parent", None) is parent
+            and getattr(service, "physical", None) is receipt
+            and receipt is not None
+            and getattr(receipt, "service", None) is service
+            and getattr(receipt, "managed_client", None) is client
+            and getattr(receipt, "ephemeral_process", False) is True
+            and isinstance(witness, dict)
+            and witness.get("parent") is parent
+            and witness.get("receipt") is receipt
+            and witness.get("_process") is not None
+            and binding is not None
+            and getattr(service, "binding", None) is binding
+            and request is not None
+            and (getattr(service, "requests", {}) or {}).get(
+                getattr(binding, "admission_id", None),
+            ) is request
+        )
+
     def _release_request_slot(self, slot_attr: str, client: Any, reason: str) -> bool:
         """Owner-thread release; True when the client stays cached (clean finish, not poisoned)."""
         with self._openai_client_lock():
             cache = self._request_slot(slot_attr)
             if cache["client"] is client:
                 if reason in self._REQUEST_CLIENT_REUSE_REASONS and not cache["poisoned"]:
+                    cache["in_use"] = False
+                    return True
+                if self._managed_acp_request_slot_recoverable(slot_attr, client, cache, reason):
                     cache["in_use"] = False
                     return True
                 _reset_slot(cache)

@@ -2,6 +2,7 @@
 import os
 from pathlib import Path
 import subprocess
+import sys
 
 import pytest
 import hermes_yaml as yaml
@@ -26,6 +27,10 @@ def test_external_validator_checkout_uses_requested_ref_and_preserves_caller(tmp
            "GITHUB_OUTPUT": str(output), "GITHUB_ENV": str(env_file), "_HERMES_REF": ref,
            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": f"url.{repo.as_uri()}.insteadOf",
            "GIT_CONFIG_VALUE_0": "https://github.com/NousResearch/hermes-agent.git"}
+    # The action selects ``python3`` on POSIX runners. Keep this local action
+    # simulation on the same PM-managed interpreter that runs the test; the
+    # macOS system python3 may be too old for the checked-out bootstrap code.
+    env["PATH"] = os.pathsep.join([str(Path(sys.executable).parent), env.get("PATH", "")])
     subprocess.run(["bash", "-c", source_step["run"]], cwd=caller, env=env, check=True,
                    capture_output=True, text=True, timeout=60)
     outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())

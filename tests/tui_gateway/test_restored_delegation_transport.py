@@ -4,6 +4,8 @@ import asyncio
 import io
 import queue
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from unittest.mock import Mock
@@ -53,20 +55,41 @@ def _session(notification_env, monkeypatch, kind):
 
 
 def _orphan_owner(home):
-    """The owner died while this process runs: pid 0 never passes the liveness probe."""
-    conn = sqlite3.connect(home / "state.db")
-    with conn:
-        conn.execute("UPDATE async_delegations SET owner_pid=0, updated_at=?", (time.time() - 3600,))
-    conn.close()
+    """Persist a real child owner, then exit it before the orphan sweep observes the row."""
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    try:
+        from gateway.status import get_process_start_time
+
+        assert child.poll() is None
+        birth = get_process_start_time(child.pid)
+        assert type(birth) is int
+        conn = sqlite3.connect(home / "state.db")
+        try:
+            with conn:
+                conn.execute(
+                    "UPDATE async_delegations SET owner_pid=?, owner_started_at=?, updated_at=?",
+                    (child.pid, birth, time.time() - 3600),
+                )
+        finally:
+            conn.close()
+    finally:
+        child.terminate()
+        child.wait(timeout=10)
 
 
 def _completion(home, *, via):
+    from tests.gateway.test_completion_admission import prepared_execution
+
     event = {
         "type": "async_delegation", "delegation_id": "completed-child",
         "session_key": "chat", "origin_ui_session_id": "ui1",
         "dispatched_at": time.time(), "completed_at": time.time(),
         "status": "completed", "summary": "child result",
         "results": [{"status": "completed", "summary": "child result"}],
+        "execution": prepared_execution("completed-child"),
     }
     ad._persist_dispatch(event)
     ad._persist_completion(event, {"summary": "child result"})

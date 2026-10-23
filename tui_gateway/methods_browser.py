@@ -95,18 +95,18 @@ def _connect_local_default(port: int, system: str, announce) -> str | None:
     return None
 
 
-def _reap_profile_browsers() -> None:
+def _reap_profile_browsers() -> bool:
     """Close the current profile's browsers only: the live connection is per profile, so other
     profiles' sessions on a multiplexed gateway keep theirs."""
     from hermes_constants import hermes_home_key
     from tools.browser_tool_lifecycle import cleanup_profile_browsers
-    cleanup_profile_browsers(hermes_home_key())
+    return cleanup_profile_browsers(hermes_home_key())
 
 
 def _browser_connect(rid, params: dict) -> dict:
     import platform
     from hermes_cli.browser_connect import DEFAULT_BROWSER_CDP_URL
-    from tools.browser_tool_cdp import set_live_cdp_override
+    from tools.browser_tool_cdp import live_cdp_override, set_live_cdp_override
     from urllib.parse import urlparse
     raw_url = params.get("url")
     if raw_url is not None and not isinstance(raw_url, str):
@@ -158,9 +158,13 @@ def _browser_connect(rid, params: dict) -> dict:
                       else parsed._replace(path="", params="", query="", fragment="").geturl())
         # Reap BEFORE publishing this profile's endpoint (an in-flight tool call sees the old
         # supervisor closed) and AFTER (the default task's cached supervisor drains against the new URL).
-        _reap_profile_browsers()
+        if _reap_profile_browsers() is False:
+            return _err(rid, 5032, "browser session cleanup is unresolved")
+        previous_cdp_url = live_cdp_override()
         set_live_cdp_override(normalized)
-        _reap_profile_browsers()
+        if _reap_profile_browsers() is False:
+            set_live_cdp_override(previous_cdp_url)
+            return _err(rid, 5032, "browser session cleanup is unresolved")
     except Exception as e:
         return _err(rid, 5031, str(e))
     return _ok(rid, {"connected": True, "url": normalized,
@@ -169,15 +173,14 @@ def _browser_connect(rid, params: dict) -> dict:
 
 def _browser_disconnect(rid) -> dict:
     # Reap, drop this profile's override, reap again — same swap window as ``_browser_connect``.
-    from tools.browser_tool_cdp import set_live_cdp_override
-
-    def reap() -> None:
-        with contextlib.suppress(Exception):
-            _reap_profile_browsers()
-
-    reap()
+    from tools.browser_tool_cdp import live_cdp_override, set_live_cdp_override
+    previous_cdp_url = live_cdp_override()
+    if _reap_profile_browsers() is False:
+        return _err(rid, 5032, "browser session cleanup is unresolved")
     set_live_cdp_override(None)
-    reap()
+    if _reap_profile_browsers() is False:
+        set_live_cdp_override(previous_cdp_url)
+        return _err(rid, 5032, "browser session cleanup is unresolved")
     return _ok(rid, {"connected": False})
 
 

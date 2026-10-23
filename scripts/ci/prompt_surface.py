@@ -74,6 +74,11 @@ SESSION_ID = FIXED_NOW.strftime("%Y%m%d_%H%M%S") + "_prompt_surface"
 
 def _pin_environment() -> None:
     """Pin every input that differs between machines; each one moved bytes in a trial render."""
+    # Platform-sensitive stdlib and binary modules must initialize against the real host
+    # before simulating Linux for deterministic skill-platform filtering.
+    import sysconfig
+    import psutil
+    sysconfig.get_config_vars()
     def refuse(*_a, **_k):
         raise OSError("network disabled while rendering the prompt surface")
     socket.socket.connect = refuse  # type: ignore[method-assign]
@@ -107,11 +112,12 @@ class _ImportFailures(logging.Handler):
 
 def _scrub(text: str, home: Path) -> str:
     import platform as _platform
-    for raw, token in sorted({
-        str(home / ".hermes"): "<HERMES_HOME>",
-        str(home): "<HOME>",
-        f"{_platform.system()} ({_platform.release()})": "<HOST_OS>",
-    }.items(), key=lambda kv: -len(kv[0])):
+    # macOS may spell the same temporary HOME as /var/... or /private/var/....
+    homes = {str(home), os.environ["HOME"]}
+    replacements = {str(Path(path) / ".hermes"): "<HERMES_HOME>" for path in homes}
+    replacements.update({path: "<HOME>" for path in homes})
+    replacements[f"{_platform.system()} ({_platform.release()})"] = "<HOST_OS>"
+    for raw, token in sorted(replacements.items(), key=lambda kv: -len(kv[0])):
         text = text.replace(raw, token)
     return text
 

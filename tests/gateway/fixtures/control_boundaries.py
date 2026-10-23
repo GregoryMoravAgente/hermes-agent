@@ -22,8 +22,19 @@ async def exercise_control_boundaries(tmp_path, monkeypatch):
     epoch = begin_runtime_epoch(db, instance_id='controls')
     admit_session_input(db, epoch=epoch, principal_id='owner', session_id='s', request_id='first', payload={'text': 'first'})
     row = claim_session_input(db, epoch=epoch, session_id='s')
-    authority = SessionAuthority(SimpleNamespace(), profile_id='p', instance_id='controls', db=db, epoch=epoch)
+    runner = SimpleNamespace(_draining=False, session_authority=None)
+    authority = SessionAuthority(runner, profile_id='p', instance_id='controls', db=db, epoch=epoch)
+    runner.session_authority = authority
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
+    authority._preservation_handles[row['admission_id']] = authority._preservation_root(
+        'I02_api_session_turn', row['admission_id'])
     live = authority.sessions['s'] = LiveSession(None, 'boundary-route')
+    live.event_stream.execution = {
+        'authority_epoch': authority.epoch,
+        'execution_generation': row['generation'],
+        'admission_id': row['admission_id'],
+    }
     ref = SessionRef('p', 's')
     actor = Principal('operator', 'p', frozenset({'session:read', 'session:approve'}), 'a')
     snap = await authority.attach(actor, ref)
@@ -45,7 +56,7 @@ async def exercise_control_boundaries(tmp_path, monkeypatch):
     ctx = SimpleNamespace(session_id='s', session_key='boundary-route', _status_adapter=adapter,
                           _status_chat_id='chat', _status_thread_metadata=None,
                           _loop_for_step=asyncio.get_running_loop(), stream_consumer_holder=[None])
-    turn = TurnRunner(SimpleNamespace(session_authority=authority), ctx)
+    turn = TurnRunner(runner, ctx)
 
     async def wait_prompt():
         loop = asyncio.get_running_loop()

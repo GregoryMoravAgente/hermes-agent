@@ -1,4 +1,5 @@
 """Forwarded profile identity is owner-bound, not a title or latest-row guess."""
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -12,7 +13,9 @@ async def test_forwarded_identity_survives_reconnect_without_policy_override(tmp
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway import run
+    from hermes_cli.backend_retirement import RetirementFence
     from gateway.session_policy import build_policy
     from hermes_state_runtime import RuntimeStoreError
 
@@ -26,6 +29,8 @@ async def test_forwarded_identity_survives_reconnect_without_policy_override(tmp
     runner._session_db = store._db
     runner._draining = False
     authority = await initialize_session_authority(runner, profile_id='target', instance_id='test')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     db = authority.db
     authority._schedule = lambda ref: None
     transport = SimpleNamespace(write=lambda frame: None)
@@ -67,7 +72,9 @@ async def test_forwarding_does_not_merge_lossy_context_or_peer_identity(tmp_path
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway import run
+    from hermes_cli.backend_retirement import RetirementFence
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
@@ -79,6 +86,8 @@ async def test_forwarding_does_not_merge_lossy_context_or_peer_identity(tmp_path
     runner._session_db = store._db
     runner._draining = False
     authority = await initialize_session_authority(runner, profile_id='target', instance_id='test')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     db = authority.db
     authority._schedule = lambda ref: None
     conn = AuthorityConnection(authority, SimpleNamespace(write=lambda frame: None), {'user_id': 'producer'})
@@ -119,11 +128,13 @@ async def test_forwarded_turns_are_authored_by_the_peer_for_memory_attribution(t
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.session_a2a import forward_author
     from gateway.session_ingress import row_turn_author
     from agent.turn_author import a2a_key
     from hermes_state_runtime import list_session_admissions
     from gateway import run
+    from hermes_cli.backend_retirement import RetirementFence
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})
@@ -135,6 +146,8 @@ async def test_forwarded_turns_are_authored_by_the_peer_for_memory_attribution(t
     runner._session_db = store._db
     runner._draining = False
     authority = await initialize_session_authority(runner, profile_id='target', instance_id='test')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
     authority._schedule = lambda ref: None
     conn = AuthorityConnection(authority, SimpleNamespace(write=lambda frame: None), {'user_id': 'producer'})
     params = dict(agent='dev', tenant='team', peer='alice', context_id='ctx/a', input_id='first', text='hello')
@@ -199,3 +212,307 @@ async def test_forward_wakes_on_the_completion_frame_instead_of_a_fixed_100ms_po
     assert receipt['status'] == 'terminal'
     assert elapsed < 1.6, elapsed  # woken by the frame, not a late tick
     assert len(calls) <= 5, f'{len(calls)} a2a.forward RPCs for a 1 s turn'
+
+
+@pytest.mark.asyncio
+async def test_forward_reconnect_recovers_the_same_persisted_custody_descriptor(tmp_path, monkeypatch):
+    """A fresh authority replays the exact SQLite row after the transport acknowledgement is lost."""
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_controls import AuthorityConnection
+    from gateway.runtime_ownership import process_ownership
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state_runtime import get_session_admission
+    from pathlib import Path
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {
+        'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []},
+    })
+    monkeypatch.setattr(run, '_resolve_gateway_model', lambda _config: 'fixture')
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.adapters = {}
+    runner.session_store = store
+    runner._session_db = store._db
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id='target', instance_id='first')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
+    authority._schedule = lambda _ref: None
+    params = dict(agent='dev', tenant='team', peer='alice', context_id='restart',
+                  input_id='lost-ack', text='hello')
+    first_conn = AuthorityConnection(authority, SimpleNamespace(write=lambda _frame: None),
+                                     {'user_id': 'producer'})
+    try:
+        first = await first_conn.dispatch({'id': 1, 'method': 'a2a.forward', 'params': params})
+        assert 'result' in first, first
+        first_row = get_session_admission(authority.db, admission_id=first['result']['admission_id'])
+        descriptor = first_row['payload']['_automation_custody_v1']
+        assert descriptor['owner_class'] == 'I09_a2a_hosted_kanban'
+        assert descriptor['request_id'] == params['input_id']
+        await first_conn.close()
+
+        # A new authority epoch sees the durable row and must recover its exact source-owned tuple;
+        # a scalar request/session match alone is insufficient to mint a successor.
+        home = Path(authority.db.db_path).parent.resolve()
+        process_ownership.reserve([home])
+        try:
+            # A real restart rebuilds the local adapter map before publishing the new authority;
+            # retaining the old adapter object would make the recovery look like a foreign drain.
+            runner.adapters = {}
+            restarted = await initialize_session_authority(runner, profile_id='target', instance_id='restart')
+            runner.runtime_custody = RuntimeCustodyCoordinator(
+                process_instance=restarted.instance_id, authority_epoch=restarted.epoch,
+                fence=RetirementFence())
+            restarted._schedule = lambda _ref: None
+            second_conn = AuthorityConnection(restarted, SimpleNamespace(write=lambda _frame: None),
+                                               {'user_id': 'producer'})
+            try:
+                second = await second_conn.dispatch({'id': 2, 'method': 'a2a.forward', 'params': params})
+                assert 'result' in second, second
+                assert second['result']['admission_id'] == first['result']['admission_id']
+                replayed = get_session_admission(restarted.db,
+                                                  admission_id=first['result']['admission_id'])
+                assert replayed['payload']['_automation_custody_v1'] == descriptor
+                binding = restarted._preservation_automation_bindings[first['result']['admission_id']]
+                assert binding['descriptor'] == descriptor
+                assert binding['handle'].authority_epoch == restarted.epoch
+            finally:
+                await second_conn.close()
+        finally:
+            process_ownership.release(home)
+    finally:
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_forward_queued_row_restarts_through_real_drain_to_terminal(tmp_path, monkeypatch):
+    """A fresh owner must drain the queued direct-custody row, not only replay its descriptor."""
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_controls import AuthorityConnection
+    from gateway.session_local_recovery import recover_local_sessions
+    from gateway.runtime_ownership import process_ownership
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state_runtime import get_session_admission
+    from pathlib import Path
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {
+        'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []},
+    })
+    monkeypatch.setattr(run, '_resolve_gateway_model', lambda _config: 'fixture')
+
+    async def bounded_provider(authority, _ref, _row):
+        return 'restarted-answer'
+
+    monkeypatch.setattr('gateway.session_finite.execute_finite_admission', bounded_provider)
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.adapters = {}
+    runner.session_store = store
+    runner._session_db = store._db
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id='target', instance_id='first')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
+    authority._schedule = lambda _ref: None
+    params = dict(agent='dev', tenant='team', peer='alice', context_id='restart-drain',
+                  input_id='queued-restart', text='hello')
+    connection = AuthorityConnection(authority, SimpleNamespace(write=lambda _frame: None),
+                                     {'user_id': 'producer'})
+    try:
+        accepted = await connection.dispatch({'id': 1, 'method': 'a2a.forward', 'params': params})
+        assert 'result' in accepted, accepted
+        admission_id = accepted['result']['admission_id']
+        queued = get_session_admission(authority.db, admission_id=admission_id)
+        assert queued['status'] == 'queued'
+        session_id = queued['target_session_id']
+        await connection.close()
+
+        home = Path(authority.db.db_path).parent.resolve()
+        process_ownership.reserve([home])
+        try:
+            runner.adapters = {}
+            restarted = await initialize_session_authority(
+                runner, profile_id='target', instance_id='restart', db=authority.db)
+            coordinator = RuntimeCustodyCoordinator(
+                process_instance=restarted.instance_id, authority_epoch=restarted.epoch,
+                fence=RetirementFence())
+            runner.runtime_custody = coordinator
+
+            # This is the actual startup recovery scheduler.  It restores the local owner and
+            # schedules its durable queued row; no replay RPC or direct helper is involved.
+            recover_local_sessions(restarted, schedule=True)
+            live = restarted.sessions[session_id]
+            assert live.task is not None
+            await live.task
+
+            terminal = get_session_admission(restarted.db, admission_id=admission_id)
+            assert terminal['status'] == 'terminal'
+            assert terminal['outcome'] == 'completed'
+            from gateway.session_results import admission_result
+            saved = admission_result(restarted.db, admission_id)
+            assert saved['result']['final_response'] == 'restarted-answer'
+            assert coordinator.status()['active_owner_classes'] == []
+            assert admission_id not in restarted._preservation_handles
+            assert admission_id not in restarted._preservation_children
+        finally:
+            process_ownership.release(home)
+    finally:
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_forward_refuses_a_copied_source_descriptor_before_new_effect(tmp_path, monkeypatch):
+    """A row copied from another producer cannot be replayed by changing its custody witness."""
+    import hashlib
+
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_controls import AuthorityConnection
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state_runtime import RuntimeStoreError, get_session_admission, list_session_admissions
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {
+        'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []},
+    })
+    monkeypatch.setattr(run, '_resolve_gateway_model', lambda _config: 'fixture')
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.adapters = {}
+    runner.session_store = store
+    runner._session_db = store._db
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id='target', instance_id='copy')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
+    authority._schedule = lambda _ref: None
+    conn = AuthorityConnection(authority, SimpleNamespace(write=lambda _frame: None),
+                               {'user_id': 'producer'})
+    params = dict(agent='dev', tenant='team', peer='alice', context_id='copy',
+                  input_id='copied', text='hello')
+    try:
+        created = await conn.dispatch({'id': 1, 'method': 'a2a.forward', 'params': params})
+        assert 'result' in created, created
+        admission_id = created['result']['admission_id']
+        row = get_session_admission(authority.db, admission_id=admission_id)
+        original_source = row['payload']['_automation_custody_v1']['source_identity']
+        payload = dict(row['payload'])
+        payload['_automation_custody_v1'] = dict(payload['_automation_custody_v1'],
+                                                 source_identity='copied-from-foreign-row')
+        encoded = json.dumps(payload, sort_keys=True, separators=(',', ':'))
+        authority.db._execute_write(lambda conn_: conn_.execute(
+            'UPDATE session_admissions SET payload_json=?, payload_digest=? WHERE admission_id=?',
+            (encoded, hashlib.sha256(encoded.encode()).hexdigest(), admission_id)))
+        with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+            await authority._preservation_i09_descriptor_for_row(
+                get_session_admission(authority.db, admission_id=admission_id),
+                source_identity=original_source,
+            )
+        # The public retry also refuses before a second row/effect; the source-owned mismatch is not
+        # converted into a fresh root or a generic permission success.
+        replay = await conn.dispatch({'id': 2, 'method': 'a2a.forward', 'params': params})
+        assert replay['error']['message'] == 'preservation_owner_unmapped'
+        assert len(list_session_admissions(authority.db, session_id=row['target_session_id'],
+                                           pending_only=False)) == 1
+    finally:
+        await conn.close()
+        store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+async def test_forward_replay_while_restarted_claim_is_started_keeps_successor_custody(
+        tmp_path, monkeypatch):
+    """A same-id A2A retry during a restarted started turn reuses its exact successor handle."""
+    from gateway import run
+    from gateway.config import GatewayConfig
+    from gateway.runtime_custody import RuntimeCustodyCoordinator
+    from gateway.session import SessionStore
+    from gateway.session_authority import initialize_session_authority
+    from gateway.session_controls import AuthorityConnection
+    from gateway.session_local_recovery import recover_local_sessions
+    from gateway.runtime_ownership import process_ownership
+    from hermes_cli.backend_retirement import RetirementFence
+    from hermes_state_runtime import get_session_admission
+    from pathlib import Path
+
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {
+        'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []},
+    })
+    monkeypatch.setattr(run, '_resolve_gateway_model', lambda _config: 'fixture')
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def held_provider(_authority, _ref, _row):
+        started.set()
+        await release.wait()
+        return 'restarted-answer'
+
+    monkeypatch.setattr('gateway.session_finite.execute_finite_admission', held_provider)
+    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
+    runner = run.GatewayRunner.__new__(run.GatewayRunner)
+    runner.adapters = {}
+    runner.session_store = store
+    runner._session_db = store._db
+    runner._draining = False
+    authority = await initialize_session_authority(runner, profile_id='target', instance_id='first')
+    runner.runtime_custody = RuntimeCustodyCoordinator(
+        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
+    authority._schedule = lambda _ref: None
+    params = dict(agent='dev', tenant='team', peer='alice', context_id='started-replay',
+                  input_id='same-id', text='hello')
+    first_conn = AuthorityConnection(authority, SimpleNamespace(write=lambda _frame: None),
+                                     {'user_id': 'producer'})
+    try:
+        accepted = await first_conn.dispatch({'id': 1, 'method': 'a2a.forward', 'params': params})
+        assert 'result' in accepted, accepted
+        admission_id = accepted['result']['admission_id']
+        queued = get_session_admission(authority.db, admission_id=admission_id)
+        assert queued['status'] == 'queued'
+        session_id = queued['target_session_id']
+        await first_conn.close()
+
+        home = Path(authority.db.db_path).parent.resolve()
+        process_ownership.reserve([home])
+        try:
+            runner.adapters = {}
+            restarted = await initialize_session_authority(
+                runner, profile_id='target', instance_id='restart', db=authority.db)
+            coordinator = RuntimeCustodyCoordinator(
+                process_instance=restarted.instance_id, authority_epoch=restarted.epoch,
+                fence=RetirementFence())
+            runner.runtime_custody = coordinator
+            recover_local_sessions(restarted, schedule=True)
+            await asyncio.wait_for(started.wait(), timeout=5)
+            executing = get_session_admission(restarted.db, admission_id=admission_id)
+            assert executing['status'] == 'started' and executing['generation'] >= 1
+
+            replay_conn = AuthorityConnection(restarted, SimpleNamespace(write=lambda _frame: None),
+                                              {'user_id': 'producer'})
+            try:
+                replay = await replay_conn.dispatch({'id': 2, 'method': 'a2a.forward', 'params': params})
+                assert 'result' in replay, replay
+                assert replay['result']['admission_id'] == admission_id
+                assert replay['result']['session_id'] == session_id
+            finally:
+                await replay_conn.close()
+
+            release.set()
+            await asyncio.wait_for(restarted.sessions[session_id].task, timeout=10)
+            terminal = get_session_admission(restarted.db, admission_id=admission_id)
+            assert terminal['status'] == 'terminal'
+            assert terminal['outcome'] == 'completed'
+            assert coordinator.status()['active_owner_classes'] == []
+        finally:
+            release.set()
+            process_ownership.release(home)
+    finally:
+        store.close_all_db_handles()

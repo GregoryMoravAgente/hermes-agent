@@ -74,12 +74,25 @@ def sample_memory() -> dict[str, Any]:
     return sample
 
 
-def _read_json(path: Path) -> Optional[dict[str, Any]]:
+def _read_json_status(path: Path) -> tuple[Optional[dict[str, Any]], str]:
+    """Read the lifecycle JSON while preserving absent, malformed, and unreadable states."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None, "absent"
+    except (OSError, UnicodeError):
+        return None, "unreadable"
+    try:
+        data = json.loads(raw)
+    except (TypeError, ValueError):
+        return None, "malformed"
+    if not isinstance(data, dict):
+        return None, "malformed"
+    return data, "ok"
+
+
+def _read_json(path: Path) -> Optional[dict[str, Any]]:
+    return _read_json_status(path)[0]
 
 
 def _write_sentinel(payload: dict[str, Any], home: Optional[Path]) -> None:
@@ -319,7 +332,10 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
     :func:`run_deferred_integrity_check`.  Pass False for the historic INLINE scan.
     """
     evidence: Optional[dict[str, Any]] = None
+    previous_sentinel: Optional[dict[str, Any]] = None
+    previous_status = "absent"
     try:
+        previous_sentinel, previous_status = _read_json_status(get_lifecycle_sentinel_path(home))
         evidence = detect_unclean_exit(home)
         if evidence is not None:
             _report_unclean_exit(evidence, home, defer_integrity_check=defer_integrity_check)
@@ -341,6 +357,26 @@ def record_startup(home: Optional[Path] = None, *, defer_integrity_check: bool =
             claim["prior_unclean_exit"] = True
             if evidence.get("suspected_oom"):
                 claim["prior_suspected_oom"] = True
+        prior_failure = (
+            previous_sentinel.get("lifecycle_record_read_failure")
+            if isinstance(previous_sentinel, dict) else None
+        )
+        if previous_status in {"malformed", "unreadable"}:
+            claim["lifecycle_record_read_failure"] = previous_status
+        elif isinstance(prior_failure, str) and prior_failure in {"malformed", "unreadable"}:
+            claim["lifecycle_record_read_failure"] = prior_failure
+        elif (
+            isinstance(previous_sentinel, dict)
+            and "handoff" in previous_sentinel
+            and not isinstance(previous_sentinel.get("handoff"), dict)
+        ):
+            claim["lifecycle_record_read_failure"] = "malformed"
+        # The lifecycle sentinel is also the cross-process restart journal.  A successor claims
+        # ``phase=running`` before it can read the old process's PID file, so preserve the exact
+        # source-generated handoff instead of erasing the only durable lineage witness.
+        handoff = previous_sentinel.get("handoff") if isinstance(previous_sentinel, dict) else None
+        if isinstance(handoff, dict):
+            claim["handoff"] = handoff
         _write_sentinel(claim, home)
     except Exception:
         logger.debug("Failed to claim lifecycle sentinel", exc_info=True)
@@ -424,6 +460,12 @@ def mark_exited(exit_code: Optional[int] = None, reason: str = "graceful_shutdow
         for key in ("start_time", "create_time"):
             if sentinel is not None and sentinel.get(key) is not None:
                 exited[key] = sentinel[key]
+        handoff = sentinel.get("handoff") if isinstance(sentinel, dict) else None
+        if isinstance(handoff, dict):
+            exited["handoff"] = handoff
+        read_failure = sentinel.get("lifecycle_record_read_failure") if isinstance(sentinel, dict) else None
+        if isinstance(read_failure, str) and read_failure in {"malformed", "unreadable"}:
+            exited["lifecycle_record_read_failure"] = read_failure
         _write_sentinel(exited, home)
     except Exception:
         logger.debug("Failed to mark lifecycle sentinel exited", exc_info=True)

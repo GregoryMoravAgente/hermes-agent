@@ -15,6 +15,8 @@ The order is now: quiesce (bounded) -> close.
 
 import asyncio
 import concurrent.futures
+import sqlite3
+import sys
 import threading
 import time
 from collections import OrderedDict
@@ -33,6 +35,34 @@ class _FakeSessionDB:
 
     def close(self):
         self._events.append(f"close:{self._name}")
+
+
+@pytest.fixture(autouse=True)
+def _source_owned_session_dbs(tmp_path, monkeypatch):
+    """Exercise checked close with real SQLite handles, recording only proven closure."""
+    from hermes_state import SessionDB
+
+    closers = []
+
+    def create(events, name):
+        db = SessionDB(db_path=tmp_path / f"quiesce-{len(closers)}.db")
+        connection = db._conn
+        close = db.close
+        closers.append(close)
+
+        def observed_close():
+            close()
+            with pytest.raises(sqlite3.ProgrammingError):
+                connection.execute("SELECT 1")
+            events.append(f"close:{name}")
+
+        db.close = observed_close
+        return db
+
+    monkeypatch.setattr(sys.modules[__name__], "_FakeSessionDB", create)
+    yield
+    for close in closers:
+        close()
 
 class _FakeGateway:
     """Minimal stand-in with just enough state for ``stop()`` to run."""

@@ -671,13 +671,24 @@ def _resolve_hermes_bin_dir() -> str | None:
 
 
 def _prepend_hermes_bin_dir(existing_path: str) -> str:
-    """Prepend the hermes install dir to ``existing_path`` if missing. A sealed payload's
-    launcher dir moves to the front even when already listed: a login PATH can list
-    another install's ``hermes`` ahead of it."""
+    """Make the Hermes install dir available on ``existing_path``.
+
+    A locally accepted client's declared PATH is authoritative for terminal tools, so
+    the Hermes dir is a fallback there. Remote sessions and local sessions without a
+    client PATH keep the gateway's Hermes-first ordering. A sealed payload still owns
+    the leading entry so its launcher cannot be shadowed by another install.
+    """
     bin_dir = _resolve_hermes_bin_dir()
     if bin_dir and _HERMES_BIN_DIR_IS_PAYLOAD:
         rest = [entry for entry in existing_path.split(os.pathsep) if entry and entry != bin_dir]
         return os.pathsep.join([bin_dir, *rest])
+    if bin_dir:
+        from agent.session_client_env import tool_env
+        if tool_env().get("PATH") is not None:
+            entries = [entry for entry in existing_path.split(os.pathsep) if entry]
+            if bin_dir not in entries:
+                return os.pathsep.join([*entries, bin_dir])
+            return existing_path
     return _prepend_missing_path_entries(existing_path, [bin_dir] if bin_dir else [])
 
 
@@ -1120,6 +1131,35 @@ class LocalEnvironment(BaseEnvironment):
                 # platform, macOS included.
                 from gateway.status import get_process_start_time
                 proc._hermes_pgid_start = get_process_start_time(proc.pid)
+        if stdin_data is not None:
+            _pipe_stdin(proc, stdin_data)
+        return proc
+
+    def _run_bash_with_custody(
+        self, cmd_string: str, *, login: bool = False, timeout: int = 120,
+        stdin_data: str | None = None, launch_transaction=None,
+    ) -> subprocess.Popen:
+        """Use the existing Windows Job primitive for a pre-effect foreground handoff."""
+        if launch_transaction is None or not _IS_WINDOWS:
+            return self._run_bash(cmd_string, login=login, timeout=timeout, stdin_data=stdin_data)
+        bash = _find_bash()
+        if login:
+            cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
+        args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        self._recover_cwd()
+        proc = launch_transaction.launch(
+            args,
+            text=True,
+            env=_make_run_env(self.env),
+            cwd=self.cwd,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            start_new_session=True,
+            creationflags=windows_hide_flags(),
+        )
         if stdin_data is not None:
             _pipe_stdin(proc, stdin_data)
         return proc

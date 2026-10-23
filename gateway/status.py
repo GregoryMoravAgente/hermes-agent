@@ -992,12 +992,10 @@ def acquire_gateway_runtime_lock() -> bool:
     _clear_running_pid_cache()
     return True
 
-def release_gateway_runtime_lock() -> None:
-    """Release only this process's profile reservations, never their lock files."""
-    from gateway.runtime_ownership import process_ownership
-    process_ownership.close()
-    _clear_running_pid_cache()
-
+def release_gateway_runtime_lock():
+    """Consume the typed physical ownership result through the canonical status seam."""
+    from gateway.runtime_ownership import release_runtime_ownership
+    return release_runtime_ownership()
 def owns_gateway_runtime_lock() -> bool:
     from gateway.runtime_ownership import process_ownership
     return process_ownership.owns(_get_process_hermes_home())
@@ -1501,16 +1499,14 @@ def live_gateway_pid_for_home(home: Path) -> Optional[int]:
     return get_runtime_status_running_pid(read_runtime_status(home / "gateway_state.json"), expected_home=home)
 
 
+def remove_pid_file_checked() -> bool:
+    """Consume the typed physical ownership result through the canonical status seam."""
+    from gateway.runtime_ownership import remove_owned_pid_file_checked
+    return remove_owned_pid_file_checked()
+
 def remove_pid_file() -> None:
-    """Remove the PID file only if it belongs to this process: during --replace the old process's
-    atexit can fire AFTER the new process wrote its own record."""
-    with contextlib.suppress(Exception):
-        path = _get_pid_path()
-        file_pid = _pid_from_record(_read_json_file(path))
-        if file_pid is not None and file_pid != os.getpid():
-            return  # Belongs to a different process — leave it alone.
-        path.unlink(missing_ok=True)
-        _clear_running_pid_cache()
+    """Legacy no-return wrapper; callers requiring a clean proof use the checked result."""
+    remove_pid_file_checked()
 
 
 def _process_is_stopped(pid: int) -> bool:

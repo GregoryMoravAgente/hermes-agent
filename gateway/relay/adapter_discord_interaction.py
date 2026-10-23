@@ -101,8 +101,24 @@ class RelayDiscordInteractionMixin:
                     src.chat_name, src.chat_topic = await self._discord_chat_labels_for(
                         str(src.scope_id or ""), src.chat_id)
                     from gateway.session_ingress_context import relay_passthrough_event
+                    from gateway.platforms.webhook_ingress import producer_scope
+                    from gateway.session_ingress_context import capture_provenance
                     with relay_passthrough_event(self._transport, forward, event):
-                        await self.handle_message(event)
+                        # The passthrough reader is a native producer, but it enters through a
+                        # relay-specific callback rather than the ordinary adapter reader.  Enter
+                        # the same authority/profile scope before synchronous classic admission;
+                        # then require the reader-bound relay proof before scheduling work.  A
+                        # forged direct call has no relay callback and is refused by the provenance
+                        # check without reaching handle_message.
+                        runner = getattr(self, "gateway_runner", None)
+                        if getattr(runner, "session_authority", None) is None:
+                            # Lightweight adapter doubles and legacy single-process hosts have
+                            # no authority boundary to enter; retain their existing dispatch.
+                            await self.handle_message(event)
+                        else:
+                            async with producer_scope(self, event):
+                                capture_provenance(runner, event)
+                                await self.handle_message(event)
                     return
             logger.info(
                 "relay passthrough_forward dropped (no handler): platform=%s method=%s path=%s",
@@ -184,7 +200,15 @@ class RelayDiscordInteractionMixin:
             # connector resolved a specific profile for it.
             profile=getattr(forward, "profile", None),
         )
-        event = MessageEvent(text=text, message_type=message_type, source=source)
+        event = MessageEvent(
+            text=text,
+            message_type=message_type,
+            source=source,
+            # Classic custody and the native admission ledger use the normalized event's
+            # provider occurrence id as their request identity. Keep it identical to the
+            # source/session identity carried by the Discord interaction.
+            message_id=source.message_id,
+        )
         if itype == 3:
             # A component press whose custom_id is a Hermes prompt token
             # (hp1:<prompt_id>:<option_id>) becomes a STRUCTURED prompt answer;

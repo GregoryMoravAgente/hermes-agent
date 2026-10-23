@@ -12,6 +12,7 @@ import asyncio
 import pytest
 
 from tests.waiting import async_wait_until
+from tests.gateway.conftest import bind_authority_runtime_custody
 
 
 @pytest.mark.asyncio
@@ -38,6 +39,7 @@ async def test_kanban_wake_during_an_admitted_turn_queues_without_interrupting(m
     adapter.gateway_runner = runner  # as GatewayRunner._create_adapter binds every adapter
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     key = runner.session_store._generate_session_key(source)
@@ -55,9 +57,34 @@ async def test_kanban_wake_during_an_admitted_turn_queues_without_interrupting(m
             running.set()
             await finish.wait()
         captured = execution_result.get()
+        result = {'final_response': 'reply ' + event.text, 'messages': []}
         if captured is not None:
-            captured['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
-        return 'reply ' + event.text
+            captured['result'] = result
+        if event.text == 'A':
+            # The stand-in for the classic messaging turn performs its real transcript and
+            # delivery handoff. The later automation wake is authority-native, not classic.
+            from gateway.session_classic_custody import attach_classic_execution_receipt
+            from gateway.session_classic_delivery import register_classic_post_delivery_callback
+            import time
+            entry = runner.session_store.lookup_by_session_key(quick_key)
+            assert entry is not None
+            timestamp = time.time()
+            event._classic_transcript_write_proofs = (
+                runner.session_store.append_to_transcript(
+                    entry.session_id, {'role': 'user', 'content': event.text,
+                                       'message_id': event.message_id, 'timestamp': timestamp}),
+                runner.session_store.append_to_transcript(
+                    entry.session_id, {'role': 'assistant', 'content': result['final_response'],
+                                       'timestamp': timestamp + 0.001}),
+            )
+            assert all(event._classic_transcript_write_proofs)
+            event._classic_agent_persisted = False
+            receipt = attach_classic_execution_receipt(runner, event, entry, result)
+            assert receipt is not None
+            register_classic_post_delivery_callback(
+                runner, authority, adapter, event, source, quick_key,
+                result['final_response'], receipt, run_generation)
+        return result['final_response']
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
 
     await adapter.handle_message(MessageEvent(text='A', source=source, message_id='A'))
@@ -107,6 +134,7 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
     monkeypatch.setattr(adapter, 'send', send)
     runner.adapters = {Platform.DISCORD: adapter}
     authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    bind_authority_runtime_custody(runner, authority)
     runner._wire_adapter_handlers(adapter)
     source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
     key = runner.session_store._generate_session_key(source)

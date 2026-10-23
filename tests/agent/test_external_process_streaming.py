@@ -8,6 +8,33 @@ from agent.turn_api_call import _should_stream
 from providers.base import ProviderProfile
 
 
+@pytest.fixture
+def standalone_external_policy(tmp_path):
+    """Give the synthetic process provider the same authenticated owner as production."""
+    from gateway.runtime_service_operations import (
+        close_after_finalizers,
+        policy_for_parent,
+        reserve_standalone_external_process_parent,
+    )
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        with reserve_standalone_external_process_parent(
+            profile_home=tmp_path,
+            profile_id=str(tmp_path),
+            operation_id="streaming-fixture",
+            source_identity="streaming-fixture",
+            profile_db=db, producer_key="provider",
+        ) as parent:
+            policy = policy_for_parent(parent, mode="standalone_maintenance")
+            yield db, policy
+            if parent.state != "terminal":
+                assert close_after_finalizers(parent) is True
+    finally:
+        db.close()
+
+
 def test_streaming_capability_preserves_positional_plugin_construction():
     from dataclasses import dataclass, fields
     from typing import Any
@@ -47,7 +74,9 @@ def test_external_process_can_opt_into_streaming(monkeypatch, auth, capability, 
     assert _should_stream(agent) is expected
 
 
-def test_discovered_process_provider_delivers_progress_before_completion(tmp_path, monkeypatch):
+def test_discovered_process_provider_delivers_progress_before_completion(
+    tmp_path, monkeypatch, standalone_external_policy,
+):
     """A buffered call deadlocks this handshake; the real streaming consumer releases it.
 
     Load a process profile through the user-plugin registry in an isolated home,
@@ -110,10 +139,12 @@ def test_discovered_process_provider_delivers_progress_before_completion(tmp_pat
             closed.append(True)
 
     monkeypatch.setattr(profile, "create_client", lambda **kwargs: FixtureClient())
+    session_db, process_policy = standalone_external_policy
     agent = AIAgent(
         provider=profile.name, model="fixture-model", api_key="fixture", base_url=profile.base_url,
         enabled_toolsets=[], quiet_mode=True, skip_context_files=True, skip_memory=True,
-        save_trajectories=False,
+        save_trajectories=False, session_id="streaming-fixture-session", session_db=session_db,
+        external_process_policy=process_policy,
     )
     agent.reasoning_callback = lambda text: progress_seen.set()
     kwargs = {"model": agent.model, "messages": [{"role": "user", "content": "fixture"}]}
