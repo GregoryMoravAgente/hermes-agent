@@ -30,6 +30,7 @@ class _TerminalSlot:
         self.ready = threading.Event()
         self.release = threading.Event()
         self.future: Any = None
+        self.lease: Any = None
         self.tids = []
         self.preparing = False
         self.args = None
@@ -111,9 +112,14 @@ class _TerminalBatch:
 
     def start(self):
         from agent.tool_executor import _resolve_sequential_tool_timeout
+        from agent.tool_worker_custody import admit_tool_worker, submit_tool_worker
         for slot in self.slots:
             slot.check_cancelled()
-            slot.future = self.executor.submit(propagate_context_to_thread(slot.run))
+            # Admission happens on the submitting turn before the prepared worker
+            # enters the pool.  A cancelled/ambiguous handoff keeps this exact slot
+            # retained until its body/finalizers settle.
+            slot.lease = admit_tool_worker(self.agent, "prepared-terminal")
+            slot.future = submit_tool_worker(self.executor, slot.lease, slot.run)
             timeout = _resolve_sequential_tool_timeout()
             started = time.monotonic()
             baseline = self.authorization_gate.excluded_seconds()
@@ -145,8 +151,10 @@ class _TerminalBatch:
             slot.release.set()
             if slot.future is not None and not slot.future.done():
                 _interrupt_worker_tids(self.agent, slot.tids)
-                slot.future.cancel()
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        # Do not cancel accepted queue items.  Their release event lets a queued
+        # preparation finish as a cancelled body, while the exact custody handle
+        # remains visible to authority retirement until that settlement.
+        self.executor.shutdown(wait=False, cancel_futures=False)
 
 
 def prepare_current_terminal(ref):

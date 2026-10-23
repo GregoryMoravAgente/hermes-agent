@@ -9,6 +9,7 @@ import json
 import os
 import threading
 import time
+from contextlib import nullcontext
 from tools.delegation_redaction import redact_child_result, redact_child_text
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Any, Dict, List, Optional
@@ -25,6 +26,19 @@ from tools.delegate_tool_results import (
 )
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
+
+
+def _tool_worker_parent_context(child: Any):
+    """Re-bind the exact registered gateway parent while a child runs.
+
+    The dispatch pool copies ContextVars, but a delegated child can be entered
+    from a relay or retry path that has no copied custody context.  The builder
+    records the source-owned opaque parent; it is re-used here, never inferred
+    from a caller name or a sibling agent.
+    """
+    from agent.tool_worker_custody import bind_tool_worker_parent, tool_worker_parent_for
+    parent = tool_worker_parent_for(child)
+    return bind_tool_worker_parent(parent) if parent is not None else nullcontext()
 
 def _num(value: Any, default: int = 0) -> int:
     """int() for counters that may be mocks/None on test doubles."""
@@ -497,11 +511,12 @@ def _validate_child_output_schema(
         # Same identity as the main child turn: this runs on the parent worker's thread, and an
         # unmarked turn is misread as the dispatcher-owned worker by every HERMES_KANBAN_* gate.
         from agent.delegation_context import delegated_child_context
-        with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-            _retry_result = child.run_conversation(
-                user_message=build_retry_message(_schema_errors), task_id=child_task_id,
-                stream_callback=relay_child_text,
-            )
+        with _tool_worker_parent_context(child):
+            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                _retry_result = child.run_conversation(
+                    user_message=build_retry_message(_schema_errors), task_id=child_task_id,
+                    stream_callback=relay_child_text,
+                )
     except Exception as _retry_exc:
         logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
     if isinstance(_retry_result, dict):
@@ -857,10 +872,11 @@ class _ChildRun:
         def _run_with_thread_capture():
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
-            with delegated_child_context(str(getattr(child, "session_id", "") or "")):
-                return child.run_conversation(
-                    user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
-                )
+            with _tool_worker_parent_context(child):
+                with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                    return child.run_conversation(
+                        user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    )
 
         future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
