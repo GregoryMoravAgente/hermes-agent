@@ -19,12 +19,21 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
+from time import monotonic as _monotonic
 from typing import Any, Callable
 from urllib.parse import quote
 
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 from agent.secret_scope import get_secret
 from agent.file_safety import raise_if_read_blocked
+from plugins.memory._retirement import (
+    ProviderIdentity,
+    new_identity,
+    receipt_reason,
+    retirement_result,
+    thread_is_closed,
+    watch_thread_until_closed,
+)
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
@@ -32,6 +41,7 @@ logger = logging.getLogger(__name__)
 _DEFAULT_BASE_URL = "https://api.retaindb.com"
 _ASYNC_SHUTDOWN = object()
 _TEXT_EXTS = (".txt", ".md", ".json", ".csv", ".yaml", ".yml", ".xml", ".html")
+_RETIREMENT_WAIT_S = 10.0
 
 
 def _load_retaindb_config() -> dict[str, Any]:
@@ -184,19 +194,70 @@ class _Client:
 class _WriteQueue:
     """SQLite-backed async write queue. Survives crashes — pending rows replay on startup."""
 
-    def __init__(self, client: _Client, db_path: Path):
+    def __init__(self, client: _Client, db_path: Path,
+                 *, on_constructed: Callable[[_WriteQueue], None] | None = None):
         self._client, self._db_path, self._q = client, db_path, queue.Queue()
-        self._thread = spawn_context_thread(self._loop, name="retaindb-writer")
-        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._thread: threading.Thread | None = None
         self._local = threading.local()  # one cached connection per thread, all tracked in _connections
         self._connections: set[sqlite3.Connection] = set()
         self._connections_lock, self._shutdown_lock, self._shutdown = threading.Lock(), threading.Lock(), False
+        self._condition = threading.Condition()
+        self._retiring = False
+        self._retirement_stop_requested = False
+        self._hard_released = False
+        self._active_flushes = 0
+        self._failed_rows: set[int] = set()
+        # A writer launch can fail before a thread exists or after a wrapper has published an
+        # unstarted thread. Keep the exact queue object and its SQLite handles so hard retirement
+        # can report UNKNOWN and retry on the same source-owned queue.
+        self._worker_start_failure: str | None = None
+        # Publish before any filesystem, SQLite, or worker operation can fail. The owning provider
+        # must retain this exact object and every native handle it acquired for cleanup/retry.
+        if on_constructed is not None:
+            on_constructed(self)
+        db_path.parent.mkdir(parents=True, exist_ok=True)
         conn = self._execute("CREATE TABLE IF NOT EXISTS pending (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT, "
                              "session_id TEXT, messages_json TEXT, created_at TEXT, last_error TEXT)").connection
-        self._thread.start()
+        self._start_worker(name="retaindb-writer", raise_on_failure=True)
         replay = conn.execute("SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200").fetchall()
         for row_id, user_id, session_id, msgs_json in replay:  # rows left from a previous crash
             self._q.put((row_id, user_id, session_id, json.loads(msgs_json)))
+
+    def _start_worker(self, *, name: str, raise_on_failure: bool) -> threading.Thread | None:
+        """Start one exact queue worker and classify pre-start versus ambiguous failures.
+
+        ``Thread.start`` may raise after the native target has begun. In that case the target
+        owns the queue admission and the caller must join/reconcile it from source state. A
+        factory or pre-start failure has no worker custody, so the queue retains a structured
+        failure and a later hard-retire attempt may retry on this same queue.
+        """
+        worker_started = threading.Event()
+        thread: threading.Thread | None = None
+        # A previous retry may have recorded a pre-start failure.  Every new launch is a
+        # fresh source observation: clear that marker before attempting it, then restore it
+        # only when this attempt is proven pre-start.  An ambiguous start must be reconciled
+        # from the exact worker/row state rather than inheriting an old failure.
+        self._worker_start_failure = None
+
+        def _run_worker() -> None:
+            worker_started.set()
+            self._loop()
+
+        try:
+            thread = spawn_context_thread(_run_worker, name=name)
+            self._thread = thread
+            thread.start()
+        except BaseException:
+            launched = thread is not None and (
+                worker_started.is_set() or getattr(thread, "ident", None) is not None
+            )
+            if not launched:
+                self._worker_start_failure = "worker_start_failed"
+            if raise_on_failure:
+                raise
+            return thread
+        self._worker_start_failure = None
+        return thread
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -212,57 +273,227 @@ class _WriteQueue:
         cur.connection.commit()
         return cur
 
-    def _close(self, *conns: sqlite3.Connection) -> None:
+    def _close(self, *conns: sqlite3.Connection, strict: bool = False) -> int:
+        failures = 0
         for conn in conns:
+            try:
+                conn.close()
+            # health: allow BLE001 -- SQLite handles may expose driver-specific close failures; hard custody retains them
+            except Exception:
+                failures += 1
+                if not strict:
+                    with self._connections_lock:
+                        self._connections.discard(conn)
+                continue
             with self._connections_lock:
                 self._connections.discard(conn)
-            with suppress(Exception):
-                conn.close()
+            if getattr(self._local, "conn", None) is conn:
+                self._local.conn = None
+        return failures
 
-    def _close_thread_conn(self) -> None:
+    def _close_thread_conn(self, *, strict: bool = False) -> None:
         conn, self._local.conn = getattr(self._local, "conn", None), None
-        self._close(*([conn] if conn is not None else []))
+        self._close(*([conn] if conn is not None else []), strict=strict)
 
-    def enqueue(self, user_id: str, session_id: str, messages: list) -> None:
+    def enqueue(self, user_id: str, session_id: str, messages: list) -> bool:
         now = datetime.now(UTC).isoformat()
         with self._shutdown_lock:
-            if self._shutdown:
-                return
+            if self._shutdown or self._retiring:
+                return False
             cur = self._execute("INSERT INTO pending (user_id, session_id, messages_json, created_at) VALUES (?,?,?,?)",
                                 (user_id, session_id, json.dumps(messages, ensure_ascii=False), now))
             self._q.put((cur.lastrowid, user_id, session_id, messages))
+            return True
 
     def _flush_row(self, row_id: int, user_id: str, session_id: str, messages: list) -> None:
         try:
             self._client.ingest_session(user_id, session_id, messages)
             self._execute("DELETE FROM pending WHERE id = ?", (row_id,))
+            with self._condition:
+                self._failed_rows.discard(row_id)
+        # health: allow BLE001 -- SQLite/JSON state inspection must fail closed during hard retirement
         except Exception as exc:
             logger.warning("RetainDB ingest failed (will retry): %s", exc)
-            self._execute("UPDATE pending SET last_error = ? WHERE id = ?", (str(exc), row_id))
+            with self._condition:
+                self._failed_rows.add(row_id)
+            with suppress(Exception):
+                self._execute("UPDATE pending SET last_error = ? WHERE id = ?", (str(exc), row_id))
             time.sleep(2)
 
     def _loop(self) -> None:
         try:
             while (item := self._q.get()) is not _ASYNC_SHUTDOWN:
+                with self._condition:
+                    self._active_flushes += 1
                 try:
                     self._flush_row(*item)
                 except Exception as exc:
                     logger.error("RetainDB writer error: %s", exc)
+                finally:
+                    with self._condition:
+                        self._active_flushes = max(0, self._active_flushes - 1)
+                        self._condition.notify_all()
         finally:
-            self._close_thread_conn()  # sqlite3 connections must close on their owning thread
+            # Keep a failed native close in the shared census so provider shutdown can retry the
+            # exact handle from the owner; dropping it here would fabricate a clean close.
+            self._close_thread_conn(strict=True)  # sqlite3 connections must close on their owning thread
+            with self._condition:
+                self._condition.notify_all()
 
-    def shutdown(self) -> None:
+    def _pending_rows(self) -> list[tuple[int, str, str, list]] | None:
+        try:
+            rows = self._get_conn().execute(
+                "SELECT id, user_id, session_id, messages_json FROM pending ORDER BY id ASC LIMIT 200"
+            ).fetchall()
+            return [(row_id, user_id, session_id, json.loads(messages_json))
+                    for row_id, user_id, session_id, messages_json in rows]
+        # health: allow BLE001 -- SQLite state inspection must fail closed during hard retirement
+        except Exception as exc:
+            logger.warning("RetainDB pending-row inspection failed: %s", exc)
+            return None
+
+    def _pending_count(self) -> int | None:
+        try:
+            return int(self._get_conn().execute("SELECT COUNT(*) FROM pending").fetchone()[0])
+        # health: allow BLE001 -- optional RetainDB seed boundary must retain provider custody on any failure
+        except Exception as exc:
+            logger.warning("RetainDB pending-row count failed: %s", exc)
+            return None
+
+    def _connection_count(self) -> int:
+        with self._connections_lock:
+            return len(self._connections)
+
+    @staticmethod
+    def _thread_is_alive(thread: threading.Thread | None) -> bool:
+        checker = getattr(thread, "is_alive", None)
+        return bool(checker is not None and checker())
+
+    def begin_retirement(self) -> None:
+        """Close new queue admission while allowing already queued rows to drain."""
         with self._shutdown_lock:
-            if self._shutdown:
+            if self._shutdown or self._hard_released:
                 return
+            self._retiring = True
+            if not self._retirement_stop_requested:
+                self._q.put(_ASYNC_SHUTDOWN)
+                self._retirement_stop_requested = True
+
+    def _start_retry_worker_locked(self) -> None:
+        """Replay durable rows on the same queue object after an unresolved attempt."""
+        if self._shutdown or self._hard_released:
+            return
+        thread = getattr(self, "_thread", None)
+        if self._thread_is_alive(thread):
+            return
+        rows = self._pending_rows()
+        if rows is None or not rows:
+            self._retirement_stop_requested = False
+            return
+        self._q = queue.Queue()
+        for row in rows:
+            self._q.put(row)
+        self._retirement_stop_requested = False
+        self._start_worker(name="retaindb-writer-retry", raise_on_failure=False)
+
+    def hard_retire(self, timeout: float = _RETIREMENT_WAIT_S) -> dict[str, object]:
+        """Drain this exact queue and close handles only after durable work is settled."""
+        with self._shutdown_lock:
+            if self._hard_released:
+                return {"status": "released", "pending_write_count": 0,
+                        "pending_flush_count": 0, "close_failure_count": 0,
+                        "active_store_count": 0, "reason": "released"}
+            if self._shutdown:
+                return {"status": "unknown", "pending_write_count": 0,
+                        "pending_flush_count": 0, "close_failure_count": 1,
+                        "active_store_count": max(1, self._connection_count()), "reason": "close_failed"}
+            self._retiring = True
+            thread = getattr(self, "_thread", None)
+            if not self._thread_is_alive(thread):
+                self._start_retry_worker_locked()
+                thread = getattr(self, "_thread", None)
+            launch_failure = self._worker_start_failure
+            if self._thread_is_alive(thread) and not self._retirement_stop_requested:
+                self._q.put(_ASYNC_SHUTDOWN)
+                self._retirement_stop_requested = True
+
+        if launch_failure:
+            pending = self._pending_count()
+            return {
+                "status": "unknown",
+                "pending_write_count": pending if pending is not None else 0,
+                "pending_flush_count": 1,
+                "close_failure_count": 0,
+                "active_store_count": max(1, self._connection_count()),
+                "reason": launch_failure,
+            }
+
+        if self._thread_is_alive(thread):
+            thread.join(timeout=max(0.0, timeout))
+            if self._thread_is_alive(thread):
+                pending = self._pending_count()
+                return {
+                    "status": "unknown",
+                    "pending_write_count": pending if pending is not None else 0,
+                    "pending_flush_count": max(1, self._active_flushes),
+                    "close_failure_count": 0,
+                    "active_store_count": max(1, self._connection_count()),
+                    "reason": "pending_flush",
+                }
+
+        pending = self._pending_count()
+        if pending is None:
+            return {"status": "unknown", "pending_write_count": 0,
+                    "pending_flush_count": 0, "close_failure_count": 0,
+                    "active_store_count": max(1, self._connection_count()), "reason": "pending_catch_up"}
+        if pending:
+            with self._shutdown_lock:
+                self._retirement_stop_requested = False
+            return {"status": "unknown", "pending_write_count": pending,
+                    "pending_flush_count": 0, "close_failure_count": 0,
+                    "active_store_count": max(1, self._connection_count()), "reason": "pending_catch_up"}
+
+        with self._connections_lock:
+            connections = list(self._connections)
+        close_failures = self._close(*connections, strict=True)
+        if close_failures:
+            return {"status": "unknown", "pending_write_count": 0,
+                    "pending_flush_count": 0, "close_failure_count": close_failures,
+                    "active_store_count": max(1, self._connection_count()), "reason": "close_failed"}
+
+        with self._shutdown_lock:
+            self._hard_released = True
             self._shutdown = True
-            self._q.put(_ASYNC_SHUTDOWN)
-        self._close_thread_conn()  # caller thread owns the connection opened in __init__
-        self._thread.join(timeout=10)
-        if not self._thread.is_alive():  # exited executor workers may have left tracked handles (check_same_thread=False)
+        return {"status": "released", "pending_write_count": 0,
+                "pending_flush_count": 0, "close_failure_count": 0,
+                "active_store_count": 0, "reason": "released"}
+
+    def shutdown(self) -> bool:
+        with self._shutdown_lock:
+            if self._hard_released:
+                return True
+            if self._retiring and not self._hard_released:
+                return False
+            if not self._shutdown:
+                self._shutdown = True
+                self._q.put(_ASYNC_SHUTDOWN)
+        # Keep a caller-owned handle in the exact queue when native close fails.  Dropping it
+        # from the census would let a failed initializer or ambiguous worker look closed.
+        self._close_thread_conn(strict=True)  # caller thread owns the connection opened in __init__
+        thread = self._thread
+        if thread is not None and thread.ident is not None:
+            thread.join(timeout=10)
+        if self._thread_is_alive(thread):
+            # The sentinel was accepted, but the native client may still be in flight.  Keep
+            # the exact queue and every handle for the next bounded cleanup attempt.
+            return False
+        if thread is None or thread.ident is None or not thread.is_alive():
+            # A constructor/start failure may leave a published partial queue with no started
+            # worker. Its exact connection set still belongs to this queue and must be closed here.
             with self._connections_lock:
                 stragglers = list(self._connections)
-            self._close(*stragglers)
+            self._close(*stragglers, strict=True)
+        return self._connection_count() == 0
 
 
 def _compact(s: str) -> str:
@@ -311,6 +542,18 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._lock = threading.Lock()  # guards the prefetch caches below
         self._context_result, self._dialectic_result, self._agent_model = "", "", {}
         self._prefetch_threads: list[threading.Thread] = []  # tracked so rapid turns don't pile up threads
+        self._soul_thread: threading.Thread | None = None
+        self._retirement_condition = threading.Condition()
+        self._retirement_mutex = threading.Lock()
+        self._retirement_identity = ProviderIdentity("", "", "")
+        self._retirement_active_calls = 0
+        self._retirement_threads: set[threading.Thread] = set()
+        self._retirement_failures = 0
+        self._retiring = False
+        self._released = False
+        self._retirement_in_progress = False
+        self._retirement_initializing = False
+        self._retirement_initialization_failed = False
 
     @property
     def name(self) -> str:
@@ -337,17 +580,182 @@ class RetainDBMemoryProvider(MemoryProvider):
         if not project:
             profile_name = os.path.basename(str(kwargs.get("hermes_home", "")))
             project = f"hermes-{profile_name}" if profile_name not in {"", ".hermes"} else "default"
-        self._client = _Client(get_secret("RETAINDB_API_KEY", "") or "", base_url, project)
-        self._session_id, self._user_id = session_id, kwargs.get("user_id", "default") or "default"
-        self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
         # Bind to the profile the manager names, not the ambient one (multiplexing contract, MemoryProvider).
         from hermes_constants import get_hermes_home
         home = Path(kwargs["hermes_home"]) if kwargs.get("hermes_home") else get_hermes_home()
-        self._queue = _WriteQueue(self._client, home / "retaindb_queue.db")
-        soul = (home / "SOUL.md").read_text(encoding="utf-8-sig", errors="replace").strip() if (home / "SOUL.md").exists() else ""
-        if soul:  # seed agent identity from SOUL.md in background
-            seed = lambda: self._client.seed_agent_identity(self._agent_id, soul, source="soul_md")
-            spawn_context_thread(_quiet, args=("soul seed", seed), name="retaindb-soul-seed").start()
+        with self._retirement_condition:
+            if (self._retirement_active_calls or self._retirement_in_progress or self._retiring or self._released
+                    or self._client is not None or self._queue is not None):
+                raise RuntimeError("RetainDB cannot be reinitialized while its provider state is owned")
+            self._retirement_identity = new_identity("retaindb", home)
+            # Keep the source-owned incarnation visible for custody while client, SQLite queue,
+            # and optional SOUL startup work are still being constructed.
+            self._retirement_initializing = True
+            self._retirement_active_calls += 1
+            self._retirement_failures = 0
+            self._retirement_initialization_failed = False
+        try:
+            self._client = _Client(get_secret("RETAINDB_API_KEY", "") or "", base_url, project)
+            self._session_id, self._user_id = session_id, kwargs.get("user_id", "default") or "default"
+            self._agent_id = kwargs.get("agent_id", "hermes") or "hermes"
+            def _publish_queue(queue_obj: _WriteQueue) -> None:
+                with self._retirement_condition:
+                    self._queue = queue_obj
+
+            self._queue = _WriteQueue(
+                self._client, home / "retaindb_queue.db", on_constructed=_publish_queue,
+            )
+            soul = (home / "SOUL.md").read_text(encoding="utf-8-sig", errors="replace").strip() if (home / "SOUL.md").exists() else ""
+            if soul:  # seed agent identity from SOUL.md in background
+                seed = lambda: self._client.seed_agent_identity(self._agent_id, soul, source="soul_md")
+                self._soul_thread = self._spawn_provider_thread(
+                    lambda: self._run_seed(seed), name="retaindb-soul-seed",
+                )
+        except BaseException:
+            with self._retirement_condition:
+                self._retirement_initialization_failed = True
+            raise
+        finally:
+            with self._retirement_condition:
+                self._retirement_initializing = False
+                self._retirement_active_calls = max(0, self._retirement_active_calls - 1)
+                self._retirement_condition.notify_all()
+
+    def retirement_receipt(self) -> dict[str, str]:
+        """Return the source-owned profile and provider incarnation identity."""
+        with self._retirement_condition:
+            return self._retirement_identity.as_mapping()
+
+    def _begin_call(self) -> bool:
+        with self._retirement_condition:
+            if self._retiring or self._released:
+                return False
+            self._retirement_active_calls += 1
+            return True
+
+    def _finish_call(self, *, failed: bool = False, thread: threading.Thread | None = None) -> None:
+        watch = False
+        with self._retirement_condition:
+            if failed:
+                self._retirement_failures += 1
+            self._retirement_active_calls = max(0, self._retirement_active_calls - 1)
+            if thread is not None:
+                if thread_is_closed(thread):
+                    self._retirement_threads.discard(thread)
+                else:
+                    watch = True
+            self._retirement_condition.notify_all()
+        if watch and thread is not None:
+            def _drop_thread() -> None:
+                with self._retirement_condition:
+                    self._retirement_threads.discard(thread)
+                    self._retirement_condition.notify_all()
+            watch_thread_until_closed(thread, _drop_thread)
+
+    def _run_seed(self, seed: Callable[[], Any]) -> bool:
+        try:
+            result = seed()
+            return result is not None
+        # health: allow BLE001 -- optional RetainDB seed boundary must retain provider custody on any failure
+        except Exception as exc:
+            logger.debug("RetainDB soul seed failed: %s", exc)
+            return False
+
+    def _spawn_provider_thread(self, target: Callable[[], Any], *, name: str) -> threading.Thread | None:
+        """Admit a provider-owned worker before starting it so retirement cannot miss the race."""
+        with self._retirement_condition:
+            # A worker created by an initializer is part of that already-admitted startup
+            # operation. Once startup has begun, retirement may close new external admission
+            # but must not silently skip the initializer's own SOUL seed.
+            if (self._retiring and not self._retirement_initializing) or self._released:
+                return None
+            self._retirement_active_calls += 1
+
+        finish_lock = threading.Lock()
+        finished = False
+        worker_started = threading.Event()
+
+        def _finish_once(*, failed: bool, thread: threading.Thread | None = None) -> None:
+            nonlocal finished
+            with finish_lock:
+                if finished:
+                    return
+                finished = True
+            self._finish_call(failed=failed, thread=thread)
+
+        thread: threading.Thread | None = None
+
+        def _work() -> None:
+            failed = False
+            try:
+                worker_started.set()
+                failed = target() is False
+            # health: allow BLE001 -- provider worker boundary must retain accepted worker custody on any failure
+            except Exception as exc:
+                failed = True
+                logger.debug("RetainDB worker %s failed: %s", name, exc)
+            finally:
+                _finish_once(failed=failed, thread=thread if thread is not None else threading.current_thread())
+
+        try:
+            thread = spawn_context_thread(_work, name=name)
+            with self._retirement_condition:
+                self._retirement_threads.add(thread)
+            thread.start()
+        except BaseException:
+            # A custom start wrapper may raise after launching the target. In that ambiguous
+            # case the worker's finally owns the lease; only an unstarted object is released here.
+            if thread is None or (not worker_started.is_set() and getattr(thread, "ident", None) is None):
+                _finish_once(failed=True, thread=thread)
+            raise
+        return thread
+
+    def _join_retirement_threads(self, timeout: float) -> bool:
+        """Join every admitted provider worker within one bounded custody window.
+
+        Initialization can admit a SOUL seed before the provider has a usable queue, and
+        prefetch workers can be admitted after the queue exists.  Both workers retain the
+        provider's native client and must settle before shutdown drops that client.  A worker
+        that is still live, or whose finish callback has not released its lease, keeps the
+        provider reachable for a later cleanup attempt.
+        """
+        deadline = _monotonic() + max(0.0, timeout)
+        current = threading.current_thread()
+        while True:
+            with self._retirement_condition:
+                threads = tuple(self._retirement_threads)
+                if not threads:
+                    return True
+            for thread in threads:
+                if thread is current:
+                    return False
+                if thread_is_closed(thread):
+                    with self._retirement_condition:
+                        self._retirement_threads.discard(thread)
+                    continue
+                remaining = deadline - _monotonic()
+                if remaining <= 0:
+                    return False
+                try:
+                    thread.join(timeout=remaining)
+                except RuntimeError as exc:
+                    # An unstarted or otherwise unusable worker remains admitted and therefore
+                    # cannot be treated as settled by dropping the provider client.
+                    logger.warning("RetainDB provider worker join failed: %s", exc)
+                    return False
+                if thread_is_closed(thread):
+                    with self._retirement_condition:
+                        self._retirement_threads.discard(thread)
+                else:
+                    return False
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                with self._retirement_condition:
+                    return not self._retirement_threads
+            with self._retirement_condition:
+                if not self._retirement_threads:
+                    return True
+                self._retirement_condition.wait(min(0.05, remaining))
 
     def system_prompt_block(self) -> str:
         project = self._client.project if self._client else "retaindb"
@@ -356,6 +764,9 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Fire context + dialectic + agent model prefetches in background (turn-end); prefetch() consumes them next turn."""
+        with self._retirement_condition:
+            if self._retiring or self._released or not self._client:
+                return
         if not self._client:
             return
         for t in self._prefetch_threads:  # wait for the previous batch so threads don't accumulate on rapid turns
@@ -369,10 +780,15 @@ class RetainDBMemoryProvider(MemoryProvider):
                 self._client.ask_user(self._user_id, query, reasoning_level=self._reasoning_level(query)).get("answer") or "") or None),
             ("retaindb-agent-model", "agent model", "_agent_model", lambda: self._agent_model_or_none(self._client.get_agent_model(self._agent_id))),
         )
-        self._prefetch_threads = [spawn_context_thread(self._store, args=(label, attr, fetch), name=name)
-                                  for name, label, attr, fetch in jobs]
-        for t in self._prefetch_threads:
-            t.start()
+        threads = []
+        for name, label, attr, fetch in jobs:
+            thread = self._spawn_provider_thread(
+                lambda label=label, attr=attr, fetch=fetch: self._store(label, attr, fetch),
+                name=name,
+            )
+            if thread is not None:
+                threads.append(thread)
+        self._prefetch_threads = threads
 
     def _context_overlay(self, query: str) -> dict:
         query_result = self._client.query_context(self._user_id, self._session_id, query)
@@ -382,12 +798,18 @@ class RetainDBMemoryProvider(MemoryProvider):
     def _agent_model_or_none(model: dict) -> dict | None:
         return model if model.get("memory_count", 0) > 0 else None
 
-    def _store(self, label: str, attr: str, fetch: Callable[[], Any]) -> None:
+    def _store(self, label: str, attr: str, fetch: Callable[[], Any]) -> bool:
         """Run one prefetch job; cache its value under the lock unless None (failures log at debug)."""
-        value = _quiet(f"{label} prefetch", fetch)
+        try:
+            value = fetch()
+        # health: allow BLE001 -- optional RetainDB prefetch boundary must retain provider custody on any failure
+        except Exception as exc:
+            logger.debug("RetainDB %s prefetch failed: %s", label, exc)
+            return False
         if value is not None:
             with self._lock:
                 setattr(self, attr, value)
+        return True
 
     @staticmethod
     def _reasoning_level(query: str) -> str:
@@ -405,12 +827,19 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         """Queue turn for async ingest. Returns immediately."""
-        if not self._queue or not user_content:
+        if not self._queue or not user_content or not self._begin_call():
             return
         now = datetime.now(UTC).isoformat()
-        self._queue.enqueue(self._user_id, session_id or self._session_id,
-                            [{"role": "user", "content": user_content, "timestamp": now},
-                             {"role": "assistant", "content": assistant_content, "timestamp": now}])
+        failed = False
+        try:
+            self._queue.enqueue(self._user_id, session_id or self._session_id,
+                                [{"role": "user", "content": user_content, "timestamp": now},
+                                 {"role": "assistant", "content": assistant_content, "timestamp": now}])
+        except Exception:
+            failed = True
+            raise
+        finally:
+            self._finish_call(failed=failed)
 
     def get_tool_schemas(self) -> list[dict[str, Any]]:
         return list(_SCHEMAS)
@@ -418,10 +847,17 @@ class RetainDBMemoryProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
         if not self._client:
             return tool_error("RetainDB not initialized")
+        if not self._begin_call():
+            return tool_error("RetainDB retirement is in progress")
+        failed = False
         try:
             return json.dumps(self._dispatch(tool_name, args))
+        # health: allow BLE001 -- optional RetainDB write boundary must retain provider custody on any failure
         except Exception as exc:
+            failed = True
             return tool_error(str(exc))
+        finally:
+            self._finish_call(failed=failed)
 
     def _dispatch(self, tool_name: str, args: dict) -> Any:
         required, handler = _TOOLS.get(tool_name, (None, None))
@@ -459,17 +895,119 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
         """Mirror built-in memory writes to RetainDB."""
-        if action != "add" or not content or not self._client:
+        if action != "add" or not content or not self._client or not self._begin_call():
             return
-        _quiet("memory mirror", lambda: self._client.add_memory(
-            self._user_id, self._session_id, content, memory_type="preference" if target == "user" else "factual"))
+        failed = False
+        try:
+            self._client.add_memory(
+                self._user_id, self._session_id, content,
+                memory_type="preference" if target == "user" else "factual",
+            )
+        # health: allow BLE001 -- optional RetainDB write boundary must retain provider custody on any failure
+        except Exception as exc:
+            failed = True
+            logger.debug("RetainDB memory mirror failed: %s", exc)
+        finally:
+            self._finish_call(failed=failed)
+
+    def retire(self, receipt: dict[str, str] | None = None) -> dict[str, object]:
+        """Drain accepted RetainDB workers and durable rows on this exact provider instance."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+        requested, reason = receipt_reason(receipt, current)
+        if reason is not None:
+            return retirement_result(requested, status="unknown", reason=reason)
+
+        if not self._retirement_mutex.acquire(blocking=False):
+            return retirement_result(current, status="unknown", reason="retirement_in_progress")
+        try:
+            with self._retirement_condition:
+                # Initialization may replace the provider identity while the first receipt
+                # check is outside this mutex. Revalidate under the fence before touching
+                # _retiring, the queue, or the client for this attempt.
+                current = self._retirement_identity
+                if current != requested:
+                    mismatch = "foreign_receipt" if (
+                        current.provider != requested.provider or current.home_id != requested.home_id
+                    ) else "stale_receipt"
+                    return retirement_result(requested, status="unknown", reason=mismatch)
+                if self._retirement_initialization_failed:
+                    return retirement_result(current, status="unknown", reason="store_open_failed")
+                if self._released:
+                    return retirement_result(current, status="released", reason="released")
+                self._retiring = True
+                self._retirement_in_progress = True
+                deadline = time.monotonic() + _RETIREMENT_WAIT_S
+                queue_obj = None
+                while self._retirement_active_calls:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return retirement_result(
+                            current, status="unknown", reason="pending_flush",
+                            pending_flush_count=self._retirement_active_calls,
+                        )
+                    self._retirement_condition.wait(remaining)
+                queue_obj = self._queue
+            if queue_obj is None:
+                return retirement_result(current, status="unknown", reason="not_initialized")
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._join_retirement_threads(remaining):
+                with self._retirement_condition:
+                    pending = max(1, len(self._retirement_threads))
+                return retirement_result(
+                    current, status="unknown", reason="pending_flush",
+                    pending_flush_count=pending,
+                )
+            queue_obj.begin_retirement()
+
+            with self._retirement_condition:
+                remaining = max(0.0, deadline - time.monotonic())
+                failures = self._retirement_failures
+
+            queue_report = queue_obj.hard_retire(timeout=remaining)
+            if queue_report["status"] != "released":
+                return retirement_result(
+                    current, status="unknown", reason=str(queue_report["reason"]),
+                    active_store_count=int(queue_report.get("active_store_count", 0)),
+                    pending_write_count=int(queue_report["pending_write_count"]),
+                    pending_flush_count=int(queue_report["pending_flush_count"]),
+                    close_failure_count=int(queue_report["close_failure_count"]),
+                )
+            if failures:
+                return retirement_result(
+                    current, status="unknown", reason="flush_failed",
+                    pending_flush_count=failures,
+                )
+            with self._retirement_condition:
+                self._released = True
+            return retirement_result(current, status="released", reason="released")
+        finally:
+            with self._retirement_condition:
+                self._retirement_in_progress = False
+                self._retirement_condition.notify_all()
+            self._retirement_mutex.release()
 
     def shutdown(self) -> None:
-        for t in self._prefetch_threads:
-            t.join(timeout=3.0)
-        queue_obj, self._prefetch_threads, self._queue, self._client = self._queue, [], None, None
-        if queue_obj:
-            queue_obj.shutdown()
+        with self._retirement_condition:
+            if self._retiring and not self._released:
+                return
+            queue_obj = self._queue
+        if not self._join_retirement_threads(_RETIREMENT_WAIT_S):
+            logger.warning("RetainDB provider shutdown remains unresolved; workers retained")
+            return
+        if queue_obj is not None and not queue_obj.shutdown():
+            logger.warning("RetainDB provider shutdown remains unresolved; queue retained")
+            return
+        with self._retirement_condition:
+            # The exact queue/client remain source-owned until every admitted worker and native
+            # queue handle reports settled.  Only this successful close path clears them.
+            if self._retirement_threads:
+                return
+            self._prefetch_threads = []
+            self._soul_thread = None
+            if self._queue is queue_obj:
+                self._queue = None
+                self._client = None
 
 
 # tool name -> (required arg or None, handler(provider, args, required_value)); missing arg -> "<arg> is required"
