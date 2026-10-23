@@ -66,6 +66,7 @@ env:
     tests/gateway/test_runtime_service_windows_retry.py
     tests/gateway/test_native_own_policy_admission.py
     tests/agent/test_copilot_acp_catalog_diagnostic.py
+    tests/gateway/test_runtime_service_delivery_drain.py
 
 jobs:
   native-custody:
