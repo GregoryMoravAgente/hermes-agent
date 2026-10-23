@@ -756,7 +756,7 @@ def close_all_under(directory: str | Path) -> int:
 def other_generations_for_path(
     db_path: Path, *, exclude: Optional[SessionDB] = None
 ) -> list[str]:
-    """Describe every other LIVE SessionDB generation THIS process holds for *db_path*.
+    """Describe every other held SessionDB generation THIS process has for *db_path*.
 
     The registry is path-keyed, so it can answer the in-process half of "is this store quiet?"
     that a ``/proc`` descriptor scan structurally cannot: that scan skips our own pid, so it only
@@ -769,19 +769,21 @@ def other_generations_for_path(
     gateway handle does not release before shutdown — counting it made ONE inode replacement
     (recovery swap, backup restore, snapshot) skip auto-VACUUM for that path for the rest of the
     process lifetime, turning the unbounded growth this maintenance exists to bound into a
-    permanent condition.
+    permanent condition. Failed checked closes are different: they remain in
+    ``_failed_generations`` precisely because their native handle is still unverified and may
+    still be open, so maintenance must count them even though the record is marked retired.
     """
     try:
         path = Path(db_path).resolve()
     except OSError:
         path = Path(db_path)
     with _lock:
+        live = [generation for generation in _generations.values() if not generation.retired]
+        failed = list(_failed_generations.values())
         return [
             f"in-process live SessionDB generation (refcount {generation.refcount})"
-            for generation in _generations.values()
-            if generation.db is not exclude
-            and generation.path == path
-            and not generation.retired
+            for generation in (*live, *failed)
+            if generation.db is not exclude and generation.path == path
         ]
 
 

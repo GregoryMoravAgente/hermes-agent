@@ -459,3 +459,269 @@ def test_checked_registry_receipt_waits_for_real_read_open_admitted_before_close
         worker.join(5)
         registry.close_all()
 
+
+def test_checked_cache_upgrades_legacy_inflight_open(tmp_path):
+    """A checked sweep must take custody of an opener first admitted by legacy close."""
+    cache = RecoverableHandleCache()
+    path = tmp_path / "legacy-first.db"
+    started, release = threading.Event(), threading.Event()
+    opened = []
+
+    class Handle:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    def opener():
+        started.set()
+        assert release.wait(5)
+        handle = Handle()
+        opened.append(handle)
+        return handle
+
+    worker = threading.Thread(target=lambda: cache.get(path, opener))
+    worker.start()
+    try:
+        assert started.wait(5)
+        cache.close_all(lambda _handle: None)
+        first = cache.close_all_checked(lambda handle: (handle.close() or True))
+        assert first.verified is False
+        assert first.pending == 1
+
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert len(opened) == 1
+        assert cache._failed_handles
+
+        second = cache.close_all_checked(lambda handle: (handle.close() or True))
+        assert second.verified is True
+        assert opened[0].closed is True
+    finally:
+        release.set()
+        worker.join(5)
+
+
+def test_checked_cache_does_not_verify_during_stale_handle_retention(tmp_path, monkeypatch):
+    """The receipt stays pending while a stale native handle is being retained."""
+    cache = RecoverableHandleCache()
+    path = tmp_path / "settling.db"
+    started, release_open = threading.Event(), threading.Event()
+    retain_entered, release_retain = threading.Event(), threading.Event()
+    opened = []
+
+    def opener():
+        started.set()
+        assert release_open.wait(5)
+        handle = registry.acquire(path)
+        opened.append(handle)
+        return handle
+
+    original_retain = cache._retain_failed_handle
+
+    def blocking_retain(retain_path, handle):
+        retain_entered.set()
+        assert release_retain.wait(5)
+        original_retain(retain_path, handle)
+
+    monkeypatch.setattr(cache, "_retain_failed_handle", blocking_retain)
+    close_checked = lambda handle: registry.release_or_close_checked(handle).verified
+    worker = threading.Thread(target=lambda: cache.get(path, opener))
+    worker.start()
+    try:
+        assert started.wait(5)
+        first = cache.close_all_checked(close_checked)
+        assert first.verified is False
+        assert first.pending == 1
+
+        release_open.set()
+        assert retain_entered.wait(5)
+        second = cache.close_all_checked(close_checked)
+        assert second.verified is False
+        assert second.pending == 1
+
+        release_retain.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        third = cache.close_all_checked(close_checked)
+        assert third.verified is True
+        assert opened[0]._conn is None
+    finally:
+        release_open.set()
+        release_retain.set()
+        worker.join(5)
+        registry.close_all()
+
+
+def test_failed_generation_stays_in_process_holder_census(tmp_path):
+    """A retained native handle remains visible to maintenance's same-process guard."""
+    from hermes_state_holders import in_process_state_db_holders
+
+    path = tmp_path / "failed-census.db"
+    db = registry.acquire(path)
+    native = db._conn
+    original_close = db._close_connection_quietly
+
+    def fail_close(_conn):
+        db._last_native_close_succeeded = False
+        return False
+
+    db._close_connection_quietly = fail_close
+    try:
+        first = registry.close_all_checked()
+        assert first.verified is False
+        assert db._conn is native
+        assert registry.other_generations_for_path(path)
+        assert in_process_state_db_holders(path)
+    finally:
+        db._close_connection_quietly = original_close
+        registry.close_all_checked()
+
+
+def test_checked_cache_does_not_verify_during_checked_callback(tmp_path):
+    """An overlapping checked sweep remains pending while the first native callback runs."""
+    cache = RecoverableHandleCache()
+    path = tmp_path / "overlapping-checked.db"
+    db = cache.get(path, lambda: registry.acquire(path))
+    entered, release = threading.Event(), threading.Event()
+    receipts = []
+
+    def blocked_close(handle):
+        entered.set()
+        assert release.wait(5)
+        return registry.release_or_close_checked(handle).verified
+
+    worker = threading.Thread(
+        target=lambda: receipts.append(cache.close_all_checked(blocked_close)),
+    )
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert db._conn is not None
+        second = cache.close_all_checked(
+            lambda handle: registry.release_or_close_checked(handle).verified,
+        )
+        assert second.verified is False
+        assert second.pending >= 1
+    finally:
+        release.set()
+        worker.join(5)
+        registry.close_all_checked()
+    assert not worker.is_alive()
+    assert receipts[0].verified is True
+
+
+def test_checked_cache_upgrades_overlapping_legacy_callback(tmp_path):
+    """A checked sweep takes custody of a legacy callback already closing a cached handle."""
+    cache = RecoverableHandleCache()
+    path = tmp_path / "overlapping-legacy.db"
+    db = cache.get(path, lambda: registry.acquire(path))
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked_legacy(_handle):
+        entered.set()
+        assert release.wait(5)
+
+    worker = threading.Thread(target=lambda: cache.close_all(blocked_legacy))
+    worker.start()
+    try:
+        assert entered.wait(5)
+        assert db._conn is not None
+        second = cache.close_all_checked(
+            lambda handle: registry.release_or_close_checked(handle).verified,
+        )
+        assert second.verified is False
+        assert second.pending >= 1
+
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert db._conn is not None
+        assert cache._failed_handles
+
+        third = cache.close_all_checked(
+            lambda handle: registry.release_or_close_checked(handle).verified,
+        )
+        assert third.verified is True
+        assert db._conn is None
+    finally:
+        release.set()
+        worker.join(5)
+        registry.close_all()
+
+
+def test_second_checked_close_cannot_miss_earlier_callback_failure(tmp_path):
+    cache = RecoverableHandleCache()
+    first_db = cache.get(tmp_path / 'first.db', lambda: registry.acquire(tmp_path / 'first.db'))
+    first_entered, second_entered = threading.Event(), threading.Event()
+    first_release, second_release = threading.Event(), threading.Event()
+    first_receipts, second_receipts = [], []
+    def fail_first(handle):
+        assert handle is first_db
+        first_entered.set()
+        assert first_release.wait(5)
+        return False
+    def close_second(handle):
+        second_entered.set()
+        assert second_release.wait(5)
+        return registry.release_or_close_checked(handle).verified
+    first = threading.Thread(target=lambda: first_receipts.append(cache.close_all_checked(fail_first)))
+    second = threading.Thread(target=lambda: second_receipts.append(cache.close_all_checked(close_second)))
+    first.start()
+    try:
+        assert first_entered.wait(5)
+        cache.get(tmp_path / 'second.db', lambda: registry.acquire(tmp_path / 'second.db'))
+        second.start()
+        assert second_entered.wait(5)
+        first_release.set()
+        first.join(5)
+        assert not first.is_alive()
+        assert first_receipts[0].verified is False
+        assert first_db._conn is not None
+        second_release.set()
+        second.join(5)
+        assert not second.is_alive()
+        assert second_receipts[0].verified is False, 'settled failed callback disappeared before receipt publication'
+    finally:
+        first_release.set()
+        second_release.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+        registry.close_all_checked()
+
+
+def test_failed_old_close_never_overwrites_newer_same_path_handle(tmp_path):
+    from hermes_state import SessionDB
+
+    cache = RecoverableHandleCache()
+    path = tmp_path / 'same.db'
+    old_db = cache.get(path, lambda: SessionDB(path))
+    entered, release = threading.Event(), threading.Event()
+    receipts = []
+    def fail_old(handle):
+        assert handle is old_db
+        entered.set()
+        assert release.wait(5)
+        return False
+    worker = threading.Thread(target=lambda: receipts.append(cache.close_all_checked(fail_old)))
+    worker.start()
+    new_db = None
+    try:
+        assert entered.wait(5)
+        new_db = cache.get(path, lambda: SessionDB(path))
+        assert new_db is not old_db
+        release.set()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert receipts[0].verified is False
+        assert cache.handles[path] is new_db, 'failed old close overwrote the newer native handle'
+        assert any(handle is old_db for _, handle in cache._failed_handles.values())
+    finally:
+        release.set()
+        worker.join(5)
+        old_db.close()
+        if new_db is not None:
+            new_db.close()

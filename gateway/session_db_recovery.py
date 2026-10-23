@@ -84,6 +84,11 @@ class RecoverableHandleCache:
         self._closing_inflight: dict[
             tuple[int, int], tuple[Path, _Unavailable, Callable[[Any], Any], bool]
         ] = {}
+        # Handles admitted to a close callback stay in this table until that callback has
+        # settled.  A second checked sweep must see an ordinary callback that is already
+        # running just as it sees a stale opener; otherwise it can publish an empty verified
+        # receipt while the native handle is still inside the first callback.
+        self._closing_handles: dict[int, tuple[Path, Any, Callable[[Any], Any], bool]] = {}
         # A stale opener can itself fail its close callback.  Keep that exact handle for the next
         # checked retry without overwriting a newer cached handle for the same path.
         self._failed_handles: dict[int, tuple[Path, Any]] = {}
@@ -101,26 +106,92 @@ class RecoverableHandleCache:
         with self.lock:
             self._failed_handles[id(handle)] = (path, handle)
 
-    def _finish_stale_open(
-        self, path: Path, handle: Any,
-        closing: tuple[Path, _Unavailable, Callable[[Any], Any], bool] | None,
+    def _admit_closing_handles_locked(
+        self,
+        handles: list[tuple[Path, Any]],
+        close: Callable[[Any], Any],
+        checked: bool,
+    ) -> list[tuple[Path, Any, Callable[[Any], Any], bool]]:
+        """Record ordinary close callbacks before invoking any of them outside ``lock``."""
+        admitted = []
+        for path, handle in handles:
+            key = id(handle)
+            if key in self._closing_handles:
+                # An overlapping sweep must not invoke the same native handle concurrently.
+                # The first callback remains the owner until its exact result settles.
+                continue
+            record = (path, handle, close, checked)
+            self._closing_handles[key] = record
+            admitted.append(record)
+        return admitted
+
+    def _settle_closing_handle(
+        self,
+        path: Path,
+        handle: Any,
+        closed: bool,
+        checked: bool,
     ) -> None:
-        """Settle a stale opener using the close mode admitted for its generation."""
-        if closing is None:
-            close_rejected = self._close_rejected
-            close_rejected_checked = self._close_rejected_checked
-        else:
-            close_rejected, close_rejected_checked = closing[2], closing[3]
+        """Remove one admitted callback and retain its exact handle when proof is missing."""
+        key = id(handle)
+        with self.lock:
+            current = self._closing_handles.pop(key, None)
+            # A legacy callback returns no typed physical receipt.  If a checked sweep arrived
+            # while it was running, its result cannot be upgraded after the fact; retain the
+            # exact handle for a later checked retry instead of claiming its opaque return.
+            upgraded = current is not None and current[3] and not checked
+            if upgraded:
+                self._failed_handles[key] = (path, handle)
+                return
+            if not checked:
+                return
+            if closed:
+                self._failed_handles.pop(key, None)
+                return
+            if key in self._failed_handles:
+                return
+            if any(existing is handle for existing in self.handles.values()):
+                return
+            if path in self.handles:
+                # A new generation may already occupy this path. Retain the failed old
+                # native handle separately; replacing the new entry would lose its custody.
+                self._failed_handles[key] = (path, handle)
+                return
+            self.handles[path] = handle
+            # The handle may have come from a registry-backed cache entry.  Its exact ownership
+            # marker remains meaningful while the checked retry is pending.
+            if _registry_owned(handle):
+                self._registry_backed.add(path)
+
+    def _finish_stale_open(
+        self, path: Path, handle: Any, unavailable: _Unavailable, generation: int,
+    ) -> None:
+        """Settle a stale opener without letting a checked sweep miss its native handle."""
+        closing_key = (id(unavailable), generation)
+        with self.lock:
+            closing = self._closing_inflight.get(closing_key)
+            if closing is None:
+                close_rejected = self._close_rejected
+                close_rejected_checked = self._close_rejected_checked
+            else:
+                close_rejected, close_rejected_checked = closing[2], closing[3]
         if close_rejected_checked:
             # A checked sweep that ended with an opener still in flight cannot publish a
             # physical receipt from this worker thread.  Retain the exact stale handle for
             # the next checked sweep; otherwise a later compatibility close could make the
             # pending handle disappear and an empty receipt would falsely verify custody.
             self._retain_failed_handle(path, handle)
-            return
-        if close_rejected is not None:
+        elif close_rejected is not None:
             with contextlib.suppress(Exception):
                 close_rejected(handle)
+        with self.lock:
+            # Keep the in-flight record until the callback/retention above has settled. A checked
+            # sweep arriving during that window must remain pending; if it upgraded a legacy
+            # callback while it was running, retain the exact handle for its next checked retry.
+            closing = self._closing_inflight.get(closing_key)
+            if closing is not None and closing[3] and not close_rejected_checked:
+                self._failed_handles[id(handle)] = (path, handle)
+            self._closing_inflight.pop(closing_key, None)
 
     def get(
         self, path: Path, opener: Callable[[], Any], *, raise_on_error: bool = False,
@@ -185,12 +256,8 @@ class RecoverableHandleCache:
                 else:
                     self._registry_backed.discard(path)
                 self._unavailable.pop(path, None)
-            if stale:
-                closing = self._closing_inflight.pop((id(unavailable), generation), None)
-            else:
-                closing = None
         if stale:
-            self._finish_stale_open(path, handle, closing)
+            self._finish_stale_open(path, handle, unavailable, generation)
             return None
         _publish_health(self._health_source, path, "ok")
         if was_unavailable and on_recovered is not None:
@@ -216,14 +283,16 @@ class RecoverableHandleCache:
                         (id(unavailable), old_generation),
                         (path, unavailable, close, False),
                     )
-            handles = list(self.handles.values())
+            handles = list(self.handles.items())
+            admitted_handles = self._admit_closing_handles_locked(handles, close, False)
             paths = set(self.handles) | set(self._unavailable)
             self.handles.clear()
             self._registry_backed.clear()
             self._unavailable.clear()
-        for handle in handles:
+        for path, handle, _callback, checked in admitted_handles:
             with contextlib.suppress(Exception):
                 close(handle)
+            self._settle_closing_handle(path, handle, False, checked)
         with _health_lock:
             states = _health_states.get(self._health_source, {})
             for path in paths:
@@ -245,6 +314,20 @@ class RecoverableHandleCache:
             handles = list(self.handles.items())
             failed_handles = list(self._failed_handles.values())
             self._failed_handles.clear()
+            # A legacy sweep may have admitted an opener and cleared _unavailable before this
+            # checked sweep began. Upgrade those still-settling entries so the stale result is
+            # retained for a checked retry instead of being forgotten by the legacy callback.
+            for key, (path, unavailable, _previous_close, _previous_checked) in list(
+                self._closing_inflight.items()
+            ):
+                self._closing_inflight[key] = (path, unavailable, close, True)
+            # Upgrade ordinary legacy callbacks that are already running.  They remain pending
+            # until their original callback returns, then retain the exact handle for a typed
+            # retry because a legacy return value cannot prove physical closure.
+            for key, (path, handle, _previous_close, _previous_checked) in list(
+                self._closing_handles.items()
+            ):
+                self._closing_handles[key] = (path, handle, close, True)
             for path, unavailable in self._unavailable.items():
                 if unavailable.in_flight:
                     self._closing_inflight.setdefault(
@@ -255,30 +338,27 @@ class RecoverableHandleCache:
             self.handles.clear()
             self._registry_backed.clear()
             self._unavailable.clear()
+            attempted_handles = self._admit_closing_handles_locked(
+                handles + failed_handles, close, True,
+            )
         failed = 0
-        attempted_handles = handles + failed_handles
-        for path, handle in attempted_handles:
+        for path, handle, _callback, checked in attempted_handles:
             try:
                 closed = close(handle) is True
             except Exception:  # health: allow BLE001 -- checked close failures stay in the receipt
                 closed = False
             if not closed:
                 failed += 1
-                with self.lock:
-                    if id(handle) in self._failed_handles:
-                        continue
-                    if any(existing is handle for existing in self.handles.values()):
-                        continue
-                    self.handles[path] = handle
-                    # The handle may have come from a registry-backed cache entry.  Its exact
-                    # ownership marker remains meaningful while the checked retry is pending.
-                    if _registry_owned(handle):
-                        self._registry_backed.add(path)
-            else:
-                with self.lock:
-                    self._failed_handles.pop(id(handle), None)
+            self._settle_closing_handle(path, handle, closed, checked)
         with self.lock:
-            pending = len(self._closing_inflight)
+            attempted_ids = {id(handle) for _path, handle, _callback, _checked in attempted_handles}
+            retained_ids = {id(handle) for handle in self.handles.values()} | set(self._failed_handles)
+            # Another callback can finish with a failure while this sweep is closing its
+            # own handles. Its settled, retained handle still prevents a verified receipt.
+            pending = (
+                len(self._closing_inflight) + len(self._closing_handles)
+                + len(retained_ids - attempted_ids)
+            )
         with _health_lock:
             states = _health_states.get(self._health_source, {})
             for path in paths:
