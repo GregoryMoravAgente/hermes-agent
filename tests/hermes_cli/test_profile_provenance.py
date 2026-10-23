@@ -6,6 +6,7 @@ import shutil
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 
 import pytest
 
@@ -427,6 +428,32 @@ def test_exclusive_birth_rejects_parent_replacement(tmp_path):
             )
     finally:
         birth._native.close()
+
+
+@pytest.mark.platforms("posix")
+def test_exclusive_birth_rejects_user_parent_alias(tmp_path):
+    """A caller-owned link above the home is not a trusted OS alias."""
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real_parent, target_is_directory=True)
+    home = alias / "profile"
+
+    with pytest.raises(ProfileProvenanceError, match="linked or reparse-backed"):
+        create_exclusive_directory_birth(home)
+
+    assert not (real_parent / "profile").exists()
+
+
+@pytest.mark.platforms("macos")
+def test_exclusive_birth_accepts_native_macos_parent_alias():
+    """The native /var -> /private/var alias does not invalidate a new home."""
+    assert os.path.realpath("/var") == "/private/var"
+    with tempfile.TemporaryDirectory(prefix="hermes-native-alias-", dir="/var/tmp") as root:
+        home = Path(root) / "profile"
+        origin = bootstrap_profile_home(home, profile_kind="named", profile_name="native-alias")
+        assert origin.is_authenticated
+        assert read_bootstrap_provenance(home, install_id=origin.install_id).is_authenticated
 
 
 def test_exclusive_birth_rejects_target_appearance(tmp_path):

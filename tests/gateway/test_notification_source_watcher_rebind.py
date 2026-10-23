@@ -7,16 +7,51 @@ from types import SimpleNamespace
 import pytest
 
 
+_RETAINED_TEST_REGISTRIES = []
+
+
+async def _drain_pending_watchers(runner, registry):
+    """Use the production watcher transfer path for fixture-owned cleanup."""
+    from gateway.run_process_watchers import drain_pending_process_watchers
+
+    await drain_pending_process_watchers(
+        runner,
+        registry,
+        lambda watcher: runner._spawn_supervised(
+            lambda w=watcher: runner._run_process_watcher(watcher=w),
+            f"process_watcher:{watcher.get('session_id')}",
+            restart=False,
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
-def _capture_terminal_history_before_third_runtime_entry(request):
+def _capture_terminal_history_before_third_runtime_entry(request, monkeypatch):
     """Attach a read-only per-session I15/native snapshot before the rebind regression enters."""
+    isolated_tests = {
+        "test_startup_watcher_batch_stays_indexed_during_mid_yield_transfer",
+        "test_startup_watcher_task_creation_failure_retains_exact_descriptor",
+    }
+    if request.node.name not in isolated_tests:
+        yield
+        return
+    # These tests exercise the I10 watcher source index, not cross-test I15 history reuse.  A
+    # Darwin process cannot prove a descendant scope, so its finished sessions correctly remain
+    # UNKNOWN.  Give each test a real registry and retain the old one instead of clearing or
+    # reclassifying that custody; Windows keeps the same source/native path.
+    from tools import process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
+
+    registry = ProcessRegistry()
+    _RETAINED_TEST_REGISTRIES.append(registry)
+    monkeypatch.setattr(process_registry_module, "process_registry", registry)
+
     if request.node.name != "test_startup_watcher_task_creation_failure_retains_exact_descriptor":
         yield
         return
     from tests.gateway.test_process_registry_terminal_history import _registry_session_snapshot
-    from tools import process_registry as process_registry_module
 
-    snapshot = _registry_session_snapshot(process_registry_module.process_registry)
+    snapshot = _registry_session_snapshot(registry)
     request.node.user_properties.append(("i15_terminal_history_snapshot", json.dumps(snapshot)))
     yield
 
@@ -138,6 +173,12 @@ async def test_startup_watcher_batch_stays_indexed_during_mid_yield_transfer(
             token = event.get("delivery_token")
             if isinstance(token, str) and token:
                 registry.acknowledge_completion_delivery(token)
+        # Test 2 intentionally leaves an exact descriptor at the mid-yield boundary.  Once its
+        # assertions are complete, transfer it through the canonical scheduler before teardown;
+        # popping/clearing it would discard source-owned custody.
+        monkeypatch.setattr(runner, "_spawn_supervised", original_spawn)
+        if registry.pending_watchers:
+            await _drain_pending_watchers(runner, registry)
         await _runtime_owned_stop_public(runner, handles)
         await runtime_context.__aexit__(None, None, None)
 
@@ -227,5 +268,10 @@ async def test_startup_watcher_task_creation_failure_retains_exact_descriptor(
             token = event.get("delivery_token")
             if isinstance(token, str) and token:
                 registry.acknowledge_completion_delivery(token)
+        # The refusal assertion above is the causal control.  Restore the real scheduler and
+        # admit the retained descriptor so it cannot poison the next runtime's coordinator bind.
+        monkeypatch.setattr(runner, "_spawn_supervised", original_spawn)
+        if registry.pending_watchers:
+            await _drain_pending_watchers(runner, registry)
         await _runtime_owned_stop_public(runner, handles)
         await runtime_context.__aexit__(None, None, None)

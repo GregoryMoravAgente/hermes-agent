@@ -233,7 +233,7 @@ def test_fire_due_forwards_manual_force_to_claim(chronos, monkeypatch):
     )
     monkeypatch.setattr(
         "cron.executions.create_execution",
-        lambda jid, source: {"id": "exec-1"},
+        lambda jid, source, admission: {"id": "exec-1"},
     )
 
     assert prov.fire_due("j1", force=True) is False

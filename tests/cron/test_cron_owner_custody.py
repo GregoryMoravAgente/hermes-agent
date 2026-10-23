@@ -366,8 +366,11 @@ def test_i13_windows_job_owns_real_cron_child_until_reap(custody_runtime):
             native_job.close()
 
 
-def _windows_split_fixture(custody_runtime, tmp_path, *, with_job, hold_after_terminal=False):
-    """Start a real root/worker split; the root waits while the worker owns the ledger."""
+def _windows_split_fixture(
+    custody_runtime, tmp_path, *, with_job, hold_after_terminal=False,
+    root_exits_before_worker=False,
+):
+    """Start a real root/worker split with an optional early root exit."""
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
 
@@ -381,6 +384,7 @@ def _windows_split_fixture(custody_runtime, tmp_path, *, with_job, hold_after_te
     assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
     ack_path = tmp_path / "worker-ack.json"
     release_path = tmp_path / "worker-release"
+    root_release_path = tmp_path / "root-release"
     worker_code = textwrap.dedent(
         f"""
         import json, os, time
@@ -408,9 +412,14 @@ def _windows_split_fixture(custody_runtime, tmp_path, *, with_job, hold_after_te
     )
     launcher_code = textwrap.dedent(
         f"""
-        import subprocess, sys
+        import subprocess, sys, time
+        from pathlib import Path
         worker = subprocess.Popen([sys.executable, "-c", {worker_code!r}])
         print(worker.pid, flush=True)
+        if {root_exits_before_worker!r}:
+            while not Path({str(root_release_path)!r}).exists():
+                time.sleep(0.01)
+            raise SystemExit(0)
         raise SystemExit(worker.wait())
         """
     )
@@ -546,6 +555,99 @@ def _windows_direct_cleanup(process, native_job):
     finally:
         if native_job is not None and getattr(native_job, "_handle", None) is not None:
             native_job.close()
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_degraded_launcher_exit_waits_for_acknowledged_worker(
+    custody_runtime, tmp_path,
+):
+    """A successful root shim exit cannot release a still-running Job worker."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True, root_exits_before_worker=True)
+    root_release_path = tmp_path / "root-release"
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        assert acknowledgement["pid"] != process.pid
+        assert child.external_worker_is_active() is True
+
+        # Let only the retained launcher/root exit.  The worker remains blocked
+        # on its release gate and owns the non-empty canonical Job.
+        root_release_path.touch()
+        from tests.waiting import wait_until
+
+        wait_until(
+            lambda: process.poll() is not None,
+            timeout=10,
+            what="Windows launcher/root exit",
+        )
+        assert child.external_worker_is_active() is True
+
+        from cron.scheduler import _wait_for_external_cron_worker_body
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            waiter = pool.submit(
+                _wait_for_external_cron_worker_body,
+                process,
+                execution_id=child.execution_id,
+                custody=child,
+                dispatch_mode="degraded",
+            )
+            # The old root-exit path terminalized here.  The corrected path
+            # remains pending on the exact worker/Job until the worker writes
+            # its durable terminal row.
+            assert not waiter.done()
+            release_path.touch()
+            assert waiter.result(timeout=15) is True
+
+        if child._reaper is not None:
+            child._reaper.join(timeout=10)
+        assert child.observe_terminal()
+        assert child._scope_proof["scope_empty"] is True
+        assert native_job._handle is None
+        assert child.settled
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
+
+
+@pytest.mark.platforms("windows")
+def test_i13_windows_launcher_exit_with_unreadable_live_job_retains_exact_custody(
+    custody_runtime, tmp_path, monkeypatch,
+):
+    """A lost native observation cannot turn the root exit into worker death."""
+    _parent, child, process, native_job, acknowledgement, release_path = _windows_split_fixture(
+        custody_runtime, tmp_path, with_job=True, root_exits_before_worker=True)
+    try:
+        child.activate_external_worker(acknowledgement, process, dispatch_mode="degraded")
+        original_handle = child.handle
+        original_job_handle = native_job._handle
+        (tmp_path / "root-release").touch()
+        from tests.waiting import wait_until
+        from cron import executions, scheduler
+
+        wait_until(lambda: process.poll() is not None, timeout=10, what="launcher exit")
+        assert executions.get_execution(child.execution_id)["status"] == "running"
+        assert child.external_worker_is_active() is True
+        terminalization_calls = []
+
+        def forbid_terminalization(*args, **kwargs):
+            terminalization_calls.append((args, kwargs))
+            raise AssertionError("an unreadable live Job is not a dead worker")
+
+        with monkeypatch.context() as fault:
+            fault.setattr(native_job, "empty", lambda: None)
+            fault.setattr(scheduler, "terminalize_dead_owner", forbid_terminalization)
+            with pytest.raises(scheduler._ExternalWorkerPostHandoffError):
+                scheduler._wait_for_external_cron_worker_body(
+                    process, execution_id=child.execution_id, custody=child, dispatch_mode="degraded")
+            assert terminalization_calls == []
+            assert child._unknown is True
+            assert child.settled is False
+            assert child.handle is original_handle
+            assert child._native_job is native_job
+            assert native_job._handle is original_job_handle
+            assert executions.get_execution(child.execution_id)["status"] == "running"
+    finally:
+        _windows_split_cleanup(process, native_job, release_path)
 
 
 @pytest.mark.platforms("windows")

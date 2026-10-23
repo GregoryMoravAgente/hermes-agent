@@ -756,6 +756,85 @@ class CronOwnerBinding:
             and scope_proof.get("worker_job_membership") == "transitive_no_breakaway_ancestry"
         )
 
+    def external_worker_is_active(self) -> Optional[bool]:
+        """Prove whether an authenticated split worker still owns native work.
+
+        On Windows ``spawn_server`` may return a launcher Popen whose process exits before the
+        acknowledged worker finishes.  The retained canonical Job and the durable worker row are
+        the authorities in that case; the launcher's return code is only a wake-up.  ``True`` is
+        returned only for the exact activated worker/row/Job tuple while the Job is non-empty.
+        ``False`` means the split is not active or the retained Job is observed empty.  Any
+        unreadable or mismatched state is ``None`` and marks the exact handle UNKNOWN, so callers
+        cannot turn an ambiguous root exit into a terminal release.
+        """
+        if self.owner_class != "I13_external_cron_worker":
+            return False
+        # The split-worker proof is a Windows Job contract.  Do not turn a
+        # non-Windows direct/scoped worker into an ambiguous split merely
+        # because a caller supplied a malformed dispatch mode.
+        if sys.platform != "win32":
+            return False
+        with self._lock:
+            if self._unknown:
+                return None
+            if self._settled:
+                return False
+            dispatch_mode = self._dispatch_mode
+            worker_pid = self._worker_pid
+            worker_started_at = self._worker_started_at
+            bound_pid = self._bound_process_pid
+            native_job = self._native_job
+            native_job_identity = self._native_job_identity
+            native_job_proven = self._native_job_proven
+            scope_proof = dict(self._scope_proof) if self._scope_proof is not None else None
+        if dispatch_mode != "degraded":
+            return False
+        if (
+            type(worker_pid) is not int
+            or worker_pid <= 0
+            or worker_pid == bound_pid
+            or native_job is None
+            or native_job_identity is not native_job
+            or native_job_proven is not True
+            or not isinstance(scope_proof, dict)
+            or scope_proof.get("kind") != "windows_job"
+            or scope_proof.get("pid") != worker_pid
+            or scope_proof.get("process_started_at") != worker_started_at
+            or scope_proof.get("root_pid") != bound_pid
+            or scope_proof.get("native_job_canonical") is not True
+            or scope_proof.get("worker_job_membership") != "transitive_no_breakaway_ancestry"
+        ):
+            self.mark_unknown("worker_scope_unproven")
+            return None
+        try:
+            from cron.executions import get_execution
+
+            record = get_execution(self.execution_id) if self.execution_id else None
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+            self.mark_unknown("read_failed")
+            return None
+        if not isinstance(record, dict):
+            self.mark_unknown("read_failed")
+            return None
+        if record.get("status") in {"completed", "failed"}:
+            return False
+        if (
+            record.get("id") != self.execution_id
+            or record.get("status") != "running"
+            or bool(record.get("handoff_pending"))
+            or record.get("pid") != worker_pid
+            or record.get("process_started_at") != worker_started_at
+            or not self._stored_active_worker_matches(
+                worker_pid, worker_started_at, "degraded")
+        ):
+            self.mark_unknown("foreign_custody")
+            return None
+        state = self._native_job_is_empty(native_job)
+        if state is None:
+            self.mark_unknown("worker_scope_unproven")
+            return None
+        return state is False
+
     def _activate_child(
         self, process: Any, dispatch_mode: Optional[str], *, scope_proven: bool = False,
         scope_proof: Optional[dict[str, Any]] = None,

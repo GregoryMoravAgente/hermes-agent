@@ -35,6 +35,7 @@ FIXED_NOW = datetime(2026, 6, 22, 12, 0, 0, tzinfo=UTC)
 @pytest.fixture()
 def cron_store(tmp_path, monkeypatch):
     """Redirect cron storage to a temp dir, pin the clock, start with no degraded store."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(store_health, "_degraded", {})
     monkeypatch.setattr(store_health, "_listener", None)
     monkeypatch.setattr(store_health, "_recovered", {})

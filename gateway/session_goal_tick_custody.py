@@ -18,6 +18,16 @@ from hermes_state_runtime import RuntimeStoreError
 I08_OWNER = "I08_goals_loops_heartbeat"
 
 
+def _i08_canonical_home(value) -> Path | None:
+    """Use the same link-safe, case-normalized home as the native owner ledger."""
+    try:
+        from gateway.runtime_ownership import canonical_home
+
+        return canonical_home(Path(value))
+    except (OSError, RuntimeError, TypeError, ValueError):
+        return None
+
+
 @dataclass(frozen=True)
 class I08ProducerGraph:
     """Identity-bound registration for every real I08 source family.
@@ -56,25 +66,39 @@ class I08ProducerGraph:
             or getattr(authority, "instance_id", None) != self.instance_id
             or getattr(authority, "epoch", None) != self.authority_epoch
             or getattr(authority, "db", None) is not self.database
-            or str(Path(getattr(getattr(authority, "db", None), "db_path", "")).resolve())
-            != self.database_path
+            or _i08_canonical_home(
+                getattr(getattr(authority, "db", None), "db_path", "")
+            ) is None
+            or str(_i08_canonical_home(
+                getattr(getattr(authority, "db", None), "db_path", "")
+            )) != self.database_path
             or getattr(runner, "_i08_watcher_tasks", None) is not self.watcher_tasks
             or getattr(authority, "_i08_source_state", None) is not self.source_state
             or getattr(coordinator, "process_instance", None) != self.instance_id
         ):
             return False
-        if self.coordinator is not None and (
-            type(self.physical_owner_epoch) is not str
-            or not self.physical_owner_epoch
-            or type(self.native_descriptor) is not int
-            or isinstance(self.native_descriptor, bool)
-            or not isinstance(self.physical_binding, tuple)
-            or self.physical_binding != (
-                str(Path(self.profile_id).resolve()),
-                self.physical_owner_epoch, self.native_descriptor,
-            )
-        ):
-            return False
+        # Embedded/legacy authorities can be source-bound before a process-owned profile lock is
+        # available.  Their graph remains an authenticated admission witness, but close readiness
+        # must stay UNKNOWN; absence of the optional native fields is not itself a mismatch.  A
+        # partially populated witness is malformed and must still fail closed.
+        physical_fields = (
+            self.physical_owner_epoch, self.native_descriptor, self.physical_binding,
+        )
+        if any(value is not None for value in physical_fields):
+            profile_home = _i08_canonical_home(self.profile_id)
+            if (
+                profile_home is None
+                or type(self.physical_owner_epoch) is not str
+                or not self.physical_owner_epoch
+                or type(self.native_descriptor) is not int
+                or isinstance(self.native_descriptor, bool)
+                or not isinstance(self.physical_binding, tuple)
+                or self.physical_binding != (
+                    str(profile_home),
+                    self.physical_owner_epoch, self.native_descriptor,
+                )
+            ):
+                return False
         return self.producer_families == _i08_producer_families()
 
 
@@ -257,8 +281,11 @@ def register_i08_source_graph(runner, authority, coordinator=None) -> I08Produce
         if not graph.matches(runner, authority, coordinator):
             raise RuntimeStoreError("i08_source_graph_binding_mismatch")
         return graph
-    home = Path(profile_id).resolve()
-    reservation = _i08_native_reservation(home)
+    home = _i08_canonical_home(profile_id)
+    reservation = _i08_native_reservation(home) if home is not None else None
+    canonical_database_path = _i08_canonical_home(database_path)
+    if canonical_database_path is None:
+        raise RuntimeStoreError("i08_source_graph_invalid")
     graph = I08ProducerGraph(
         runner=runner,
         authority=authority,
@@ -267,7 +294,7 @@ def register_i08_source_graph(runner, authority, coordinator=None) -> I08Produce
         instance_id=instance_id,
         authority_epoch=epoch,
         database=database,
-        database_path=str(Path(database_path).resolve()),
+        database_path=str(canonical_database_path),
         source_state=state,
         watcher_tasks=watcher_tasks,
         producer_families=_i08_producer_families(),
@@ -638,6 +665,9 @@ def _i08_runtime_epoch_matches(authority) -> bool:
 
 def _i08_native_reservation(home):
     """Read the retained descriptor-bound native owner witness for one profile."""
+    home = _i08_canonical_home(home)
+    if home is None:
+        return None
     try:
         from gateway.runtime_ownership import process_ownership
         reservation = process_ownership.reservation_evidence(home)
@@ -668,8 +698,10 @@ def _i08_native_owner_snapshot(authority, coordinator):
     graph = _i08_graph(runner, authority, coordinator)
     if graph is None:
         return None
-    home = Path(authority.profile_id).resolve()
-    if str(Path(authority.db.db_path).resolve().parent) != str(home):
+    home = _i08_canonical_home(authority.profile_id)
+    database_path = _i08_canonical_home(authority.db.db_path)
+    database_home = _i08_canonical_home(database_path.parent) if database_path is not None else None
+    if home is None or database_path is None or database_home is None or database_home != home:
         return None
     if not _i08_runtime_epoch_matches(authority):
         return None
@@ -702,7 +734,7 @@ def _i08_native_owner_snapshot(authority, coordinator):
         "authority_epoch": authority.epoch,
         "process_instance": authority.instance_id,
         "physical_owner_epoch": graph.physical_owner_epoch,
-        "database_path": str(Path(authority.db.db_path).resolve()),
+        "database_path": str(database_path),
         "database_identity": id(authority.db),
         "native_descriptor": graph.native_descriptor,
         "native_handle_retained": True,

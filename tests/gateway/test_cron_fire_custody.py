@@ -120,36 +120,26 @@ async def test_managed_api_refuses_provider_receipt_before_returning_202(monkeyp
 
 @pytest.mark.asyncio
 async def test_managed_api_split_provider_runs_real_ledger_task_and_releases_custody(
-    monkeypatch, tmp_path,
+    monkeypatch, runtime_owned_api_owner,
 ):
     """The managed HTTP route consumes the real provider receipt and detached task to terminal."""
     from cron import executions, jobs, scheduler
     from cron.scheduler_provider import InProcessCronScheduler
 
-    home = tmp_path / "profile"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path
+
+    _api, authority = runtime_owned_api_owner
+    runner = authority.runner
+    home = Path(authority.db.db_path).parent
     scripts_dir = home / "scripts"
-    (home / "cron").mkdir(parents=True)
-    scripts_dir.mkdir(parents=True)
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
     db = home / "cron" / "executions.db"
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
-    coordinator = RuntimeCustodyCoordinator(
-        process_instance="api-real-provider-test", authority_epoch=15, fence=RetirementFence())
-    runner = SimpleNamespace(
-        _draining=False,
-        _external_drain_active=False,
-        _running=True,
-        adapters={},
-        runtime_custody=coordinator,
-        session_runtime_descriptor={
-            "instance_id": "api-real-provider-test", "authority_epoch": 15, "state": "ready"},
-        config=SimpleNamespace(
-            multiplex_profiles=False,
-            _runtime_profile_homes=[("default", home)],
-        ),
-        _primary_profile_name="default",
-    )
+    coordinator = runner.runtime_custody
+    active_before = coordinator.status()["active_owner_classes"]
+    assert not {"I12_cron_fire", "I14_api_detached_cron"}.intersection(active_before)
     script = scripts_dir / "cron-success.py"
     script.write_text("print('managed cron result', flush=True)\n", encoding="utf-8")
     with jobs.use_cron_store(home):
@@ -218,7 +208,7 @@ async def test_managed_api_split_provider_runs_real_ledger_task_and_releases_cus
     assert record["source"] == "builtin"
     assert record["status"] == "completed"
     assert record["delivery_outcome"] == "suppressed"
-    assert coordinator.status()["active_owner_classes"] == []
+    assert coordinator.status()["active_owner_classes"] == active_before
 
 
 @pytest.mark.asyncio
@@ -493,7 +483,7 @@ async def test_managed_api_cancelled_continuation_before_first_step_releases_onl
 
 @pytest.mark.asyncio
 async def test_managed_api_cancellation_after_claim_reuses_receipt_and_detaches(
-    monkeypatch, tmp_path,
+    monkeypatch, runtime_owned_api_owner,
 ):
     """A cancellation racing a completed claim reuses its exact receipt and runs the real fire."""
     from cron import executions, jobs, scheduler
@@ -501,30 +491,20 @@ async def test_managed_api_cancellation_after_claim_reuses_receipt_and_detaches(
     from gateway.platforms import api_server_cron_fire as fire_api
     from tests.waiting import async_wait_until
 
-    home = tmp_path / "profile"
-    monkeypatch.setenv("HERMES_HOME", str(home))
+    from pathlib import Path
+
+    _api, authority = runtime_owned_api_owner
+    runner = authority.runner
+    home = Path(authority.db.db_path).parent
     scripts_dir = home / "scripts"
-    (home / "cron").mkdir(parents=True)
-    scripts_dir.mkdir(parents=True)
+    (home / "cron").mkdir(parents=True, exist_ok=True)
+    scripts_dir.mkdir(parents=True, exist_ok=True)
     db = home / "cron" / "executions.db"
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", db)
-    coordinator = RuntimeCustodyCoordinator(
-        process_instance="api-cancel-after-claim", authority_epoch=18, fence=RetirementFence())
-    runner = SimpleNamespace(
-        _draining=False,
-        _external_drain_active=False,
-        _running=True,
-        adapters={},
-        runtime_custody=coordinator,
-        session_runtime_descriptor={
-            "instance_id": "api-cancel-after-claim", "authority_epoch": 18, "state": "ready"},
-        config=SimpleNamespace(
-            multiplex_profiles=False,
-            _runtime_profile_homes=[("default", home)],
-        ),
-        _primary_profile_name="default",
-    )
+    coordinator = runner.runtime_custody
+    active_before = coordinator.status()["active_owner_classes"]
+    assert not {"I12_cron_fire", "I14_api_detached_cron"}.intersection(active_before)
     script = scripts_dir / "cron-cancel-race.py"
     script.write_text("print('managed cron race', flush=True)\n", encoding="utf-8")
     with jobs.use_cron_store(home):
@@ -585,4 +565,4 @@ async def test_managed_api_cancellation_after_claim_reuses_receipt_and_detaches(
             assert api_custody._claim_future is None
     assert reservation["detached"] is True
     assert adapter._pending_agent_requests == 0
-    assert coordinator.status()["active_owner_classes"] == []
+    assert coordinator.status()["active_owner_classes"] == active_before

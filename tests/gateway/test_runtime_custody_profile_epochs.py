@@ -408,6 +408,28 @@ async def test_i15_close_seals_real_terminal_children_from_mixed_profile_epochs(
             )
         sessions.append(secondary_session)
         _finish_native_profile_child(registry, secondary_session)
+        secondary_registration = next(
+            registration for registration in registry._i15_zero_factory.registrations()
+            if registration.profile_id == secondary.profile_id
+        )
+        # The native child is terminal, but the source fence has not crossed its close boundary
+        # yet.  Retirement must not consume a terminal receipt from an open admission fence.
+        assert secondary_registration.scope.terminal_history_retirement() is False
+        secondary_registration.scope.close()
+        assert secondary_registration.scope.terminal_history_retirement() is True
+        original_profile_id = secondary_session.profile_id
+        original_authority_epoch = secondary_session.authority_epoch
+        original_coordinator = secondary_session.custody.coordinator
+        secondary_session.profile_id = launch.profile_id
+        assert secondary_registration.scope.terminal_history_retirement() is False
+        secondary_session.profile_id = original_profile_id
+        secondary_session.authority_epoch = launch.epoch
+        assert secondary_registration.scope.terminal_history_retirement() is False
+        secondary_session.authority_epoch = original_authority_epoch
+        secondary_session.custody.coordinator = object()
+        assert secondary_registration.scope.terminal_history_retirement() is False
+        secondary_session.custody.coordinator = original_coordinator
+        assert secondary_registration.scope.terminal_history_retirement() is True
         assert await unserve_profile_runtime(runner, entries[1][1]) is True
         successor = await serve_profile_runtime(runner, "alpha", entries[1][1])
         assert successor.epoch > secondary.epoch

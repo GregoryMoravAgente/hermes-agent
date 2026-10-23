@@ -21,6 +21,7 @@ from hermes_cli.backend_retirement import (
     RetirementLease,
     retirement,
 )
+from hermes_state_runtime import RuntimeStoreError
 from gateway.runtime_custody_profiles import ProfileScopeResolver, ProfileScopeResult
 from gateway.runtime_custody_i17 import I17PreparedChildCustodyMixin
 from gateway.runtime_native_cleanup import (
@@ -1843,18 +1844,54 @@ class RuntimeCustodyCoordinator(I17PreparedChildCustodyMixin, NativeCleanupMixin
 def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
     descriptor = getattr(runner, "session_runtime_descriptor", None) or {}
     registry = getattr(runner, "session_authorities", None)
-    coordinator = RuntimeCustodyCoordinator(
-        process_instance=descriptor.get("instance_id", ""),
-        authority_epoch=descriptor.get("authority_epoch", 0),
-        profile_scope=ProfileScopeResolver(runner) if registry is not None else None,
+    authorities = tuple(
+        item for item in (list(registry) if registry is not None else [
+            getattr(runner, 'session_authority', None),
+        ]) if item is not None
     )
+    existing = getattr(runner, "runtime_custody", None)
+    # Fixture and embedded launch paths may invoke the binder more than once while the same
+    # process/authority is still serving.  Reusing the exact coordinator preserves its source
+    # graph and leases; constructing a second ledger would make the original graph look foreign
+    # and either strand accepted work or fail every subsequent source readiness check.  A changed
+    # process/epoch is a real replacement and is handled by the normal binding checks below.
+    if (
+        isinstance(existing, RuntimeCustodyCoordinator)
+        and existing.process_instance == descriptor.get("instance_id")
+        and existing.authority_epoch == descriptor.get("authority_epoch")
+    ):
+        if existing.state != "open":
+            raise RuntimeStoreError("runtime_custody_binding_closed")
+        if (
+            hasattr(existing, "_runtime_custody_registry")
+            and existing._runtime_custody_registry is not registry
+        ):
+            raise RuntimeStoreError("runtime_custody_binding_collision")
+        bound_authorities = getattr(existing, "_runtime_custody_authorities", ())
+        if any(
+            not any(previous is current for current in authorities)
+            for previous in bound_authorities
+        ):
+            raise RuntimeStoreError("runtime_custody_binding_collision")
+        bound_graphs = getattr(existing, "_runtime_custody_source_graphs", ())
+        for previous, preservation, automation, i08 in bound_graphs:
+            if not any(previous is current for current in authorities):
+                raise RuntimeStoreError("runtime_custody_binding_collision")
+            if (
+                getattr(previous, "_preservation_producer_graph", None) is not preservation
+                or getattr(previous, "_preservation_automation_source_graph", None) is not automation
+                or getattr(previous, "_i08_source_graph", None) is not i08
+            ):
+                raise RuntimeStoreError("runtime_custody_binding_collision")
+        coordinator = existing
+    else:
+        coordinator = RuntimeCustodyCoordinator(
+            process_instance=descriptor.get("instance_id", ""),
+            authority_epoch=descriptor.get("authority_epoch", 0),
+            profile_scope=ProfileScopeResolver(runner) if registry is not None else None,
+        )
     runner.runtime_custody = coordinator
-    authorities = list(registry) if registry is not None else [
-        getattr(runner, 'session_authority', None),
-    ]
     for authority in authorities:
-        if authority is None:
-            continue
         bind_graph = getattr(authority, '_register_preservation_producer_graph', None)
         if callable(bind_graph):
             # Bootstrap created and registered the exact empty producer containers.  Bind that
@@ -1869,4 +1906,21 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
         from gateway.session_goal_tick_custody import register_i08_source_graph
         # Bind I08's real watcher/goal/heartbeat indexes before any source task starts.
         register_i08_source_graph(runner, authority, coordinator)
+    coordinator._runtime_custody_registry = registry
+    prior_authorities = tuple(getattr(coordinator, "_runtime_custody_authorities", ()))
+    coordinator._runtime_custody_authorities = tuple(
+        (*prior_authorities, *(
+            authority for authority in authorities
+            if not any(authority is previous for previous in prior_authorities)
+        ))
+    )
+    coordinator._runtime_custody_source_graphs = tuple(
+        (
+            authority,
+            getattr(authority, "_preservation_producer_graph", None),
+            getattr(authority, "_preservation_automation_source_graph", None),
+            getattr(authority, "_i08_source_graph", None),
+        )
+        for authority in coordinator._runtime_custody_authorities
+    )
     return coordinator

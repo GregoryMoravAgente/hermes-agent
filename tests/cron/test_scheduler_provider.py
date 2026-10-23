@@ -362,8 +362,8 @@ def test_claim_fire_persists_attempt_before_fire_claimed(monkeypatch):
     monkeypatch.setattr(
         executions,
         "create_execution",
-        lambda jid, source, _create=executions.create_execution:
-        events.append("ledger") or _create(jid, source=source),
+        lambda jid, source, admission, _create=executions.create_execution:
+        events.append("ledger") or _create(jid, source=source, admission=admission),
     )
     monkeypatch.setattr(
         sched,

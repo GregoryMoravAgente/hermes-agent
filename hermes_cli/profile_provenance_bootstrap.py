@@ -438,6 +438,47 @@ def install_id_path(root: Path) -> Path:
     return Path(root) / INSTALL_ID_FILENAME
 
 
+def _trusted_native_parent_alias(path: Path) -> bool:
+    """Return whether *path* is a system-owned macOS root alias.
+
+    macOS exposes several system directories through a symlink at the filesystem
+    root (for example ``/var`` -> ``/private/var``).  The lexical spelling is
+    part of the public path contract, so resolving those aliases globally would
+    lose the caller's path while rejecting them would make ordinary temporary
+    homes impossible to create.  A user-created link must not receive the same
+    treatment: only a root-level, root-owned link whose canonical target is the
+    matching directory below a native system data root is trusted here.
+    """
+    if sys.platform != "darwin" or os.name == "nt":
+        return False
+    if path.parent != Path(path.anchor):
+        return False
+    try:
+        link = os.lstat(path)
+        if not stat.S_ISLNK(link.st_mode) or link.st_uid != 0:
+            return False
+        target = Path(os.path.realpath(os.fspath(path)))
+        native_roots = (Path("/private"), Path("/System/Volumes/Data"))
+        if not any(target == root / path.name for root in native_roots):
+            return False
+        target_info = os.stat(target, follow_symlinks=False)
+        if not stat.S_ISDIR(target_info.st_mode) or target_info.st_uid != 0:
+            return False
+        # /private/tmp is intentionally world-writable, but its sticky bit keeps
+        # entries owned by other users from being removed or renamed by callers.
+        if target_info.st_mode & 0o022 and not (target_info.st_mode & stat.S_ISVTX):
+            return False
+        for root in native_roots:
+            if target.parent != root:
+                continue
+            root_info = os.stat(root, follow_symlinks=False)
+            if root_info.st_uid == 0 and not root_info.st_mode & 0o022:
+                return True
+        return False
+    except (OSError, ValueError):
+        return False
+
+
 def _safe_path(path: Path, *, label: str) -> Path:
     """Return an absolute lexical path after rejecting links/reparse points in its prefix.
 
@@ -460,9 +501,14 @@ def _safe_path(path: Path, *, label: str) -> Path:
         except OSError as exc:
             raise ProfileProvenanceError(f"{label} is unavailable") from exc
         attributes = getattr(info, "st_file_attributes", 0)
-        if stat.S_ISLNK(info.st_mode) or (
-            type(attributes) is int and attributes & _REPARSE_POINT
-        ):
+        if stat.S_ISLNK(info.st_mode):
+            # Keep the lexical spelling, but permit only native aliases strictly
+            # above the owned profile boundary.  A symlink at the requested leaf
+            # or anywhere below it remains an ownership refusal, even on macOS.
+            if current != candidate and _trusted_native_parent_alias(current):
+                continue
+            raise ProfileProvenanceError(f"{label} is linked or reparse-backed")
+        if type(attributes) is int and attributes & _REPARSE_POINT:
             raise ProfileProvenanceError(f"{label} is linked or reparse-backed")
     return candidate
 

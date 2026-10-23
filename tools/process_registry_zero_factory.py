@@ -229,16 +229,17 @@ class ProcessRegistryZeroFactory:
             return False
         receipt = registration.scope.close()
         if (
-            receipt.get("created_session_ids")
-            or receipt.get("pending_reservation_ids")
+            receipt.get("pending_reservation_ids")
             or receipt.get("late_creation") is True
         ):
+            return False
+        if receipt.get("created_session_ids") and not registration.scope.terminal_history_retirement():
             return False
         self._registrations.pop(profile_id, None)
         return True
 
     def retire_profile(self, profile_id: str, authority_epoch: int) -> bool:
-        """Remove one profile only after its exact source fence proves no native effect."""
+        """Remove one profile only after its exact source fence proves no pending native work."""
         with self._admission_lock:
             with self._lock:
                 return self._retire_profile_locked(profile_id, authority_epoch)

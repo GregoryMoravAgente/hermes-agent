@@ -70,6 +70,48 @@ async def test_i08_real_two_profile_zero_work_uses_exact_graph_and_native_owner(
         assert await _close_boot(runner, entries) is True
 
 
+def test_i08_legacy_graph_rebind_is_idempotent_and_config_changes_do_not_replace_it(
+    tmp_path,
+):
+    """A legacy embedded authority has no optional native lock, but its source graph is real.
+
+    Some desktop/session fixtures bind the same runner twice while profile config is edited between
+    turns.  Reusing the exact open coordinator keeps the graph and its source state authenticated;
+    a config change is not a source-owner replacement.
+    """
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    from tests.gateway.test_session_follow_profile_config import _owner
+    from gateway.session_goal_tick_custody import has_i08_source_graph
+
+    home = tmp_path / "legacy-home"
+    home.mkdir()
+    store, runner, authority, _owner_connection = _owner(home)
+    try:
+        first = runner.runtime_custody
+        graph = authority._i08_source_graph
+        assert graph.physical_owner_epoch is None
+        assert graph.native_descriptor is None
+        assert graph.physical_binding is None
+        assert has_i08_source_graph(runner) is True
+
+        (home / "config.yaml").write_text(
+            '{"model": {"provider": "custom", "default": "before"}}',
+            encoding="utf-8",
+        )
+        second = bind_authority_runtime_custody(runner, authority)
+
+        assert second is first
+        assert authority._i08_source_graph is graph
+        assert has_i08_source_graph(runner) is True
+        (home / "config.yaml").write_text(
+            '{"model": {"provider": "custom", "default": "after"}}',
+            encoding="utf-8",
+        )
+        assert has_i08_source_graph(runner) is True
+    finally:
+        store.close_all_db_handles()
+
+
 @pytest.mark.asyncio
 async def test_i08_close_cancels_real_watchers_and_resumes_same_families(
     tmp_path, monkeypatch,

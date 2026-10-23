@@ -429,6 +429,9 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
                 'SELECT state FROM delivery_obligations WHERE obligation_id IS NOT NULL'
             ).fetchone()[0] == 'delivered'
         assert coordinator.status()['active_owner_classes'] == []
+        from gateway.runtime_ownership import process_ownership
+        physical_owner = process_ownership.reservation_evidence(Path(owner.db.db_path).resolve().parent)
+        assert physical_owner is not None
         prepared = await run_runtime.prepare_preservation_handoff(
             owner.runner, {'receipt': receipt}, 'test-peer')
         assert prepared == {'status': 'refused', 'reason': 'unknown_owner', 'owner_class': 'I03_api_run_direct'}
@@ -438,14 +441,20 @@ async def test_real_native_adapter_ledger_finalization_releases_marker(tmp_path,
         assert states['I04_fifo_turn_execution'] == 'sealed'
         from gateway.runtime_custody import OWNER_CLASSES
         assert set(states) == set(OWNER_CLASSES)
-        # I15 is already wired by the existing process-registry integration.  Keep the assertion
-        # causal and roster-based: the remaining first unclaimed owner is the I03 route, and a stale
-        # aggregate count must not be updated whenever another owner is added to the graph.
+        # The real registry and retained profile reservation account for I15 and I20.  Keep the
+        # closed roster explicit so an unexpected seal is visible; the first unwired route is I03.
         assert states['I15_process_registry_terminal'] == 'sealed'
+        # This fixture also holds a real process-owned profile reservation.  I20 can seal its
+        # physical-owner graph without releasing that descriptor before the later native ACK.
+        assert states['I20_runtime_ownership_and_foreign_handoff'] == 'sealed'
+        still_owned = process_ownership.reservation_evidence(Path(owner.db.db_path).resolve().parent)
+        assert still_owned is not None
+        assert still_owned['native_descriptor'] == physical_owner['native_descriptor']
+        assert still_owned['owner_epoch'] == physical_owner['owner_epoch']
         assert states['I03_api_run_direct'] == 'unwired'
         assert {owner for owner, state in states.items() if state == 'sealed'} == {
             'I01_native_inbound', 'I02_api_session_turn', 'I04_fifo_turn_execution',
-            'I15_process_registry_terminal'}
+            'I15_process_registry_terminal', 'I20_runtime_ownership_and_foreign_handoff'}
         reopened = await run_runtime.abort_preservation_drain(
             owner.runner, {'receipt': receipt}, 'test-peer')
         assert reopened['status'] == 'open'

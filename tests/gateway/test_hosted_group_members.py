@@ -26,8 +26,12 @@ from tests.waiting import wait_until
 
 @contextmanager
 def _gateway(tmp_path, monkeypatch, *, served, unserved=(), linked=(), multiplex=True):
-    """A running gateway over ``default`` + ``served`` + ``linked``; ``unserved`` profiles exist on
-    disk only, and each ``linked`` profile is a ``profiles/<name>`` link to a home elsewhere."""
+    """A running gateway over ``default`` + ``served`` + ``linked``.
+
+    Linked names keep their unsafe ``profiles/<name>`` alias on disk for the group-layer refusal,
+    but the runtime owns the resolved target instead.  Reserving the alias itself would stop in
+    ``process_ownership`` before the group code can exercise its name/path mismatch contract.
+    """
     from gateway.config import GatewayConfig
     from gateway.control_socket import GatewayControlServer
     from gateway.run import GatewayRunner
@@ -36,14 +40,17 @@ def _gateway(tmp_path, monkeypatch, *, served, unserved=(), linked=(), multiplex
 
     root, homes = _reserve_homes(tmp_path, monkeypatch, names=(*served, *unserved))
     homes = dict(homes)
+    linked_targets = {}
     for name in linked:
         target = tmp_path / 'elsewhere' / name
         target.mkdir(parents=True)
         homes[name] = _link(target, root / 'profiles' / name)
+        linked_targets[name] = target
     for home in homes.values():
         # A default install's profile config: no hosted_rooms key anywhere.
         (home / 'config.yaml').write_text(json.dumps({'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}}))
-    reserved = [(name, homes[name]) for name in ('default', *served, *linked)]
+    reserved = [(name, homes[name]) for name in ('default', *served)]
+    reserved.extend((name, linked_targets[name]) for name in linked)
     config = GatewayConfig()
     config.multiplex_profiles = multiplex
     config._runtime_profile_homes = tuple(reserved)
@@ -92,6 +99,23 @@ def _link(target, link):
         except (ImportError, OSError) as exc:
             pytest.skip(f'this host cannot link a profile directory: {exc}')
     return link
+
+
+def test_native_reservation_refuses_linked_profile_alias(tmp_path, monkeypatch):
+    """The physical linked home remains refused before any group/runtime ownership is created."""
+    from gateway.runtime_ownership import OwnershipConflict, process_ownership
+
+    root, _homes = _reserve_homes(tmp_path, monkeypatch, names=())
+    (root / 'profiles').mkdir()
+    target = tmp_path / 'elsewhere' / 'linked'
+    target.mkdir(parents=True)
+    linked = _link(target, root / 'profiles' / 'linked')
+
+    with pytest.raises(OwnershipConflict, match="linked profile"):
+        process_ownership.reserve([linked])
+
+    assert linked.exists() and linked.resolve() == target.resolve()
+    assert not (linked / 'gateway.lock').exists()
 
 
 def _desktop(runner, call, scope='host'):

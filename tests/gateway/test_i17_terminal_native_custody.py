@@ -203,6 +203,11 @@ def test_i17_host_evidence_uses_retained_native_identity_after_supervisor_mutati
     assert hosted_tui_custody.bind_supervisor(supervisor, home, "i17-native-retained")
     supervisor.start()
     try:
+        # HostSupervisor.shutdown() clears its mutable native fields after acknowledging a clean
+        # stop.  Capture the exact source-owned identity at the real shutdown boundary before
+        # calling it; host_shutdown then validates the retained object rather than a post-close
+        # scalar snapshot.
+        hosted_tui_custody._capture_host_shutdown_identity(supervisor)
         receipt = supervisor.shutdown()
         assert hosted_tui_custody.host_shutdown(supervisor, receipt) is True
         supervisor._host_generation += 1

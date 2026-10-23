@@ -847,14 +847,19 @@ def _control_endpoint_identity(home: Path) -> dict[str, Any] | None:
             import struct
 
             stat = os.stat(path)
-            identity.update({"device": stat.st_dev, "inode": stat.st_ino, "mode": stat.st_mode})
+            identity.update({
+                "device": stat.st_dev, "inode": stat.st_ino, "mode": stat.st_mode,
+                # The same process can recreate a listener and the filesystem may reuse its
+                # inode immediately.  Bind the actual socket incarnation as well as its inode.
+                "ctime_ns": stat.st_ctime_ns,
+            })
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
                 peer.settimeout(2.0)
                 peer.connect(str(path))
                 if hasattr(socket, "SO_PEERCRED"):
                     identity["peer_pid"] = struct.unpack(
                         "3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-                    )[1]
+                    )[0]
                     identity["peer_birth"] = _birth(identity["peer_pid"])
         elif path is not None:
             from gateway.runtime_bootstrap_windows import probe_runtime_control_peer
@@ -882,7 +887,7 @@ def _control_observation(
 
 def _control_endpoint_key(identity: Mapping[str, Any]) -> tuple[Any, ...]:
     return tuple(identity.get(key) for key in (
-        "transport", "endpoint", "device", "inode", "mode", "peer_pid", "peer_birth",
+        "transport", "endpoint", "device", "inode", "mode", "ctime_ns", "peer_pid", "peer_birth",
         "peer_subject",
     ))
 

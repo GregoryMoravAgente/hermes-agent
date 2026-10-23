@@ -144,7 +144,10 @@ async def test_real_terminal_history_allows_new_runtime_coordinator(
         async_delivery=True,
     )
     try:
-        async with runtime_owned_api(first_root, monkeypatch):
+        # Completion watchers must be admitted by the real public scheduler before the profile
+        # is retired.  The test still exercises the retained native history/rebind boundary;
+        # it no longer leaves a valid watcher stranded in the pre-start queue.
+        async with runtime_owned_api(first_root, monkeypatch, start_public_runtime=True):
             result = json.loads(spawn_background_process(
                 command=shell_python_command(
                     "import sys; print('terminal-history-proof', flush=True)", temp_dir=first_root,

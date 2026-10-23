@@ -23,6 +23,7 @@ from cron.scheduler_provider import (
 @pytest.fixture()
 def tmp_cron_dir(tmp_path, monkeypatch):
     """Redirect cron storage to a temp directory."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")

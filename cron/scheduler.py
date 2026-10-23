@@ -3609,39 +3609,65 @@ def _wait_for_external_cron_worker_body(
         current = get_execution(execution_id)
         return bool(current and current.get("status") in _TERMINAL_STATES)
 
+    reaper_started = False
+    root_exited = False
+
+    def _ensure_reaper() -> None:
+        """Start one retained-root reaper before terminal reconciliation."""
+        nonlocal reaper_started
+        if not reaper_started:
+            _start_external_worker_reaper(process, custody)
+            reaper_started = True
+
+    def _split_worker_active() -> Optional[bool]:
+        if custody is None:
+            return False
+        probe = getattr(custody, "external_worker_is_active", None)
+        if not callable(probe):
+            return False
+        return probe()
+
     # The worker commits its terminal row before its process exits, so exit is
     # the correct wakeup.  Each ledger read opens a connection and re-runs
     # schema init; polling it at 50ms for an hours-long agent run is ~72k
     # opens/hour of pure contention with the worker's own writes.
     while True:
-        try:
-            returncode = process.wait(timeout=1.0)
-        except subprocess.TimeoutExpired:
-            if not _is_terminal():
-                continue
-            # Recovery can win between the timeout and this ledger read. If
-            # the worker has since exited, consume its diagnostics below before
-            # cleanup; only a still-live terminal worker needs background reaping.
-            returncode = process.poll()
-            if returncode is None:
-                # A terminal row can precede the real child exit even for an unmanaged caller.
-                # Start the existing asynchronous reaper on every early-return path; never join
-                # here, because this waiter must remain bounded and nonblocking.
-                _start_external_worker_reaper(process, custody)
-                if custody is not None:
-                    reconciliation = custody.reconcile_unacknowledged(
-                        process, dispatch_mode=dispatch_mode)
-                    if reconciliation == "unknown":
-                        raise _ExternalWorkerPostHandoffError(
-                            "terminal execution has unverified external ownership")
-                return True
+        if not root_exited:
+            try:
+                returncode = process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                if not _is_terminal():
+                    continue
+                # Recovery can win between the timeout and this ledger read. If
+                # the worker has since exited, consume its diagnostics below before
+                # cleanup; only a still-live terminal worker needs background reaping.
+                returncode = process.poll()
+                if returncode is None:
+                    # A terminal row can precede the real child exit even for an unmanaged caller.
+                    # Start the existing asynchronous reaper on every early-return path; never join
+                    # here, because this waiter must remain bounded and nonblocking.
+                    _ensure_reaper()
+                    if custody is not None:
+                        reconciliation = custody.reconcile_unacknowledged(
+                            process, dispatch_mode=dispatch_mode)
+                        if reconciliation == "unknown":
+                            raise _ExternalWorkerPostHandoffError(
+                                "terminal execution has unverified external ownership")
+                    return True
+            else:
+                # The retained root/launcher is only a wakeup for a Windows
+                # degraded split. The acknowledged worker and its canonical
+                # Job remain the custody authorities after this point.
+                root_exited = True
+                _ensure_reaper()
+
         # The worker can commit its terminal row and exit between the first
         # read and wait(). Re-read the exact attempt before declaring that
         # it died without terminalizing.
         current = get_execution(execution_id)
         if current and current.get("status") in ("completed", "failed"):
             if custody is not None:
-                _start_external_worker_reaper(process, custody)
+                _ensure_reaper()
                 reconciliation = custody.reconcile_unacknowledged(
                     process, dispatch_mode=dispatch_mode)
                 if reconciliation == "unknown":
@@ -3649,6 +3675,20 @@ def _wait_for_external_cron_worker_body(
                         "terminal execution has unverified external ownership")
                 custody.observe_terminal()
             return True
+
+        if root_exited:
+            # A Windows degraded/trampoline launcher may exit successfully
+            # while the ACK-authenticated worker is still executing under the
+            # retained canonical Job. Never terminalize its durable row from
+            # the launcher return code; wait for the worker row and Job to
+            # settle instead.
+            active = _split_worker_active()
+            if active is True:
+                time.sleep(0.05)
+                continue
+            if active is None:
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker custody became unverifiable after launcher exit")
         # If the adopted worker died without terminalizing, its owner is
         # now provably gone. Recover to ``unknown`` rather than routing the
         # exception through the pre-handoff dispatch-failure path, which
@@ -3671,7 +3711,7 @@ def _wait_for_external_cron_worker_body(
             current = get_execution(execution_id)
             if current and current.get("status") in ("completed", "failed"):
                 if custody is not None:
-                    _start_external_worker_reaper(process, custody)
+                    _ensure_reaper()
                     reconciliation = custody.reconcile_unacknowledged(
                         process, dispatch_mode=dispatch_mode)
                     if reconciliation == "unknown":

@@ -115,6 +115,56 @@ class ProcessScopeFence:
         with self._lock:
             return self._close_locked()
 
+    def terminal_history_retirement(self) -> bool:
+        """Prove that every accepted session is settled terminal history.
+
+        Profile retirement is allowed to hand a closed profile to a successor only after the
+        exact sessions admitted by this fence have completed their native custody cycle.  This
+        is deliberately a read-only check: the fence receipt and the registry's retained
+        history stay in place for later reconciliation.  In particular, ``release_session``
+        must not be used here because it is reserved for a proven pre-effect failure.
+        """
+        with self._lock:
+            if not self._closed or self._pending_reservation_ids or self._late_creation:
+                return False
+            session_ids = tuple(self._created_session_ids)
+
+        if not session_ids:
+            return True
+
+        try:
+            with self.registry._lock:
+                finished = dict(self.registry._finished)
+                completion_tokens = self.registry._completion_tokens
+                pending_watchers = tuple(self.registry.pending_watchers)
+                coordinator = self.registry._runtime_custody
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            return False
+        if coordinator is None:
+            return False
+
+        # Import lazily to keep this low-level evidence object independent of the registry
+        # module's construction order.
+        from tools.process_registry_terminal_history import finished_session_is_terminal_history
+
+        for session_id in session_ids:
+            session = finished.get(session_id)
+            custody = getattr(session, "custody", None) if session is not None else None
+            if (
+                session is None
+                or getattr(session, "profile_id", None) != self.profile_id
+                or getattr(session, "process_instance", None) != self.process_instance
+                or getattr(session, "authority_epoch", None) != self.authority_epoch
+                or getattr(custody, "coordinator", None) is not coordinator
+                or not finished_session_is_terminal_history(
+                    session,
+                    completion_tokens=completion_tokens,
+                    pending_watchers=pending_watchers,
+                )
+            ):
+                return False
+        return True
+
     def _close_locked(self) -> dict[str, Any]:
         if self._receipt is not None:
             return dict(self._receipt)
