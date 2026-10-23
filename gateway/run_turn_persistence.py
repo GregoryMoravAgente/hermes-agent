@@ -353,13 +353,11 @@ class GatewayTurnPersistenceMixin:
         # Pending process watchers (check_interval on background processes)
         try:
             from tools.process_registry import process_registry
-            # Detach the batch atomically (reassign, not clear()) so concurrent appends aren't dropped.
-            watchers = process_registry.pending_watchers
-            process_registry.pending_watchers = []
-            for i, watcher in enumerate(watchers):
-                asyncio.create_task(self._run_process_watcher(watcher))
-                if i % 100 == 99:
-                    await asyncio.sleep(0)
+            from gateway.run_process_watchers import drain_pending_process_watchers
+            await drain_pending_process_watchers(
+                self, process_registry,
+                lambda watcher: asyncio.create_task(self._run_process_watcher(watcher)),
+            )
         except Exception as e:
             logger.error("Process watcher setup error: %s", e)
 
