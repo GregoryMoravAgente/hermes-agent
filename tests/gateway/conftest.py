@@ -980,8 +980,9 @@ def started_mux(tmp_path, monkeypatch, unused_tcp_port):
                 runner = GatewayRunner(config)
                 call(initialize_gateway_runtime(runner))
                 control_server = runner.session_control_server = GatewayControlServer(
-                    root, verb_handlers={"identify": lambda: runner.session_runtime_descriptor}
+                    root, verb_handlers={"identify": lambda: _runtime_owned_identify(runner)}
                 )
+                control_server.ticket_store = runner.session_ticket_store
                 call(control_server.start())
                 # This is the same listener startup used by gateway.run.start_gateway; it is required
                 # before GatewayRunner.start(), because publish_gateway_runtime_ready checks its live task.
@@ -1208,8 +1209,9 @@ def started_yuanbao(tmp_path, monkeypatch, unused_tcp_port):
             runner = GatewayRunner(config)
             call(initialize_gateway_runtime(runner))
             control_server = runner.session_control_server = GatewayControlServer(
-                root, verb_handlers={'identify': lambda: runner.session_runtime_descriptor}
+                root, verb_handlers={'identify': lambda: _runtime_owned_identify(runner)}
             )
+            control_server.ticket_store = runner.session_ticket_store
             call(control_server.start())
             call(start_gateway_runtime_api(runner))
             assert call(runner.start()) is True
