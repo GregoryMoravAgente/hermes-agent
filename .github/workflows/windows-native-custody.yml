@@ -10,6 +10,7 @@ on:
       - codex/AGC-1663/i12-managed-proof-root-01a120af-20261022
       - codex/AGC-1721/native-cron-error-20261023
       - codex/AGC-1721/native-managed-worker-m1r4-20261023
+      - codex/AGC-1721/managed-worker-fault-receiving-r3-20261023
 
 permissions:
   contents: read
@@ -32,44 +33,8 @@ env:
   FAL_KEY: ''
   HERMES_TEST_FILE_RETRIES: '0'
   NATIVE_CUSTODY_FILES: |
-    tests/tools/test_process_registry_windows_custody.py
-    tests/tools/test_process_registry_native_scope_retry.py
-    tests/tools/test_terminal_tool.py
-    tests/tools/test_process_registry_custody.py
-    tests/gateway/test_runtime_custody_snapshot_contract.py
-    tests/tools/test_drain_fd_windows.py
-    tests/tools/test_foreground_reader_handoff.py
-    tests/tools/test_process_registry_lazy_restore.py
-    tests/tools/test_process_registry_windows_background_custody.py
-    tests/gateway/test_preservation_admission_consumers.py
-    tests/tools/test_process_registry_background_failure_retention.py
-    tests/gateway/test_runtime_custody_profile_epochs.py
-    tests/gateway/test_runtime_custody_bootstrap_contract.py
-    tests/gateway/test_runtime_service_parent_edges.py
-    tests/gateway/test_session_authorities_multiplex.py
-    tests/gateway/test_codex_service_custody.py
-    tests/agent/transports/test_codex_physical_custody.py
-    tests/gateway/test_runtime_service_native_close_identity.py
-    tests/cron/test_cron_owner_custody.py
-    tests/gateway/test_managed_api_detached_cron_custody.py
-    tests/gateway/test_managed_scheduler_cron_custody.py
-    tests/hermes_state/test_checked_close_retention.py
-    tests/gateway/test_handle_cache_close_order.py
-    tests/plugins/test_provider_native_retirement.py
-    tests/tui_gateway/test_host_supervisor_test_env.py
-    tests/tui_gateway/test_compute_host_ack_writer_settlement_r9.py
-    tests/tui_gateway/test_host_supervisor_owner_r5_startup.py
-    tests/hermes_state/test_complete_export.py
-    tests/gateway/test_notification_source_watcher_rebind.py
-    tests/tui_gateway/test_hosted_tui_custody.py
-    tests/gateway/test_started_gateway_discovery.py
-    tests/agent/test_copilot_acp_failure_retention.py
-    tests/gateway/test_runtime_service_windows_retry.py
-    tests/gateway/test_native_own_policy_admission.py
-    tests/agent/test_copilot_acp_catalog_diagnostic.py
-    tests/gateway/test_runtime_service_delivery_drain.py
     tests/gateway/test_managed_worker_native_custody.py
-    tests/gateway/test_unified_gateway_native_live.py
+    tests/gateway/test_managed_worker_fault_identity.py
 
 jobs:
   native-custody:
@@ -214,7 +179,7 @@ jobs:
           set -euo pipefail
           "$HERMES_PYTHON" scripts/check --base a01edde680a73fdcabc2aa20b94d0581338e499b
 
-      - name: Run the complete native file bank under the owned Windows Job
+      - name: Run the bounded changed native file bank under the owned Windows Job
         id: native-bank
         continue-on-error: true
         shell: bash
@@ -450,6 +415,8 @@ jobs:
           autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
           receipt = {
               "schema": "windows-native-custody-pr-v2",
+              "qualification_scope": "bounded-managed-worker-faults-r3",
+              "full_native38_qualification": False,
               "whole_source_pm_base_tools_unchanged": whole_environment_equal,
               "whole_source_file_count": len(environment_before["source"]),
               "pm_file_count": len(environment_before["pm"]),

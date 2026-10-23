@@ -327,6 +327,8 @@ class ManagedWorkerCustody:
 
 
 def _managed_cleanup_failure(worker: Any, receipt: Any, reason: str) -> None:
+    if reason == "reader_close_failed":
+        receipt.reader_error = reason
     receipt.mark_unknown(reason)
     worker.closed.set()
     worker._demand.release()
@@ -423,6 +425,10 @@ def reserve_managed_worker(binding: Any, store_path: str) -> ManagedWorkerCustod
 
         physical = reserve_physical(owner.parent)
         owner.physical = physical
+        physical.source_owner = owner
+        physical.source_parent = owner.parent
+        physical.source_service = owner.service
+        physical.source_root_handle = owner.handle
         physical.ephemeral_process = True
         return ManagedWorkerCustody(owner, binding, store_path)
     except BaseException as exc:  # health: allow BLE001 -- reservation faults retain the exact parent lease
