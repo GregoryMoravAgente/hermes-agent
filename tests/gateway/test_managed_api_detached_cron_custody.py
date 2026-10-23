@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 import aiohttp
 import pytest
@@ -113,6 +114,12 @@ async def test_public_started_api_detached_cron_runs_real_agent_and_settles(
 
         execution_id = claimed_job["execution_id"]
         record = executions.get_execution(execution_id)
+        # Keep the actual synthetic agent failure in native CI's captured output;
+        # status alone cannot distinguish execution failure from custody settlement.
+        print(json.dumps({
+            "cron_execution_status": record.get("status") if record else None,
+            "cron_execution_error": record.get("error") if record else None,
+        }, sort_keys=True))
         assert record is not None
         assert record["id"] == execution_id
         assert record["job_id"] == job["id"]
