@@ -45,7 +45,8 @@ async def _build_profile_authority(runner, name, home, *, register, defer_local_
     with _profile_runtime_scope(home, hydrate_secrets=False):
         db = getattr(runner._session_db, '_db', runner._session_db)
         if db is None:
-            raise RuntimeError(_store_open_failure(runner, home))
+            from gateway.run_runtime_profile_support import store_open_failure
+            raise RuntimeError(store_open_failure(runner, home))
         if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
             raise RuntimeError(f'session authority database does not belong to the reserved profile {home}')
         registry.add(home, None, name=name)
@@ -58,21 +59,6 @@ async def _build_profile_authority(runner, name, home, *, register, defer_local_
             raise
     registry.replace(home, authority)
     return authority
-
-
-def _store_open_failure(runner, home):
-    """Why *home*'s ``state.db`` has no handle: the scoped handle caches answer None for a failed open
-    (and while they back off), so the park reason named an ownership mismatch over the real cause, a
-    legacy store that crashed its migration on every open (#141467). The reason is the exception the
-    failed open recorded; reopening here to learn it could create or migrate the store, and would skip
-    the caches' backoff."""
-    path = home / 'state.db'
-    caches = (getattr(getattr(runner, 'session_store', None), '_db_handle_cache', None),
-              getattr(runner, '_session_db_handle_cache', None))
-    error = next((e for e in (c.last_error(path) for c in caches if c is not None) if e), '')
-    if error:
-        return f'{path} did not open: {error}'
-    return f'{path} is unavailable (its last open failed; retry pending)'
 
 
 def bootstrap_i10_consumer_sources(runner) -> None:
@@ -289,6 +275,9 @@ async def initialize_gateway_runtime(runner):
     # Bind the process registry only after the authenticated process instance and authority epoch
     # exist. Pre-existing children are retained as unknown instead of being adopted after Popen.
     from tools.process_registry import process_registry
+    from tools.process_registry_zero_factory import register_process_registry_profiles
+    if not register_process_registry_profiles(process_registry, coordinator, runner):
+        raise RuntimeError("I15 process factory registration refused")
     process_registry.bind_runtime_custody(coordinator)
     from tui_gateway.hosted_tui_custody import bind_runtime
     # Publish the binding during bootstrap.  Reserve an I17 root here only when a real adapter is
@@ -828,11 +817,10 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
     # observation, not an empty running map. A missing or failed source hook is explicitly unknown.
     try:
         from tools.process_registry import process_registry
-        from tools.process_registry_custody_evidence import (
-            preservation_owner_evidence_for_profiles,
-        )
-        process_evidence = preservation_owner_evidence_for_profiles(
+        from tools.process_registry_zero_factory import process_registry_owner_evidence
+        process_evidence, process_reason = process_registry_owner_evidence(
             process_registry,
+            runner,
             process_instance=receipt.process_instance,
             authority_epoch=receipt.authority_epoch,
             close_generation=receipt.close_generation,
@@ -840,7 +828,9 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
             launch_profile_id=process_registry._process_profile_id(),
         )
         if process_evidence is None:
-            coordinator.mark_owner_unknown('I15_process_registry_terminal', 'cross_process_unproven')
+            coordinator.mark_owner_unknown(
+                'I15_process_registry_terminal', process_reason or 'cross_process_unproven',
+            )
         else:
             process_evidence = dict(process_evidence)
             process_evidence['source'] = OWNER_SPECS['I15_process_registry_terminal'].source
@@ -1662,6 +1652,9 @@ async def serve_profile_runtime(runner, name, home):
         # retirement without waiting, or refuse (the caller parks and keeps the reservation).
         if not await _retire_profile_authority(existing, timeout=0):
             raise ProfileOwnershipRetained(f'an earlier serve of {home} is still stopping')
+        from gateway.run_runtime_profile_support import retire_process_registry_profile
+        if not retire_process_registry_profile(runner, existing):
+            raise ProfileOwnershipRetained(f'process source for {home} is still retained')
         registry.remove(home)
     elif existing is not None:
         return existing
@@ -1677,6 +1670,16 @@ async def serve_profile_runtime(runner, name, home):
                 bind_automation_graph(coordinator)
             from gateway.runtime_i16_source_registry import refresh_i16_source_registry
             refresh_i16_source_registry(runner, coordinator)
+            # A hot-served authority joins the same source-owned I15 factory before its recovery
+            # can admit a native child.  Registration is exact (profile, live epoch and current
+            # registry indexes); a failed registration keeps the profile out of service rather
+            # than letting it fall back to the launch profile's evidence.
+            from tools.process_registry import process_registry
+            process_registry.bind_process_registry_zero_factory(
+                coordinator,
+                runner=runner,
+                profiles=((str(home), authority.epoch, home),),
+            )
         # Hot-served profiles are added after the hosted runtime binding is published.  Reserve
         # the I17 root before recovery can publish a hosted service, room, or compute-host
         # producer; waiting for owner_evidence would be too late because preservation has already
@@ -1751,13 +1754,20 @@ async def unserve_profile_runtime(runner, home):
     """Retire one profile's authority (deleted while running) and shrink the published set.
     False when one of its turns outlived the Stop deadline (keep the reservation); True otherwise,
     including for a profile this process never served."""
-    home = await asyncio.to_thread(Path(home).resolve)
+    from hermes_cli.profile_provenance_bootstrap import ProfileProvenanceError, _safe_path
+    try:
+        home = await asyncio.to_thread(_safe_path, Path(home), label="served profile home")
+    except ProfileProvenanceError:
+        return False
     registry = runner.session_authorities
     authority = registry.for_home(home)
     if authority is None:
         return True
     retired = await _retire_profile_authority(authority)
     if not retired:
+        return False
+    from gateway.run_runtime_profile_support import retire_process_registry_profile
+    if not retire_process_registry_profile(runner, authority):
         return False
     registry.remove(home)
     _publish_served_set(runner)

@@ -49,6 +49,23 @@ class ProfileReleaseSummary:
         return details or "released"
 
 
+@dataclass(frozen=True)
+class ProfileLineage:
+    """Typed relationship between a new profile origin and its current gateway owner."""
+
+    status: str
+    reason: str = ""
+    generation: str | None = None
+    birth_binding: tuple[int, int, int | None] | None = None
+    owner_epoch: str | None = None
+    record_binding: tuple[object, ...] | None = None
+    prior_lock_present: bool = False
+
+    @property
+    def is_authenticated_new_profile(self) -> bool:
+        return self.status == "new_profile_started"
+
+
 class OwnershipReleaseError(OwnershipConflict):
     """A reservation cleanup did not prove that every OS exclusion was released."""
 
@@ -58,7 +75,13 @@ class OwnershipReleaseError(OwnershipConflict):
 
 
 def canonical_home(home: Path) -> Path:
-    return Path(os.path.normcase(str(Path(home).expanduser().resolve())))
+    from hermes_cli.profile_provenance_bootstrap import ProfileProvenanceError, _safe_path
+
+    try:
+        safe_home = _safe_path(home, label="profile home")
+    except ProfileProvenanceError as exc:
+        raise OwnershipConflict(f"Gateway runtime ownership refused for linked profile {home}") from exc
+    return Path(os.path.normcase(str(safe_home)))
 
 
 def tighten_lock_mode(fd: int) -> None:
@@ -182,6 +205,7 @@ class ProfileOwnership:
         self._owner_epochs: dict[Path, str] = {}
         self._owner_record_bindings: dict[Path, tuple[object, str, tuple[object, ...], int]] = {}
         self._predecessor_records: dict[Path, dict | None] = {}
+        self._lineages: dict[Path, ProfileLineage] = {}
         # Object-bound custody already used by the finalizer path.  An ambiguous physical
         # close keeps the same profile handle until that exact token is terminal; this is not
         # a second ledger and a successor cannot satisfy it with a copied object.
@@ -194,9 +218,107 @@ class ProfileOwnership:
         with self._mutex:
             return tuple(self._handles)
 
+    def _record_reservation_lineage(
+        self, home: Path, origin, owner_epoch: str, prior_lock: bool, record: dict,
+    ) -> None:
+        from hermes_cli.profile_provenance import mark_profile_started
+
+        if origin.is_new_profile and not prior_lock:
+            try:
+                started = mark_profile_started(
+                    home, owner_epoch=owner_epoch,
+                    record_binding=(
+                        record.get('owner_epoch'), record.get('pid'), record.get('kind'),
+                        record.get('start_time'), record.get('hermes_home'),
+                    ),
+                )
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                self._lineages[home] = ProfileLineage(
+                    "unknown", "origin_transition_failed", owner_epoch=owner_epoch,
+                    prior_lock_present=prior_lock,
+                )
+                raise OwnershipConflict(
+                    f"Profile origin transition was not authenticated for {home}"
+                ) from exc
+            else:
+                if started.is_authenticated:
+                    self._lineages[home] = ProfileLineage(
+                        "new_profile_started",
+                        generation=started.generation,
+                        birth_binding=started.birth_binding,
+                        owner_epoch=owner_epoch,
+                        record_binding=started.started_record_binding,
+                        prior_lock_present=prior_lock,
+                    )
+                else:
+                    self._lineages[home] = ProfileLineage(
+                        "unknown", "origin_transition_unproven",
+                        owner_epoch=owner_epoch, prior_lock_present=prior_lock,
+                    )
+                    raise OwnershipConflict(
+                        f"Profile origin transition was not proven for {home}"
+                    )
+        elif origin.status == "valid" and origin.state == "started":
+            self._lineages[home] = ProfileLineage(
+                "existing_profile_started", "prior_origin_started",
+                generation=origin.generation, birth_binding=origin.birth_binding,
+                owner_epoch=owner_epoch, prior_lock_present=prior_lock,
+            )
+        elif origin.status == "valid" and origin.state == "never_started":
+            self._lineages[home] = ProfileLineage(
+                "unknown", "prior_lock_before_first_start",
+                generation=origin.generation, birth_binding=origin.birth_binding,
+                owner_epoch=owner_epoch, prior_lock_present=prior_lock,
+            )
+        else:
+            self._lineages[home] = ProfileLineage(
+                "unknown", origin.reason or "origin_unavailable",
+                owner_epoch=owner_epoch, prior_lock_present=prior_lock,
+            )
+
+    def _publish_reservation(
+        self, home: Path, handle, origin, owner_epoch: str, prior_lock_present: bool,
+        purpose: str | None, *, record: dict | None = None, lineage_prepared: bool = False,
+    ) -> None:
+        from gateway.status import _build_pid_record, _read_gateway_lock_record
+
+        path = home / 'gateway.lock'
+        if not _still_names(path, handle.fileno()):
+            raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
+        predecessor = _read_gateway_lock_record(path)
+        self._predecessor_records[home] = (
+            copy.deepcopy(predecessor) if isinstance(predecessor, dict) else None
+        )
+        try:
+            prior_payload = os.fstat(handle.fileno()).st_size > 0
+        except OSError:
+            prior_payload = True
+        prior_lock = prior_lock_present or prior_payload or isinstance(predecessor, dict)
+        if record is None:
+            captured = _build_pid_record()
+            record = {**captured, 'hermes_home': str(home), 'owner_epoch': owner_epoch}
+        # Bind the acquisition tuple to this exact descriptor and nonce before publishing the
+        # record. Later reads must match this tuple exactly; only the independent live-process
+        # start reading may use the existing platform drift tolerance.
+        self._owner_record_bindings[home] = (
+            handle, owner_epoch,
+            (record.get('pid'), record.get('kind'), record.get('start_time'), record.get('hermes_home')),
+            handle.fileno(),
+        )
+        if purpose:
+            record['purpose'] = purpose
+        if not lineage_prepared:
+            self._record_reservation_lineage(home, origin, owner_epoch, prior_lock, record)
+        handle.seek(0)
+        handle.truncate()
+        json.dump(record, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+
     def reserve(self, homes, *, purpose: str | None = None) -> None:
         """Reserve the real profile lock and publish one fresh physical incarnation."""
-        from gateway.status import _read_gateway_lock_record, _try_acquire_file_lock, _build_pid_record
+        from gateway.status import _try_acquire_file_lock
+        from hermes_cli.profile_provenance import read_profile_provenance
         with self._mutex:
             added = []
             try:
@@ -205,12 +327,37 @@ class ProfileOwnership:
                         raise OwnershipConflict(f'Gateway runtime ownership is unknown for profile {home}')
                     if home in self._handles:
                         continue
-                    make_user_dir(home, mode=0o700, parents=True, exist_ok=True)
+                    # Preserve the historical reservation ABI for a brand-new legacy home.  The
+                    # directory birth is not an I15 witness; without the authenticated origin it
+                    # remains UNKNOWN at the close fence.  Existing markerless homes are never
+                    # touched by this compatibility path.
+                    if not os.path.lexists(home):
+                        make_user_dir(home, mode=0o700, parents=True, exist_ok=False)
                     path = home / 'gateway.lock'
+                    prior_lock_present = os.path.lexists(path)
+                    origin = read_profile_provenance(home)
+                    if origin.is_new_profile and prior_lock_present:
+                        raise OwnershipConflict(
+                            f"Profile {home} has a first-run origin but a prior gateway lock"
+                        )
                     # Generate the logical incarnation before any OS acquisition.  If UUID
                     # creation fails there is no descriptor to retain; once acquisition succeeds
                     # the already-created token can be registered without another fallible step.
                     owner_epoch = uuid.uuid4().hex
+                    from gateway.status import _build_pid_record
+
+                    captured = _build_pid_record()
+                    record = {**captured, 'hermes_home': str(home), 'owner_epoch': owner_epoch}
+                    if purpose:
+                        record['purpose'] = purpose
+                    lineage_prepared = origin.is_new_profile and not prior_lock_present
+                    if lineage_prepared:
+                        # Publish the one-way source transition before creating/opening
+                        # gateway.lock.  A crash after this point is a started/unknown
+                        # profile, never a replayable first-run claim.
+                        self._record_reservation_lineage(
+                            home, origin, owner_epoch, prior_lock_present, record,
+                        )
                     fd = _open_lock(path)
                     try:
                         handle = os.fdopen(fd, 'r+', encoding='utf-8')  # windows-footgun: ok — write-only
@@ -226,38 +373,16 @@ class ProfileOwnership:
                     self._handles[home] = handle
                     self._owner_epochs[home] = owner_epoch
                     self._predecessor_records[home] = None
+                    if not lineage_prepared:
+                        self._lineages[home] = ProfileLineage(
+                            "unknown", "owner_record_unpublished", owner_epoch=owner_epoch,
+                            prior_lock_present=prior_lock_present,
+                        )
                     added.append(home)
-                    try:
-                        if not _still_names(path, handle.fileno()):
-                            raise OwnershipConflict(f'Gateway runtime already owns profile {home}')
-                        predecessor = _read_gateway_lock_record(path)
-                        self._predecessor_records[home] = (
-                            copy.deepcopy(predecessor) if isinstance(predecessor, dict) else None
-                        )
-                        captured = _build_pid_record()
-                        record = {**captured, 'hermes_home': str(home),
-                                  'owner_epoch': owner_epoch}
-                        # Bind the acquisition tuple to this exact descriptor and nonce before
-                        # publishing the record.  Later reads must match this tuple exactly;
-                        # only the independent live-process start reading may use the existing
-                        # platform drift tolerance.
-                        self._owner_record_bindings[home] = (
-                            handle, owner_epoch,
-                            (record.get('pid'), record.get('kind'), record.get('start_time'),
-                             record.get('hermes_home')),
-                            handle.fileno(),
-                        )
-                        if purpose:
-                            record['purpose'] = purpose
-                        handle.seek(0)
-                        handle.truncate()
-                        json.dump(record, handle)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    except BaseException:
-                        # The outer rollback still owns the descriptor and reports a typed
-                        # unknown if its close is not proven successful.
-                        raise
+                    self._publish_reservation(
+                        home, handle, origin, owner_epoch, prior_lock_present, purpose,
+                        record=record, lineage_prepared=lineage_prepared,
+                    )
             except BaseException as exc:
                 rollback = self._release_homes(added)
                 if rollback.failed:
@@ -286,6 +411,11 @@ class ProfileOwnership:
         with self._mutex:
             record = self._predecessor_records.get(canonical_home(home))
             return copy.deepcopy(record) if isinstance(record, dict) else None
+
+    def reservation_lineage(self, home: Path) -> ProfileLineage | None:
+        """Return the typed creation lineage bound to this retained owner descriptor."""
+        with self._mutex:
+            return self._lineages.get(canonical_home(home))
 
     def reservation_is_current(self, home: Path, expected_epoch: str) -> bool:
         """Validate a retained callback token without treating ``owns`` as proof."""
@@ -438,6 +568,18 @@ class ProfileOwnership:
                         if key in self._unknown_homes else ProfileReleaseOutcome.ABSENT)
             if key in self._unknown_homes and not self._revalidate_owner_locked(key):
                 return ProfileReleaseOutcome.UNKNOWN_LOST_EXCLUSION
+            # A caller may have closed the exact retained descriptor behind this owner.  Calling
+            # close() again can report success even though the OS exclusion was already lost (and
+            # on POSIX the descriptor number may already have been reused).  Keep that exact
+            # object in custody and classify the release as unknown; never replace or discard it.
+            try:
+                descriptor = handle.fileno()
+                if getattr(handle, "closed", False) or type(descriptor) is not int or descriptor < 0:
+                    self._unknown_homes.add(key)
+                    return ProfileReleaseOutcome.UNKNOWN_LOST_EXCLUSION
+            except BaseException:  # health: allow BLE001 -- invalid retained handle is ambiguous
+                self._unknown_homes.add(key)
+                return ProfileReleaseOutcome.UNKNOWN_LOST_EXCLUSION
             try:
                 # Closing the original descriptor is the OS owner operation on both POSIX and
                 # Windows. Do not unlock first and then pretend a failing close was harmless.
@@ -450,6 +592,7 @@ class ProfileOwnership:
             self._owner_epochs.pop(key, None)
             self._owner_record_bindings.pop(key, None)
             self._predecessor_records.pop(key, None)
+            self._lineages.pop(key, None)
             return ProfileReleaseOutcome.RELEASED
 
     def release(self, home: Path) -> bool:

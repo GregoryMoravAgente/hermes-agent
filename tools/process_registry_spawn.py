@@ -517,7 +517,15 @@ class ProcessRegistrySpawnMixin:
         pty_env.setdefault("GIT_PAGER", "cat")
         pty_env.setdefault("PAGER", "cat")
         self._prepare_reader(session, self._pty_reader_loop, f"proc-pty-reader-{session.id}")
-        pty_proc = _PtyProcessCls.spawn(pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120))
+        self._i15_before_process_effect(session)
+        effect = False
+        try:
+            pty_proc = _PtyProcessCls.spawn(
+                pty_argv, cwd=session.cwd, env=pty_env, dimensions=(30, 120),
+            )
+            effect = True
+        finally:
+            self._i15_after_process_effect(session, effect=effect)
         session.pid = pty_proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session._pty = pty_proc
@@ -751,6 +759,8 @@ class ProcessRegistrySpawnMixin:
         transaction = None
         output = None
         active_error = None
+        effect = False
+        self._i15_before_process_effect(session)
         try:
             _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
             spawn_argv = self._scope_argv(
@@ -781,12 +791,14 @@ class ProcessRegistrySpawnMixin:
                     creationflags=_popen_kwargs.get("creationflags", 0),
                     on_process_bound=_publish_native_bound,
                 )
+                effect = transaction.has_process_effect
             else:
                 proc = subprocess.Popen(
                     spawn_argv, text=True, cwd=session.cwd, env=spawn_env, encoding="utf-8",
                     errors="replace", stdout=output, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                     start_new_session=True, **_popen_kwargs)
                 self._publish_started_session(session, process=proc)
+                effect = True
         except (OSError, TypeError, ValueError) as exc:
             active_error = exc
             self._recover_pipe_launch_error(session, exc, transaction, known_pre_effect=True)
@@ -796,6 +808,7 @@ class ProcessRegistrySpawnMixin:
             self._recover_pipe_launch_error(session, exc, transaction, known_pre_effect=False)
             raise
         finally:
+            self._i15_after_process_effect(session, effect=effect)
             self._close_spawn_output(session, log, output, active_error, transaction)
         session.output_log = str(log or "")
         try:

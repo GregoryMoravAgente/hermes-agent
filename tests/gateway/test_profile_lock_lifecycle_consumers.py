@@ -25,7 +25,8 @@ def test_i20_evidence_requires_current_descriptor_and_physical_epoch(tmp_path):
         assert evidence["os_lock_owner"] is True
         assert evidence["cross_process_proof"] is True
         assert evidence["physical_binding"] == (
-            str(home.resolve()), evidence["owner_epoch"], evidence["native_descriptor"],
+            str(runtime_ownership.canonical_home(home)),
+            evidence["owner_epoch"], evidence["native_descriptor"],
         )
         epoch = evidence["owner_epoch"]
         assert owner.reservation_is_current(home, epoch)

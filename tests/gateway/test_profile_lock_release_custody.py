@@ -225,6 +225,24 @@ def test_ambiguous_close_after_underlying_close_keeps_unknown_from_releasing_a_r
         assert owner.close().failed
 
 
+def test_already_closed_retained_handle_stays_unknown_without_discard(tmp_path):
+    from gateway import runtime_ownership
+
+    home = tmp_path / "profile"
+    owner = runtime_ownership.ProfileOwnership()
+    owner.reserve([home])
+    retained = owner._handles[home.resolve()]
+    retained.close()
+    try:
+        assert owner.release_outcome(home) is runtime_ownership.ProfileReleaseOutcome.UNKNOWN_LOST_EXCLUSION
+        assert owner._handles[home.resolve()] is retained
+        assert home.resolve() in owner.homes
+    finally:
+        # The native descriptor was closed by the simulated external loss; the owner must retain
+        # the exact unknown object rather than manufacture a replacement or silently discard it.
+        assert owner.close().failed
+
+
 def test_foreign_replacement_cannot_validate_an_old_token_or_sibling(tmp_path):
     from gateway import runtime_ownership
 

@@ -35,6 +35,9 @@ from hermes_cli.config import get_hermes_home
 from tools.process_registry_notifications import heartbeat_output_tail
 from tools.process_registry_spawn import ProcessRegistrySpawnMixin
 from tools.process_registry_custody import ProcessRegistryCustodyMixin
+from tools.process_registry_zero_factory import (
+    COMPLETION_OUTPUT_CHARS, ProcessRegistryZeroFactoryMixin, completion_output as _completion_output,
+)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_termination import ProcessTerminationMixin
@@ -57,9 +60,6 @@ def _checkpoint_path() -> Path:
     return CHECKPOINT_PATH if CHECKPOINT_PATH != _CHECKPOINT_PATH_AT_IMPORT else get_hermes_home() / "processes.json"
 
 MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
-# Tail of the output a completion notification carries. Right for a build log; a spawner whose
-# output IS the payload (a bot DM's reply) asks for more per process (completion_output_chars).
-COMPLETION_OUTPUT_CHARS = 2000
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
 # A disappearing sandbox backend gets the existing backend_lost completion after three
@@ -531,17 +531,6 @@ def _output_tail(session: "ProcessSession", n: int) -> str:
     return strip_ansi(session.output_buffer[-n:])
 
 
-def _completion_output(session: "ProcessSession") -> dict:
-    """``output`` sized by the session's ``completion_output_chars`` plus ``output_cut`` when trimmed.
-
-    Shared by the completion notification AND the wait/poll/kill snapshots: a bot in an api_server
-    or one-shot session cannot receive notifications and polls instead, so the polled result must
-    carry the same whole reply and the same cut marker (#115334)."""
-    limit = session.completion_output_chars or COMPLETION_OUTPUT_CHARS
-    cut = len(session.output_buffer) - limit
-    return {"output": _output_tail(session, limit), **({"output_cut": cut} if cut > 0 else {})}
-
-
 @dataclass
 class ProcessSession:
     """A tracked background process with output buffering."""
@@ -702,7 +691,8 @@ _WSL_CHAIN_NOTE = (
 
 
 class ProcessRegistry(
-    ProcessRegistrySpawnMixin, ProcessRegistryCustodyMixin, ProcessTerminationMixin,
+    ProcessRegistrySpawnMixin, ProcessRegistryCustodyMixin, ProcessRegistryZeroFactoryMixin,
+    ProcessTerminationMixin,
     ProcessCheckpointMixin, ProcessOutputLogMixin,
 ):
     """In-memory registry of running and finished background processes.
@@ -1199,6 +1189,16 @@ class ProcessRegistry(
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
         session.notify_on_complete = notify_on_complete
+        if not self._i15_observe_existing_process(session):
+            # The caller omitted the pre-effect source lease.  Keep the exact adopted child
+            # visible and unbound so its real reader/native handle can settle, but never promote
+            # the late observation into I15 source evidence.
+            if session.custody is not None:
+                session.custody.mark_unknown("source_registration_missing")
+                self._sync_process_custody(session)
+            session.custody_state = "unknown"
+            session.custody_error = "source_registration_missing"
+            self._custody_unbound_sessions.add(session.id)
         self._publish_started_session(session, process=proc)
         if output_so_far:
             session.append_output(output_so_far)
@@ -1233,6 +1233,8 @@ class ProcessRegistry(
             f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
             f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
             f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
+        effect = False
+        self._i15_before_process_effect(session)
         try:
             result = env.execute(
                 bg_command, cwd=cwd or "", timeout=timeout,
@@ -1240,6 +1242,10 @@ class ProcessRegistry(
             )
             output = result.get("output", "").strip()
             session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+            # A missing sandbox PID after an authenticated launch is ambiguous: the wrapper may
+            # have created the child before its response was lost.  Retain the source admission
+            # whenever runtime custody is active so zero evidence cannot consume that unknown.
+            effect = session.pid is not None or self._runtime_custody is not None
             if session.pid is None:
                 if self._runtime_custody is None:
                     # No observed sandbox child and no custody lease: report the launch
@@ -1260,11 +1266,14 @@ class ProcessRegistry(
                 session._sandbox_marker_pid = session.pid
                 self._sandbox_bind_attempt(session)
         except BaseException as exc:
+            effect = True
             if self._runtime_custody is None:
                 raise
             logger.exception("Background process spawn_via_env failed; retaining existing custody")
             session.output_buffer = f"Failed to start: {exc}"
             self._sandbox_bind_failure_or_unknown(session, exc)
+        finally:
+            self._i15_after_process_effect(session, effect=effect)
         try:
             self._track_started(
                 session, self._env_poller_loop, f"proc-poller-{session.id}",

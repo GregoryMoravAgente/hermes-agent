@@ -43,6 +43,30 @@ class ProcessScopeFence:
             self._created_session_ids.append(session_id)
             return True
 
+    def contains_session(self, session_id: str) -> bool:
+        """Return whether this exact source admission is still retained."""
+        with self._lock:
+            return session_id in self._created_session_ids
+
+    def contains_foreground(self, reservation_id: str) -> bool:
+        """Return whether this exact foreground reservation is still pending."""
+        with self._lock:
+            return reservation_id in self._pending_reservation_ids
+
+    def release_session(self, session_id: str, owner_task_id: str) -> bool:
+        """Release one admission only after its caller proved no native effect occurred."""
+        with self._lock:
+            if (
+                self._closed
+                or owner_task_id != self.owner_task_id
+                or session_id not in self._created_session_ids
+            ):
+                self._late_creation = True
+                self._receipt = None
+                return False
+            self._created_session_ids.remove(session_id)
+            return True
+
     def reserve_foreground(self, reservation_id: str, owner_task_id: str) -> bool:
         """Record a foreground custody reservation before the launcher can create a child."""
         with self._lock:
@@ -65,6 +89,25 @@ class ProcessScopeFence:
                 self._receipt = None
                 return False
             self._pending_reservation_ids.remove(reservation_id)
+            return True
+
+    def transfer_foreground(
+        self, reservation_id: str, session_id: str, owner_task_id: str,
+    ) -> bool:
+        """Transfer one admitted foreground reservation to its exact registry session."""
+        with self._lock:
+            if (
+                self._closed
+                or owner_task_id != self.owner_task_id
+                or reservation_id not in self._pending_reservation_ids
+                or not isinstance(session_id, str)
+                or not session_id
+            ):
+                self._late_creation = True
+                self._receipt = None
+                return False
+            self._pending_reservation_ids.remove(reservation_id)
+            self._created_session_ids.append(session_id)
             return True
 
     def close(self) -> dict[str, Any]:

@@ -3,6 +3,11 @@
 import os
 from pathlib import Path
 from hermes_dir_acl import make_user_dir
+from hermes_cli.profile_provenance_bootstrap import (
+    ExclusiveDirectoryBirth,
+    ProfileProvenanceError,
+    create_exclusive_directory_birth,
+)
 
 
 class HomeInitializationError(RuntimeError):
@@ -25,10 +30,13 @@ def _operator_owned_links(links: list[Path], home: Path) -> list[Path]:
     return [link for link in links if link == home or home in link.parents]
 
 
-def _ensure_directory(path: Path, *, create: bool, secure: bool, home: Path) -> None:
+def _ensure_directory(
+    path: Path, *, create: bool, secure: bool, home: Path, exclusive_create: bool = False,
+) -> ExclusiveDirectoryBirth | None:
     from hermes_cli.config import _secure_dir
 
     detail = ""
+    birth: ExclusiveDirectoryBirth | None = None
     try:
         links = _directory_links(path)
         detail = "; ".join(f"{link} -> {link.readlink()}" for link in links)
@@ -37,13 +45,24 @@ def _ensure_directory(path: Path, *, create: bool, secure: bool, home: Path) -> 
             if not link.is_dir():
                 raise FileNotFoundError(f"Directory link is unavailable: {link}")
         if create:
-            make_user_dir(path, parents=True, exist_ok=True)
+            if exclusive_create and not os.path.lexists(path):
+                # The root birth is the provenance boundary. Create its parent normally, then
+                # create the leaf exclusively so a concurrent initializer cannot be mistaken for
+                # this process's clean first run.
+                try:
+                    birth = create_exclusive_directory_birth(path)
+                except FileExistsError:
+                    # Another initializer won the birth race. Continue normal initialization, but
+                    # the provenance consumer remains UNKNOWN unless it published the marker.
+                    make_user_dir(path, parents=False, exist_ok=True)
+            else:
+                make_user_dir(path, parents=True, exist_ok=True)
         elif not path.is_dir():
             raise FileNotFoundError(f"Required directory does not exist: {path}")
         # The operator owns permissions beyond a link, including logs/curator.
         if secure and not _operator_owned_links(links, home):
             _secure_dir(path)
-    except OSError as exc:
+    except (OSError, ProfileProvenanceError) as exc:
         raise HomeInitializationError(
             f"Cannot initialize Hermes directory {path}: {exc}. "
             + (f"Directory links: {detail}. " if detail else "")
@@ -51,6 +70,7 @@ def _ensure_directory(path: Path, *, create: bool, secure: bool, home: Path) -> 
             "restore the mount or repair the link before retrying. "
             "Hermes has not replaced the link or created its missing target."
         ) from exc
+    return birth
 
 
 def initialize_home(home: Path, subdirs: tuple[str, ...], ensured: set[str]) -> None:
@@ -59,7 +79,18 @@ def initialize_home(home: Path, subdirs: tuple[str, ...], ensured: set[str]) -> 
     managed = is_managed()
     old_umask = os.umask(0o007) if managed else None
     try:
-        _ensure_directory(home, create=not managed, secure=not managed, home=home)
+        home_birth = _ensure_directory(
+            home, create=not managed, secure=not managed, home=home, exclusive_create=True,
+        )
+        if home_birth is not None:
+            try:
+                from hermes_cli.profile_provenance import publish_new_profile_origin
+                publish_new_profile_origin(home, profile_kind="default", birth=home_birth)
+            except Exception as exc:
+                raise HomeInitializationError(
+                    f"Cannot publish Hermes home creation provenance {home}: {exc}. "
+                    "The new home was not authenticated; repair storage and retry."
+                ) from exc
         required = ("cron", "sessions", "logs", "memories") if managed else subdirs
         for subdir in required:
             _ensure_directory(home / subdir, create=not managed, secure=not managed, home=home)

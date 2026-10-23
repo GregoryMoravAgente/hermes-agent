@@ -234,6 +234,10 @@ class ProcessCustody:
         if refusal is not None:
             self.mark_unknown(getattr(refusal, "code", "accepted_row_unknown"))
             return False
+        factory = getattr(self, "_i15_zero_factory", None)
+        if factory is not None and not factory.release_foreground(self):
+            self.mark_unknown("source_registration_missing")
+            return False
         self.state = "not_accepted"
         self.handle = None
         return True
@@ -338,6 +342,7 @@ class ProcessRegistryCustodyMixin:
                     session.custody_state = "unknown"
                     session.custody_error = "preexisting_process"
                     self._custody_unbound_sessions.add(session.id)
+        self.bind_process_registry_zero_factory(coordinator)
 
     @staticmethod
     def _foreground_record(transaction) -> ForegroundCustodyRecord:
@@ -393,6 +398,12 @@ class ProcessRegistryCustodyMixin:
         owner_id = getattr(transaction_custody, "owner_id", "") or getattr(custody, "owner_id", "")
         if not owner_id:
             return False
+        factory = getattr(transaction_custody or custody, "_i15_zero_factory", None)
+        if factory is not None and factory.has_foreground_reservation(transaction_custody or custody):
+            if not factory.release_foreground(transaction_custody or custody):
+                if transaction_custody is not None:
+                    transaction_custody.mark_unknown("source_registration_missing")
+                return False
         with self._lock:
             if self._foreground_custody_transactions.get(owner_id) is not transaction:
                 return False
@@ -766,6 +777,10 @@ class ProcessRegistryCustodyMixin:
                 custody.mark_unknown("foreground_identity_mismatch")
                 self.retain_foreground_custody(transaction)
             return False
+        if not self._i15_observe_existing_process(session):
+            custody.mark_unknown("source_registration_missing")
+            self.retain_foreground_custody(transaction)
+            return False
         custody.reader_eof = True
         custody.scope_settled = True
         custody.cross_process_proven = custody.process_bound
@@ -784,7 +799,8 @@ class ProcessRegistryCustodyMixin:
     @staticmethod
     def _process_profile_id() -> str:
         from hermes_constants import get_hermes_home
-        return str(get_hermes_home().resolve())
+        from hermes_cli.profile_provenance_bootstrap import _safe_path
+        return str(_safe_path(get_hermes_home(), label="process profile home"))
 
     def _reserve_process_custody(
         self, session, *, parent_handle: Any = None,
@@ -807,37 +823,6 @@ class ProcessRegistryCustodyMixin:
         session.custody_owner_id = custody.owner_id
         session.custody_state = custody.state
         self._custody_observed = True
-
-    def reserve_foreground_custody(
-        self, *, profile_id: Optional[str] = None,
-        binding: Optional[ForegroundParentBinding] = None,
-        parent_handle: Any = None,
-        scope_fence: Optional[ProcessScopeFence] = None,
-        owner_task_id: Optional[str] = None,
-    ):
-        """Reserve the lease a foreground launcher must pass into ``adopt_local``.
-
-        The current local environment invokes its yield callback after Popen. A caller that can
-        reserve before that side effect passes this handle; an omitted handle is retained as
-        unknown instead of receiving a late reservation.
-        """
-        coordinator = self._runtime_custody
-        if coordinator is None:
-            return None
-        custody = ProcessCustody.reserve(
-            coordinator,
-            f"{coordinator.process_instance}:process:foreground:{uuid.uuid4().hex}",
-            profile_id or self._process_profile_id(),
-            parent_handle=parent_handle,
-            scope_fence=scope_fence,
-        )
-        custody.foreground_binding = binding
-        if scope_fence is not None:
-            if not scope_fence.reserve_foreground(custody.owner_id, owner_task_id or ""):
-                custody.mark_unknown("process_scope_unavailable")
-            else:
-                custody.foreground_reserved = True
-        return custody
 
     @staticmethod
     def _foreground_reader_identity_valid(transaction, custody, proc) -> bool:

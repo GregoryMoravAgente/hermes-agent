@@ -1266,7 +1266,12 @@ def _copytree_keep_junctions(src: Path, dst: Path, ignore, dirs_exist_ok: bool =
 def _clone_all_into(source_dir: Path, profile_dir: Path, canon: str) -> None:
     """--clone-all: full copytree minus infrastructure/history, then strip runtime files
     and cloned single-use OAuth grants."""
-    _copytree_keep_junctions(source_dir, profile_dir, _clone_all_copytree_ignore(source_dir))
+    # ``profile_dir`` is born exclusively by ``create_profile_staging_dir`` so its native identity can
+    # anchor the fresh origin receipt; copy into that private directory rather than asking
+    # copytree to create a second root object.
+    _copytree_keep_junctions(
+        source_dir, profile_dir, _clone_all_copytree_ignore(source_dir), dirs_exist_ok=True,
+    )
     materialized = _materialize_symlinked_files(profile_dir)
     if materialized:
         logger.info("profile %s: materialized symlinked %s so the clone never writes through to %s",
@@ -1439,7 +1444,8 @@ def create_profile(
     # on every create and every 30 s, and ``_iter_named_profile_dirs`` only lists valid ids (no leading
     # dot), so it can never adopt the half-copied tree and start adapters on credentials the strip
     # below has not removed yet.
-    staging = _clone_staging_dir(profile_dir)
+    from hermes_cli.profiles_initialization import create_profile_staging_dir
+    staging, staging_birth = create_profile_staging_dir(profile_dir)
     try:
         if clone_all and source_dir:
             _clone_all_into(source_dir, staging, canon)
@@ -1451,10 +1457,16 @@ def create_profile(
             if stripped:
                 logger.info("profile %s: cloned without messaging channels %s", canon, stripped)
         from hermes_cli.profiles_initialization import finish_profile_layout
-        finish_profile_layout(staging, no_skills=no_skills, clone_all=clone_all, description=description, soul=soul)
-        os.rename(staging, profile_dir)
+        from hermes_cli.profile_provenance_bootstrap import publish_profile_directory_noreplace
+        finish_profile_layout(
+            staging, no_skills=no_skills, clone_all=clone_all, description=description, soul=soul,
+            profile_name=canon, publish_target=profile_dir, origin_birth=staging_birth,
+        )
+        publish_profile_directory_noreplace(staging, profile_dir, birth=staging_birth)
     except BaseException:
-        shutil.rmtree(staging, ignore_errors=True)
+        from hermes_cli.profile_provenance_bootstrap import discard_unpublished_directory_birth
+        if not discard_unpublished_directory_birth(staging, birth=staging_birth):
+            logger.warning("profile staging cleanup retained exact unknown path: %s", staging)
         raise
 
     # Inside a container under s6, register the gateway as a runtime s6 service so
@@ -1465,18 +1477,6 @@ def create_profile(
     # rescans periodically, so a missed signal only delays serving).
     _notify_multiplexer(canon)
     return profile_dir
-
-
-def _clone_staging_dir(profile_dir: Path) -> Path:
-    """Fresh ``profiles/.<name>.staging-<pid>`` beside the final dir (same filesystem, so the publish
-    rename is atomic). A leftover from a crashed create is discarded."""
-    staging = profile_dir.parent / f".{profile_dir.name}.staging-{os.getpid()}"
-    profile_dir.parent.mkdir(parents=True, exist_ok=True)
-    if staging.is_symlink() or staging.is_file():
-        staging.unlink()
-    elif staging.is_dir():
-        shutil.rmtree(staging, ignore_errors=True)
-    return staging
 
 
 def _notify_multiplexer(canon: str) -> None:

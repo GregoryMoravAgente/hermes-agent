@@ -1200,6 +1200,14 @@ class GatewayStartupMixin:
             try:
                 with _profile_runtime_scope(Path(profile_home), {}):
                     recovered += process_registry.recover_from_checkpoint()
+                    factory = getattr(process_registry, "_i15_zero_factory", None)
+                    if factory is not None and not factory.note_checkpoint_recovery(
+                        str(Path(profile_home).resolve()),
+                    ):
+                        logger.warning(
+                            "I15 checkpoint recovery for profile %r was not a typed observation",
+                            profile_name,
+                        )
             except Exception:
                 logger.warning("Process checkpoint recovery for profile %r failed", profile_name, exc_info=True)
         return recovered
@@ -1219,6 +1227,9 @@ class GatewayStartupMixin:
         with _log_suppressed(logging.WARNING, "Process checkpoint recovery: %s"):
             from tools.process_registry import process_registry
             recovered = process_registry.recover_from_checkpoint()
+            factory = getattr(process_registry, "_i15_zero_factory", None)
+            if factory is not None and not factory.note_checkpoint_recovery():
+                logger.warning("I15 launch-profile checkpoint recovery was not a typed observation")
             recovered += self._recover_secondary_process_checkpoints(process_registry)
             if recovered:
                 logger.info("Recovered %s background process(es) from previous run", recovered)
