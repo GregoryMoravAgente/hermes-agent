@@ -15,18 +15,42 @@ import pytest
 
 from gateway.config import Platform
 import gateway.session_envelope as _session_envelope
+import gateway.session_authority as _session_authority
 from gateway.session_envelope import check_native_route, snapshot_native
 from gateway.session_ingress import executing_admission
 from hermes_state_runtime import RuntimeStoreError
 from plugins.platforms.yuanbao import yuanbao_proto
 
 _ORIGINAL_PREPARE_NATIVE = _session_envelope.prepare_native
+_ORIGINAL_ADMIT_SESSION_INPUT = _session_authority.admit_session_input
 
 
 @pytest.fixture(autouse=True)
 def _restore_test_seams():
     yield
     _session_envelope.prepare_native = _ORIGINAL_PREPARE_NATIVE
+    _session_authority.admit_session_input = _ORIGINAL_ADMIT_SESSION_INPUT
+
+
+def _capture_native_write(payloads):
+    """Observe the final producer input before the real durable write, without changing it.
+
+    Admission adds its server-owned producer mode after prepare_native. Restart controls must
+    compare the complete produced payload, including that binding, against independent DB reads.
+    """
+    def capture(*args, **kwargs):
+        payload = kwargs.get('payload')
+        captured = (
+            deepcopy(payload)
+            if isinstance(payload, dict) and isinstance(payload.get('native_text_v1'), dict)
+            else None
+        )
+        result = _ORIGINAL_ADMIT_SESSION_INPUT(*args, **kwargs)
+        if captured is not None:
+            payloads.append(captured)
+        return result
+
+    _session_authority.admit_session_input = capture
 
 
 async def _wait_until(predicate, *, timeout=20.0, what='condition'):
@@ -282,21 +306,13 @@ async def test_yuanbao_restart_route_uses_fresh_live_policy(started_yuanbao):
     events, payloads = [], []
 
     async def install():
-        import gateway.session_envelope as envelope
-
-        original_prepare = envelope.prepare_native
         original_handle = runner._handle_message
-
-        async def capture_prepare(owner, event):
-            payload = await original_prepare(owner, event)
-            payloads.append(payload)
-            return payload
 
         async def observe(event):
             events.append(event)
             return await original_handle(event)
 
-        envelope.prepare_native = capture_prepare
+        _capture_native_write(payloads)
         runner._handle_message = observe
 
     call(install())
@@ -350,21 +366,13 @@ async def test_yuanbao_restart_rejects_copied_source_and_replaced_adapter(starte
     events, payloads = [], []
 
     async def install():
-        import gateway.session_envelope as envelope
-
-        original_prepare = envelope.prepare_native
         original_handle = runner._handle_message
-
-        async def capture_prepare(owner, event):
-            payload = await original_prepare(owner, event)
-            payloads.append(payload)
-            return payload
 
         async def observe(event):
             events.append(event)
             return await original_handle(event)
 
-        envelope.prepare_native = capture_prepare
+        _capture_native_write(payloads)
         runner._handle_message = observe
 
     call(install())
@@ -423,21 +431,13 @@ async def test_yuanbao_group_policy_rechecks_revocation_after_restart(started_yu
     events, payloads = [], []
 
     async def install():
-        import gateway.session_envelope as envelope
-
-        original_prepare = envelope.prepare_native
         original_handle = runner._handle_message
-
-        async def capture_prepare(owner, event):
-            payload = await original_prepare(owner, event)
-            payloads.append(payload)
-            return payload
 
         async def observe(event):
             events.append(event)
             return await original_handle(event)
 
-        envelope.prepare_native = capture_prepare
+        _capture_native_write(payloads)
         runner._handle_message = observe
 
     call(install())
