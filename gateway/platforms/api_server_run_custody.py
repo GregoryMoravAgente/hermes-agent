@@ -884,13 +884,17 @@ class ApiRunCustody:
             authoritative_epoch = getattr(authority, "epoch", None)
             if (not isinstance(authoritative_profile, str) or not authoritative_profile
                     or authoritative_instance != process_instance
-                    or authoritative_epoch != authority_epoch):
+                    or type(authoritative_epoch) is not int or authoritative_epoch < 1):
                 return None, CustodyRefusal("runtime_authority_mismatch", "I03_api_run_direct")
             from gateway.session_authorities import served_profile_name
             if (profile_id is not None
                     and profile_id not in (authoritative_profile, served_profile_name(authoritative_profile))):
                 return None, CustodyRefusal("profile_identity_mismatch", "I03_api_run_direct")
             profile_id = authoritative_profile
+            # The descriptor carries the launch profile's process-close epoch. Each
+            # served profile has its own durable epoch; the canonical coordinator
+            # validates that live profile and native ownership before reserving.
+            authority_epoch = authoritative_epoch
         elif getattr(runner, "session_authorities", None) is not None:
             return None, CustodyRefusal("runtime_authority_missing", "I03_api_run_direct")
         if not isinstance(profile_id, str) or not profile_id:
