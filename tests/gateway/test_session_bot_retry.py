@@ -25,23 +25,28 @@ async def bot(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
+    from gateway.session_authorities import SessionAuthorities
     from gateway.session_local import create_local_session
     from gateway.session_local_title import title_new_session
+    from gateway.runtime_ownership import process_ownership
     from hermes_state import SessionDB
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
-    store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    store._db = SessionDB(db_path=tmp_path / 'state.db')
+    home = tmp_path.resolve()
+    process_ownership.reserve([home])
+    store = SessionStore(home / 'sessions', GatewayConfig())
+    store._db = SessionDB(db_path=home / 'state.db')
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
                              _evict_cached_agent=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = await initialize_session_authority(runner, profile_id='default', instance_id='fixture')
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
-    from hermes_cli.backend_retirement import RetirementFence
-    runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=authority.instance_id, authority_epoch=authority.epoch, fence=RetirementFence())
-    owner = Principal('uid:1000', 'default', frozenset({'session:create', 'session:read', 'session:submit'}), 'native')
+    authority = await initialize_session_authority(runner, profile_id=str(home), instance_id='fixture')
+    authorities = SessionAuthorities(home)
+    authorities.add(home, authority)
+    runner.session_authorities = authorities
+    from tests.gateway.conftest import bind_authority_runtime_custody
+    bind_authority_runtime_custody(runner, authority)
+    owner = Principal('uid:1000', str(home), frozenset({'session:create', 'session:read', 'session:submit'}), 'native')
     chat = create_local_session(authority, owner, {'request_id': 'bot', 'source': 'gui', 'cwd': str(tmp_path),
                                                     'model': 'fixture', 'toolsets': []})
     title_new_session(authority, chat, 'Bot Chat')
@@ -61,6 +66,7 @@ async def bot(tmp_path, monkeypatch):
                               connection=SimpleNamespace(authority=authority, actor=owner))
     finally:
         store._db.close()
+        assert process_ownership.release(home) is True
 
 
 def _admissions(bot):

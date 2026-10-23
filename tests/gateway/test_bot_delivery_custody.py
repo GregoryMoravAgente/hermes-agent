@@ -72,15 +72,13 @@ async def test_bot_queued_generation_is_pinned_only_by_its_real_fifo_claim(bot, 
 
 
 def _install_custody(authority):
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
-    from hermes_cli.backend_retirement import RetirementFence
+    # Reinstall through the canonical runtime binder so this legacy Bot fixture carries the
+    # same real profile registry, DB epoch, graph identity, and retained process-ownership
+    # witness as a booted authority.  A bare coordinator would make the strict I07 source
+    # reader correctly refuse at the physical-owner boundary.
+    from tests.gateway.conftest import bind_authority_runtime_custody
 
-    authority.runner.runtime_custody = RuntimeCustodyCoordinator(
-        process_instance=authority.instance_id,
-        authority_epoch=authority.epoch,
-        fence=RetirementFence(),
-    )
-    return authority.runner.runtime_custody
+    return bind_authority_runtime_custody(authority.runner, authority)
 
 
 async def _start_held_bot_admission(bot, monkeypatch, key):

@@ -244,8 +244,21 @@ def _owner_ready_special_source(authority, owner_class, custody):
         if not isinstance(close_generation, int) or not source_owner_ready(
                 authority.runner, close_generation):
             return False
-    if owner_class == 'I07_automation_route_wakes' and not authority._route_wake_inbound_seen:
-        return False
+    if owner_class == 'I07_automation_route_wakes':
+        if authority._route_wake_inbound_seen is True:
+            # The activity bit only says that an I07 producer was observed.  The close reader
+            # still needs the durable terminal row/result and the current source graph/native
+            # owner witness; otherwise a stale or fabricated bit could seal the owner.
+            from gateway.session_automation_custody import _i07_terminal_receipt_snapshot
+            return _i07_terminal_receipt_snapshot(
+                authority, authority._preservation_coordinator(), custody.get('close_generation'),
+            ) is not None
+        # An untouched source has no activity bit to read.  Only the source-owned bootstrap graph
+        # can authenticate zero work, and only after this close generation has fenced ingress.
+        from gateway.session_automation_custody import automation_zero_work_snapshot
+        if automation_zero_work_snapshot(
+                authority, authority._preservation_coordinator(), custody.get('close_generation')) is None:
+            return False
     if owner_class == 'I01_native_inbound':
         teams_pending = authority._preservation_teams_job_pending()
         if teams_pending is None or teams_pending:

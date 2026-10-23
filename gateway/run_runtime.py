@@ -586,6 +586,18 @@ def _authority_hosted_owner_evidence(_runner, authority, receipt, _owner_class, 
     )
 
 
+def _authority_automation_owner_evidence(_runner, authority, receipt, _owner_class, owner_id):
+    from gateway.session_automation_custody import preservation_owner_evidence
+
+    return preservation_owner_evidence(
+        authority,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        owner_id=owner_id,
+    )
+
+
 def _authority_readiness_owner_evidence(_runner, authority, receipt, owner_class, owner_id):
     from gateway.session_authority_readiness import preservation_owner_evidence
 
@@ -601,6 +613,7 @@ def _authority_readiness_owner_evidence(_runner, authority, receipt, owner_class
 _AUTHORITY_OWNER_EVIDENCE_HANDLERS = {
     'I01_native_inbound': _authority_source_owner_evidence,
     'I06_busy_followup_delivery': _authority_source_owner_evidence,
+    'I07_automation_route_wakes': _authority_automation_owner_evidence,
     'I08_goals_loops_heartbeat': _authority_goal_owner_evidence,
     'I09_a2a_hosted_kanban': _authority_hosted_owner_evidence,
     'I05_controls_and_unknown': _authority_readiness_owner_evidence,
@@ -1654,6 +1667,9 @@ async def serve_profile_runtime(runner, name, home):
         # this exact successor before recovery/hosted services can reserve any sidecar child.
         coordinator = getattr(runner, 'runtime_custody', None)
         if coordinator is not None:
+            bind_automation_graph = getattr(authority, '_register_automation_source_graph', None)
+            if callable(bind_automation_graph):
+                bind_automation_graph(coordinator)
             from gateway.runtime_i16_source_registry import refresh_i16_source_registry
             refresh_i16_source_registry(runner, coordinator)
         # Hot-served profiles are added after the hosted runtime binding is published.  Reserve

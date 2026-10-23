@@ -4,10 +4,12 @@ The coordinator still owns every lease.  This module only canonicalizes the sour
 that is stamped into an existing FIFO payload so a successor can authenticate the same row.
 """
 import asyncio
+from dataclasses import dataclass
 from functools import partial
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 from hermes_state_runtime import RuntimeStoreError, admit_session_input
 
@@ -25,6 +27,575 @@ _AUTOMATION_OWNER_CLASSES = frozenset({
     'I08_goals_loops_heartbeat',
     'I09_a2a_hosted_kanban',
 })
+
+
+_I07_SOURCE_INDEX_TYPES = (
+    ('_preservation_automation_roots', dict),
+    ('_preservation_automation_children', dict),
+    ('_preservation_automation_bindings', dict),
+    ('_preservation_automation_rehomes', dict),
+    ('_preservation_handles', dict),
+    ('_preservation_children', dict),
+    ('_preservation_pending_roots', dict),
+)
+_I07_READ_FAILED = object()
+_I07_IGNORE_ROW = object()
+
+
+@dataclass(frozen=True)
+class AutomationProducerGraph:
+    """Exact bootstrap witness for the real I07 producer families.
+
+    This is an identity-bound source graph, not another custody ledger.  The existing coordinator
+    remains the only owner of leases; these references let the close reader distinguish a registered
+    empty automation source from a missing, replaced, or malformed source index.
+    """
+
+    authority: object
+    coordinator: object | None
+    profile_id: str
+    instance_id: str
+    authority_epoch: int
+    database: object
+    database_path: str
+    indexes: tuple[tuple[str, object, type], ...]
+    producer_families: tuple[tuple[str, object], ...]
+    # The source graph keeps the exact native profile-owner incarnation captured when it is
+    # bound to the live coordinator.  Close-time code may revalidate this witness, but it must
+    # never replace it with a newly acquired lock or a current owner observation.
+    physical_owner_epoch: str | None = None
+    native_descriptor: int | None = None
+    physical_binding: tuple[str, str, int] | None = None
+
+    def matches(self, authority, coordinator) -> bool:
+        if (
+            self.authority is not authority
+            or self.coordinator is not coordinator
+            or getattr(authority, 'runner', None) is None
+            or getattr(authority.runner, 'runtime_custody', None) is not coordinator
+            or getattr(authority, 'profile_id', None) != self.profile_id
+            or getattr(authority, 'instance_id', None) != self.instance_id
+            or getattr(authority, 'epoch', None) != self.authority_epoch
+            or getattr(authority, 'db', None) is not self.database
+            or str(getattr(getattr(authority, 'db', None), 'db_path', '')) != self.database_path
+            or getattr(coordinator, 'process_instance', None) != self.instance_id
+        ):
+            return False
+        sentinel = object()
+        for name, expected, expected_type in self.indexes:
+            current = getattr(authority, name, sentinel)
+            if current is not expected or type(current) is not expected_type:
+                return False
+        if self.coordinator is not None and (
+            type(self.physical_owner_epoch) is not str
+            or not self.physical_owner_epoch
+            or type(self.native_descriptor) is not int
+            or isinstance(self.native_descriptor, bool)
+            or not isinstance(self.physical_binding, tuple)
+            or self.physical_binding != (
+                str(Path(self.profile_id).resolve()),
+                self.physical_owner_epoch, self.native_descriptor,
+            )
+        ):
+            return False
+        return self.producer_families == _i07_producer_families()
+
+
+def _i07_producer_families():
+    """Resolve the public and trusted I07 producer entrypoints at the source boundary."""
+    from gateway.run_plugin_injection import GatewayPluginInjectionMixin
+    from gateway.session_automation import admit_automation, admit_route_wake
+    from gateway.session_bot import deliver
+    from gateway.wake import deliver_wake
+
+    return (
+        ('automation', admit_automation),
+        ('route_wake', admit_route_wake),
+        ('plugin_injection', GatewayPluginInjectionMixin._admit_plugin_injection),
+        ('bot_delivery', deliver),
+        ('wake_delivery', deliver_wake),
+    )
+
+
+def _i07_graph(authority, coordinator):
+    graph = getattr(authority, '_preservation_automation_source_graph', None)
+    if not isinstance(graph, AutomationProducerGraph):
+        return None
+    try:
+        return graph if graph.matches(authority, coordinator) else None
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _i07_graph_indexes_empty(graph):
+    return all(not value for _, value, _ in graph.indexes)
+
+
+def _i07_runtime_epoch_matches(authority):
+    try:
+        with authority.db._read_ctx() as conn:
+            row = conn.execute(
+                'SELECT epoch, instance_id FROM runtime_epoch WHERE singleton=1'
+            ).fetchone()
+    except (AttributeError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+        return False
+    return (
+        row is not None
+        and type(row[0]) is int
+        and row[0] == authority.epoch
+        and row[1] == authority.instance_id
+    )
+
+
+def _i07_pending_admissions(authority):
+    try:
+        with authority.db._read_ctx() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM session_admissions "
+                "WHERE status IN ('queued', 'started', 'unknown')"
+            ).fetchone()
+    except (AttributeError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+        return None
+    if row is None or type(row[0]) is not int:
+        return None
+    return row[0]
+
+
+def _i07_native_reservation(home):
+    """Read the retained descriptor-bound native owner witness for one profile."""
+    try:
+        from gateway.runtime_ownership import process_ownership
+        reservation = process_ownership.reservation_evidence(home)
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        not isinstance(reservation, dict)
+        or reservation.get('profile_home') != str(home)
+        or type(reservation.get('owner_epoch')) is not str
+        or not reservation.get('owner_epoch')
+        or reservation.get('observed') is not True
+        or reservation.get('native_handle_retained') is not True
+        or reservation.get('os_lock_owner') is not True
+        or reservation.get('cross_process_proof') is not True
+        or type(reservation.get('native_descriptor')) is not int
+        or isinstance(reservation.get('native_descriptor'), bool)
+        or reservation.get('physical_binding') != (
+            str(home), reservation.get('owner_epoch'), reservation.get('native_descriptor'),
+        )
+    ):
+        return None
+    return reservation
+
+
+def _i07_native_owner_snapshot(authority, coordinator):
+    """Read the bound profile owner and reject a replacement incarnation."""
+    graph = _i07_graph(authority, coordinator)
+    if graph is None:
+        return None
+    home = Path(authority.profile_id).resolve()
+    if str(Path(authority.db.db_path).resolve().parent) != str(home):
+        return None
+    if not _i07_runtime_epoch_matches(authority):
+        return None
+    try:
+        scope = coordinator.profile_scope_observation(
+            authority.profile_id, authority.epoch,
+            require_serving=False, allow_retiring=True,
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if (
+        not getattr(scope, 'ok', False)
+        or type(getattr(scope, 'physical_owner_epoch', None)) is not str
+        or not scope.physical_owner_epoch
+    ):
+        return None
+    reservation = _i07_native_reservation(home)
+    if reservation is None:
+        return None
+    if (
+        reservation.get('owner_epoch') != graph.physical_owner_epoch
+        or reservation.get('native_descriptor') != graph.native_descriptor
+        or reservation.get('physical_binding') != graph.physical_binding
+        or scope.physical_owner_epoch != graph.physical_owner_epoch
+    ):
+        return None
+    return {
+        'profile_home': str(home),
+        'profile_id': authority.profile_id,
+        'authority_epoch': authority.epoch,
+        'process_instance': authority.instance_id,
+        'physical_owner_epoch': graph.physical_owner_epoch,
+        'database_path': str(Path(authority.db.db_path).resolve()),
+        'database_identity': id(authority.db),
+        'native_descriptor': graph.native_descriptor,
+        'native_handle_retained': True,
+        'os_lock_owner': True,
+        'cross_process_proof': True,
+    }
+
+
+def _i07_close_source_snapshot(authority, coordinator, close_generation, *, require_empty=True):
+    """Read the common live-source witness for this exact close generation.
+
+    I07 has two terminal shapes: a genuinely untouched source and a source that admitted a
+    wake and later published its durable terminal result.  Both shapes must authenticate the
+    same registered graph and the current profile/DB/OS owner before the owner can be sealed.
+    """
+    graph = _i07_graph(authority, coordinator)
+    if graph is None or (require_empty and not _i07_graph_indexes_empty(graph)):
+        return None
+    try:
+        status = coordinator.status()
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return None
+    if close_generation is None:
+        if status.get('state') != 'open' or status.get('close_generation') is not None:
+            return None
+    elif (
+        status.get('state') != 'closing'
+        or status.get('close_generation') != close_generation
+        or type(close_generation) is not int
+    ):
+        return None
+    if (
+        'I07_automation_route_wakes' in status.get('active_owner_classes', ())
+        or 'I07_automation_route_wakes' in status.get('unknown_owner_classes', ())
+    ):
+        return None
+    pending = _i07_pending_admissions(authority)
+    if pending is None or pending != 0:
+        return None
+    native = _i07_native_owner_snapshot(authority, coordinator)
+    if native is None:
+        return None
+    return {
+        'close_generation': close_generation,
+        'producer_families': tuple(name for name, _ in graph.producer_families),
+        'registered_indexes': tuple(name for name, _, _ in graph.indexes),
+        'empty_indexes': tuple(name for name, value, _ in graph.indexes if not value),
+        'pending_admissions': 0,
+        'coordinator_id': getattr(coordinator, '_coordinator_id', None),
+        **native,
+    }
+
+
+def _i07_terminal_root_index(graph):
+    """Return the retained terminal-root map when every other I07 index is empty."""
+    root_index = None
+    for name, value, _ in graph.indexes:
+        if name == '_preservation_automation_roots':
+            root_index = value
+        elif value:
+            return None
+    return root_index
+
+
+def _i07_terminal_admission_ids(authority):
+    try:
+        with authority.db._read_ctx() as conn:
+            return tuple(row[0] for row in conn.execute(
+                "SELECT admission_id FROM session_admissions WHERE status='terminal' ORDER BY seq"
+            ))
+    except (AttributeError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+        return _I07_READ_FAILED
+
+
+def _i07_terminal_receipt_row(
+        authority, admission_id, *, home, current_process, current_coordinator,
+        effective_close_generation,
+):
+    """Read and authenticate one current-process I07 terminal row, or ignore old history."""
+    try:
+        from hermes_state_runtime import get_session_admission
+        from gateway.session_results import admission_result
+        row = get_session_admission(authority.db, admission_id=admission_id)
+    except (AttributeError, KeyError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+        return _I07_READ_FAILED
+    descriptor = row_descriptor(row)
+    if not isinstance(descriptor, dict) or descriptor.get('owner_class') != 'I07_automation_route_wakes':
+        return _I07_IGNORE_ROW
+    # A current-process I07 row with any identity mismatch is an untrusted source read, not a
+    # reason to choose a different row. Rows from an older process or epoch are history.
+    if descriptor.get('process_instance') != current_process or descriptor.get('authority_epoch') != authority.epoch:
+        return _I07_IGNORE_ROW
+    if (
+        not _automation_descriptor_complete(descriptor)
+        or descriptor.get('profile_id') != authority.profile_id
+        or descriptor.get('profile_home') != home
+        or descriptor.get('process_instance') != authority.instance_id
+        or descriptor.get('coordinator_id') != current_coordinator
+        or descriptor.get('session_id') != row.get('target_session_id')
+        or descriptor.get('principal_id') != row.get('principal_id')
+        or descriptor.get('request_id') != row.get('request_id')
+        or descriptor.get('owner_id') != authority._automation_owner_id(
+            'I07_automation_route_wakes', row.get('target_session_id'), row.get('request_id'))
+        or row.get('owner_epoch') != authority.epoch
+        or type(descriptor.get('close_generation')) is not int
+        or descriptor.get('close_generation') < 0
+        or descriptor.get('close_generation') > effective_close_generation
+    ):
+        return _I07_READ_FAILED
+    generation = row.get('generation')
+    outcome = row.get('outcome')
+    cancelled = outcome == 'cancelled' and generation is None
+    result = None
+    if not cancelled and (type(generation) is not int or generation < 1):
+        return _I07_READ_FAILED
+    if not cancelled:
+        try:
+            result = admission_result(authority.db, admission_id)
+        except (AttributeError, KeyError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError):
+            return _I07_READ_FAILED
+        if result is None:
+            return _I07_READ_FAILED
+    root_keys = {descriptor.get('delivery_id') or descriptor['request_id']}
+    # Bot delivery keeps the mailbox key as the in-memory root key while the durable admission
+    # identity is ``bot:<key>``. This normalization is source-owned and still requires the exact
+    # terminal handle below; it is not a generic caller alias.
+    request_id = descriptor['request_id']
+    if descriptor.get('delivery_id') is None and request_id.startswith('bot:'):
+        root_keys.add(request_id[4:])
+    return {
+        'receipt': {
+            'admission_id': admission_id,
+            'owner_id': descriptor['owner_id'],
+            'authority_epoch': descriptor['authority_epoch'],
+            'process_instance': descriptor['process_instance'],
+            'coordinator_id': descriptor['coordinator_id'],
+            'close_generation': descriptor['close_generation'],
+            'generation': generation,
+            'outcome': outcome,
+            'result_present': cancelled or result is not None,
+        },
+        'root_keys': root_keys,
+    }
+
+
+def _i07_terminal_root_matches(authority, coordinator, common, root_key, handle, root_keys, receipts):
+    if not isinstance(root_key, str) or root_key not in root_keys:
+        return False
+    if not coordinator.is_terminal_handle(
+            handle, owner_class='I07_automation_route_wakes',
+            profile_id=authority.profile_id, authority_epoch=authority.epoch):
+        return False
+    matching = next((receipt for receipt in receipts
+                     if receipt['owner_id'] == getattr(handle, 'owner_id', None)), None)
+    return (
+        getattr(handle, 'process_instance', None) == common['process_instance']
+        and getattr(handle, 'coordinator_id', None) == common.get('coordinator_id')
+        and getattr(handle, 'physical_owner_epoch', None) == common['physical_owner_epoch']
+        and matching is not None
+    )
+
+
+def _i07_validate_terminal_roots(authority, coordinator, common, root_index, root_keys, receipts):
+    if root_index is None:
+        return None
+    retained = {}
+    for root_key, handle in root_index.items():
+        if not _i07_terminal_root_matches(
+                authority, coordinator, common, root_key, handle, root_keys, receipts):
+            return None
+        retained[root_key] = handle
+    return tuple(sorted(retained))
+
+
+def _i07_terminal_receipt_snapshot(authority, coordinator, close_generation):
+    """Read one real source-owned terminal I07 admission receipt.
+
+    ``_route_wake_inbound_seen`` is only an ingress hint. It is never terminal evidence: the
+    durable admission row, exact automation descriptor, and committed result must match this
+    authority/process/coordinator. Old rows from an earlier process or profile epoch are history.
+    """
+    common = _i07_close_source_snapshot(
+        authority, coordinator, close_generation, require_empty=False,
+    )
+    if common is None or authority._route_wake_inbound_seen is not True:
+        return None
+    graph = _i07_graph(authority, coordinator)
+    if graph is None:
+        return None
+    root_index = _i07_terminal_root_index(graph)
+    admission_ids = _i07_terminal_admission_ids(authority)
+    if admission_ids is _I07_READ_FAILED or not admission_ids:
+        return None
+    home = str(Path(authority.db.db_path).resolve().parent)
+    current_process = getattr(coordinator, 'process_instance', None)
+    current_coordinator = getattr(coordinator, '_coordinator_id', None)
+    effective_close_generation = close_generation if type(close_generation) is int else 0
+    receipts = []
+    root_keys = set()
+    for admission_id in admission_ids:
+        item = _i07_terminal_receipt_row(
+            authority, admission_id, home=home, current_process=current_process,
+            current_coordinator=current_coordinator, effective_close_generation=effective_close_generation,
+        )
+        if item is _I07_READ_FAILED:
+            return None
+        if item is _I07_IGNORE_ROW:
+            continue
+        receipts.append(item['receipt'])
+        root_keys.update(item['root_keys'])
+    if not receipts:
+        return None
+    retained = _i07_validate_terminal_roots(
+        authority, coordinator, common, root_index, root_keys, receipts,
+    )
+    if retained is None:
+        return None
+    return {
+        'mode': 'active_terminal',
+        'terminal_receipts': tuple(receipts),
+        'retained_terminal_roots': retained,
+        **common,
+    }
+
+
+def automation_zero_work_snapshot(authority, coordinator, close_generation):
+    """Return a typed I07 zero-work witness only at a fenced close boundary."""
+    if getattr(authority, '_route_wake_inbound_seen', None) is not False:
+        return None
+    common = _i07_close_source_snapshot(authority, coordinator, close_generation)
+    if common is None:
+        return None
+    return {
+        'mode': 'zero_work',
+        'zero_work': True,
+        'ingress_closed': True,
+        **common,
+    }
+
+
+def register_automation_source_graph(authority, coordinator=None):
+    """Install or bind the exact I07 graph during authenticated runtime bootstrap."""
+    graph = getattr(authority, '_preservation_automation_source_graph', None)
+    if graph is None:
+        db = getattr(authority, 'db', None)
+        db_path = getattr(db, 'db_path', None)
+        if (
+            db is None
+            or not isinstance(db_path, (str, Path))
+            or not isinstance(getattr(authority, 'profile_id', None), str)
+            or not isinstance(getattr(authority, 'instance_id', None), str)
+            or type(getattr(authority, 'epoch', None)) is not int
+            or authority.epoch < 1
+        ):
+            raise RuntimeStoreError('automation_source_graph_invalid')
+        indexes = []
+        sentinel = object()
+        for name, expected_type in _I07_SOURCE_INDEX_TYPES:
+            value = getattr(authority, name, sentinel)
+            if value is sentinel or type(value) is not expected_type:
+                raise RuntimeStoreError('automation_source_graph_invalid')
+            indexes.append((name, value, expected_type))
+        graph = AutomationProducerGraph(
+            authority=authority,
+            coordinator=None,
+            profile_id=authority.profile_id,
+            instance_id=authority.instance_id,
+            authority_epoch=authority.epoch,
+            database=db,
+            database_path=str(Path(db_path).resolve()),
+            indexes=tuple(indexes),
+            producer_families=_i07_producer_families(),
+        )
+    elif not isinstance(graph, AutomationProducerGraph) or graph.authority is not authority:
+        raise RuntimeStoreError('automation_source_graph_invalid')
+    if coordinator is None:
+        authority._preservation_automation_source_graph = graph
+        return graph
+    if getattr(authority.runner, 'runtime_custody', None) is not coordinator:
+        raise RuntimeStoreError('automation_source_graph_binding_mismatch')
+    if getattr(coordinator, 'process_instance', None) != authority.instance_id:
+        raise RuntimeStoreError('automation_source_graph_binding_mismatch')
+    if graph.coordinator is not None and graph.coordinator is not coordinator:
+        records = getattr(graph.coordinator, '_records', None)
+        if getattr(graph.coordinator, 'state', None) != 'open' or type(records) is not dict or records:
+            raise RuntimeStoreError('automation_source_graph_binding_collision')
+    if graph.coordinator is coordinator:
+        # A source graph already bound to this coordinator owns a single immutable native
+        # incarnation.  Re-reading a different current lock here would silently adopt a
+        # replacement profile owner and make the old close receipt appear valid.
+        if (
+            graph.physical_owner_epoch is None
+            and graph.native_descriptor is None
+            and graph.physical_binding is None
+        ):
+            # Some embedded/legacy adapters do not own an OS profile lock.  Keep their source
+            # graph registered so their existing admission/unknown paths remain functional, but
+            # leave I07 readiness UNKNOWN rather than manufacturing a physical witness.
+            return graph
+        if (
+            type(graph.physical_owner_epoch) is not str
+            or type(graph.native_descriptor) is not int
+            or graph.physical_binding != (
+                str(Path(graph.profile_id).resolve()),
+                graph.physical_owner_epoch, graph.native_descriptor,
+            )
+        ):
+            raise RuntimeStoreError('automation_source_graph_binding_mismatch')
+        current = _i07_native_reservation(Path(graph.profile_id).resolve())
+        if (
+            current is None
+            or current.get('owner_epoch') != graph.physical_owner_epoch
+            or current.get('native_descriptor') != graph.native_descriptor
+            or current.get('physical_binding') != graph.physical_binding
+        ):
+            raise RuntimeStoreError('automation_source_graph_binding_mismatch')
+        return graph
+    reservation = _i07_native_reservation(Path(graph.profile_id).resolve())
+    physical_owner_epoch = reservation.get('owner_epoch') if reservation is not None else None
+    native_descriptor = reservation.get('native_descriptor') if reservation is not None else None
+    physical_binding = reservation.get('physical_binding') if reservation is not None else None
+    graph = AutomationProducerGraph(
+        authority=graph.authority,
+        coordinator=coordinator,
+        profile_id=graph.profile_id,
+        instance_id=graph.instance_id,
+        authority_epoch=graph.authority_epoch,
+        database=graph.database,
+        database_path=graph.database_path,
+        indexes=graph.indexes,
+        producer_families=graph.producer_families,
+        physical_owner_epoch=physical_owner_epoch,
+        native_descriptor=native_descriptor,
+        physical_binding=physical_binding,
+    )
+    authority._preservation_automation_source_graph = graph
+    return graph
+
+
+def preservation_owner_evidence(
+    authority, *, process_instance, authority_epoch, close_generation, owner_id,
+):
+    """Build the dedicated I07 evidence, including active terminal or typed zero-work paths."""
+    from gateway.runtime_custody import OWNER_SPECS
+
+    coordinator = authority._preservation_coordinator()
+    if authority._route_wake_inbound_seen is True:
+        snapshot = _i07_terminal_receipt_snapshot(authority, coordinator, close_generation)
+    else:
+        snapshot = automation_zero_work_snapshot(authority, coordinator, close_generation)
+    if (
+        coordinator is None
+        or snapshot is None
+        or process_instance != coordinator.process_instance
+        or authority_epoch != coordinator.authority_epoch
+        or coordinator.status().get('close_generation') != close_generation
+        or not isinstance(owner_id, str)
+        or not owner_id
+    ):
+        return None
+    return {
+        'source': OWNER_SPECS['I07_automation_route_wakes'].source,
+        'process_instance': process_instance,
+        'authority_epoch': authority_epoch,
+        'close_generation': close_generation,
+        'owner_id': owner_id,
+        'observed': True,
+        'source_snapshot': snapshot,
+    }
 
 
 def _kanban_occurrence_digest(board, task_id, old_cursor, claimed_cursor, event_ids):
@@ -195,6 +766,9 @@ class AutomationCustodyMixin:
     This is a topical mixin only: RuntimeCustodyCoordinator remains the sole owner ledger,
     while SessionAuthority supplies the profile/session indexes consumed by these methods.
     """
+    def _register_automation_source_graph(self, coordinator=None):
+        return register_automation_source_graph(self, coordinator)
+
     def _preservation_automation_root(self, *, request_id, principal_id, session_id,
                                       source_identity, delivery_id=None,
                                       owner_class='I07_automation_route_wakes'):
@@ -212,6 +786,13 @@ class AutomationCustodyMixin:
                 # Bare legacy adapters remain functional, but managed automation cannot
                 # reserve effects without the source-owned coordinator.
                 return None
+        # Some embedded authorities install the coordinator directly rather than through the
+        # full runtime bootstrap.  Bind the exact source graph at the producer boundary before
+        # reserving this root; a close-time fallback would authenticate work only after the fact.
+        register_graph = getattr(self, '_register_automation_source_graph', None)
+        if not callable(register_graph):
+            raise RuntimeStoreError('automation_source_graph_invalid')
+        register_graph(coordinator)
         values = (request_id, principal_id, session_id, source_identity, owner_class)
         if any(not isinstance(value, str) or not value for value in values):
             raise RuntimeStoreError('invalid_params')

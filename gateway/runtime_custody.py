@@ -1675,4 +1675,9 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
             # witness to this coordinator; a missing or colliding graph must fail closed rather
             # than leaving a source that can later appear quiescent by default.
             bind_graph(coordinator)
+        bind_automation_graph = getattr(authority, '_register_automation_source_graph', None)
+        if callable(bind_automation_graph):
+            # I07 has several real producer families sharing the existing automation indexes.
+            # Bind their identity witness before any runtime source can publish a new root.
+            bind_automation_graph(coordinator)
     return coordinator
