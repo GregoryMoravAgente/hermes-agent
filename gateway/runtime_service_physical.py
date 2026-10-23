@@ -8,7 +8,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import hashlib
+import subprocess
 import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 from gateway.runtime_service_custody import (
@@ -29,6 +31,9 @@ from gateway.runtime_sidecar_transport import required_reader_streams
 
 if TYPE_CHECKING:
     from gateway.runtime_service_custody import ServiceLease
+
+
+_PROCESS_RETRY_CLEANUP_BUDGET_SECONDS = 2.0
 
 
 @dataclass
@@ -321,7 +326,8 @@ class ServiceProcessReceipt:
 
     def prepare_process_retry(self) -> bool:
         """Close retained native objects only after the original setup fence is terminal."""
-        if not self.stop_process_for_retry():
+        deadline = time.monotonic() + _PROCESS_RETRY_CLEANUP_BUDGET_SECONDS
+        if not self.stop_process_for_retry(deadline=deadline):
             return False
         return self.close_native_after_process()
 
@@ -352,11 +358,26 @@ class ServiceProcessReceipt:
             return self._posix_process_group_empty()
         return self.scope == "posix_direct" and self.process is not None and self.process.poll() is not None
 
-    def stop_process_for_retry(self) -> bool:
+    @staticmethod
+    def _drain_windows_transaction(transaction: Any, deadline: float) -> bool:
+        """Drain the retained Job once, within the shared retry deadline."""
+        drain = getattr(transaction, "drain_after_process_exit", None)
+        if not callable(drain):
+            return False
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0.0:
+            return False
+        if drain(remaining) is not True:
+            return False
+        return time.monotonic() <= deadline
+
+    def stop_process_for_retry(self, *, deadline: float | None = None) -> bool:
         """Stop the retained process while leaving readers and native handles reachable."""
         setup_fence = self.setup_fence
         if setup_fence is not None and not setup_fence.is_set():
             return False
+        if deadline is None:
+            deadline = time.monotonic() + _PROCESS_RETRY_CLEANUP_BUDGET_SECONDS
         process = self.process
         transaction = self.transaction
         if process is None:
@@ -370,18 +391,25 @@ class ServiceProcessReceipt:
                     if not callable(terminate):
                         return False
                     terminate()
+                    remaining = max(0.0, deadline - time.monotonic())
+                    if remaining <= 0.0:
+                        return False
+                    process.wait(timeout=remaining)
                 if process.poll() is None:
                     return False
-                return True
+                return self._drain_windows_transaction(transaction, deadline)
             if self.scope == "posix_process_group":
                 return self._stop_posix_process_group()
             if self.scope != "posix_direct":
                 return False
             if process.poll() is None:
                 process.terminate()
-                process.wait(timeout=2.0)
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining <= 0.0:
+                    return False
+                process.wait(timeout=remaining)
             return process.poll() is not None
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError, subprocess.TimeoutExpired):
             return False
 
     def close_native_after_process(self) -> bool:
