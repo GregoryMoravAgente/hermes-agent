@@ -247,6 +247,8 @@ async def initialize_gateway_runtime(runner):
     # registration remains UNKNOWN and cannot be converted into an empty-map success.
     from gateway.runtime_i16_source_registry import bootstrap_i16_source_registry
     bootstrap_i16_source_registry(runner, coordinator)
+    from gateway.platforms.api_server_run_factory import refresh_api_run_factories
+    refresh_api_run_factories(runner)
     # Bind the source-owned I19 lifecycle graph at the same authenticated runtime boundary.  The
     # graph is intentionally independent from the preservation owner seal loop: ordinary stop/
     # restart must retain its ForeignLifecycleLease until its own finalizer/native/global-close
@@ -1680,6 +1682,8 @@ async def serve_profile_runtime(runner, name, home):
         raise
     _publish_served_set(runner)
     start_ready_hosted_services(runner)
+    from gateway.platforms.api_server_run_factory import refresh_api_run_factories
+    refresh_api_run_factories(runner)
     return authority
 
 

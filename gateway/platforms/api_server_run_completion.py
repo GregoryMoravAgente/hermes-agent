@@ -159,8 +159,13 @@ def _retained_custody_owner_is_exact(custody: Any) -> bool:
         or handle.process_instance != getattr(custody, "process_instance", None)
         or getattr(coordinator, "process_instance", None)
         != getattr(custody, "process_instance", None)
-        or getattr(coordinator, "authority_epoch", None)
-        != getattr(custody, "authority_epoch", None)
+    ):
+        return False
+    scope_valid = getattr(coordinator, "profile_scope_valid", None)
+    if not callable(scope_valid) or not scope_valid(
+        handle.profile_id, handle.authority_epoch,
+        require_serving=False, allow_retiring=True,
+        physical_owner_epoch=handle.physical_owner_epoch,
     ):
         return False
     if getattr(custody, "parent_bound", None) is True:
@@ -1072,8 +1077,7 @@ def _managed_i02_source_custody_valid(
         and handle.process_instance == getattr(custody, "process_instance", None)
         and getattr(custody, "profile_id", None) == getattr(authority, "profile_id", None)
         and getattr(custody, "authority_epoch", None) == getattr(authority, "epoch", None)
-        and getattr(coordinator, "authority_epoch", None)
-        == getattr(custody, "authority_epoch", None)
+        and _retained_custody_owner_is_exact(custody)
         and getattr(coordinator, "process_instance", None)
         == getattr(custody, "process_instance", None)
     )
@@ -1186,7 +1190,6 @@ def _replay_authority_context_exact(completion: Any, custody: Any, authority: An
     if (
         getattr(custody, "coordinator", None) is not coordinator
         or getattr(coordinator, "process_instance", None) != process_instance
-        or getattr(coordinator, "authority_epoch", None) != authority_epoch
         or getattr(custody, "profile_id", None) != profile_id
         or getattr(custody, "authority_epoch", None) != authority_epoch
         or getattr(custody, "process_instance", None) != process_instance

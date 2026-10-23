@@ -763,52 +763,13 @@ async def run_legacy_authority_turn(
 
 def preservation_owner_evidence(adapters: Any, runner: Any, *, process_instance: str,
                                  authority_epoch: int, close_generation: int, owner_id: str):
-    """Return I03 quiescence only from each adapter's retained source-owned run witnesses."""
-    if not isinstance(adapters, (list, tuple)) or not adapters:
-        return None
-    descriptor = getattr(runner, "session_runtime_descriptor", None) or {}
-    if (descriptor.get("instance_id") != process_instance
-            or descriptor.get("authority_epoch") != authority_epoch):
-        return None
-    from pathlib import Path
-    from gateway.runtime_ownership import process_ownership
-    from gateway.session_authorities import all_authorities
-    from gateway.platforms.api_server_run_witness import owner_evidence
-    authorities = all_authorities(runner)
-    homes = [getattr(authority, "profile_id", None) for authority in authorities]
-    if (not authorities or any(not isinstance(home, str) or not home for home in homes)
-            or any(not process_ownership.owns(Path(home)) for home in homes)):
-        return None
-    adapter_evidence = []
-    for adapter in adapters:
-        evidence = owner_evidence(
-            adapter, process_instance=process_instance, authority_epoch=authority_epoch,
-            close_generation=close_generation, owner_id=owner_id)
-        if evidence is None:
-            return None
-        adapter_evidence.append(evidence)
-    witnesses = tuple(
-        witness for evidence in adapter_evidence for witness in evidence.get("witnesses", ()))
-    process_receipts = tuple(
-        receipt for evidence in adapter_evidence for receipt in evidence.get("process_receipts", ()))
-    if not witnesses or len(process_receipts) != len(witnesses):
-        return None
-    return {
-        "process_instance": process_instance, "authority_epoch": authority_epoch,
-        "close_generation": close_generation, "owner_id": owner_id, "observed": True,
-        "cross_process_proof": all(
-            isinstance(receipt, dict) and receipt.get("observed") is True
-            and receipt.get("kind") in {
-                "parent_handle", "I15_process_registry_terminal", "I03_direct_executor"
-            }
-            and receipt.get("cross_process_proof") is True
-            for receipt in process_receipts),
-        "profile_ids": tuple(sorted(str(authority.profile_id) for authority in authorities)),
-        "registered_adapters": len(adapters),
-        "run_witnesses": witnesses,
-        "process_receipts": process_receipts,
-    }
+    """Read the adapter factories and retained source witnesses through their topical owner."""
+    from gateway.platforms.api_server_run_factory import preservation_owner_evidence as read_evidence
 
+    return read_evidence(
+        adapters, runner, process_instance=process_instance, authority_epoch=authority_epoch,
+        close_generation=close_generation, owner_id=owner_id,
+    )
 
 @dataclass
 class ApiRunCustody:

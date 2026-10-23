@@ -223,6 +223,15 @@ def read_run_witness(adapter: Any, custody: Any):
 def owner_evidence(adapter: Any, *, process_instance: str, authority_epoch: int,
                    close_generation: int, owner_id: str):
     """Read every retained launch for one adapter and return source-owned quiescence evidence."""
+    factory = getattr(adapter, "_api_run_factory", None)
+    if factory is not None:
+        from gateway.platforms.api_server_run_factory import ApiRunFactory
+        if not isinstance(factory, ApiRunFactory) or factory.adapter is not adapter:
+            return None
+        return factory.evidence(
+            process_instance=process_instance, authority_epoch=authority_epoch,
+            close_generation=close_generation, owner_id=owner_id,
+        )
     if getattr(adapter, "_api_run_owner_registered", False) is not True:
         return None
     descriptor = getattr(getattr(adapter, "gateway_runner", None), "session_runtime_descriptor", None) or {}

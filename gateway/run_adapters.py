@@ -1376,6 +1376,8 @@ class GatewayAdapterLifecycleMixin:
         # with no close-generation proof behind it.
         from gateway.preservation_source_close import register_source_adapter
         register_source_adapter(self, adapter, preservation_profile)
+        from gateway.platforms.api_server_run_factory import register_api_run_factory
+        register_api_run_factory(self, adapter)
         adapter.set_message_handler(message_handler or self._primary_message_handler())
         adapter.set_fatal_error_handler(fatal_error_handler or self._handle_adapter_fatal_error)
         adapter.set_session_store(self.session_store)
