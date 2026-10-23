@@ -998,6 +998,18 @@ class SessionAuthority(
         payload = {'text': request.payload['text'], **finite, **admit_surface(request.payload),
                    **admit_display(request.payload), **admit_cli_turn(request.payload),
                    **admit_attachments(request.payload.get('attachments'), admitted=existing_admission)}
+        # This is the actual local prompt producer, including text-only and image
+        # submissions.  Stamp the managed route before the durable row exists so the
+        # claim can recover the exact I04 binding; never infer it from an absent
+        # ContextVar or from the attachment schema.
+        from gateway.session_managed_worker import managed_policy
+        from gateway.session_operator import MANAGED_WORKER_DESCRIPTOR, MANAGED_WORKER_FIELD
+        # Minimal owner fixtures and hosted-room adapters may expose no local policy
+        # resolver at all; absence of that server-owned resolver is a fail-closed
+        # ordinary route, never permission to stamp a managed descriptor.
+        if (callable(getattr(self.runner, '_adapter_for_source', None))
+                and managed_policy(self, request.ref) is not None):
+            payload[MANAGED_WORKER_FIELD] = dict(MANAGED_WORKER_DESCRIPTOR)
         if _kanban_card is not None:
             payload['kanban_card_v1'] = _kanban_card
         source = self.sessions[request.ref.session_id].source

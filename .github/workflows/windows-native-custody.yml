@@ -9,6 +9,7 @@ on:
       - codex/AGC-1722/windows-close-worker-root-20261021-01a120af
       - codex/AGC-1663/i12-managed-proof-root-01a120af-20261022
       - codex/AGC-1721/native-cron-error-20261023
+      - codex/AGC-1721/native-managed-worker-m1r4-20261023
 
 permissions:
   contents: read
@@ -67,6 +68,8 @@ env:
     tests/gateway/test_native_own_policy_admission.py
     tests/agent/test_copilot_acp_catalog_diagnostic.py
     tests/gateway/test_runtime_service_delivery_drain.py
+    tests/gateway/test_managed_worker_native_custody.py
+    tests/gateway/test_unified_gateway_native_live.py
 
 jobs:
   native-custody:

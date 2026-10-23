@@ -7,9 +7,16 @@ public submission parameters cannot supply it.
 """
 from hermes_state_runtime import RuntimeStoreError
 
+# A local ``prompt.submit`` is a server-owned managed producer when the session's
+# frozen policy selects the out-of-process worker.  Keep this discriminator in its
+# own closed descriptor: ``attachments_v1`` is an immutable media schema and must
+# not carry execution routing metadata.
+MANAGED_WORKER_FIELD = 'managed_worker_v1'
+MANAGED_WORKER_DESCRIPTOR = {'producer_process_mode': 'managed_turn'}
+
 # Fields ``SessionAuthority.submit`` commits for a local session's input; producers commit their own envelope.
 LOCAL_INPUT_FIELDS = frozenset({'text', 'attachments_v1', 'finite', 'unattended', 'surface_v1', 'display_v1',
-                                'cli_turn_v1', 'kanban_card_v1'})
+                                'cli_turn_v1', 'kanban_card_v1', MANAGED_WORKER_FIELD})
 
 
 def is_viewer_input(row):
@@ -23,6 +30,18 @@ def is_viewer_input(row):
 def check_local_input(authority, ref, row, *, source=None):
     payload = row['payload']
     allowed = set(LOCAL_INPUT_FIELDS)
+    managed_descriptor = payload.get(MANAGED_WORKER_FIELD)
+    if managed_descriptor is not None:
+        if managed_descriptor != MANAGED_WORKER_DESCRIPTOR:
+            raise RuntimeStoreError('permission_denied')
+        # The marker is written only by SessionAuthority._submit.  Re-check the
+        # frozen policy at the claim boundary so a copied/old marker cannot route a
+        # normal in-process turn through the managed custody path.
+        from gateway.session_managed_worker import managed_policy
+        if not callable(getattr(authority.runner, '_adapter_for_source', None)):
+            raise RuntimeStoreError('permission_denied')
+        if managed_policy(authority, ref) is None:
+            raise RuntimeStoreError('permission_denied')
     if 'local_operator_v1' in payload:
         allowed.add('local_operator_v1')
         if payload['local_operator_v1'] != {

@@ -10,6 +10,7 @@ import base64
 import contextlib
 import contextvars
 from concurrent.futures import ThreadPoolExecutor
+import hashlib
 import json
 import logging
 import os
@@ -245,9 +246,12 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
         return SessionDB._decode_content(content)
 
-    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024):
+    def __init__(self, rpc, scope, outbox_dir, adopted=None, *, max_bytes=4 * 1024 * 1024,
+                 managed_custody=None):
         self.rpc = rpc
         self.scope = dict(scope)
+        self._managed_custody = dict(managed_custody) if isinstance(managed_custody, dict) else None
+        self._managed_written_rows = []
         if 'pid' in self.scope and 'birth' in self.scope:
             supplied_birth = self.scope['birth']
             if type(supplied_birth) is not int:
@@ -422,6 +426,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self._save(candidate)
                     self.scope = candidate['scope']
                     self.journal = candidate
+                    self._record_replayed_compression_rows(entry, result)
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)
@@ -444,11 +449,123 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         if chunk_rows is not None:
             raise WorkerPersistenceError('unsupported_operation')
         if compression_lock_holder is not None or turn_lease_ttl_seconds != 300.0:
-            return self._append_compression_messages(session_id, messages, compression_lock_holder,
+            count = self._append_compression_messages(session_id, messages, compression_lock_holder,
                 turn_lease_holder, turn_lease_ttl_seconds)
+            return count
         result = self._apply('transcript.append', {'messages': messages, 'turn_lease_holder': turn_lease_holder})
+        from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(messages, result['annotations'])
+        self._record_managed_rows(messages, session_id=session_id)
         return result['count']
+
+    def _record_managed_rows(self, messages, *, session_id=None):
+        """Retain only owner-stamped rows for the managed finish witness."""
+        if self._managed_custody is None:
+            return
+        session_id = self.scope.get('session_id') if session_id is None else session_id
+        if session_id != self.scope.get('session_id'):
+            return
+        from agent.message_metadata import DB_ROW_SNAPSHOT
+        by_id = {row[0]: index for index, row in enumerate(self._managed_written_rows)}
+        for message in messages:
+            row_id = message.get('_row_id') if isinstance(message, dict) else None
+            snapshot = message.get(DB_ROW_SNAPSHOT) if isinstance(message, dict) else None
+            role = message.get('role') if isinstance(message, dict) else None
+            if type(row_id) is not int or row_id <= 0 or type(snapshot) is not str or not snapshot:
+                continue
+            if role not in {'user', 'assistant', 'tool', 'system'}:
+                continue
+            row = (row_id, role, snapshot)
+            previous = by_id.get(row_id)
+            if previous is None:
+                by_id[row_id] = len(self._managed_written_rows)
+                self._managed_written_rows.append(row)
+            else:
+                self._managed_written_rows[previous] = row
+
+    def _record_replayed_compression_rows(self, entry, result):
+        """Re-apply committed row annotations when a lost compression ACK is retried.
+
+        The public compression methods annotate their caller-owned list after ``_apply``;
+        a lost ACK skips that return path, so retry must recover the exact source-owned row
+        identities from the persisted journal payload and receipt before readback can close.
+        """
+        if entry.get('operation') not in {
+            'transcript.append', 'compression.append', 'compression.archive', 'compression.publish',
+        }:
+            return
+        payload = entry.get('payload')
+        messages = payload.get('messages') if isinstance(payload, dict) else None
+        annotations = result.get('annotations') if isinstance(result, dict) else None
+        if not isinstance(messages, list) or not isinstance(annotations, list):
+            return
+        apply_row_annotations(messages, annotations)
+        self._record_managed_rows(messages, session_id=self.scope.get('session_id'))
+
+    def _managed_finish_proof(self):
+        """Read back the exact append receipts before the execution closes."""
+        metadata = self._managed_custody
+        if metadata is None:
+            return None
+        admission_id = metadata.get('admission_id')
+        store_path = metadata.get('store_path')
+        generation = metadata.get('generation')
+        session_id = self.scope.get('session_id')
+        if (
+            type(admission_id) is not str or not admission_id
+            or type(store_path) is not str or not store_path
+            or type(generation) is not int or generation < 1
+            or type(session_id) is not str or not session_id
+        ):
+            return None
+        if len(self._managed_written_rows) < 2:
+            return None
+        row_ids = tuple(row[0] for row in self._managed_written_rows)
+        placeholders = ','.join('?' for _ in row_ids)
+        readback = self._read_all(
+            f'SELECT * FROM messages WHERE session_id = ? AND id IN ({placeholders})',
+            (session_id, *row_ids),
+        )
+        by_id = {row.get('id'): row for row in readback if isinstance(row, dict)}
+        ordered = []
+        from agent.transcript_repair import transcript_row_snapshot
+        for row_id, role, expected_snapshot in self._managed_written_rows:
+            row = by_id.get(row_id)
+            if (
+                not isinstance(row, dict)
+                or row.get('session_id') != session_id
+                or row.get('id') != row_id
+                or row.get('role') != role
+            ):
+                return None
+            snapshot = transcript_row_snapshot(row)
+            if snapshot != expected_snapshot:
+                return None
+            ordered.append((row_id, role, snapshot))
+        last_user = next((index for index in range(len(ordered) - 1, -1, -1)
+                          if ordered[index][1] == 'user'), None)
+        if last_user is None:
+            return None
+        turn_rows = ordered[last_user:]
+        result_rows = turn_rows[1:]
+        if not result_rows or any(role not in {'assistant', 'tool'} for _row_id, role, _snapshot in result_rows):
+            return None
+        digest_input = '\n'.join(
+            f'{row_id}:{session_id}:{role}:{snapshot}'
+            for row_id, role, snapshot in turn_rows
+        )
+        return {
+            'store_path': store_path,
+            'session_id': session_id,
+            'admission_id': admission_id,
+            'execution_generation': generation,
+            'row_ids': [row_id for row_id, _role, _snapshot in turn_rows],
+            'row_snapshots': [snapshot for _row_id, _role, snapshot in turn_rows],
+            'row_sessions': [session_id for _row_id, _role, _snapshot in turn_rows],
+            'row_roles': [role for _row_id, role, _snapshot in turn_rows],
+            'payload_digest': hashlib.sha256(digest_input.encode('utf-8')).hexdigest(),
+            'result_row_ids': [row_id for row_id, _role, _snapshot in result_rows],
+        }
 
     def try_acquire_session_turn_lease(self, session_id, holder, *, ttl_seconds=300.0, patience_s=None):
         self._session(session_id)
@@ -614,7 +731,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('session.tools', {'tool_names': pin})
 
     def finish(self):
-        return self._apply('execution.finish', {})
+        proof = self._managed_finish_proof()
+        result = self._apply('execution.finish', {})
+        if self._managed_custody is None:
+            return result
+        return {**result, 'managed_durable_proof': proof}
 
     def close(self):
         with self.lock:

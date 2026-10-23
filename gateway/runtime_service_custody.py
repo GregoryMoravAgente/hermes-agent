@@ -31,7 +31,9 @@ _MANAGED_PROCESS_RETRY_REASONS = frozenset({
     "process_identity_rejected", "physical_launch_identity_mismatch",
     "physical_launch_transaction_missing", "reader_identity_missing",
     "reader_identity_replaced", "reader_state_invalid", "reader_failed",
-    "reader_still_alive", "reader_start_unknown", "posix_process_group_live",
+    "reader_still_alive", "reader_start_unknown", "writer_join_failed",
+    "writer_close_failed", "reader_close_failed", "posix_process_group_live",
+    "physical_custody_pending",
 })
 _EXTERNAL_CLOSE_RETRY_REASONS = frozenset({
     "join_failed", "native_close_failed", "physical_close_failed",

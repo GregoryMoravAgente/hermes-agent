@@ -107,7 +107,18 @@ def encode_frame(frame):
 
 
 def validate_bootstrap(frame):
-    if set(frame) - {'attachments_v1'} != BOOTSTRAP_FIELDS or frame['version'] != 1:
+    if set(frame) - {'attachments_v1', 'managed_custody'} != BOOTSTRAP_FIELDS or frame['version'] != 1:
+        raise ValueError('invalid_managed_worker_bootstrap')
+    managed_custody = frame.get('managed_custody')
+    if managed_custody is not None and (
+            not isinstance(managed_custody, dict)
+            or set(managed_custody) != {'admission_id', 'session_id', 'generation', 'store_path'}
+            or type(managed_custody['admission_id']) is not str or not managed_custody['admission_id']
+            or type(managed_custody['session_id']) is not str or not managed_custody['session_id']
+            or type(managed_custody['generation']) is not int or managed_custody['generation'] < 1
+            or type(managed_custody['store_path']) is not str
+            or not Path(managed_custody['store_path']).is_absolute()
+    ):
         raise ValueError('invalid_managed_worker_bootstrap')
     scope = frame['scope']
     fields = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret', 'epoch'}
@@ -337,7 +348,13 @@ def execute(frame, channel):
     adopted = rpc('worker.adopt', **{k: v for k, v in scope.items() if k != 'epoch'})
     if adopted['owner_epoch'] != scope['epoch']:
         raise RuntimeError('stale_epoch')
-    store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
+    store_kwargs = {}
+    managed_custody = frame.get('managed_custody')
+    if isinstance(managed_custody, dict):
+        store_kwargs['managed_custody'] = managed_custody
+    store = RuntimeSessionStore(
+        rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted, **store_kwargs,
+    )
     from gateway.session_kanban import bind_worker_context
     bind_worker_context(frame)
     # Background processes a previous admission of this session started outlive that worker
@@ -414,8 +431,12 @@ def execute(frame, channel):
             channel.send('result', result=result_frame(result))
             if not controls.finish.wait(30):
                 raise ValueError('managed_finish_timeout')
-            store.finish()
-            channel.send('finished')
+            finish_result = store.finish()
+            managed_proof = finish_result.get('managed_durable_proof') if isinstance(finish_result, dict) else None
+            if managed_proof is None:
+                channel.send('finished')
+            else:
+                channel.send('finished', managed_durable_proof=managed_proof)
     finally:
         unregister_gateway_notify(frame['route'])
         if agent is not None:

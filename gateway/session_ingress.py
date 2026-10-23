@@ -459,9 +459,15 @@ def _managed_process_route(row):
     raise ServiceCustodyError('producer_policy_invalid')
 
 
-def _bind_process_route(authority, ref, row):
+def _bind_process_route(authority, ref, row, *, require_managed=False):
     from gateway.runtime_service_custody import admission_binding, bind_turn
     if not _managed_process_route(row):
+        if require_managed:
+            from gateway.runtime_service_custody import ServiceCustodyError
+            # A legacy row has no authenticated producer route.  Current policy
+            # cannot safely infer that it was a managed producer, so refuse before
+            # the child spawn rather than silently taking the untracked path.
+            raise ServiceCustodyError('managed_producer_binding_missing')
         return None, None
     binding = admission_binding(authority, ref, row)
     return binding, bind_turn(binding)
@@ -532,7 +538,18 @@ async def execute_admission(authority, ref, row):
     from gateway.session_managed_worker import managed_policy, admit_managed
     policy = managed_policy(authority, ref)
     if policy is not None:
-        return await admit_managed(authority, ref, row, policy)
+        # Managed workers are still I04 admissions.  Bind the exact FIFO child before
+        # the worker route can reserve I16 custody or create a process; the ordinary
+        # route below keeps its historical binding point and reset.
+        managed_binding = None
+        managed_binding_token = None
+        try:
+            managed_binding, managed_binding_token = _bind_process_route(
+                authority, ref, row, require_managed=True,
+            )
+            return await admit_managed(authority, ref, row, policy, managed_binding)
+        finally:
+            _reset_process_route(managed_binding_token)
     live = authority.sessions[ref.session_id]
     native = row['admission_id'] in authority.native_waiters
     authority.native_waiters.discard(row['admission_id'])

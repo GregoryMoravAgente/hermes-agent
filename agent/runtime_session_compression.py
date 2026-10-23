@@ -23,6 +23,9 @@ class RuntimeSessionCompressionMixin:
             turn_lease_ttl_seconds=turn_lease_ttl_seconds))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(messages, result['annotations'])
+        record = getattr(self, '_record_managed_rows', None)
+        if callable(record):
+            record(messages, session_id=session_id)
         return result['count']
 
     def get_session(self, session_id):
@@ -87,6 +90,9 @@ class RuntimeSessionCompressionMixin:
             unresolved_held=unresolved, held_for_cas=cas))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(compacted_messages, result['annotations'])
+        record = getattr(self, '_record_managed_rows', None)
+        if callable(record):
+            record(compacted_messages, session_id=session_id)
         return result['value']
 
     def publish_compression_child(self, *, parent_session_id, child_session_id, source, messages,
@@ -101,6 +107,9 @@ class RuntimeSessionCompressionMixin:
             lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling))
         from agent.runtime_session_store import apply_row_annotations
         apply_row_annotations(messages, result['annotations'])
+        record = getattr(self, '_record_managed_rows', None)
+        if callable(record):
+            record(messages, session_id=self.scope.get('session_id'))
 
     def _compression_receipt_journal(self, candidate, result):
         assignment = result.get('worker_assignment')
@@ -108,6 +117,12 @@ class RuntimeSessionCompressionMixin:
             from agent.runtime_session_store import WorkerPersistenceError
             if assignment['parent'] != self.scope['session_id']:
                 raise WorkerPersistenceError('outbox_scope_mismatch')
+            if assignment['session_id'] != self.scope['session_id']:
+                # A rotation publishes a new durable child. Rows captured under the
+                # closed parent cannot be read through the adopted child scope; recapture
+                # the annotated child rows from this same receipt instead of claiming a
+                # cross-scope readback.
+                self._managed_written_rows.clear()
             candidate = dict(candidate, scope=dict(self.scope, session_id=assignment['session_id']))
         return candidate
 

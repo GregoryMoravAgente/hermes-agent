@@ -64,6 +64,7 @@ def can_retry_managed_native_close(receipt: Any) -> bool:
     return bool(
         receipt.unknown_reason in {
             "termination_failed", "native_job_nonempty", "native_close_failed",
+            "physical_custody_pending",
         }
         and isinstance(receipt.service.binding, TurnCustodyBinding)
         and _managed_parent_matches(receipt)
