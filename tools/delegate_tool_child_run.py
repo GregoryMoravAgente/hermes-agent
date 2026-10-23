@@ -417,7 +417,7 @@ def _create_isolated_worktree(parent_agent: Any, parent_task_id: Any, subagent_i
         )
     return None
 
-def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
+def _defer_close_after_timeout(child: Any, child_future: Any, *, close_callback=None) -> None:
     """Hand ``child.close()`` to a Future done-callback and drain its transports.
 
     The interrupt is cooperative: the worker still runs its finally path, so closing now could close SQLite under its
@@ -427,7 +427,12 @@ def _defer_close_after_timeout(child: Any, child_future: Any) -> None:
     sweep + one delayed re-sweep for a connection opened in between; a worker that still won't settle keeps its
     resources until process exit.
     """
-    child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
+    # The caller may have registered the close callback before the Future could
+    # complete.  That preserves the native Future's callback custody boundary;
+    # registering only here would race a fast worker that finishes between the
+    # timeout observation and this helper.
+    if close_callback is None:
+        child_future.add_done_callback(lambda _done: _close_child(child, "Failed to close timed-out child after worker exit"))
     # Bounded drain (#94248 native half): the deferred close above only fires once the abandoned worker
     # unwinds, but that worker is typically parked inside an in-flight OpenSSL read (Codex / httpx). Never
     # hard-close that transport from this thread — releasing FDs under a live SSL read is the #29507/#70773
@@ -858,6 +863,7 @@ class _ChildRun:
             _STALE_RESULT_GRACE_SECONDS, _get_child_timeout, _get_subagent_approval_callback, _set_subagent_approval_cb,
         )
         from tools.daemon_pool import DaemonThreadPoolExecutor
+        from agent.tool_worker_custody import admit_tool_worker, submit_tool_worker
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
         executor = DaemonThreadPoolExecutor(
@@ -878,7 +884,34 @@ class _ChildRun:
                         user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
                     )
 
-        future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
+        # The delegated child itself is a real source-owned worker.  Admit its
+        # exact child identity before the queue sees the callable, then retain
+        # the Future and native post-callback boundary through the outer
+        # delegation timeout.
+        try:
+            with _tool_worker_parent_context(child):
+                child_worker_handle = admit_tool_worker(child, "delegated-child-run")
+                future = submit_tool_worker(
+                    executor, child_worker_handle, contextvars.copy_context().run, _run_with_thread_capture,
+                )
+        except BaseException:
+            executor.shutdown(wait=False)
+            raise
+        timeout_close_lock = threading.Lock()
+        timeout_close_armed = False
+        timeout_close_completed = False
+
+        def _close_timed_out_child(_done) -> None:
+            nonlocal timeout_close_completed
+            with timeout_close_lock:
+                if not timeout_close_armed or timeout_close_completed:
+                    return
+                timeout_close_completed = True
+            _close_child(child, "Failed to close timed-out child after worker exit")
+
+        # Register before waiting so an accepted Future cannot finish and pass
+        # its native finalizer before the timeout cleanup callback is admitted.
+        future.add_done_callback(_close_timed_out_child)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
         # Without the second, a worker wedged after its final answer holds a finite (-Q / Bot Chat
         # one-shot) turn — and its session lease — forever, since that runtime has no gateway
@@ -979,9 +1012,18 @@ class _ChildRun:
             "diagnostic_path": diagnostic_path,
         }
         _error_entry = self.finish_failed(_error_entry, _late_pending_steer, preview=f"Timed out after {duration}s" if is_timeout else str(exc))
-        close_deferred = is_timeout and not future.done()
-        if close_deferred:
-            _defer_close_after_timeout(child, future)
+        close_deferred = False
+        if is_timeout:
+            # Arm the callback after the timeout decision.  If the Future won
+            # the race and completed already, invoke the same exact callback
+            # once so cleanup still occurs before returning custody.
+            with timeout_close_lock:
+                timeout_close_armed = True
+                completed_at_arm = future.done()
+            if completed_at_arm:
+                _close_timed_out_child(future)
+            _defer_close_after_timeout(child, future, close_callback=_close_timed_out_child)
+            close_deferred = True
         return None, _error_entry, close_deferred
 
     def append_sibling_write_reminder(self, entry: dict[str, Any]) -> None:

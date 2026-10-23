@@ -49,6 +49,7 @@ class OwnedFuture(Future):
         super().__init__()
         self._owned_on_finalized = on_finalized
         self._owned_finalized = False
+        self._owned_finalizer_in_progress = False
         self._owned_completion_dispatched = False
         self._owned_callbacks = set()
         self._owned_finalizer_lock = threading.Lock()
@@ -57,15 +58,25 @@ class OwnedFuture(Future):
         with self._owned_finalizer_lock:
             if (
                 self._owned_finalized
+                or self._owned_finalizer_in_progress
                 or not self._owned_completion_dispatched
                 or self._owned_callbacks
             ):
                 return
-            self._owned_finalized = True
+            # Linearize the source-owned finalizer boundary before calling it.
+            # A callback registered after this point is a normal late observer;
+            # callbacks admitted before it remain in ``_owned_callbacks`` and
+            # therefore cannot be mistaken for a settled source operation.
+            self._owned_finalizer_in_progress = True
             callback = self._owned_on_finalized
             self._owned_on_finalized = None
-        if callback is not None:
-            callback(self)
+        try:
+            if callback is not None:
+                callback(self)
+        finally:
+            with self._owned_finalizer_lock:
+                self._owned_finalizer_in_progress = False
+                self._owned_finalized = True
 
     def add_done_callback(self, fn):
         # Future invokes callbacks registered after FINISHED in the registrar's
@@ -73,7 +84,7 @@ class OwnedFuture(Future):
         # retain its exact admission until it returns, too.
         token = object()
         with self._owned_finalizer_lock:
-            retained = not self._owned_finalized
+            retained = not (self._owned_finalized or self._owned_finalizer_in_progress)
             if retained:
                 self._owned_callbacks.add(token)
         if not retained:

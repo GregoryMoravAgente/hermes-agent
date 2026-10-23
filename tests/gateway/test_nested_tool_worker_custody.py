@@ -453,3 +453,94 @@ def test_real_concurrent_route_detaches_unknown_submission(tmp_path, monkeypatch
         assert "remained unknown" in str(batch.results[0].result)
     finally:
         db.close()
+
+
+def test_real_delegated_child_run_retains_parent_through_profile_join(tmp_path, monkeypatch):
+    """A timed-out delegated child Future remains physical work until it settles."""
+    import time
+
+    from tools import delegate_tool
+    from agent.tool_worker_custody import bind_tool_worker_parent
+    from gateway.session_runtime_workers import await_authority_work, join_authority_work, physical_workers
+    from run_agent import AIAgent
+    from tools.delegate_tool import _build_child_agent
+    from tools.delegate_tool_child_run import _ChildRun
+
+    home = tmp_path / ".hermes"
+    runtime = tmp_path / "runtime"
+    home.mkdir()
+    runtime.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_RUNTIME_DIR", str(runtime))
+    db, authority, _test_owner, worker, parent = _real_authority_parent(tmp_path)
+    owner = AIAgent(
+        api_key="test-key", base_url="http://127.0.0.1:9/v1", provider="openai",
+        model="test-model", max_iterations=1, quiet_mode=True,
+        skip_context_files=True, skip_memory=True, load_soul_identity=False,
+        session_id="outer-child-run-custody", platform="cli",
+    )
+    parent.holder[0] = owner
+    authority.runner._running_agents = {}
+    entered = threading.Event()
+    release = threading.Event()
+    child = None
+    try:
+        with bind_tool_worker_parent(parent):
+            child = _build_child_agent(
+                task_index=0, goal="noncooperative child-run custody", context=None, toolsets=None,
+                model="test-model", max_iterations=1, task_count=1, parent_agent=owner,
+            )
+
+        def blocked_conversation(*_args, **_kwargs):
+            entered.set()
+            while not release.wait(0.01):
+                pass
+            return {"summary": "released"}
+
+        child.run_conversation = blocked_conversation
+        child.get_activity_summary = lambda: {"api_call_count": 1}
+        child_run = _ChildRun(child, owner, 0, "probe", None, None, heartbeat=None)
+        original_timeout = delegate_tool._get_child_timeout
+        delegate_tool._get_child_timeout = lambda: 0.05
+        try:
+            result, error_entry, close_deferred = child_run.await_child()
+        finally:
+            delegate_tool._get_child_timeout = original_timeout
+
+        assert result is None
+        assert error_entry["status"] == "timeout"
+        assert close_deferred is True
+        assert entered.wait(5)
+        worker.worker_done.set()
+        retained = parent.pending_tool_workers()
+        assert len(retained) == 1
+        child_handle = retained[0]
+        child_future = child_handle.future
+        assert child_handle.owner is child
+        assert child_handle.pending
+        assert list(physical_workers(authority)) == [(worker, [owner])]
+
+        async def assert_profile_close_retains_work():
+            with pytest.raises(TimeoutError, match="Profile workers did not stop"):
+                await join_authority_work(authority, 0.05)
+            with pytest.raises(TimeoutError, match="Profile workers remain"):
+                await await_authority_work(authority, 0.05)
+
+        asyncio.run(assert_profile_close_retains_work())
+        assert len(authority._turn_workers) == 1
+        release.set()
+        assert child_future.result(timeout=5)["summary"] == "released"
+        deadline = time.monotonic() + 5
+        while parent.pending_tool_workers() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert parent.pending_tool_workers() == ()
+        assert list(physical_workers(authority)) == []
+    finally:
+        release.set()
+        if child is not None:
+            try:
+                child.close()
+            except Exception:
+                pass
+        owner.close()
+        db.close()

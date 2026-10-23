@@ -153,6 +153,48 @@ def test_owned_accepted_without_future_is_unknown_without_a_join():
     assert executor.waits == [(False, False)]
 
 
+def test_foreign_submit_owned_result_stays_unknown_without_native_finalizer():
+    from agent.tool_worker_custody import admit_tool_worker, bind_tool_worker_parent, submit_tool_worker
+    from tools.daemon_pool import OwnedSubmission
+
+    class ForeignExecutor:
+        def __init__(self):
+            self.thread = None
+            self.received_kwargs = None
+
+        def submit_owned(self, handoff_id, fn, *args, **kwargs):
+            from concurrent.futures import Future
+
+            self.received_kwargs = dict(kwargs)
+            future = Future()
+
+            def run():
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:
+                    future.set_exception(exc)
+
+            self.thread = threading.Thread(target=run)
+            self.thread.start()
+            return OwnedSubmission(handoff_id, future, "yes")
+
+    parent = _Parent()
+    executor = ForeignExecutor()
+    with bind_tool_worker_parent(parent):
+        handle = admit_tool_worker(object(), "sequential")
+        future = submit_tool_worker(executor, handle, lambda: "foreign result")
+
+    try:
+        assert future.result(timeout=5) == "foreign result"
+        assert "on_finalized" not in executor.received_kwargs
+        assert handle.state == "unknown"
+        assert handle.pending
+        assert parent.children == {handle.handle_id: handle}
+    finally:
+        executor.thread.join(5)
+        assert not executor.thread.is_alive()
+
+
 def test_legacy_prepared_future_retains_unknown_with_exact_identity():
     from agent.tool_worker_custody import (
         admit_tool_worker,
@@ -345,3 +387,41 @@ def test_callback_admitted_during_dispatch_keeps_parent():
         if registrar.ident is not None:
             registrar.join(5)
         pool.shutdown(wait=True, cancel_futures=False)
+
+
+def test_source_finalizer_boundary_allows_reentrant_late_observer():
+    from tools.daemon_pool import OwnedFuture
+
+    source_started = threading.Event()
+    source_release = threading.Event()
+    source_returned = threading.Event()
+    observer_seen = threading.Event()
+    future_holder = []
+
+    def source_finalizer(done_future):
+        source_started.set()
+        # Future's public callback API remains re-entrant while the source
+        # finalizer is in progress; this observer is after the linearized
+        # finalizer boundary and must not deadlock or be silently dropped.
+        future_holder[0].add_done_callback(lambda _done: observer_seen.set())
+        assert source_release.wait(5)
+        source_returned.set()
+
+    future = OwnedFuture(source_finalizer)
+    future_holder.append(future)
+    setter = threading.Thread(target=lambda: future.set_result("done"))
+    setter.start()
+    try:
+        assert source_started.wait(5)
+        assert observer_seen.wait(5)
+        assert not source_returned.is_set()
+        assert future._owned_finalizer_in_progress
+        assert not future._owned_finalized
+        source_release.set()
+        setter.join(5)
+        assert not setter.is_alive()
+        assert source_returned.is_set()
+        assert future._owned_finalized
+    finally:
+        source_release.set()
+        setter.join(5)

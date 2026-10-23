@@ -243,6 +243,27 @@ def admit_tool_worker(owner: Any, route: str) -> ToolWorkerHandle:
     return handle
 
 
+def _native_submit_owned(executor: Any):
+    """Return the exact daemon-pool handoff method, or ``None`` for foreign APIs.
+
+    A callable named ``submit_owned`` is not enough to authorize the native
+    finalizer callback.  Foreign executors may accept that keyword and invoke it
+    before returning a plain ``Future``; that is an observation boundary we
+    cannot use for source-owned settlement.  Inherited daemon-pool methods are
+    safe because their bound method retains the exact base ``__func__``.
+    """
+    submit_owned = getattr(executor, "submit_owned", None)
+    if not callable(submit_owned):
+        return None
+    try:
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+        if getattr(submit_owned, "__func__", None) is DaemonThreadPoolExecutor.submit_owned:
+            return submit_owned
+    except (AttributeError, TypeError):
+        return None
+    return None
+
+
 def submit_tool_worker(executor: Any, handle: ToolWorkerHandle, fn, /, *args, **kwargs):
     """Submit a worker while retaining queue/start/finish identity.
 
@@ -253,7 +274,9 @@ def submit_tool_worker(executor: Any, handle: ToolWorkerHandle, fn, /, *args, **
     exception is conservatively UNKNOWN because it cannot prove that no work was
     accepted.
     """
-    native_owned = callable(getattr(executor, "submit_owned", None))
+    submit_owned = getattr(executor, "submit_owned", None)
+    native_submit_owned = _native_submit_owned(executor)
+    native_owned = native_submit_owned is not None
 
     def run_with_custody(*call_args, **call_kwargs):
         handle.mark_started(threading.get_ident())
@@ -266,25 +289,25 @@ def submit_tool_worker(executor: Any, handle: ToolWorkerHandle, fn, /, *args, **
             handle.mark_body_done()
             return result
         finally:
-            # A foreign/legacy executor cannot prove the post-WorkItem
-            # callback boundary.  Direct unbound callers retain the historical
-            # local settlement; a bound parent stays UNKNOWN until a native
-            # owned Future proves finalization.
-            if not native_owned or handle.parent is None:
+            # A foreign/legacy executor cannot prove the post-WorkItem callback
+            # boundary.  Only an unbound caller may settle locally; a bound
+            # parent stays UNKNOWN until the exact native OwnedFuture callback
+            # proves finalization.
+            if handle.parent is None:
                 handle.mark_finalizers_done()
 
     handle.mark_queued()
-    submit_owned = getattr(executor, "submit_owned", None)
     if callable(submit_owned):
-        submission = submit_owned(
-            handle.handle_id,
-            run_with_custody,
-            *args,
-            on_started=lambda _handoff_id: handle.mark_started(threading.get_ident()),
-            on_exited=lambda _handoff_id: handle.mark_worker_exited(),
-            on_finalized=lambda _handoff_id: handle.mark_finalizers_done(),
-            **kwargs,
-        )
+        submit_callbacks = {}
+        if native_owned:
+            submit_callbacks = {
+                "on_started": lambda _handoff_id: handle.mark_started(threading.get_ident()),
+                "on_exited": lambda _handoff_id: handle.mark_worker_exited(),
+                "on_finalized": lambda _handoff_id: handle.mark_finalizers_done(),
+            }
+        submit_kwargs = dict(kwargs)
+        submit_kwargs.update(submit_callbacks)
+        submission = submit_owned(handle.handle_id, run_with_custody, *args, **submit_kwargs)
         accepted = getattr(submission, "accepted", None)
         future = getattr(submission, "future", None)
         error = getattr(submission, "error", None)
