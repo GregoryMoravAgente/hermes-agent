@@ -461,13 +461,26 @@ def _run_job_script_effect(
     instead of the scripts-dir parent. See #69396. interpreter: the job's optional Python for
     ``.py`` scripts (#8714).
     """
+    # Diagnostic branch only: bounded source-stage observations contain no script data or env.
+    def native_stage(stage, **values):
+        import json
+        print("NATIVE_SCRIPT_STAGE=" + json.dumps({"stage": stage, **values}),
+              file=sys.stderr, flush=True)
+
+    native_stage("resolve_script")
     path, err = _resolve_script_path(script_path)
     if path is None:
         return False, err
     script_timeout = _get_script_timeout()
     proc = None
     try:
+        native_stage("interpreter_begin")
         argv, env_overlay, err = _script_argv(path, interpreter)
+        import hashlib
+        native_stage("interpreter_selected", executable=Path(argv[0]).name if argv else None,
+                     executable_digest=hashlib.sha256(os.path.normcase(argv[0]).encode()).hexdigest() if argv else None,
+                     mode="bootstrap" if argv and "-c" in argv[1:2] else "direct",
+                     argc=len(argv) if argv else 0, overlay_names=sorted(env_overlay))
         if argv is None:
             return False, err
         from tools.environments.local import build_subprocess_env
@@ -505,9 +518,12 @@ def _run_job_script_effect(
         proc = subprocess.Popen(
             argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             cwd=workdir or str(path.parent), env=env, **popen_kwargs)
+        native_stage("popen_return", pid=proc.pid, stdout_pipe=proc.stdout is not None,
+                     stderr_pipe=proc.stderr is not None)
         from cron.runtime_custody import register_script_process
         register_script_process(proc)
         deadline = time.monotonic() + script_timeout
+        native_stage("communicate_begin")
         while True:
             # Tree-kill on cancel AND timeout: killpg misses setsid grandchildren (watchdogs,
             # backgrounded shell jobs); kill_process_tree snapshots descendants BEFORE signalling.
@@ -528,6 +544,7 @@ def _run_job_script_effect(
                 return False, f"Script timed out after {script_timeout}s: {path}"
             try:
                 stdout_raw, stderr_raw = proc.communicate(timeout=min(0.1, remaining))
+                native_stage("communicate_return", returncode=proc.returncode)
                 break
             except subprocess.TimeoutExpired:
                 continue
@@ -557,7 +574,9 @@ def _run_job_script_effect(
     finally:
         if proc is not None:
             from cron.runtime_custody import finish_script_process
+            native_stage("finish_script_begin", returncode=proc.poll())
             finish_script_process(proc)
+            native_stage("finish_script_return")
 
 
 def _start_heartbeat_thread(loop_fn, name: str, fail_log) -> Optional[threading.Thread]:

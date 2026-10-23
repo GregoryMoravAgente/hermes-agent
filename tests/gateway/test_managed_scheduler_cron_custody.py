@@ -681,11 +681,18 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
     scripts.mkdir(parents=True, exist_ok=True)
     script = scripts / "managed-cron-child.py"
     script.write_text(
+        "from pathlib import Path\n"
+        "marker = str(Path(__file__))\n"
+        "Path(marker + '.script-enter').write_text('1')\n"
         "import subprocess\n"
         "import sys\n"
         "child = subprocess.Popen([sys.executable, '-c', "
-        "\"print('cron-descendant-ok', flush=True)\"])\n"
+        "\"import sys; from pathlib import Path; "
+        "Path(sys.argv[1] + '.child-enter').write_text('1'); "
+        "print('cron-descendant-ok', flush=True)\", marker])\n"
+        "Path(marker + '.child-popen').write_text('1')\n"
         "child.wait()\n"
+        "Path(marker + '.child-wait').write_text('1')\n"
         "print('cron-script-ok', flush=True)\n",
         encoding="utf-8",
     )
@@ -701,10 +708,28 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
         )
         provider = InProcessCronScheduler()
         deadline = asyncio.get_running_loop().time() + 90.0
-        assert await asyncio.wait_for(
-            asyncio.to_thread(provider.fire_due, job["id"]),
-            timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
-        ) is True
+        try:
+            assert await asyncio.wait_for(
+                asyncio.to_thread(provider.fire_due, job["id"]),
+                timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
+            ) is True
+        finally:
+            print("NATIVE_SCRIPT_MARKERS=" + json.dumps({
+                name: Path(str(script) + '.' + name).is_file()
+                for name in ('script-enter', 'child-popen', 'child-enter', 'child-wait')
+            }, sort_keys=True), flush=True)
+            execution_id = getattr(captured[0], 'execution_id', None) if len(captured) == 1 else None
+            if (type(execution_id) is str and execution_id
+                    and Path(execution_id).name == execution_id):
+                stderr_file = home / 'cron' / 'external-workers' / f'{execution_id}.stderr'
+                if stderr_file.is_file():
+                    with stderr_file.open('rb') as stream:
+                        stream.seek(0, 2)
+                        stream.seek(max(0, stream.tell() - 65536))
+                        snapshot = stream.read(65536).decode('utf-8', errors='replace')
+                    for line in snapshot.splitlines():
+                        if line.startswith('NATIVE_SCRIPT_STAGE='):
+                            print(line, flush=True)
 
     assert len(captured) == 1
     binding = captured[0]
