@@ -53,7 +53,9 @@ def _session() -> dict:
     return {
         "agent": _agent(),
         "session_key": _SESSION_KEY,
-        "profile_home": "",
+        # The child must retain the actual profile scope from its inherited
+        # synthetic environment; an empty value redirects the registry to cwd.
+        "profile_home": os.environ["HERMES_HOME"],
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,

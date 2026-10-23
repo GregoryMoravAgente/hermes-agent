@@ -319,7 +319,9 @@ def _session() -> dict:
     return {
         "agent": _agent(),
         "session_key": _SESSION_KEY,
-        "profile_home": "",
+        # Keep the synthetic session on the same temporary profile registry as
+        # the parent.  An empty value resolves active-session paths from cwd.
+        "profile_home": os.environ["HERMES_HOME"],
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,
@@ -541,23 +543,40 @@ def _install_completion_backpressure(paths: argparse.Namespace) -> None:
         if write_count == 2:
             os.set_blocking(fd, False)
             padding_count = 0
+            pending_frame = None
             try:
                 while True:
+                    frame = pending_frame if pending_frame is not None else memoryview(data)
                     try:
-                        written = os.write(fd, data)
+                        written = os.write(fd, frame)
                     except BlockingIOError:
                         break
-                    if written != len(data):
-                        raise OSError("completion padding made a short framed write")
+                    if type(written) is not int or written <= 0 or written > len(frame):
+                        raise OSError("completion padding made no progress")
+                    if written < len(frame):
+                        # A nonblocking pipe may split the final valid JSONL frame.
+                        # Keep its exact remainder and finish that same frame after
+                        # the parent releases the reader; never append a new frame
+                        # behind an unterminated record.
+                        pending_frame = frame[written:]
+                        break
+                    pending_frame = None
                     padding_count += 1
             finally:
                 os.set_blocking(fd, True)
+            if pending_frame is not None:
+                # Count this frame in the parent-side drain target. Its bytes are
+                # still pending, but its newline-framed completion is source-valid
+                # and will be completed before the real terminal record.
+                padding_count += 1
             Path(paths.completion_filled).write_text(str(padding_count), encoding="utf-8")
             wait_until(
                 lambda: Path(paths.completion_release).exists(),
                 timeout=30,
                 what="test-owned completion pipe release",
             )
+            if pending_frame is not None:
+                original_write(fd, pending_frame)
         return original_write(fd, data, **kwargs)
 
     compute_host._write_completion_bytes = blocked_write

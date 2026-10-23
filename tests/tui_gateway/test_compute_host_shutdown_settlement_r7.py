@@ -21,6 +21,10 @@ _SID = "r7-shutdown-sid"
 _SESSION_KEY = "r7-shutdown-session"
 
 
+def _profile_home(tmp_path: Path) -> Path:
+    return tmp_path / "hermes-home"
+
+
 def _frame(tmp_path: Path, request_id: str) -> dict:
     return {
         "type": "turn.start",
@@ -28,7 +32,7 @@ def _frame(tmp_path: Path, request_id: str) -> dict:
         "request_id": request_id,
         "turn_id": request_id,
         "session_key": _SESSION_KEY,
-        "profile_home": "",
+        "profile_home": str(_profile_home(tmp_path)),
         "text": "r7 delayed shutdown refusal",
         "history": [],
         "history_version": 0,
@@ -46,7 +50,7 @@ def _supervisor(
     monkeypatch.setattr(backend_retirement, "retirement", fence)
     root = Path(__file__).resolve().parents[2]
     fixture = Path(__file__).with_name("compute_host_shutdown_admission_r7_child.py")
-    hermes_home = tmp_path / "hermes-home"
+    hermes_home = _profile_home(tmp_path)
     hermes_home.mkdir()
     paths = {
         "turn-entered": tmp_path / "turn-entered",

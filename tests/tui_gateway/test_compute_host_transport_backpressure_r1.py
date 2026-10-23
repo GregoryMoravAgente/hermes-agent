@@ -42,14 +42,20 @@ class _ObservedStdin:
         return getattr(self._stream, name)
 
 
-def _frame(tmp_path: Path, request_id: str) -> dict[str, object]:
+def _profile_home(tmp_path: Path) -> Path:
+    return tmp_path / "hermes-home"
+
+
+def _frame(
+    tmp_path: Path, request_id: str, *, profile_home: Path | None = None,
+) -> dict[str, object]:
     return {
         "type": "turn.start",
         "sid": _SID,
         "request_id": request_id,
         "turn_id": request_id,
         "session_key": _SESSION_KEY,
-        "profile_home": "",
+        "profile_home": str(profile_home or _profile_home(tmp_path)),
         # The child has authenticated hello but is not reading stdin. This real
         # payload fills the OS pipe while the exact turn lease is already pending.
         "text": "pipe-fill:" + ("x" * (256 * 1024)),
@@ -64,7 +70,7 @@ def _frame(tmp_path: Path, request_id: str) -> dict[str, object]:
 def _supervisor(tmp_path: Path) -> tuple[HostSupervisor, Path, Path, Path]:
     root = Path(__file__).resolve().parents[2]
     fixture = Path(__file__).with_name("compute_host_transport_backpressure_child_r1.py")
-    hermes_home = tmp_path / "hermes-home"
+    hermes_home = _profile_home(tmp_path)
     hermes_home.mkdir()
     ready = tmp_path / "stdin-reader-ready"
     release = tmp_path / "stdin-reader-release"
@@ -607,7 +613,14 @@ def test_real_completion_pipe_backpressure_makes_child_close_refuse_unknown_cust
         wait_until(stdout_gate_reached.is_set, timeout=15, what="stdout reader startup gate")
         profile = tmp_path / "profile"
         profile.mkdir()
-        supervisor.submit_turn(_frame(profile, "completion-fill-turn"), on_complete=completion)
+        supervisor.submit_turn(
+            _frame(
+                profile,
+                "completion-fill-turn",
+                profile_home=tmp_path / "completion-hermes-home",
+            ),
+            on_complete=completion,
+        )
         wait_until(filled.exists, timeout=30, what="real completion pipe fill")
         padding_count = int(filled.read_text(encoding="utf-8"))
         assert padding_count > 0

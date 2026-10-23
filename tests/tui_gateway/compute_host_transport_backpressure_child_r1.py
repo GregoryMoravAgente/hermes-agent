@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 import threading
@@ -48,7 +49,10 @@ def _session() -> dict:
     return {
         "agent": _agent(),
         "session_key": _SESSION_KEY,
-        "profile_home": "",
+        # Keep the synthetic session bound to the same profile home that the
+        # parent supplied through ``synthetic_host_env``.  An empty value is
+        # interpreted as the current working directory by active_sessions.
+        "profile_home": os.environ["HERMES_HOME"],
         "history": [],
         "history_lock": threading.Lock(),
         "history_version": 0,
