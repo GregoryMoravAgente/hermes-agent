@@ -1469,8 +1469,8 @@ class SessionAuthority(
                 row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
                                                         session_id=ref.session_id, _guard=self._admission_gate(),
                                                         head=first['admission_id'] if first is not None else None),
-                                          then=partial(self._stamp_claim, ref, live, claim_child,
-                                                       first['admission_id'] if first is not None else None),
+                                          then=partial(self._stamp_claim, ref, live, claim_child=claim_child,
+                                                       claim_admission_id=first['admission_id'] if first is not None else None),
                                           ordered=True)
             except BaseException:
                 if claim_child is not None:
@@ -1481,7 +1481,7 @@ class SessionAuthority(
             # instead of letting the drain exit idle over a committed admission.
             return (False if row is None and live.rescan else row), first
 
-    def _stamp_claim(self, ref, live, claim_child=None, claim_admission_id=None, row=None):
+    def _stamp_claim(self, ref, live, row=None, *, claim_child=None, claim_admission_id=None):
         """The claim's execution stamp, in the same tracked task as its commit: no observer (or
         retirement's join) ever sees a committed claim that no execution stamp names."""
         admission_id = row.get('admission_id') if row else claim_admission_id

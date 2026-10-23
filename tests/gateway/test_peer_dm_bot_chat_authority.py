@@ -228,9 +228,9 @@ async def peer(tmp_path, monkeypatch):
     original_stamp_claim = SessionAuthority._stamp_claim
 
     @functools.wraps(original_stamp_claim)
-    def observed_stamp_claim(authority, ref, live, claim_child=None, claim_admission_id=None, row=None):
+    def observed_stamp_claim(authority, ref, live, row=None, *, claim_child=None, claim_admission_id=None):
         result = original_stamp_claim(
-            authority, ref, live, claim_child, claim_admission_id, row)
+            authority, ref, live, row, claim_child=claim_child, claim_admission_id=claim_admission_id)
         timeline.append({
             'event': 'claim_after', 'row': _row_scalars(result),
         })
