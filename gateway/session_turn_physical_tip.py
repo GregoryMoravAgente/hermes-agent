@@ -63,11 +63,20 @@ def _lineage_rows(db: Any, lineage: tuple[str, ...]) -> tuple[tuple[str, str | N
             return None
         if index < len(lineage) - 1:
             child = db.get_session(lineage[index + 1])
-            if row.get("end_reason") != "compression" or row.get("ended_at") is None:
+            if row.get("ended_at") is None:
                 return None
             if not isinstance(child, dict) or child.get("parent_session_id") != session_id:
                 return None
-            if not callable(is_child) or is_child(child) is not True:
+            if row.get("end_reason") == "compression":
+                if not callable(is_child) or is_child(child) is not True:
+                    return None
+            elif row.get("end_reason") == "session_reset":
+                try:
+                    if json.loads(child.get("model_config") or "{}").get("_reset_from") != session_id:
+                        return None
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    return None
+            else:
                 return None
         elif row.get("ended_at") is not None or row.get("end_reason") is not None:
             return None
@@ -174,21 +183,47 @@ def _binding_row_matches(db: Any, binding: Any, root: str) -> bool:
 def _validated_lineage(
     db: Any, authority: Any, binding: Any, profile_id: str, root: str, physical: str,
 ):
-    if not _turn_binding_custody_matches(binding) or not _binding_row_matches(db, binding, root):
+    binding_ok = _turn_binding_custody_matches(binding)
+    row_ok = _binding_row_matches(db, binding, root)
+    if not binding_ok or not row_ok:
         return None
-    lineage = tuple(db.get_compression_lineage(root))
+    # Reset rotations are local-policy lineage, not compression lineage.  The existing
+    # persisted local receipt is the source-owned witness for that route; use it before the
+    # compression-only projection so a managed worker assigned to a reset child can still
+    # prove its exact physical transcript without changing the logical I04 owner.
+    local_witness = None
+    try:
+        from gateway.session_recovery_custody import local_policy_lineage_witness
+        local_witness = local_policy_lineage_witness(authority, root)
+    except BaseException:  # health: allow BLE001 -- unreadable local-policy lineage stays fail-closed
+        local_witness = None
+    local_lineage = (
+        local_witness is not None
+        and getattr(local_witness, "session_id", None) == root
+        and getattr(local_witness, "physical_session_id", None) == physical
+        and getattr(local_witness, "profile_id", None) == profile_id
+        and getattr(local_witness, "authority_epoch", None) == getattr(binding, "authority_epoch", None)
+        and getattr(local_witness, "process_instance", None) == getattr(binding, "process_instance", None)
+    )
+    if local_lineage:
+        lineage = tuple(local_witness.lineage)
+    else:
+        lineage = tuple(db.get_compression_lineage(root))
     if (
         not lineage or lineage[0] != root or lineage[-1] != physical
         or len(set(lineage)) != len(lineage)
     ):
         return None
-    if db.get_compression_tip(root) != physical:
+    if not local_lineage and db.get_compression_tip(root) != physical:
         return None
     from gateway.session_contract import SessionRef
-    if authority.physical_target(SessionRef(profile_id, root)) != physical:
+    if (
+        not local_lineage
+        and authority.physical_target(SessionRef(profile_id, root)) != physical
+    ):
         return None
     fingerprints = _lineage_rows(db, lineage)
-    return (lineage, fingerprints) if fingerprints is not None else None
+    return (lineage, fingerprints, local_lineage) if fingerprints is not None else None
 
 
 def _current_route(authority: Any, root: str, physical: str) -> str | None:
@@ -233,20 +268,24 @@ def resolve_physical_tip_witness(
         )
         if validated is None:
             return None
-        lineage, fingerprints = validated
+        lineage, fingerprints, local_lineage = validated
         route = _current_route(authority, root, physical_session_id)
         if route is None:
             return None
         # The lineage rows and route are independently mutable.  Re-read both canonical
         # tip views after those checks so a rotation between the first read and witness
         # publication cannot make an old physical child look current.
-        from gateway.session_contract import SessionRef
-        if (
-            db.get_compression_tip(root) != physical_session_id
-            or authority.physical_target(SessionRef(profile_id, root)) != physical_session_id
-            or _current_route(authority, root, physical_session_id) != route
-        ):
-            return None
+        if local_lineage:
+            if _current_route(authority, root, physical_session_id) != route:
+                return None
+        else:
+            from gateway.session_contract import SessionRef
+            if (
+                db.get_compression_tip(root) != physical_session_id
+                or authority.physical_target(SessionRef(profile_id, root)) != physical_session_id
+                or _current_route(authority, root, physical_session_id) != route
+            ):
+                return None
         if _profile_scope_witness(binding) != physical_owner_epoch:
             return None
         return PhysicalTipWitness(

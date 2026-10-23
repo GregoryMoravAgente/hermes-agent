@@ -111,6 +111,13 @@ class ServiceProcessReceipt:
     # published to its session.  Keep that partial construction owner attached to
     # this exact receipt until native cleanup and retry reconciliation finish.
     construction_owner: Any = field(default=None, repr=False)
+    # Managed-worker adapters keep a view object beside the canonical parent/receipt.
+    # Retain that exact view only so a verified pre-Popen release can clear every
+    # alias; it is not an additional custody ledger.
+    source_owner: Any = field(default=None, repr=False)
+    source_parent: Any = field(default=None, repr=False)
+    source_service: Any = field(default=None, repr=False)
+    source_root_handle: Any = field(default=None, repr=False)
 
     def retain_construction_owner(self, owner: Any) -> bool:
         """Attach the exact transport object while its constructor is still in flight."""
@@ -288,8 +295,43 @@ class ServiceProcessReceipt:
             return False
         self.transaction = None
         self.state = "released"
-        self.service.physical = None
+        self._clear_release_aliases()
         return True
+
+    def _clear_release_aliases(self) -> None:
+        """Drop only aliases of this receipt after a verified no-effect release."""
+        if self.service.physical is self:
+            self.service.physical = None
+        owner = self.source_owner
+        parent = (
+            self.source_parent
+            if owner is not None
+            else getattr(self.service, "external_parent", None)
+        )
+        if getattr(parent, "_physical", None) is self:
+            parent._physical = None
+        if getattr(owner, "physical", None) is self:
+            owner.physical = None
+
+    def _managed_source_identity_matches(self) -> bool:
+        """Return true only when this managed receipt still owns every live edge."""
+        owner = self.source_owner
+        parent = self.source_parent
+        service = self.source_service
+        return (
+            owner is not None
+            and parent is not None
+            and service is self.service
+            and getattr(owner, "service", None) is service
+            and getattr(owner, "parent", None) is parent
+            and getattr(owner, "physical", None) is self
+            and getattr(parent, "_service", None) is service
+            and getattr(parent, "_physical", None) is self
+            and getattr(parent, "root_handle", None) is self.source_root_handle
+            and getattr(service, "handle", None) is self.source_root_handle
+            and getattr(service, "external_parent", None) is parent
+            and getattr(service, "physical", None) is self
+        )
 
     def release_before_effect(self) -> bool:
         transaction = self.transaction
@@ -310,7 +352,7 @@ class ServiceProcessReceipt:
                 return False
             return (
                 self.state == "released"
-                and self.service.physical is None
+                and self.service.physical is not self
                 and getattr(transaction, "job_handle_closed", False) is True
             )
         if self.state != "reserved" or self.process is not None:
@@ -321,7 +363,7 @@ class ServiceProcessReceipt:
             self.mark_unknown(getattr(result, "code", "release_failed"))
             return False
         self.state = "released"
-        self.service.physical = None
+        self._clear_release_aliases()
         return True
 
     def prepare_process_retry(self) -> bool:
@@ -537,12 +579,29 @@ class ServiceProcessReceipt:
     def mark_unknown(self, reason: str) -> None:
         if self.state in {"closed", "released"}:
             return
-        if self.state == "unknown":
-            return
-        self.state = "unknown"
-        self.unknown_reason = reason
-        self.service.unknown = True
-        self.service.coordinator.mark_unknown(self.handle, reason)
+        if self.state != "unknown":
+            self.state = "unknown"
+            self.unknown_reason = reason
+        effective_reason = self.unknown_reason or reason
+        managed_source = self.ephemeral_process and self.source_owner is not None
+        managed_source_matches = managed_source and self._managed_source_identity_matches()
+        if not managed_source or managed_source_matches:
+            self.service.unknown = True
+        self.service.coordinator.mark_unknown(self.handle, effective_reason)
+        # A managed reader/launch fault may reach this physical receipt before the
+        # generic source adapter cascades it.  Cascade only through the exact captured
+        # source parent; never poison a replacement parent/service edge.
+        if (
+            managed_source_matches
+        ):
+            service_handle = getattr(self.service, "handle", None)
+            if service_handle is not None and service_handle is not self.handle:
+                self.service.coordinator.mark_unknown(service_handle, effective_reason)
+            parent = self.source_parent
+            if parent is not None and getattr(parent, "state", None) not in {
+                "closed", "released", "terminal",
+            }:
+                parent.state = "unknown"
 
     def bind_source_receipt(self, receipt: Any) -> None:
         """Retain one exact source transport witness for a result-less close path."""

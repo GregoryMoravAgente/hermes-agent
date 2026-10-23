@@ -147,6 +147,7 @@ class WindowsLaunchTransaction:
         errors: Optional[str],
         bufsize: int = -1,
         start_new_session: bool = True,
+        close_fds: bool = True,
         creationflags: int = 0,
         on_process_bound=None,
     ) -> subprocess.Popen:
@@ -179,6 +180,7 @@ class WindowsLaunchTransaction:
                 errors=errors,
                 bufsize=bufsize,
                 start_new_session=start_new_session,
+                close_fds=close_fds,
                 creationflags=creationflags | CREATE_SUSPENDED,
             )
             self.state = "popen_bound"
@@ -415,6 +417,11 @@ class WindowsLaunchTransaction:
         if self.native_empty_observed:
             return True
         deadline = time.monotonic() + max(0.0, float(timeout))
+        if not self.assigned:
+            # No assignment was proven.  The process handle still has to be exited
+            # and the exact Job must prove both nonmembership and emptiness before
+            # the retained transaction can be retried.
+            return self._observe_unassigned_empty() is True
         if self.observe_empty() is True:
             return True
         if self.scope_observation != "nonempty":
@@ -589,6 +596,12 @@ class WindowsLaunchTransaction:
         if not exited:
             self.scope_observation = "process_alive"
             return None
+        # A post-Popen failure can happen before the Job assignment call starts.  In
+        # that branch ``assigned`` is deliberately still false, but the exact Job,
+        # process handle, and process identity are retained.  Only this direct
+        # membership + empty + exited observation may close that partial transaction;
+        # a missing observation remains UNKNOWN and retryable on the same handles.
+        self.assignment_observation = "nonmember"
         self.scope_observation = "empty_nonmember"
         self.native_empty_observed = True
         return True
