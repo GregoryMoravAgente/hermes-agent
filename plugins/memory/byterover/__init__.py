@@ -22,7 +22,9 @@ from typing import Any, Dict, List, Optional
 from agent.memory_provider import MemoryProvider, spawn_context_thread
 from plugins.memory._retirement import (
     ProviderIdentity,
+    ProviderRetirementLease,
     new_identity,
+    preparation_result,
     receipt_reason,
     retirement_result,
     thread_is_closed,
@@ -177,6 +179,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
         self._retirement_in_progress = False
         self._retirement_initializing = False
         self._retirement_initialization_failed = False
+        self._retirement_lease: ProviderRetirementLease | None = None
 
     @property
     def name(self) -> str:
@@ -463,8 +466,123 @@ class ByteRoverMemoryProvider(MemoryProvider):
         result = run(self, value)
         return json.dumps(on_ok(result.get("output", ""))) if result["success"] else tool_error(result.get("error", fail_msg))
 
+    def prepare_retirement(self, receipt: dict[str, str] | None = None) -> dict[str, object]:
+        """Reversibly fence this provider after all accepted native work has settled."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+        requested, reason = receipt_reason(receipt, current)
+        if reason is not None:
+            return preparation_result(current, status="unknown", lease=None, reason=reason)
+
+        if not self._retirement_mutex.acquire(blocking=False):
+            with self._retirement_condition:
+                lease = self._retirement_lease
+                current = self._retirement_identity
+            return preparation_result(current, status="unknown", lease=lease, reason="retirement_in_progress")
+        lease: ProviderRetirementLease | None = None
+        try:
+            with self._retirement_condition:
+                current = self._retirement_identity
+                if current != requested:
+                    return preparation_result(current, status="unknown", lease=None, reason="stale_receipt")
+                if self._retirement_initialization_failed:
+                    return preparation_result(current, status="unknown", lease=None, reason="store_open_failed")
+                if self._released:
+                    return preparation_result(current, status="unknown", lease=self._retirement_lease, reason="released")
+                lease = self._retirement_lease
+                if lease is None:
+                    lease = ProviderRetirementLease(current)
+                    self._retirement_lease = lease
+                elif lease._resumed:
+                    return preparation_result(current, status="unknown", lease=None, reason="stale_lease")
+                elif lease._commit_started:
+                    return preparation_result(current, status="unknown", lease=lease, reason="commit_started")
+                self._retiring = True
+                self._retirement_in_progress = True
+                deadline = time.monotonic() + _RETIREMENT_WAIT_S
+                while self._retirement_active_calls:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return preparation_result(
+                            current, status="unknown", lease=lease, reason="pending_flush",
+                        )
+                    self._retirement_condition.wait(remaining)
+            remaining = max(0.0, deadline - time.monotonic())
+            if not self._join_retirement_threads(remaining):
+                return preparation_result(current, status="unknown", lease=lease, reason="pending_flush")
+            with self._retirement_condition:
+                failures = self._retirement_failures
+                if failures:
+                    return preparation_result(current, status="unknown", lease=lease, reason="flush_failed")
+                lease._prepared = True
+            return preparation_result(current, status="prepared", lease=lease, reason="prepared")
+        finally:
+            with self._retirement_condition:
+                self._retirement_in_progress = False
+                self._retirement_condition.notify_all()
+            self._retirement_mutex.release()
+
+    def resume_retirement(self, lease: object) -> bool:
+        """Reopen admission for the exact uncommitted source-owned lease."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            if (
+                not isinstance(lease, ProviderRetirementLease)
+                or self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._commit_started
+                or lease._resumed
+                or self._released
+                or self._retirement_in_progress
+            ):
+                return False
+            self._retiring = False
+            lease._resumed = True
+            self._retirement_lease = None
+            self._retirement_condition.notify_all()
+            return True
+
+    def commit_retirement(self, lease: object) -> dict[str, object]:
+        """Begin irreversible retirement only for the exact prepared lease."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            if (
+                not isinstance(lease, ProviderRetirementLease)
+                or self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._resumed
+            ):
+                return retirement_result(current, status="unknown", reason="foreign_receipt")
+            if not lease._prepared and not lease._commit_started:
+                return retirement_result(current, status="unknown", reason="pending_flush")
+            lease._commit_started = True
+        return self._retire_exact_lease(lease)
+
+    def _retire_exact_lease(self, lease: ProviderRetirementLease) -> dict[str, object]:
+        """Run the irreversible path only after the exact opaque lease was admitted."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            if (
+                self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._resumed
+                or not lease._commit_started
+            ):
+                return retirement_result(current, status="unknown", reason="foreign_receipt")
+            receipt = current.as_mapping()
+        return self._retire_impl(receipt, lease=lease)
+
     def retire(self, receipt: dict[str, str] | None = None) -> dict[str, object]:
         """Drain accepted CLI work and retain the provider on any ambiguous failure."""
+        return self._retire_impl(receipt)
+
+    def _retire_impl(
+        self,
+        receipt: dict[str, str] | None = None,
+        *,
+        lease: ProviderRetirementLease | None = None,
+    ) -> dict[str, object]:
+        """Run receipt retirement, with the lease-only hard path kept private."""
         with self._retirement_condition:
             current = self._retirement_identity
         requested, reason = receipt_reason(receipt, current)
@@ -488,6 +606,16 @@ class ByteRoverMemoryProvider(MemoryProvider):
                     return retirement_result(current, status="unknown", reason="store_open_failed")
                 if self._released:
                     return retirement_result(current, status="released", reason="released")
+                if self._retirement_lease is not None:
+                    if lease is None:
+                        return retirement_result(current, status="unknown", reason="retirement_in_progress")
+                    if (
+                        self._retirement_lease is not lease
+                        or lease._identity != current
+                        or lease._resumed
+                        or not lease._commit_started
+                    ):
+                        return retirement_result(current, status="unknown", reason="foreign_receipt")
                 self._retiring = True
                 self._retirement_in_progress = True
                 deadline = time.monotonic() + _RETIREMENT_WAIT_S
@@ -524,6 +652,10 @@ class ByteRoverMemoryProvider(MemoryProvider):
             self._retirement_mutex.release()
 
     def shutdown(self) -> None:
+        with self._retirement_condition:
+            if self._retirement_lease is not None and not self._retirement_lease._commit_started:
+                logger.warning("ByteRover shutdown deferred while reversible retirement lease is active")
+                return
         if not self._join_retirement_threads(_RETIREMENT_WAIT_S):
             logger.warning("ByteRover provider shutdown remains unresolved; workers retained")
             return

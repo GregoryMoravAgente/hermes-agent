@@ -28,7 +28,9 @@ from agent.secret_scope import get_secret
 from agent.file_safety import raise_if_read_blocked
 from plugins.memory._retirement import (
     ProviderIdentity,
+    ProviderRetirementLease,
     new_identity,
+    preparation_result,
     receipt_reason,
     retirement_result,
     thread_is_closed,
@@ -207,6 +209,11 @@ class _WriteQueue:
         self._hard_released = False
         self._active_flushes = 0
         self._failed_rows: set[int] = set()
+        # A reversible resume may be requested while one native ingest is still in flight.  Do
+        # not put that row back into the queue until the current flush has settled; otherwise the
+        # same durable row can be admitted twice.  The settled worker then replays every exact
+        # failed row on this queue before accepting later writes.
+        self._replay_failed_after_active = False
         # A writer launch can fail before a thread exists or after a wrapper has published an
         # unstarted thread. Keep the exact queue object and its SQLite handles so hard retirement
         # can report UNKNOWN and retry on the same source-owned queue.
@@ -320,11 +327,40 @@ class _WriteQueue:
                 self._execute("UPDATE pending SET last_error = ? WHERE id = ?", (str(exc), row_id))
             time.sleep(2)
 
+    def _requeue_failed_rows_locked(self) -> bool:
+        """Replay exact failed durable rows after an active flush fence has settled.
+
+        The shutdown lock is held by callers.  A failed row has already been removed from the
+        in-memory queue by ``Queue.get`` while its SQLite row remains durable.  Only those source
+        row ids are requeued, so a current in-flight item or an unrelated accepted row is never
+        duplicated.  A failed durable read leaves the rows and failure ids retained for a later
+        same-queue retry.
+        """
+        if self._shutdown or self._hard_released:
+            return False
+        with self._condition:
+            if self._active_flushes:
+                return False
+            failed_ids = set(self._failed_rows)
+        if not failed_ids:
+            return True
+        rows = self._pending_rows()
+        if rows is None:
+            return False
+        replay = [row for row in rows if row[0] in failed_ids]
+        replay_ids = {row[0] for row in replay}
+        for row in replay:
+            self._q.put(row)
+        with self._condition:
+            self._failed_rows.difference_update(replay_ids)
+        return True
+
     def _loop(self) -> None:
         try:
             while (item := self._q.get()) is not _ASYNC_SHUTDOWN:
                 with self._condition:
                     self._active_flushes += 1
+                replay_failed = False
                 try:
                     self._flush_row(*item)
                 except Exception as exc:
@@ -332,7 +368,14 @@ class _WriteQueue:
                 finally:
                     with self._condition:
                         self._active_flushes = max(0, self._active_flushes - 1)
+                        replay_failed = self._replay_failed_after_active and self._active_flushes == 0
+                        if replay_failed:
+                            self._replay_failed_after_active = False
                         self._condition.notify_all()
+                    if replay_failed:
+                        with self._shutdown_lock:
+                            if not self._retiring:
+                                self._requeue_failed_rows_locked()
         finally:
             # Keep a failed native close in the shared census so provider shutdown can retry the
             # exact handle from the owner; dropping it here would fabricate a clean close.
@@ -378,6 +421,97 @@ class _WriteQueue:
             if not self._retirement_stop_requested:
                 self._q.put(_ASYNC_SHUTDOWN)
                 self._retirement_stop_requested = True
+
+    def prepare_retirement(self, timeout: float = _RETIREMENT_WAIT_S) -> dict[str, object]:
+        """Fence queue admission and drain durable rows while retaining all handles open."""
+        deadline = _monotonic() + max(0.0, timeout)
+        with self._shutdown_lock:
+            if self._hard_released:
+                return {"status": "unknown", "pending_write_count": 0,
+                        "pending_flush_count": 0, "close_failure_count": 0,
+                        "active_store_count": 0, "reason": "released"}
+            if self._shutdown:
+                return {"status": "unknown", "pending_write_count": 0,
+                        "pending_flush_count": 0, "close_failure_count": 1,
+                        "active_store_count": max(1, self._connection_count()), "reason": "close_failed"}
+            self._retiring = True
+            thread = getattr(self, "_thread", None)
+            if self._worker_start_failure and thread_is_closed(thread):
+                self._worker_start_failure = None
+            if not self._thread_is_alive(thread) and self._pending_count() not in (0, None):
+                self._start_retry_worker_locked()
+                thread = getattr(self, "_thread", None)
+            launch_failure = self._worker_start_failure
+
+        if launch_failure:
+            pending = self._pending_count()
+            return {
+                "status": "unknown",
+                "pending_write_count": pending if pending is not None else 0,
+                "pending_flush_count": 1,
+                "close_failure_count": 0,
+                "active_store_count": max(1, self._connection_count()),
+                "reason": launch_failure,
+            }
+
+        while True:
+            pending = self._pending_count()
+            with self._condition:
+                active = self._active_flushes
+            if pending is None:
+                return {"status": "unknown", "pending_write_count": 0,
+                        "pending_flush_count": max(1, active), "close_failure_count": 0,
+                        "active_store_count": max(1, self._connection_count()), "reason": "pending_catch_up"}
+            if pending == 0 and active == 0:
+                return {"status": "prepared", "pending_write_count": 0,
+                        "pending_flush_count": 0, "close_failure_count": 0,
+                        "active_store_count": max(1, self._connection_count()), "reason": "prepared"}
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                return {"status": "unknown", "pending_write_count": pending,
+                        "pending_flush_count": max(1, active), "close_failure_count": 0,
+                        "active_store_count": max(1, self._connection_count()), "reason": "pending_catch_up"}
+            thread = getattr(self, "_thread", None)
+            if not self._thread_is_alive(thread) and pending:
+                with self._shutdown_lock:
+                    self._start_retry_worker_locked()
+            with self._condition:
+                self._condition.wait(min(0.05, remaining))
+
+    def resume_admission(self) -> bool:
+        """Reopen this exact queue after a reversible preparation fence."""
+        with self._shutdown_lock:
+            if self._shutdown or self._hard_released:
+                return False
+            thread = getattr(self, "_thread", None)
+            thread_was_alive = self._thread_is_alive(thread)
+            active = 0
+            if not thread_was_alive:
+                rows = self._pending_rows()
+                if rows is None:
+                    return False
+                self._q = queue.Queue()
+                for row in rows:
+                    self._q.put(row)
+                self._retirement_stop_requested = False
+                self._start_worker(name="retaindb-writer-resume", raise_on_failure=False)
+                if self._worker_start_failure:
+                    return False
+            else:
+                with self._condition:
+                    active = self._active_flushes
+                if active:
+                    # The current native call remains the sole owner of its queue item.  Its
+                    # completion path will replay any failed durable rows after decrementing the
+                    # active count, so resume never duplicates an in-flight row.
+                    self._replay_failed_after_active = True
+            self._retiring = False
+            if thread_was_alive and not active:
+                if not self._requeue_failed_rows_locked():
+                    self._retiring = True
+                    return False
+            self._retirement_stop_requested = False
+            return True
 
     def _start_retry_worker_locked(self) -> None:
         """Replay durable rows on the same queue object after an unresolved attempt."""
@@ -554,6 +688,7 @@ class RetainDBMemoryProvider(MemoryProvider):
         self._retirement_in_progress = False
         self._retirement_initializing = False
         self._retirement_initialization_failed = False
+        self._retirement_lease: ProviderRetirementLease | None = None
 
     @property
     def name(self) -> str:
@@ -866,6 +1001,121 @@ class RetainDBMemoryProvider(MemoryProvider):
         value = args.get(required, "") if required else None
         return {"error": f"{required} is required"} if required and not value else handler(self, args, value)
 
+    def prepare_retirement(self, receipt: dict[str, str] | None = None) -> dict[str, object]:
+        """Reversibly fence this provider after workers and durable rows have settled."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+        requested, reason = receipt_reason(receipt, current)
+        if reason is not None:
+            return preparation_result(current, status="unknown", lease=None, reason=reason)
+
+        if not self._retirement_mutex.acquire(blocking=False):
+            with self._retirement_condition:
+                lease = self._retirement_lease
+                current = self._retirement_identity
+            return preparation_result(current, status="unknown", lease=lease, reason="retirement_in_progress")
+        lease: ProviderRetirementLease | None = None
+        try:
+            with self._retirement_condition:
+                current = self._retirement_identity
+                if current != requested:
+                    return preparation_result(current, status="unknown", lease=None, reason="stale_receipt")
+                if self._retirement_initialization_failed:
+                    return preparation_result(current, status="unknown", lease=None, reason="store_open_failed")
+                if self._released:
+                    return preparation_result(current, status="unknown", lease=self._retirement_lease, reason="released")
+                lease = self._retirement_lease
+                if lease is None:
+                    lease = ProviderRetirementLease(current)
+                    self._retirement_lease = lease
+                elif lease._resumed:
+                    return preparation_result(current, status="unknown", lease=None, reason="stale_lease")
+                elif lease._commit_started:
+                    return preparation_result(current, status="unknown", lease=lease, reason="commit_started")
+                self._retiring = True
+                self._retirement_in_progress = True
+                deadline = _monotonic() + _RETIREMENT_WAIT_S
+                while self._retirement_active_calls:
+                    remaining = deadline - _monotonic()
+                    if remaining <= 0:
+                        return preparation_result(current, status="unknown", lease=lease, reason="pending_flush")
+                    self._retirement_condition.wait(remaining)
+                queue_obj = self._queue
+            if queue_obj is None:
+                return preparation_result(current, status="unknown", lease=lease, reason="not_initialized")
+            remaining = max(0.0, deadline - _monotonic())
+            if not self._join_retirement_threads(remaining):
+                return preparation_result(current, status="unknown", lease=lease, reason="pending_flush")
+            with self._retirement_condition:
+                failures = self._retirement_failures
+            if failures:
+                return preparation_result(current, status="unknown", lease=lease, reason="flush_failed")
+            queue_report = queue_obj.prepare_retirement(timeout=max(0.0, deadline - _monotonic()))
+            if queue_report["status"] != "prepared":
+                return preparation_result(current, status="unknown", lease=lease, reason=str(queue_report["reason"]))
+            with self._retirement_condition:
+                lease._prepared = True
+            return preparation_result(current, status="prepared", lease=lease, reason="prepared")
+        finally:
+            with self._retirement_condition:
+                self._retirement_in_progress = False
+                self._retirement_condition.notify_all()
+            self._retirement_mutex.release()
+
+    def resume_retirement(self, lease: object) -> bool:
+        """Reopen admission for the exact uncommitted provider lease and queue object."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            queue_obj = self._queue
+            if (
+                not isinstance(lease, ProviderRetirementLease)
+                or self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._commit_started
+                or lease._resumed
+                or self._released
+                or self._retirement_in_progress
+                or queue_obj is None
+            ):
+                return False
+            if not queue_obj.resume_admission():
+                return False
+            self._retiring = False
+            lease._resumed = True
+            self._retirement_lease = None
+            self._retirement_condition.notify_all()
+            return True
+
+    def commit_retirement(self, lease: object) -> dict[str, object]:
+        """Begin irreversible queue/client retirement only for the exact prepared lease."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            if (
+                not isinstance(lease, ProviderRetirementLease)
+                or self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._resumed
+            ):
+                return retirement_result(current, status="unknown", reason="foreign_receipt")
+            if not lease._prepared and not lease._commit_started:
+                return retirement_result(current, status="unknown", reason="pending_flush")
+            lease._commit_started = True
+        return self._retire_exact_lease(lease)
+
+    def _retire_exact_lease(self, lease: ProviderRetirementLease) -> dict[str, object]:
+        """Run the irreversible path only after the exact opaque lease was admitted."""
+        with self._retirement_condition:
+            current = self._retirement_identity
+            if (
+                self._retirement_lease is not lease
+                or lease._identity != current
+                or lease._resumed
+                or not lease._commit_started
+            ):
+                return retirement_result(current, status="unknown", reason="foreign_receipt")
+            receipt = current.as_mapping()
+        return self._retire_impl(receipt, lease=lease)
+
     def _tool_upload_file(self, args: dict, local_path: str) -> Any:
         path_obj = Path(local_path)
         if not path_obj.exists():
@@ -912,6 +1162,15 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def retire(self, receipt: dict[str, str] | None = None) -> dict[str, object]:
         """Drain accepted RetainDB workers and durable rows on this exact provider instance."""
+        return self._retire_impl(receipt)
+
+    def _retire_impl(
+        self,
+        receipt: dict[str, str] | None = None,
+        *,
+        lease: ProviderRetirementLease | None = None,
+    ) -> dict[str, object]:
+        """Run receipt retirement, with the lease-only hard path kept private."""
         with self._retirement_condition:
             current = self._retirement_identity
         requested, reason = receipt_reason(receipt, current)
@@ -935,6 +1194,16 @@ class RetainDBMemoryProvider(MemoryProvider):
                     return retirement_result(current, status="unknown", reason="store_open_failed")
                 if self._released:
                     return retirement_result(current, status="released", reason="released")
+                if self._retirement_lease is not None:
+                    if lease is None:
+                        return retirement_result(current, status="unknown", reason="retirement_in_progress")
+                    if (
+                        self._retirement_lease is not lease
+                        or lease._identity != current
+                        or lease._resumed
+                        or not lease._commit_started
+                    ):
+                        return retirement_result(current, status="unknown", reason="foreign_receipt")
                 self._retiring = True
                 self._retirement_in_progress = True
                 deadline = time.monotonic() + _RETIREMENT_WAIT_S
@@ -989,6 +1258,9 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         with self._retirement_condition:
+            if self._retirement_lease is not None and not self._retirement_lease._commit_started:
+                logger.warning("RetainDB shutdown deferred while reversible retirement lease is active")
+                return
             if self._retiring and not self._released:
                 return
             queue_obj = self._queue

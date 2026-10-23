@@ -29,6 +29,7 @@ RESULT_KEYS = (
     "close_failure_count",
     "reason",
 )
+PREPARATION_KEYS = frozenset({"status", "receipt", "lease", "reason"})
 
 
 def thread_is_closed(thread: object) -> bool:
@@ -103,6 +104,40 @@ class ProviderIdentity:
             "home_id": self.home_id,
             "incarnation": self.incarnation,
         }
+
+
+class ProviderRetirementLease:
+    """Opaque source-owned identity for one reversible provider retirement fence.
+
+    The lease deliberately has no mapping or serialization protocol.  Core can carry the object
+    returned by ``prepare_retirement`` back to the same provider, but it cannot manufacture a
+    lease for another provider or incarnation.  Providers mutate only the phase flags below
+    while holding their own retirement condition.
+    """
+
+    __slots__ = ("_commit_started", "_identity", "_prepared", "_resumed")
+
+    def __init__(self, identity: ProviderIdentity):
+        self._identity = identity
+        self._prepared = False
+        self._commit_started = False
+        self._resumed = False
+
+
+def preparation_result(
+    identity: ProviderIdentity,
+    *,
+    status: str,
+    lease: ProviderRetirementLease | None,
+    reason: str,
+) -> dict[str, object]:
+    """Construct the exact reversible provider-preparation wire shape."""
+    return {
+        "status": status,
+        "receipt": identity.as_mapping(),
+        "lease": lease,
+        "reason": reason,
+    }
 
 
 def new_identity(provider: str, home: str | Path | None) -> ProviderIdentity:

@@ -80,6 +80,16 @@ async def begin_preservation_drain_impl(runner, params, peer_subject):
         if lifecycle_refusal is not None:
             coordinator.abort_before_handoff(receipt)
             return lifecycle_refusal.as_wire()
+        from gateway.profile_lifecycle_custody import begin_profile_lifecycle_close
+        profile_lifecycle_active = getattr(runner, "_profile_lifecycle_custody", None) is not None
+        if profile_lifecycle_active and not begin_profile_lifecycle_close(
+            runner, receipt.close_generation,
+        ):
+            _abort_lifecycle_close(runner, receipt.close_generation)
+            refused = coordinator.abort_before_handoff(receipt)
+            return refused.as_wire() if hasattr(refused, "as_wire") else {
+                "status": "refused", "reason": "profile_lifecycle_source_close_conflict",
+            }
         # Freeze MCP discovery before any close worker can cancel its task.  The
         # factory is attached to each authority during bootstrap and uses the
         # existing finalizer/coordinator roots for every accepted route.
@@ -96,7 +106,7 @@ async def begin_preservation_drain_impl(runner, params, peer_subject):
             if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
                 _reclose_mcp_factories(mcp_entries)
                 return {'status': 'refused', 'reason': 'mcp_source_resume_pending', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
+            completed, reason = await _abort_mcp_factories(
                 runner, coordinator, receipt, mcp_entries,
             )
             if not completed:
@@ -108,7 +118,7 @@ async def begin_preservation_drain_impl(runner, params, peer_subject):
             if not _resume_mcp_factories(runner, receipt.close_generation, mcp_entries):
                 _reclose_mcp_factories(mcp_entries)
                 return {'status': 'refused', 'reason': 'mcp_source_resume_pending', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
+            completed, reason = await _abort_mcp_factories(
                 runner, coordinator, receipt, mcp_entries,
             )
             if not completed:
@@ -132,7 +142,7 @@ async def begin_preservation_drain_impl(runner, params, peer_subject):
                     runner, receipt.close_generation, source_registry, mcp_entries,
                 )
                 return {'status': 'refused', 'reason': 'source_close_conflict', 'receipt': wire}
-            completed, reason = _abort_mcp_factories(
+            completed, reason = await _abort_mcp_factories(
                 runner, coordinator, receipt, mcp_entries,
             )
             if not completed:
@@ -270,6 +280,14 @@ async def abort_preservation_drain_impl(runner, params, peer_subject):
             runner, receipt.close_generation, source_registry, mcp_entries,
         )
         return {'status': 'refused', 'reason': prepare_reason or 'source_finalization_pending'}
+    from gateway.run_runtime_source_abort import (
+        refence_profile_sources, resume_profile_sources_before_open,
+    )
+    if not await resume_profile_sources_before_open(runner, coordinator, receipt):
+        _reclose_preservation_sources(
+            runner, receipt.close_generation, source_registry, mcp_entries,
+        )
+        return {'status': 'refused', 'reason': 'profile_lifecycle_source_resume_conflict'}
     outcome = finish_sources_atomically(runner, mcp_entries, coordinator, receipt)
     if not outcome.completed:
         if outcome.committed_open:
@@ -284,6 +302,7 @@ async def abort_preservation_drain_impl(runner, params, peer_subject):
         _reclose_preservation_sources(
             runner, receipt.close_generation, source_registry, mcp_entries,
         )
+        await refence_profile_sources(runner, coordinator, receipt)
         return {'status': 'refused', 'reason': outcome.reason or 'source_finalization_pending'}
     from gateway.lifecycle_custody import abort_preservation_lifecycle_close
     if not abort_preservation_lifecycle_close(runner, receipt.close_generation):

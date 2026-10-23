@@ -248,6 +248,11 @@ async def initialize_gateway_runtime(runner):
     # Every managed authority now has the process coordinator. Each source reserves its I10/I11
     # owner before the existing compression write; the legacy initializer never enters this loop.
     from gateway.session_authorities import all_authorities, owner_scope
+    # Register each live authority's I18 lifecycle witness before recovery/adapters can publish
+    # work. A later empty or replaced registry is not an absence receipt.
+    from gateway.profile_lifecycle_custody import register_profile_lifecycle_source
+    for authority in all_authorities(runner):
+        register_profile_lifecycle_source(runner, authority)
     from gateway.session_local_adoption import adopt_local_compressions
     from gateway.session_local_recovery import recover_local_sessions
     for authority in all_authorities(runner):
@@ -295,6 +300,11 @@ async def initialize_gateway_runtime(runner):
         reserve=bool(_api_server_adapters(runner))
         or getattr(runner, "session_control_server", None) is not None,
     )
+    # Install the native cleanup producer only after every source graph and profile binding is
+    # present.  It snapshots exact native/provider leases at ACK time and never infers zero work
+    # from a boot-time empty registry.
+    from gateway.run_runtime_native_cleanup import install_native_cleanup_plan_provider
+    install_native_cleanup_plan_provider(runner)
     # Publish this boot's verdict (an empty map clears a previous run's parked set).
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
@@ -788,6 +798,8 @@ def _seal_integrated_preservation_owners(runner, coordinator, receipt):
         seal_owner(runner, coordinator, receipt)
     except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
         coordinator.mark_owner_unknown('I17_hosted_tui_services', 'read_failed')
+    from gateway.profile_lifecycle_custody import seal_profile_lifecycle_owner
+    seal_profile_lifecycle_owner(runner, coordinator, receipt, descriptor)
     if authorities:
         _seal_i10_preservation_owner(runner, coordinator, receipt, descriptor)
         for owner_class in _INTEGRATED_PRESERVATION_OWNER_CLASSES:
@@ -989,11 +1001,8 @@ async def prepare_preservation_handoff(runner, params, peer_subject):
             await await_authority_work(authority, remaining)
         except TimeoutError:
             return {'status': 'refused', 'reason': 'custody_pending'}
-    _seal_integrated_preservation_owners(runner, coordinator, receipt)
-    prepared = coordinator.prepare_handoff(receipt)
-    if hasattr(prepared, 'as_wire'):
-        return prepared.as_wire()
-    return {'status': 'refused', 'reason': getattr(prepared, 'code', 'custody_pending')}
+    from gateway.run_runtime_source_abort import prepare_global_provider_handoff
+    return await prepare_global_provider_handoff(runner, coordinator, receipt)
 
 
 def _mcp_factory_participants(runner):
@@ -1108,10 +1117,11 @@ def _finish_mcp_factories(entries, coordinator, coordinator_receipt) -> bool:
     return ok
 
 
-def _abort_mcp_factories(runner, coordinator, receipt, entries) -> tuple[bool, str | None]:
+async def _abort_mcp_factories(runner, coordinator, receipt, entries) -> tuple[bool, str | None]:
     """Compatibility adapter for early-failure callers using the shared typed transition."""
     from gateway.run_runtime_source_abort import (
         finish_sources_atomically, prepare_source_participants,
+        refence_profile_sources, resume_profile_sources_before_open,
     )
     prepared, reason = prepare_source_participants(
         runner, coordinator, receipt, include_i08=False,
@@ -1119,9 +1129,13 @@ def _abort_mcp_factories(runner, coordinator, receipt, entries) -> tuple[bool, s
     if not prepared:
         _reclose_mcp_factories(entries)
         return False, reason
+    if not await resume_profile_sources_before_open(runner, coordinator, receipt):
+        _reclose_mcp_factories(entries)
+        return False, 'profile_lifecycle_source_resume_conflict'
     outcome = finish_sources_atomically(runner, entries, coordinator, receipt)
     if outcome.completed:
         return True, None
+    await refence_profile_sources(runner, coordinator, receipt)
     return False, outcome.reason or 'mcp_source_finalization_pending'
 
 
@@ -1136,7 +1150,9 @@ def _reclose_preservation_sources(runner, close_generation: int, source_registry
         _mcp_factory_entries(runner, close_generation)
         if mcp_entries is None else mcp_entries
     )
-    return hosted_ok and legacy_ok and mcp_ok
+    from gateway.profile_lifecycle_custody import refence_preservation_lifecycle_sources
+    lifecycle_ok = refence_preservation_lifecycle_sources(runner, close_generation)
+    return hosted_ok and legacy_ok and mcp_ok and lifecycle_ok
 
 
 async def abort_preservation_drain(runner, params, peer_subject):

@@ -12,6 +12,45 @@ from gateway.run_runtime_mcp_abort import (
 )
 
 
+async def resume_profile_sources_before_open(runner, coordinator, receipt) -> bool:
+    """Restore the exact I18 manager leases before the coordinator can reopen."""
+    if getattr(runner, "_profile_lifecycle_custody", None) is None:
+        return True
+    from gateway.profile_global_provider import resume_global_memory_providers
+
+    remaining = coordinator.remaining_seconds()
+    if remaining is None or not await resume_global_memory_providers(
+        runner, receipt.close_generation, remaining=remaining,
+    ):
+        return False
+    from gateway.profile_lifecycle_custody import abort_profile_lifecycle_close
+
+    if abort_profile_lifecycle_close(runner, receipt.close_generation):
+        return True
+    from gateway.profile_global_provider import refence_global_memory_providers
+
+    await refence_global_memory_providers(
+        runner, receipt.close_generation, remaining=coordinator.remaining_seconds(),
+    )
+    return False
+
+
+async def refence_profile_sources(runner, coordinator, receipt) -> bool:
+    """Re-fence I18 after a pre-open source failure while retaining the same generation."""
+    if getattr(runner, "_profile_lifecycle_custody", None) is None:
+        return True
+    from gateway.profile_global_provider import refence_global_memory_providers
+
+    remaining = coordinator.remaining_seconds()
+    if remaining is None or not await refence_global_memory_providers(
+        runner, receipt.close_generation, remaining=remaining,
+    ):
+        return False
+    from gateway.profile_lifecycle_custody import begin_profile_lifecycle_close
+
+    return begin_profile_lifecycle_close(runner, receipt.close_generation)
+
+
 def prepare_source_participants(
     runner, coordinator, receipt, *, include_i08: bool = True,
 ) -> tuple[bool, str | None]:
@@ -65,3 +104,18 @@ def outcome_wire(outcome: MCPFinishOutcome, receipt_wire: dict | None = None) ->
     if receipt_wire is not None:
         wire["receipt"] = receipt_wire
     return wire
+
+
+async def prepare_global_provider_handoff(runner, coordinator, receipt) -> dict:
+    """Seal the exact provider graph and publish its typed coordinator result."""
+    from gateway.profile_global_provider import prepare_global_memory_providers
+    from gateway.run_runtime import _seal_integrated_preservation_owners
+
+    await prepare_global_memory_providers(
+        runner, receipt.close_generation, remaining=coordinator.remaining_seconds(),
+    )
+    _seal_integrated_preservation_owners(runner, coordinator, receipt)
+    result = coordinator.prepare_handoff(receipt)
+    return result.as_wire() if hasattr(result, "as_wire") else {
+        "status": "refused", "reason": getattr(result, "code", "custody_pending"),
+    }

@@ -193,3 +193,17 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
             bind_automation_graph(coordinator)
     return coordinator
 
+
+def install_native_cleanup_plan_provider(runner) -> None:
+    """Bind the live source-plan builder after bootstrap has registered every source graph."""
+    from functools import partial
+
+    from gateway.runtime_native_cleanup_sources import build_native_cleanup_plan
+
+    current = getattr(runner, "_preservation_native_cleanup_plan", None)
+    if current is not None:
+        if getattr(current, "func", None) is build_native_cleanup_plan:
+            return
+        raise RuntimeError("native_cleanup_plan_provider_replaced")
+    runner._preservation_native_cleanup_plan = partial(build_native_cleanup_plan, runner)
+
