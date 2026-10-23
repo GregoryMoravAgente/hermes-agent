@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, Callable, Dict, List, Optional
 
@@ -25,7 +26,19 @@ from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance,
 from agent.memory_context import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
+from agent.memory_retirement import (
+    MemoryRetirementCallError,
+    MemoryRetirementCapabilityError,
+    ManagerPreparationReport,
+    ManagerRetirementLease,
+    MemoryRetirementReport,
+    MemoryRetirementValidationError,
+    RetirementAttempt,
+    RetirementReceipt,
+    retire_memory_provider,
+)
 from agent.memory_provider import MemoryProvider, PRE_COMPRESS_CHECKPOINT_API_VERSION, ctx_bound, spawn_context_thread
+from agent.memory_retirement_manager import HardRetirementState, retire_hard as retire_hard_operation
 from agent.skill_commands import extract_user_instruction_from_skill_message
 from hermes_constants import hermes_home_key
 from tools.hook_output_spill import get_spill_config, spill_if_oversized
@@ -222,6 +235,17 @@ class MemoryManager:
         # the builtin-only path spawns no threads; one worker serializes a provider's writes.
         self._sync_executor: Optional[ThreadPoolExecutor] = None
         self._sync_executor_lock = threading.Lock()
+        self._provider_call_condition = threading.Condition(self._sync_executor_lock)
+        self._active_provider_calls: dict[object, tuple[MemoryProvider, str]] = {}
+        self._provider_call_failures: dict[int, tuple[MemoryProvider, str]] = {}
+        # Admission tokens are captured before a background task or bounded prefetch thread is
+        # submitted.  The provider call may start after hard-retirement admission closes, but it
+        # still owns the token accepted by the manager before that close.
+        self._background_admission_tokens: dict[object, str] = {}
+        self._background_future_tokens: dict[Future, object] = {}
+        self._provider_admission_tokens: dict[object, tuple[MemoryProvider, str]] = {}
+        self._provider_admission_local = threading.local()
+        self._provider_setup_generation = 0
         # Futures by durability class ("write" / "prefetch") so shutdown can drain FIFO
         # within a bound, then report exactly what it abandoned.
         self._background_futures: dict[Future, str] = {}
@@ -230,19 +254,30 @@ class MemoryManager:
         self._shutdown_drain_state: dict[str, Any] = {
             "status": "not_started", "abandoned_writes": 0, "abandoned_prefetches": 0, "active_tasks": 0,
         }
+        # Hard retirement retains the loaded provider objects and their provider-owned receipts across
+        # unknown/failure results.  A later attempt must retry those exact objects, never reload a module.
+        self._hard_retirement_state: Optional[HardRetirementState] = None
+        # Global maintenance uses the same admission reservation as hard retirement, but the
+        # provider-owned lease remains reversible until ``commit_retirement``.
+        self._retirement_preparation_lease: Optional[ManagerRetirementLease] = None
+        self._provider_setup_inflight = 0
         # The profile ``initialize_all`` bound the providers to; tool calls must come from it (#140058).
         self._bound_scope: Optional[dict[str, Any]] = None
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
     def _each_provider(self, label: str, call: Callable[[MemoryProvider], Any], *, level: int = logging.DEBUG,
-                       providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False) -> list[Any]:
+                       providers: Optional[list[MemoryProvider]] = None, exc_info: bool = False,
+                       kind: str = "callback", strict: bool = False) -> list[Any]:
         """Call ``call(provider)`` per provider, logging+swallowing failures; returns successes in order.
         ``label`` completes the log line ``Memory provider '<name>' <label>: <exc>``."""
         results: list[Any] = []
         for provider in self._providers if providers is None else providers:
             try:
-                results.append(call(provider))
+                with self._provider_call(provider, kind=kind):
+                    results.append(call(provider))
             except Exception as e:
+                if strict:
+                    raise
                 logger.log(level, "Memory provider '%s' %s: %s", provider.name, label, e, exc_info=exc_info)
         return results
 
@@ -266,7 +301,134 @@ class MemoryManager:
         self._tool_to_provider = {t: p for t, p in self._tool_to_provider.items() if p is not provider}
         self._has_external = any(p.name != "builtin" for p in self._providers)
 
+    @staticmethod
+    def _provider_label(provider: Any) -> str:
+        try:
+            return str(provider.name)
+        except Exception:  # health: allow BLE001 -- provider name is an optional boundary; redact and fall back to its type
+            return type(provider).__name__
+
+    def _retirement_scope(self) -> tuple[Any, Any]:
+        scope = self._bound_scope or {}
+        return scope.get("home_key"), scope.get("agent_identity")
+
+    @staticmethod
+    def _same_provider_objects(left: tuple[MemoryProvider, ...], right: tuple[MemoryProvider, ...]) -> bool:
+        return len(left) == len(right) and all(a is b for a, b in zip(left, right))
+
+    def _retirement_attempts(self, providers: tuple[MemoryProvider, ...], reason: str) -> tuple[RetirementAttempt, ...]:
+        return tuple(
+            RetirementAttempt(provider=self._provider_label(provider), status="unknown", reason=reason)
+            for provider in providers
+        )
+
+    def _retirement_refusal(self, providers: tuple[MemoryProvider, ...], reason: str) -> MemoryRetirementReport:
+        report = MemoryRetirementReport(
+            status="unknown", reason=reason, attempts=self._retirement_attempts(providers, reason),
+        )
+        logger.warning(
+            "Memory provider hard retirement refused (%s) for %d provider(s); custody remains retained",
+            reason, len(providers),
+        )
+        return report
+
+    def _current_provider_admission(self) -> object | None:
+        return getattr(self._provider_admission_local, "token", None)
+
+    def _admit_provider_thread(self, provider: MemoryProvider, kind: str) -> object | None:
+        """Reserve a provider call before an unstarted bounded thread is handed to start."""
+        with self._provider_call_condition:
+            if self._hard_retirement_state is not None or self._shutting_down:
+                return None
+            token = object()
+            self._provider_admission_tokens[token] = (provider, kind)
+            return token
+
+    def _release_background_admission(self, token: object) -> None:
+        with self._provider_call_condition:
+            self._background_admission_tokens.pop(token, None)
+            self._provider_call_condition.notify_all()
+
+    def _release_provider_thread_admission(self, token: object) -> None:
+        with self._provider_call_condition:
+            self._provider_admission_tokens.pop(token, None)
+            self._provider_call_condition.notify_all()
+
+    def _run_admitted_background(self, fn: Callable[[], Any], token: object) -> None:
+        previous = self._current_provider_admission()
+        self._provider_admission_local.token = token
+        try:
+            fn()
+        finally:
+            self._provider_admission_local.token = previous
+            self._release_background_admission(token)
+
+    def _run_admitted_provider_thread(
+            self, fn: Callable[[], Any], token: object,
+    ) -> None:
+        previous = self._current_provider_admission()
+        self._provider_admission_local.token = token
+        try:
+            fn()
+        finally:
+            self._provider_admission_local.token = previous
+            self._release_provider_thread_admission(token)
+
+    @contextmanager
+    def _provider_call(self, provider: MemoryProvider, *, kind: str):
+        """Retain custody while a provider call runs outside the manager lock.
+
+        ``sync_turn`` normally runs in the serialized executor, while external ``prefetch``
+        deliberately runs in its own bounded thread.  Both paths must be visible to hard
+        retirement: a completed executor queue is not enough when the provider call itself is
+        still running.  A failed accepted write is retained as uncertainty instead of being
+        hidden by the fan-out logger.
+        """
+        token = object()
+        with self._provider_call_condition:
+            admission = self._current_provider_admission()
+            accepted = (
+                admission in self._background_admission_tokens
+                or (
+                    admission in self._provider_admission_tokens
+                    and self._provider_admission_tokens[admission][0] is provider
+                )
+            )
+            if self._hard_retirement_state is not None and not accepted:
+                raise RuntimeError("memory provider retirement admission is closed")
+            self._active_provider_calls[token] = (provider, kind)
+        try:
+            yield
+        except Exception:
+            if kind == "write":
+                with self._provider_call_condition:
+                    self._provider_call_failures[id(provider)] = (provider, "accepted_write_failed")
+            raise
+        finally:
+            with self._provider_call_condition:
+                self._active_provider_calls.pop(token, None)
+                self._provider_call_condition.notify_all()
+
+    @contextmanager
+    def _provider_setup(self):
+        """Serialize setup admission against the hard-retirement snapshot."""
+        with self._sync_executor_lock:
+            state = self._hard_retirement_state
+            if state is not None:
+                raise RuntimeError("hard retirement owns provider setup")
+            self._provider_setup_generation += 1
+            self._provider_setup_inflight += 1
+        try:
+            yield
+        finally:
+            with self._sync_executor_lock:
+                self._provider_setup_inflight -= 1
+
     def add_provider(self, provider: MemoryProvider) -> None:
+        with self._provider_setup():
+            self._register_provider(provider)
+
+    def _register_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
@@ -345,6 +507,9 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        with self._sync_executor_lock:
+            if self._shutting_down:
+                return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
@@ -357,24 +522,40 @@ class MemoryManager:
     def _prefetch_provider(self, provider: MemoryProvider, query: str, *, session_id: str = "") -> str:
         """Run one provider's prefetch; external providers are bounded by a timeout. A stuck external
         call keeps running on its daemon thread; _PREFETCH_GATE decides whether later turns call again."""
+        with self._sync_executor_lock:
+            if self._shutting_down:
+                return ""
         if provider.name == "builtin":
-            return provider.prefetch(query, session_id=session_id)
+            with self._provider_call(provider, kind="prefetch"):
+                return provider.prefetch(query, session_id=session_id)
 
         result_box: dict[str, Any] = {}
 
         key = self._registry_key(provider)
+        admission = self._admit_provider_thread(provider, "prefetch")
+        if admission is None:
+            return ""
 
         def _run() -> None:
             try:
-                result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
+                with self._provider_call(provider, kind="prefetch"):
+                    result_box["value"] = provider.prefetch(query, session_id=session_id) or ""
             except Exception as exc:  # pragma: no cover - re-raised by caller
                 result_box["error"] = exc
             finally:
                 self._PREFETCH_GATE.leave(key, thread, ok="error" not in result_box)
 
-        thread = spawn_context_thread(_run, name=f"memory-prefetch-{provider.name}")
+        try:
+            thread = spawn_context_thread(
+                lambda: self._run_admitted_provider_thread(_run, admission),
+                name=f"memory-prefetch-{provider.name}",
+            )
+        except Exception:
+            self._release_provider_thread_admission(admission)
+            raise
         skipped = self._PREFETCH_GATE.enter(key, thread, self._external_prefetch_timeout)
         if skipped:
+            self._release_provider_thread_admission(admission)
             logger.debug("Memory provider '%s' prefetch skipped (%d stuck, %d in flight)",
                          provider.name, *skipped[:2])
             return ""
@@ -383,6 +564,7 @@ class MemoryManager:
         except RuntimeError:
             # Never started, so its finally never runs: drop the entry or it would count forever.
             self._PREFETCH_GATE.leave(key, thread, ok=False)
+            self._release_provider_thread_admission(admission)
             raise
 
         thread.join(self._external_prefetch_timeout)
@@ -428,7 +610,9 @@ class MemoryManager:
         clean_query = _redact_for_provider(clean_query)
         self._submit_background(lambda: self._each_provider(
             "queue_prefetch failed (non-fatal)",
-            lambda p: self._call_unless_stalled(p, lambda: p.queue_prefetch(clean_query, session_id=session_id)),
+            lambda p: self._call_unless_stalled(
+                p, lambda: p.queue_prefetch(clean_query, session_id=session_id), kind="prefetch",
+            ),
             providers=providers,
         ), kind="prefetch")
 
@@ -476,10 +660,17 @@ class MemoryManager:
         durability class. Runs under the caller's contextvars (``ctx_bound``). If the executor is
         unavailable outside shutdown, run inline — the historical fail-safe."""
         fn = ctx_bound(in_owner_home(self._bound_scope, fn))
-        executor = None if self._shutting_down else self._sync_executor
-        if executor is None and not self._shutting_down:
+        executor = None
+        future = None
+        admission = None
+        try:
+            # Submit+track atomically with the shutdown snapshot. The callback is attached
+            # outside the lock: an already-completed future invokes callbacks synchronously.
             with self._sync_executor_lock:
-                if self._sync_executor is None and not self._shutting_down:
+                if self._shutting_down or self._hard_retirement_state is not None:
+                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
+                    return
+                if self._sync_executor is None:
                     try:
                         # Daemon workers: a wedged provider must never block interpreter exit.
                         from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -487,30 +678,27 @@ class MemoryManager:
                     except Exception as e:  # pragma: no cover - resource exhaustion
                         logger.warning("Failed to create memory sync executor: %s", e)
                 executor = self._sync_executor
-        future = None
-        try:
-            # Submit+track atomically with the shutdown snapshot. The callback is attached
-            # outside the lock: an already-completed future invokes callbacks synchronously.
-            with self._sync_executor_lock:
-                if self._shutting_down:
-                    logger.warning("Memory manager is shutting down; rejecting late %s task", kind)
-                    return
+                admission = object()
+                self._background_admission_tokens[admission] = kind
                 if executor is not None:
-                    future = executor.submit(fn)
+                    future = executor.submit(self._run_admitted_background, fn, admission)
                     self._background_futures[future] = kind
+                    self._background_future_tokens[future] = admission
         except RuntimeError:
-            if self._shutting_down:
+            if admission is not None:
+                self._release_background_admission(admission)
+            if self._shutting_down or self._hard_retirement_state is not None:
                 logger.warning("Memory manager shut down during %s submission; task rejected", kind)
                 return
         if future is not None:
             future.add_done_callback(self._forget_background_future)
             return
         try:
-            fn()
+            self._run_admitted_background(fn, admission)
         except Exception as e:  # pragma: no cover - fn guards internally
             logger.debug("Inline memory background task failed: %s", e)
 
-    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any]) -> None:
+    def _call_unless_stalled(self, provider: MemoryProvider, call: Callable[[], Any], *, kind: str = "write") -> None:
         """Run a background provider call unless _BACKGROUND_GATE skips it (the provider has stuck calls);
         skipping costs that turn's write/prefetch but stops a wedged backend from pinning one more
         thread per fresh manager. The builtin provider is never gated."""
@@ -531,7 +719,8 @@ class MemoryManager:
             return
         ok = False
         try:
-            call()
+            with self._provider_call(provider, kind=kind):
+                call()
             ok = True
         finally:
             self._BACKGROUND_GATE.leave(key, token, ok=ok)
@@ -542,8 +731,12 @@ class MemoryManager:
         return ((self._bound_scope or {}).get("home_key") or self._home_key, provider.name)
 
     def _forget_background_future(self, future: Future) -> None:
-        with self._sync_executor_lock:
+        with self._provider_call_condition:
             self._background_futures.pop(future, None)
+            token = self._background_future_tokens.pop(future, None)
+            if token is not None:
+                self._background_admission_tokens.pop(token, None)
+            self._provider_call_condition.notify_all()
 
     def flush_pending(self, timeout: Optional[float] = None) -> bool:
         """Block until queued sync/prefetch work has drained (False on timeout).
@@ -602,7 +795,8 @@ class MemoryManager:
         args = _redact_for_provider(args)
         from hermes_cli.observability.shared_metrics_loop import record_provider_memory_call
         try:
-            result = provider.handle_tool_call(tool_name, args, **kwargs)
+            with self._provider_call(provider, kind="write"):
+                result = provider.handle_tool_call(tool_name, args, **kwargs)
         except Exception as e:
             logger.error("Memory provider '%s' handle_tool_call(%s) failed: %s", provider.name, tool_name, e)
             record_provider_memory_call(provider.name, tool_name, args, raised=True)
@@ -621,14 +815,16 @@ class MemoryManager:
             accepted = kwargs if params is None or _has_var_kwargs(params) else {k: v for k, v in kwargs.items() if k in params}
             p.on_turn_start(turn_number, message, **accepted)
 
-        self._each_provider("on_turn_start failed", _tick)
+        self._each_provider("on_turn_start failed", _tick, kind="write")
 
-    def on_session_end(self, messages: list[dict[str, Any]]) -> None:
+    def on_session_end(self, messages: list[dict[str, Any]], *, strict: bool = False) -> None:
         if not self._owner_allows("on_session_end"):
             return
         messages = _redact_messages_for_egress(messages or [])
-        self._each_provider("on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
-                            exc_info=True)
+        self._each_provider(
+            "on_session_end failed", lambda p: p.on_session_end(messages), level=logging.WARNING,
+            exc_info=True, kind="write", strict=strict,
+        )
 
     def commit_session_boundary_async(self, messages: list[dict[str, Any]], *, new_session_id: str,
                                       parent_session_id: str = "", reason: str = "new_session") -> None:
@@ -675,6 +871,7 @@ class MemoryManager:
         self._each_provider(
             "on_session_switch failed",
             lambda p: p.on_session_switch(new_session_id, parent_session_id=parent_session_id, reset=reset, **kwargs),
+            kind="write",
         )
 
     @staticmethod
@@ -718,7 +915,8 @@ class MemoryManager:
             if is_checkpoint_provider and _accepts_require_checkpoint(provider.on_pre_compress):
                 kwargs["require_checkpoint"] = require_checkpoint
             try:
-                result = provider.on_pre_compress(provider_messages, **kwargs)
+                with self._provider_call(provider, kind="write"):
+                    result = provider.on_pre_compress(provider_messages, **kwargs)
                 if result and result.strip():
                     parts.append(result)
                 checkpoint_succeeded = checkpoint_succeeded or is_checkpoint_provider
@@ -758,7 +956,7 @@ class MemoryManager:
                 provider.on_memory_write(action, target, content, metadata=dict(metadata or {}))
 
         external = [p for p in self._providers if p.name != "builtin"]
-        self._each_provider("on_memory_write failed", _notify, providers=external)
+        self._each_provider("on_memory_write failed", _notify, providers=external, kind="write")
 
     # Actions mirrored to external providers; non-mutating results (errors, staged) are
     # filtered by ``notify_memory_tool_write`` first.
@@ -833,7 +1031,105 @@ class MemoryManager:
         self._each_provider(
             "on_delegation failed",
             lambda p: p.on_delegation(task, result, child_session_id=child_session_id, **kwargs),
+            kind="write",
         )
+
+    def _retire_provider_attempt(self, provider: MemoryProvider, receipt: RetirementReceipt) -> RetirementAttempt:
+        label = self._provider_label(provider)
+        try:
+            result = retire_memory_provider(provider, receipt=receipt)
+        except MemoryRetirementCapabilityError:
+            reason = "missing_capability"
+            logger.warning("Memory provider '%s' hard retirement is unavailable", label)
+            return RetirementAttempt(provider=label, status="unknown", reason=reason)
+        except MemoryRetirementValidationError as error:
+            reason = "invalid_result"
+            logger.warning("Memory provider '%s' hard retirement returned an invalid result: %s", label, error)
+            return RetirementAttempt(provider=label, status="unknown", reason=reason)
+        except MemoryRetirementCallError as error:
+            reason = "provider_call_failed"
+            logger.warning("Memory provider '%s' hard retirement failed: %s", label, error)
+            return RetirementAttempt(provider=label, status="unknown", reason=reason)
+        except Exception as error:  # Optional provider boundary: retain custody on every unexpected failure.
+            reason = "provider_call_failed"
+            logger.warning("Memory provider '%s' hard retirement failed: %s", label, error, exc_info=True)
+            return RetirementAttempt(provider=label, status="unknown", reason=reason)
+
+        if not result.released:
+            logger.warning("Memory provider '%s' hard retirement remains unknown: %s", label, result.reason)
+        return RetirementAttempt(provider=label, status=result.status, reason=result.reason, result=result)
+
+    def _hard_retirement_drain(self) -> bool:
+        """Close admission without cancelling accepted writes; timeout retains their custody.
+
+        The executor futures cover queued manager work.  ``_active_provider_calls`` additionally
+        covers direct/bounded prefetch threads and the provider call inside a running sync task.
+        """
+        with self._sync_executor_lock:
+            self._shutting_down = True
+            executor = self._sync_executor
+            self._sync_executor = None
+        try:
+            if executor is not None:
+                executor.shutdown(wait=False, cancel_futures=False)
+        except Exception as error:  # pragma: no cover - resource/executor failure
+            logger.warning("Memory hard retirement drain failed: %s", error, exc_info=True)
+            return False
+        deadline = time.monotonic() + _SYNC_DRAIN_TIMEOUT_S
+        with self._provider_call_condition:
+            while True:
+                pending_futures = any(not future.done() for future in self._background_futures)
+                if (
+                    not pending_futures
+                    and not self._background_admission_tokens
+                    and not self._provider_admission_tokens
+                    and not self._active_provider_calls
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._provider_call_condition.wait(min(remaining, 0.05))
+
+    def _prepare_retirement_drain(self) -> bool:
+        """Join accepted manager work without shutting down the executor or provider stores."""
+        deadline = time.monotonic() + _SYNC_DRAIN_TIMEOUT_S
+        with self._provider_call_condition:
+            while True:
+                pending_futures = any(not future.done() for future in self._background_futures)
+                if (
+                    not pending_futures
+                    and not self._background_admission_tokens
+                    and not self._provider_admission_tokens
+                    and not self._active_provider_calls
+                ):
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._provider_call_condition.wait(min(remaining, 0.05))
+
+    def retire_hard(self) -> MemoryRetirementReport:
+        """Retire exact loaded providers with receipt-bound retry custody."""
+        return retire_hard_operation(self)
+
+    def prepare_retirement(self) -> ManagerPreparationReport:
+        """Acquire the reversible manager/provider retirement lease."""
+        from agent.memory_retirement_manager import prepare_retirement as prepare_operation
+
+        return prepare_operation(self)
+
+    def resume_retirement(self, lease: ManagerRetirementLease) -> bool:
+        """Reopen the exact prepared manager lease before irreversible commit."""
+        from agent.memory_retirement_manager import resume_retirement as resume_operation
+
+        return resume_operation(self, lease)
+
+    def commit_retirement(self, lease: ManagerRetirementLease) -> MemoryRetirementReport:
+        """Commit the exact prepared provider leases and retain unknown custody for retry."""
+        from agent.memory_retirement_manager import commit_retirement as commit_operation
+
+        return commit_operation(self, lease)
 
     def claim_teardown(self, *, session_end: bool) -> bool:
         """Claim extraction + ``shutdown_all()`` for end-of-session shutdown or soft release. The first
@@ -842,6 +1138,12 @@ class MemoryManager:
         its flush, then ``shutdown_memory_provider`` claims again); a soft release is once-only and also
         loses to a manager another owner is already draining."""
         with self._sync_executor_lock:
+            if self._hard_retirement_state is not None and not (
+                self._hard_retirement_state.report is not None
+                and self._hard_retirement_state.report.released
+            ):
+                logger.warning("Memory teardown refused while hard retirement custody remains unresolved")
+                return False
             if self._teardown_claim is None and (session_end or not self._shutting_down):
                 self._teardown_claim = "session_end" if session_end else "soft_release"
                 return True
@@ -855,11 +1157,23 @@ class MemoryManager:
             self.flush_pending(timeout=10)
             self.shutdown_all()
 
-    def shutdown_all(self) -> None:
+    def shutdown_all(self, *, strict: bool = False) -> None:
         """Drain the background executor (bounded), then shut providers down in reverse order."""
+        with self._sync_executor_lock:
+            if self._hard_retirement_state is not None and not (
+                self._hard_retirement_state.report is not None
+                and self._hard_retirement_state.report.released
+            ):
+                logger.warning("Memory shutdown refused while hard retirement custody remains unresolved")
+                if strict:
+                    raise RuntimeError("Memory retirement custody remains unresolved")
+                return
+            # Claim the ordinary drain before releasing the lock, so hard retirement cannot
+            # capture a provider while this path is about to flush or close it.
+            self._shutting_down = True
         self._drain_sync_executor()
         self._each_provider("shutdown failed", lambda p: p.shutdown(), level=logging.WARNING,
-                            providers=self._providers[::-1])
+                            providers=self._providers[::-1], strict=strict)
 
     @property
     def shutdown_drain_state(self) -> dict[str, Any]:
@@ -917,6 +1231,10 @@ class MemoryManager:
         return self._has_external
 
     def initialize_all(self, session_id: str, **kwargs) -> None:
+        with self._provider_setup():
+            self._initialize_providers(session_id, **kwargs)
+
+    def _initialize_providers(self, session_id: str, **kwargs) -> None:
         """Initialize all providers, injecting ``hermes_home`` so they resolve profile-scoped paths."""
         if "hermes_home" not in kwargs:
             from hermes_constants import get_hermes_home

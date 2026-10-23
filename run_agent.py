@@ -927,6 +927,48 @@ class AIAgent(
             _quietly(lambda: self._memory_manager.shutdown_all())
         _notify_context_engine_session_end(self, messages)
 
+    def retire_memory_provider(self):
+        """Request receipt-bound hard retirement and return its unresolved/released report.
+
+        This is an explicit owner operation.  It intentionally does not use ``_quietly``: the
+        caller must observe ``unknown`` and retain the profile until the same provider instance
+        and receipt can be retried successfully.
+        """
+        from agent.memory_retirement import MemoryRetirementReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return MemoryRetirementReport(status="released", reason="no_provider")
+        report = manager.retire_hard()
+        if report.released:
+            self._memory_provider_shutdown = True
+        return report
+
+    def prepare_memory_provider(self):
+        """Acquire a reversible manager/provider retirement lease for global maintenance."""
+        from agent.memory_retirement import ManagerPreparationReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return ManagerPreparationReport(status="prepared", reason="no_provider", lease=None)
+        return manager.prepare_retirement()
+
+    def resume_memory_provider(self, lease) -> bool:
+        """Resume the exact reversible provider lease before native handoff."""
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return lease is None
+        return manager.resume_retirement(lease)
+
+    def commit_memory_provider(self, lease):
+        """Commit the exact prepared provider lease and return its typed terminal report."""
+        from agent.memory_retirement import MemoryRetirementReport
+
+        manager = getattr(self, "_memory_manager", None)
+        if manager is None:
+            return MemoryRetirementReport(status="released", reason="no_provider")
+        return manager.commit_retirement(lease)
+
     def commit_memory_session(self, messages: list | None = None) -> None:
         """Flush end-of-session extraction on session_id rotation (/new, compression) without tearing providers
         down."""
