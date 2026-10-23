@@ -62,6 +62,9 @@ env:
     tests/gateway/test_notification_source_watcher_rebind.py
     tests/tui_gateway/test_hosted_tui_custody.py
     tests/gateway/test_started_gateway_discovery.py
+    tests/agent/test_copilot_acp_failure_retention.py
+    tests/gateway/test_runtime_service_windows_retry.py
+    tests/gateway/test_native_own_policy_admission.py
 
 jobs:
   native-custody:
