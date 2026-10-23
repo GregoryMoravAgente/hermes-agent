@@ -287,12 +287,12 @@ def _current_epoch(authority):
 
 
 def _physical_owner(authority):
-    from gateway.runtime_ownership import process_ownership
+    from gateway.runtime_ownership import canonical_home, process_ownership
 
     evidence = process_ownership.reservation_evidence(_home(authority))
     if not isinstance(evidence, dict):
         raise RuntimeStoreError("foreign_custody")
-    expected = str(_home(authority))
+    expected = str(canonical_home(_home(authority)))
     if (
         evidence.get("profile_home") != expected
         or evidence.get("os_lock_owner") is not True
