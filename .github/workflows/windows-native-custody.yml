@@ -51,6 +51,10 @@ env:
     tests/cron/test_cron_owner_custody.py
     tests/gateway/test_managed_api_detached_cron_custody.py
     tests/gateway/test_managed_scheduler_cron_custody.py
+    tests/hermes_state/test_checked_close_retention.py
+    tests/tui_gateway/test_host_supervisor_test_env.py
+    tests/tui_gateway/test_compute_host_ack_writer_settlement_r9.py
+    tests/tui_gateway/test_host_supervisor_owner_r5_startup.py
 
 jobs:
   native-custody:
