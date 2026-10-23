@@ -1619,13 +1619,30 @@ class GatewayStartupMixin:
         # concurrent append during the yield must not be lost); yield every 100 to keep the loop live.
         with _log_suppressed(logging.ERROR, "Recovered watcher setup error: %s"):
             from tools.process_registry import process_registry
+            from gateway.run_notifications import initialize_i10_source_indexes
             watchers = process_registry.pending_watchers
             process_registry.pending_watchers = []
+            # Keep the detached batch in the canonical list until each watcher has been accepted
+            # by the supervisor. Producers can append to this fresh list while the loop yields;
+            # failed transfers remain visible as UNKNOWN instead of becoming an empty absence.
+            process_registry.pending_watchers.extend(watchers)
+            # The atomic replacement is intentional: a watcher admitted while the loop yields
+            # belongs to the fresh list. Refresh the source-owned identity binding at that seam so
+            # close-time readback follows the current list without weakening stale-index refusal.
+            initialize_i10_source_indexes(self)
             for i, watcher in enumerate(watchers):
                 self._spawn_supervised(
                     lambda w=watcher: self._run_process_watcher(w),
                     f"process_watcher:{watcher.get('session_id')}", restart=False,
                 )
+                for pending_index, pending in enumerate(process_registry.pending_watchers):
+                    if pending is watcher:
+                        del process_registry.pending_watchers[pending_index]
+                        break
+                else:
+                    # A concurrent producer may have removed or replaced this descriptor; retain
+                    # the source identity and let the next close-time read establish the outcome.
+                    logger.debug("Recovered watcher transfer was already reconciled")
                 logger.info("Resumed watcher for recovered process %s", watcher.get("session_id"))
                 if i % 100 == 99:
                     await asyncio.sleep(0)
