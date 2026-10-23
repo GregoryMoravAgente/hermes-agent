@@ -1169,10 +1169,17 @@ async def acknowledge_preservation_native(runner, params, peer_subject):
     coordinator = getattr(runner, 'runtime_custody', None)
     if coordinator is None:
         return {'status': 'refused', 'reason': 'runtime_custody_unavailable'}
-    ownership_reason = _preservation_ownership_reason(runner, require_running=False)
-    if ownership_reason is not None:
-        return {'status': 'refused', 'reason': ownership_reason}
-    from gateway.run_runtime_native_cleanup import acknowledge_native_cleanup
+    from gateway.run_runtime_native_cleanup import (
+        acknowledge_native_cleanup, validate_closed_native_cleanup_retry,
+    )
+    if receipt.state == 'closed':
+        refusal = validate_closed_native_cleanup_retry(coordinator, receipt)
+        if refusal is not None:
+            return {'status': 'refused', 'reason': getattr(refusal, 'code', 'native_cleanup_mismatch')}
+    else:
+        ownership_reason = _preservation_ownership_reason(runner, require_running=False)
+        if ownership_reason is not None:
+            return {'status': 'refused', 'reason': ownership_reason}
     result = await acknowledge_native_cleanup(runner, coordinator, receipt)
     if hasattr(result, 'as_wire'):
         return result.as_wire()

@@ -217,6 +217,19 @@ def planned_stop(home, proc, desc):
                               (home / '.gateway-planned-stop.json').exists(), detail))
 
 
+def _capture_native_fixture_logs(home, log_name):
+    """Retain synthetic daemon diagnostics next to this exact native JUnit receipt."""
+    junit_arg = next((value for value in sys.argv if value.startswith("--junitxml=")), None)
+    if junit_arg is None:
+        return
+    target = Path(junit_arg.split("=", 1)[1]).parent / "gateway-daemon-logs"
+    target.mkdir(parents=True, exist_ok=True)
+    for source in (home.parent / log_name, home / "logs" / "gateway.log", home / "logs" / "stacks.txt"):
+        if source.is_file():
+            name = f"{home.parent.name}--{log_name}--{source.name}"
+            (target / name).write_text(source.read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
+
+
 @contextmanager
 def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
     command = [sys.executable, str(ROOT / 'tests/gateway/fixtures' / fixture)] if fixture else [sys.executable, '-m', 'gateway.run']
@@ -266,6 +279,7 @@ def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
             elif proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=20)
+            _capture_native_fixture_logs(home, log_name)
 
 
 def query(home, sql, args=()):

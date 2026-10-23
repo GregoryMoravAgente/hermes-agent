@@ -22,6 +22,11 @@ from gateway.runtime_custody import (
     NativeCleanupPlan,
 )
 from gateway.runtime_cron_source_registry import CronSourceRegistry
+from gateway.runtime_native_cleanup_profile import (
+    profile_bindings_match,
+    profile_native_cleanup_witness_ready,
+    profile_participants_match_witness,
+)
 
 
 def _identity_matches(value: Any, coordinator: Any, receipt: DrainReceipt) -> bool:
@@ -121,6 +126,34 @@ class ProfileNativeCleanupReceipt:
     close_generation: int
     source: str = "gateway.runtime_ownership"
     source_ready: Any = field(default=None, repr=False, compare=False)
+    source_witness: Any = field(default=None, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ProfileNativeCleanupWitness:
+    """Exact I18 graph captured before the first irreversible native ACK.
+
+    Profile lock participants run after provider participants.  Once the first lock is released,
+    a fresh all-profile physical read necessarily sees an incomplete graph and would reject the
+    remaining exact participants.  This witness keeps the source-owned record/authority/provider
+    identities captured at plan bind; each participant still revalidates its own live handle and
+    evidence before closing it.
+    """
+
+    coordinator: Any = field(repr=False, compare=False)
+    custody: Any = field(repr=False, compare=False)
+    provider_custody: Any = field(repr=False, compare=False)
+    process_instance: str
+    authority_epoch: int
+    close_generation: int
+    records: tuple[Any, ...] = field(repr=False, compare=False)
+    profile_bindings: tuple[tuple[Any, Any, dict[str, Any]], ...] = field(
+        repr=False, compare=False,
+    )
+    provider_entries: tuple[tuple[Any, Any, Any, Any, Any], ...] = field(
+        repr=False, compare=False,
+    )
+    source_evidence: Any = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -263,9 +296,21 @@ class ProfileNativeCleanupParticipant:
         )
         owner = self._receipt.owner
         home = self._receipt.home
-        source_ready = self._receipt.source_ready
-        if callable(source_ready) and source_ready() is not True:
-            raise RuntimeError("profile_native_cleanup_source_unknown")
+        source_witness = self._receipt.source_witness
+        if source_witness is not None:
+            if not _profile_native_cleanup_witness_ready(
+                source_witness,
+                coordinator=coordinator,
+                capability=capability,
+                source_receipt=source_receipt,
+                participant=self,
+                home=home,
+            ):
+                raise RuntimeError("profile_native_cleanup_source_unknown")
+        else:
+            source_ready = self._receipt.source_ready
+            if callable(source_ready) and source_ready() is not True:
+                raise RuntimeError("profile_native_cleanup_source_unknown")
         with owner._mutex:
             current_handle = owner._handles.get(home)
             if current_handle is not self._receipt.handle:
@@ -297,6 +342,22 @@ def _profile_evidence_matches(expected: dict[str, Any], current: Any) -> bool:
         "observed",
     )
     return all(current.get(field) == expected.get(field) for field in fields)
+
+
+def _profile_native_cleanup_witness_ready(
+    witness: ProfileNativeCleanupWitness, *, coordinator: Any, capability: Any,
+    source_receipt: Any, participant: Any, home: Path,
+) -> bool:
+    if not isinstance(witness, ProfileNativeCleanupWitness):
+        return False
+    return profile_native_cleanup_witness_ready(
+        witness,
+        coordinator=coordinator,
+        capability=capability,
+        source_receipt=source_receipt,
+        participant=participant,
+        home=home,
+    )
 
 
 def _profile_handle(owner: Any, home: Path, evidence: dict[str, Any]) -> Any:
@@ -349,28 +410,21 @@ def _cron_participant(runner: Any, coordinator: Any, receipt: DrainReceipt):
     return snapshot, participant, fences
 
 
-def _profile_participants(runner: Any, coordinator: Any, receipt: DrainReceipt):
-    try:
-        from gateway.run_runtime import reserved_profile_homes
-        from gateway.runtime_ownership import canonical_home, process_ownership
+def _profile_participants(
+    runner: Any, coordinator: Any, receipt: DrainReceipt,
+    *, source_witness: ProfileNativeCleanupWitness | None = None,
+):
+    from gateway.runtime_ownership import process_ownership
 
-        homes = tuple(home for _name, home in reserved_profile_homes(runner))
-    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+    bindings = _reserved_profile_bindings(runner)
+    if not bindings:
         return None
-    if not homes:
+    if source_witness is not None and not profile_bindings_match(
+        source_witness.profile_bindings, bindings,
+    ):
         return None
     entries = []
-    for home in homes:
-        canonical = canonical_home(home)
-        try:
-            evidence = process_ownership.reservation_evidence(canonical)
-        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
-            return None
-        if not isinstance(evidence, dict):
-            return None
-        handle = _profile_handle(process_ownership, canonical, evidence)
-        if handle is None:
-            return None
+    for canonical, handle, evidence in bindings:
         snapshot = ProfileNativeCleanupReceipt(
             coordinator=coordinator,
             owner=process_ownership,
@@ -381,9 +435,41 @@ def _profile_participants(runner: Any, coordinator: Any, receipt: DrainReceipt):
             authority_epoch=receipt.authority_epoch,
             close_generation=receipt.close_generation,
             source_ready=partial(_source_prerequisites, runner, coordinator, receipt),
+            source_witness=source_witness,
         )
         entries.append((snapshot, ProfileNativeCleanupParticipant(snapshot), handle))
     return tuple(entries)
+
+
+def _reserved_profile_bindings(runner: Any):
+    try:
+        from gateway.run_runtime import reserved_profile_homes
+        from gateway.runtime_ownership import canonical_home, process_ownership
+
+        homes = tuple(home for _name, home in reserved_profile_homes(runner))
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if not homes:
+        return None
+    bindings = []
+    seen = set()
+    for home in homes:
+        canonical = canonical_home(home)
+        key = str(canonical)
+        if key in seen:
+            return None
+        seen.add(key)
+        try:
+            evidence = process_ownership.reservation_evidence(canonical)
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            return None
+        if not isinstance(evidence, dict):
+            return None
+        handle = _profile_handle(process_ownership, canonical, evidence)
+        if handle is None:
+            return None
+        bindings.append((canonical, handle, evidence))
+    return tuple(bindings)
 
 
 def _provider_participants(runner: Any, coordinator: Any, receipt: DrainReceipt):
@@ -541,6 +627,78 @@ def _source_prerequisites(runner: Any, coordinator: Any, receipt: DrainReceipt) 
     )
 
 
+def _capture_profile_native_cleanup_witness(
+    runner: Any, coordinator: Any, receipt: DrainReceipt,
+) -> ProfileNativeCleanupWitness | None:
+    """Capture I18 identities once, before any native participant is settled."""
+    if not _profile_lifecycle_prerequisite(runner, coordinator, receipt):
+        return None
+    custody = getattr(runner, "_profile_lifecycle_custody", None)
+    current = getattr(custody, "_current", None)
+    if custody is None or not isinstance(current, dict):
+        return None
+    try:
+        from gateway.profile_global_provider import custody_for
+
+        provider_custody = custody_for(runner)
+        provider_entries = provider_custody.native_entries(receipt.close_generation)
+    except (AttributeError, ImportError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    if provider_entries is None:
+        return None
+    profile_bindings = _reserved_profile_bindings(runner)
+    if not profile_bindings:
+        return None
+    records = []
+    for home, record in tuple(current.items()):
+        if (
+            not isinstance(home, str)
+            or record.state not in {"closing", "retired_ready"}
+            or record.close_generation != receipt.close_generation
+            or record.producer is not None
+            or record.global_provider_prepared is not True
+            or record.global_provider_snapshot is None
+        ):
+            return None
+        records.append((
+            home,
+            record,
+            record.authority,
+            record.lease,
+            record.graph,
+            record.global_provider_snapshot,
+        ))
+    if not records:
+        return None
+    descriptor = getattr(runner, "session_runtime_descriptor", None) or {}
+    from gateway.profile_lifecycle_custody import profile_lifecycle_owner_evidence
+
+    source_evidence = profile_lifecycle_owner_evidence(
+        runner,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        owner_id=f'{descriptor.get("instance_id", receipt.process_instance)}:I18',
+    )
+    if not isinstance(source_evidence, dict):
+        return None
+    return ProfileNativeCleanupWitness(
+        coordinator=coordinator,
+        custody=custody,
+        provider_custody=provider_custody,
+        process_instance=receipt.process_instance,
+        authority_epoch=receipt.authority_epoch,
+        close_generation=receipt.close_generation,
+        records=tuple(records),
+        profile_bindings=profile_bindings,
+        provider_entries=tuple(
+            (entry, entry.agent, entry.authority, entry.manager, entry.lease)
+            for entry in provider_entries
+        ),
+        source_evidence=source_evidence,
+    )
+
+
 def build_native_cleanup_plan(runner: Any, coordinator: Any, receipt: Any):
     """Capture a source-owned native plan, or return ``None`` before irreversible ACK."""
     if (
@@ -577,12 +735,21 @@ def build_native_cleanup_plan(runner: Any, coordinator: Any, receipt: Any):
         or receipt.authority_epoch != getattr(coordinator, "authority_epoch", None)
     ):
         return None
-    if not _source_prerequisites(runner, coordinator, receipt):
+    if not _hosted_tui_prerequisite(runner, coordinator, receipt):
+        return None
+    source_witness = _capture_profile_native_cleanup_witness(runner, coordinator, receipt)
+    if source_witness is None:
         return None
     cron = _cron_participant(runner, coordinator, receipt)
-    profiles = _profile_participants(runner, coordinator, receipt)
+    profiles = _profile_participants(
+        runner, coordinator, receipt, source_witness=source_witness,
+    )
     providers = _provider_participants(runner, coordinator, receipt)
-    if profiles is None or providers is None:
+    if (
+        profiles is None
+        or not profile_participants_match_witness(source_witness, profiles)
+        or providers is None
+    ):
         return None
     participants = []
     native_fences = []

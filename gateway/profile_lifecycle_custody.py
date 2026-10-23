@@ -617,6 +617,49 @@ class ProfileLifecycleCustody:
             record.global_provider_prepared = prepared
         return True
 
+    def mark_global_provider_settled(
+        self, close_generation: int, authority: Any, provider_entries: Any,
+    ) -> bool:
+        """Publish one exact global provider commit only after its typed native result."""
+        if self._global_close_generation != close_generation:
+            return False
+        record = self._record_for(authority)
+        if (
+            record is None
+            or record.close_generation != close_generation
+            or record.global_provider_snapshot is None
+            or record.global_provider_prepared is not True
+            or not isinstance(provider_entries, (tuple, list))
+        ):
+            return False
+        matching = tuple(
+            entry for entry in provider_entries
+            if getattr(entry, "authority", None) is authority
+        )
+        if not matching or any(getattr(entry, "status", None) != "committed" for entry in matching):
+            return False
+        try:
+            _initial_keys, cached_agents = record.global_provider_snapshot
+            rows = tuple(cached_agents)
+        except (TypeError, ValueError):
+            return False
+        for entry in matching:
+            if (
+                getattr(entry, "agent", None) is None
+                or getattr(entry, "manager", None) is None
+                or getattr(entry, "lease", None) is None
+                or not any(
+                    isinstance(row, tuple)
+                    and len(row) == 4
+                    and row[2] is entry.agent
+                    and row[3] is entry.manager
+                    for row in rows
+                )
+            ):
+                return False
+        record.provider_settled = True
+        return True
+
     def begin_retirement(self, authority: Any) -> ProfileLifecycleProducerLease | None:
         """Fence one profile's lifecycle producer before retirement side effects begin."""
         home = self._home(authority)

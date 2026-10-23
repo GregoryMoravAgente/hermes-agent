@@ -366,6 +366,14 @@ class GlobalProviderCustody:
             entry.status = "commit_unknown"
             return False
         entry.status = "committed"
+        lifecycle = self._custody()
+        settle = getattr(lifecycle, "mark_global_provider_settled", None)
+        if callable(settle) and not settle(
+            generation, entry.authority, tuple(self._entries.values()),
+        ):
+            entry.status = "commit_unknown"
+            entry.reason = "provider_binding_changed"
+            return False
         return True
 
     async def commit(self, generation: int) -> bool:

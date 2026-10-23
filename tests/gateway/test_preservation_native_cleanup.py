@@ -271,9 +271,25 @@ def test_public_gateway_route_binds_api_factory_before_native_ack(started_mux, m
     }
     wire = call(run_runtime.begin_preservation_drain(runner, params, "fixture-peer"))
     assert wire["status"] == "closing", wire
-    prepared = call(run_runtime.prepare_preservation_handoff(
-        runner, {"receipt": wire}, "fixture-peer",
-    ))
+    # Bootstrap now installs the real hosted room. Keep this fixture's missing-native-receipt
+    # boundary explicit instead of expecting a successfully stopped I17 source to be UNKNOWN.
+    authority = runner.session_authority
+    service = authority.hosted_room_service
+    retained_root = authority._i17_service_handle
+    stop_attempts = []
+
+    def refuse_hosted_native_stop(*, timeout):
+        stop_attempts.append(timeout)
+        return False
+
+    with monkeypatch.context() as missing_native:
+        missing_native.setattr(service, "stop", refuse_hosted_native_stop)
+        prepared = call(run_runtime.prepare_preservation_handoff(
+            runner, {"receipt": wire}, "fixture-peer",
+        ))
+    assert stop_attempts
+    assert authority.hosted_room_service is service
+    assert authority._i17_service_handle is retained_root
     if prepared.get("status") != "handoff_pending":
         # The public fixture intentionally boots the API factory but not every independent
         # cron/process/host source.  Keep this as a causal boundary check: I03 is sealed from

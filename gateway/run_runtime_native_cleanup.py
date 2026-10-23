@@ -148,6 +148,28 @@ async def acknowledge_native_cleanup(runner, coordinator, receipt):
     return await settle_native_cleanup(runner, coordinator, result.capability)
 
 
+def validate_closed_native_cleanup_retry(coordinator, receipt):
+    """Authenticate a retry after native participants have released profile ownership.
+
+    A closed receipt spends only the coordinator's retained native capability. Requiring every
+    profile lock again would strand the remaining original participants after the first release.
+    Each pending participant still validates its exact source graph and native fences itself.
+    """
+    if (
+        not isinstance(receipt, DrainReceipt)
+        or receipt.state != "closed"
+        or getattr(coordinator, "state", None) != "closed"
+    ):
+        return CustodyRefusal("native_cleanup_mismatch")
+    result = coordinator.native_cleanup_result(receipt)
+    if not isinstance(result, NativeCleanupResult):
+        return result
+    plan = getattr(coordinator, "_native_cleanup_plan", None)
+    if not isinstance(plan, NativeCleanupPlan) or result.capability.plan is not plan:
+        return CustodyRefusal("native_cleanup_plan_mismatch")
+    return None
+
+
 def pending_wire(runner, params):
     """Return the retained closed receipt for a timed-out private socket operation."""
     receipt = params.get("receipt") if isinstance(params, dict) else None
