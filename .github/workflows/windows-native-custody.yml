@@ -8,6 +8,7 @@ on:
     branches:
       - codex/AGC-1722/windows-close-worker-root-20261021-01a120af
       - codex/AGC-1663/i12-managed-proof-root-01a120af-20261022
+      - codex/AGC-1721/native-cron-error-20261023
 
 permissions:
   contents: read
