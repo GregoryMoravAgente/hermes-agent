@@ -46,6 +46,12 @@ def _producer(module: str, name: str):
     return getattr(value, "__func__", value)
 
 
+def _physical_home(value: str | Path) -> Path:
+    from gateway.runtime_ownership import canonical_home
+
+    return canonical_home(Path(value))
+
+
 @dataclass(frozen=True)
 class _ProfileFactory:
     authority: Any
@@ -127,7 +133,7 @@ class ApiRunFactory:
                 getattr(authority, "db", None) is not retained.db
                 or getattr(authority, "profile_id", None) != retained.home
                 or getattr(authority, "epoch", None) != retained.epoch
-                or str(Path(retained.db.db_path).parent.resolve()) != retained.home
+                or _physical_home(Path(retained.db.db_path).parent) != _physical_home(retained.home)
                 or not self.coordinator.profile_scope_valid(
                     retained.home, retained.epoch, require_serving=True,
                     allow_retiring=False, physical_owner_epoch=retained.physical_owner_epoch,

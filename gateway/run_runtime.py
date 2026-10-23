@@ -451,6 +451,8 @@ _INTEGRATED_PRESERVATION_OWNER_CLASSES = (
 
 def _strict_physical_owner_bindings(physical, homes):
     """Validate the physical evidence tuple before handing I20 to the existing coordinator."""
+    from gateway.runtime_ownership import canonical_home
+
     if not physical or len(physical) != len(homes):
         return None
     bindings = []
@@ -459,22 +461,25 @@ def _strict_physical_owner_bindings(physical, homes):
         if not isinstance(evidence, dict):
             return None
         try:
-            expected_home = str(Path(home).resolve())
-            profile_home = Path(evidence['profile_home']).resolve()
+            expected_path = canonical_home(Path(home))
+            profile_path = canonical_home(Path(evidence['profile_home']))
             epoch = evidence['owner_epoch']
             descriptor = evidence['native_descriptor']
             record = evidence['record']
-            record_home = Path(record['hermes_home']).resolve()
+            record_path = canonical_home(Path(record['hermes_home']))
+            expected_home = str(expected_path)
+            profile_home = str(profile_path)
+            record_home = str(record_path)
         except (KeyError, OSError, RuntimeError, TypeError, ValueError):
             return None
         if (
-            str(profile_home) != expected_home
+            profile_home != expected_home
             or not isinstance(epoch, str) or not epoch
             or isinstance(descriptor, bool) or not isinstance(descriptor, int) or descriptor < 0
             or not isinstance(record, dict)
             or record.get('owner_epoch') != epoch
-            or str(record_home) != expected_home
-            or evidence.get('physical_binding') != (str(profile_home), epoch, descriptor)
+            or record_home != expected_home
+            or evidence.get('physical_binding') != (profile_home, epoch, descriptor)
             or evidence.get('native_handle_retained') is not True
             or evidence.get('os_lock_owner') is not True
             or evidence.get('cross_process_proof') is not True

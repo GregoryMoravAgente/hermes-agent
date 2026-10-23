@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pytest
 
@@ -64,6 +65,38 @@ async def test_idle_api_factory_reads_real_two_profile_epochs_and_native_owners(
         from gateway.run_runtime import _seal_integrated_preservation_owners
         _seal_integrated_preservation_owners(runner, runner.runtime_custody, receipt)
         assert runner.runtime_custody.status()["owner_states"]["I03_api_run_direct"] == "sealed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.platforms("windows")
+async def test_windows_idle_api_factory_canonicalizes_db_home_alias_and_rejects_replacement(
+        tmp_path, monkeypatch,
+):
+    """Physical DB aliases must not change the logical profile or owner incarnation."""
+    from gateway.runtime_ownership import process_ownership
+
+    async with _factory(tmp_path, monkeypatch) as (runner, adapter, receipt, entries):
+        factory = adapter._api_run_factory
+        logical_ids = tuple(item.home for item in factory.profiles)
+        original_paths = tuple(item.db.db_path for item in factory.profiles)
+        try:
+            for item, original in zip(factory.profiles, original_paths):
+                alias_parent = "".join(
+                    char.swapcase() if char.isalpha() else char
+                    for char in str(Path(original).parent)
+                )
+                item.db.db_path = Path(alias_parent) / Path(original).name
+            assert _evidence(runner, adapter, receipt) is not None
+            assert tuple(item.home for item in factory.profiles) == logical_ids
+        finally:
+            for item, original in zip(factory.profiles, original_paths):
+                item.db.db_path = original
+
+        secondary = entries[1][1]
+        assert process_ownership.release(secondary) is True
+        assert _evidence(runner, adapter, receipt) is None
+        process_ownership.reserve([secondary])
+        assert _evidence(runner, adapter, receipt) is None
 
 
 def _replace_producer(changed, runner, adapter):

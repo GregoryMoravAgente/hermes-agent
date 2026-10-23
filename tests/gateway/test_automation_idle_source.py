@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 import sqlite3
 
 import pytest
@@ -302,6 +303,50 @@ async def test_i07_idle_source_refuses_released_and_reacquired_native_owner(
         assert authority.preservation_owner_ready('I07_automation_route_wakes') is False
     finally:
         if receipt is not None and runner.runtime_custody.status()['state'] == 'closing':
+            assert runner.runtime_custody.abort_before_handoff(receipt) is None
+        assert await _close_boot(runner, entries) is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.platforms("windows")
+async def test_windows_i07_case_alias_keeps_physical_owner_and_rejects_replacement(
+        tmp_path, monkeypatch,
+):
+    """A case-only NTFS alias is physical evidence; a new owner incarnation is not."""
+    from gateway.runtime_ownership import canonical_home, process_ownership
+    from gateway.run_runtime import _strict_physical_owner_bindings
+    from gateway.session_automation_custody import _i07_native_reservation
+
+    runner, entries = await _boot(tmp_path, monkeypatch)
+    receipt = None
+    try:
+        authority = runner.session_authorities.launch
+        coordinator = runner.runtime_custody
+        home = Path(authority.profile_id)
+        alias = Path("".join(char.swapcase() if char.isalpha() else char for char in str(home)))
+        assert str(alias) != str(home)
+        assert canonical_home(alias) == canonical_home(home)
+
+        evidence = process_ownership.reservation_evidence(alias)
+        assert evidence is not None
+        assert evidence["profile_home"] == str(canonical_home(home))
+        assert _strict_physical_owner_bindings(
+            [evidence], [("default", alias)],
+        ) == ((str(canonical_home(home)), evidence["owner_epoch"], evidence["native_descriptor"]),)
+        assert _i07_native_reservation(alias) is not None
+
+        receipt = coordinator.begin_close(owner_id="i07-windows-case-alias")
+        assert authority.preservation_owner_ready("I07_automation_route_wakes") is True
+        bound_epoch = evidence["owner_epoch"]
+
+        assert process_ownership.release(alias) is True
+        process_ownership.reserve([alias])
+        replacement = process_ownership.reservation_evidence(home)
+        assert replacement is not None
+        assert replacement["owner_epoch"] != bound_epoch
+        assert authority.preservation_owner_ready("I07_automation_route_wakes") is False
+    finally:
+        if receipt is not None and runner.runtime_custody.status()["state"] == "closing":
             assert runner.runtime_custody.abort_before_handoff(receipt) is None
         assert await _close_boot(runner, entries) is True
 

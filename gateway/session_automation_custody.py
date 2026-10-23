@@ -42,6 +42,23 @@ _I07_READ_FAILED = object()
 _I07_IGNORE_ROW = object()
 
 
+def _physical_home(value):
+    """Canonicalize a filesystem home without changing the logical profile identity."""
+    from gateway.runtime_ownership import canonical_home
+
+    return canonical_home(Path(value))
+
+
+def _physical_home_matches(value, expected) -> bool:
+    if not isinstance(value, (str, Path)):
+        return False
+    try:
+        candidate = Path(value)
+        return candidate.is_absolute() and _physical_home(candidate) == _physical_home(expected)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 @dataclass(frozen=True)
 class AutomationProducerGraph:
     """Exact bootstrap witness for the real I07 producer families.
@@ -68,6 +85,7 @@ class AutomationProducerGraph:
     physical_binding: tuple[str, str, int] | None = None
 
     def matches(self, authority, coordinator) -> bool:
+        database_path = getattr(getattr(authority, 'db', None), 'db_path', None)
         if (
             self.authority is not authority
             or self.coordinator is not coordinator
@@ -77,7 +95,8 @@ class AutomationProducerGraph:
             or getattr(authority, 'instance_id', None) != self.instance_id
             or getattr(authority, 'epoch', None) != self.authority_epoch
             or getattr(authority, 'db', None) is not self.database
-            or str(getattr(getattr(authority, 'db', None), 'db_path', '')) != self.database_path
+            or not isinstance(database_path, (str, Path))
+            or str(_physical_home(database_path)) != self.database_path
             or getattr(coordinator, 'process_instance', None) != self.instance_id
         ):
             return False
@@ -93,7 +112,7 @@ class AutomationProducerGraph:
             or isinstance(self.native_descriptor, bool)
             or not isinstance(self.physical_binding, tuple)
             or self.physical_binding != (
-                str(Path(self.profile_id).resolve()),
+                str(_physical_home(self.profile_id)),
                 self.physical_owner_epoch, self.native_descriptor,
             )
         ):
@@ -164,6 +183,7 @@ def _i07_pending_admissions(authority):
 def _i07_native_reservation(home):
     """Read the retained descriptor-bound native owner witness for one profile."""
     try:
+        home = _physical_home(home)
         from gateway.runtime_ownership import process_ownership
         reservation = process_ownership.reservation_evidence(home)
     except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
@@ -192,8 +212,8 @@ def _i07_native_owner_snapshot(authority, coordinator):
     graph = _i07_graph(authority, coordinator)
     if graph is None:
         return None
-    home = Path(authority.profile_id).resolve()
-    if str(Path(authority.db.db_path).resolve().parent) != str(home):
+    home = _physical_home(authority.profile_id)
+    if _physical_home(Path(authority.db.db_path).parent) != home:
         return None
     if not _i07_runtime_epoch_matches(authority):
         return None
@@ -226,7 +246,7 @@ def _i07_native_owner_snapshot(authority, coordinator):
         'authority_epoch': authority.epoch,
         'process_instance': authority.instance_id,
         'physical_owner_epoch': graph.physical_owner_epoch,
-        'database_path': str(Path(authority.db.db_path).resolve()),
+        'database_path': str(_physical_home(authority.db.db_path)),
         'database_identity': id(authority.db),
         'native_descriptor': graph.native_descriptor,
         'native_handle_retained': True,
@@ -322,7 +342,7 @@ def _i07_terminal_receipt_row(
     if (
         not _automation_descriptor_complete(descriptor)
         or descriptor.get('profile_id') != authority.profile_id
-        or descriptor.get('profile_home') != home
+        or not _physical_home_matches(descriptor.get('profile_home'), home)
         or descriptor.get('process_instance') != authority.instance_id
         or descriptor.get('coordinator_id') != current_coordinator
         or descriptor.get('session_id') != row.get('target_session_id')
@@ -420,7 +440,7 @@ def _i07_terminal_receipt_snapshot(authority, coordinator, close_generation):
     admission_ids = _i07_terminal_admission_ids(authority)
     if admission_ids is _I07_READ_FAILED or not admission_ids:
         return None
-    home = str(Path(authority.db.db_path).resolve().parent)
+    home = str(_physical_home(Path(authority.db.db_path).parent))
     current_process = getattr(coordinator, 'process_instance', None)
     current_coordinator = getattr(coordinator, '_coordinator_id', None)
     effective_close_generation = close_generation if type(close_generation) is int else 0
@@ -496,7 +516,7 @@ def register_automation_source_graph(authority, coordinator=None):
             instance_id=authority.instance_id,
             authority_epoch=authority.epoch,
             database=db,
-            database_path=str(Path(db_path).resolve()),
+            database_path=str(_physical_home(db_path)),
             indexes=tuple(indexes),
             producer_families=_i07_producer_families(),
         )
@@ -530,12 +550,12 @@ def register_automation_source_graph(authority, coordinator=None):
             type(graph.physical_owner_epoch) is not str
             or type(graph.native_descriptor) is not int
             or graph.physical_binding != (
-                str(Path(graph.profile_id).resolve()),
+                str(_physical_home(graph.profile_id)),
                 graph.physical_owner_epoch, graph.native_descriptor,
             )
         ):
             raise RuntimeStoreError('automation_source_graph_binding_mismatch')
-        current = _i07_native_reservation(Path(graph.profile_id).resolve())
+        current = _i07_native_reservation(_physical_home(graph.profile_id))
         if (
             current is None
             or current.get('owner_epoch') != graph.physical_owner_epoch
@@ -544,7 +564,7 @@ def register_automation_source_graph(authority, coordinator=None):
         ):
             raise RuntimeStoreError('automation_source_graph_binding_mismatch')
         return graph
-    reservation = _i07_native_reservation(Path(graph.profile_id).resolve())
+    reservation = _i07_native_reservation(_physical_home(graph.profile_id))
     physical_owner_epoch = reservation.get('owner_epoch') if reservation is not None else None
     native_descriptor = reservation.get('native_descriptor') if reservation is not None else None
     physical_binding = reservation.get('physical_binding') if reservation is not None else None
@@ -852,7 +872,7 @@ class AutomationCustodyMixin:
         if (coordinator is None
                 or getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES):
             raise RuntimeStoreError('preservation_owner_unmapped')
-        home = str(Path(self.db.db_path).parent.resolve())
+        home = str(_physical_home(Path(self.db.db_path).parent))
         descriptor = {
             'owner_class': handle.owner_class,
             'owner_id': handle.owner_id,
@@ -878,7 +898,9 @@ class AutomationCustodyMixin:
         if (not _automation_descriptor_complete(descriptor)
                 or descriptor.get('owner_class') != 'I09_a2a_hosted_kanban'
                 or descriptor.get('profile_id') != self.profile_id
-                or descriptor.get('profile_home') != str(Path(self.db.db_path).parent.resolve())
+                or not _physical_home_matches(
+                    descriptor.get('profile_home'), Path(self.db.db_path).parent,
+                )
                 or descriptor.get('session_id') != session_id
                 or descriptor.get('principal_id') != principal_id
                 or descriptor.get('request_id') != request_id
@@ -1011,7 +1033,9 @@ class AutomationCustodyMixin:
         if descriptor_valid and (
                 descriptor.get('owner_class') != owner_class
                 or descriptor.get('profile_id') != self.profile_id
-                or descriptor.get('profile_home') != str(Path(self.db.db_path).parent.resolve())
+                or not _physical_home_matches(
+                    descriptor.get('profile_home'), Path(self.db.db_path).parent,
+                )
                 or descriptor.get('session_id') != row.get('target_session_id')
                 or descriptor.get('principal_id') != row.get('principal_id')
                 or descriptor.get('request_id') != row.get('request_id')
@@ -1068,14 +1092,14 @@ class AutomationCustodyMixin:
             receipt_descriptor = receipt.get('automation_custody') if isinstance(receipt, dict) else None
             if not isinstance(receipt_descriptor, dict) or receipt_descriptor != descriptor:
                 raise RuntimeStoreError('preservation_owner_unmapped')
-        home = str(Path(self.db.db_path).parent.resolve())
+        home = str(_physical_home(Path(self.db.db_path).parent))
         owner_class = descriptor.get('owner_class')
-        if owner_class not in _AUTOMATION_OWNER_CLASSES:
+        if (owner_class not in _AUTOMATION_OWNER_CLASSES
+                or not _physical_home_matches(descriptor.get('profile_home'), home)):
             raise RuntimeStoreError('preservation_owner_unmapped')
         if any((descriptor.get(name) != value for name, value in {
             'owner_class': owner_class,
             'profile_id': self.profile_id,
-            'profile_home': home,
             'session_id': row.get('target_session_id'),
             'principal_id': row.get('principal_id'),
             'request_id': row.get('request_id'),
