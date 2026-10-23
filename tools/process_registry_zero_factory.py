@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from hermes_cli.profile_provenance_bootstrap import ProfileProvenanceError, _safe_path
 from tools.process_registry_custody_evidence import ProcessScopeFence
+from tools.process_registry_terminal_history import finished_session_is_terminal_history
 
 
 _SOURCE = (
@@ -508,13 +509,23 @@ class ProcessRegistryZeroFactory:
             with self.registry._lock:
                 running = tuple(self.registry._running.values())
                 finished = tuple(self.registry._finished.values())
+                terminal_history_ids = frozenset(
+                    session.id
+                    for session in finished
+                    if finished_session_is_terminal_history(
+                        session,
+                        completion_tokens=self.registry._completion_tokens,
+                        pending_watchers=self.registry.pending_watchers,
+                        live_coordinator=self.coordinator,
+                    )
+                )
                 foreground = tuple(self.registry._foreground_custody_transactions.items())
                 unbound = tuple(self.registry._custody_unbound_sessions)
                 watchers = tuple(self.registry.pending_watchers)
                 tokens = tuple(self.registry._completion_tokens)
         except (AttributeError, RuntimeError, TypeError):
             return (), "registry_inventory_unavailable"
-        return (running, finished, foreground, unbound, watchers, tokens), None
+        return (running, finished, foreground, unbound, watchers, tokens, terminal_history_ids), None
 
     def observe_close(self, close_generation: int) -> ProcessRegistryZeroObservation:
         """Fence admissions and classify zero, nonempty, or unknown conservatively."""
@@ -555,11 +566,18 @@ class ProcessRegistryZeroFactory:
                     result = ProcessRegistryZeroObservation("unknown", reason, close_generation, registrations)
                     self._observation = result
                     return result
-                running, finished, foreground, unbound, watchers, tokens = inventory
+                (
+                    running, finished, foreground, unbound, watchers, tokens,
+                    terminal_history_ids,
+                ) = inventory
+                live_finished = tuple(
+                    item for item in finished
+                    if getattr(item, "id", None) not in terminal_history_ids
+                )
                 registered_profiles = {item.profile_id for item in registrations}
                 if any(
                     getattr(item, "profile_id", None) not in registered_profiles
-                    for item in (*running, *finished)
+                    for item in (*running, *live_finished)
                 ) or any(
                     getattr(getattr(transaction, "custody", None), "profile_id", None)
                     not in registered_profiles
@@ -575,16 +593,17 @@ class ProcessRegistryZeroFactory:
                     for registration in registrations
                     for session_id in registration.scope.close().get("created_session_ids", ())
                 }
-                known = {getattr(item, "id", None) for item in (*running, *finished)}
+                live_created = created - terminal_history_ids
+                known = {getattr(item, "id", None) for item in (*running, *live_finished)}
                 known.update(owner_id for owner_id, _transaction in foreground)
-                if any(item not in known for item in created):
+                if any(item not in known for item in live_created):
                     result = ProcessRegistryZeroObservation(
                         "unknown", "accepted_inventory_conservation_failed", close_generation,
                         registrations,
                     )
                     self._observation = result
                     return result
-                if any(item not in created for item in known):
+                if any(item not in live_created for item in known):
                     result = ProcessRegistryZeroObservation(
                         "unknown", "unregistered_process_inventory", close_generation,
                         registrations,
@@ -615,7 +634,7 @@ class ProcessRegistryZeroFactory:
                     )
                     self._observation = result
                     return result
-                if running or finished or foreground or created:
+                if running or live_finished or foreground or live_created:
                     result = ProcessRegistryZeroObservation(
                         "nonempty", "accepted_process_effect", close_generation, registrations,
                     )
@@ -757,6 +776,33 @@ class ProcessRegistryZeroFactory:
 class ProcessRegistryZeroFactoryMixin:
     """Small facade hooks mixed into ProcessRegistry without another ownership ledger."""
 
+    def _completion_queue_empty_for_rebind_locked(self) -> bool:
+        queue = getattr(self, "completion_queue", None)
+        mutex = getattr(queue, "mutex", None)
+        entries = getattr(queue, "queue", None)
+        if mutex is None or entries is None:
+            return False
+        try:
+            with mutex:
+                return not entries
+        except (AttributeError, RuntimeError, TypeError):
+            return False
+
+    def _finished_history_rebind_safe_locked(self) -> bool:
+        """Allow a coordinator replacement only after every retained result is terminal.
+
+        The caller already holds the registry lock.  Finished output remains in place for
+        ``list``/``read_log``; this predicate only separates settled history from live custody.
+        """
+        return all(
+            finished_session_is_terminal_history(
+                session,
+                completion_tokens=self._completion_tokens,
+                pending_watchers=self.pending_watchers,
+            )
+            for session in self._finished.values()
+        )
+
     def reserve_foreground_custody(
         self, *, profile_id: Optional[str] = None,
         binding: Any = None,
@@ -803,9 +849,12 @@ class ProcessRegistryZeroFactoryMixin:
             with self._lock:
                 if (
                     self._running
-                    or self._finished
+                    or not self._finished_history_rebind_safe_locked()
                     or self._foreground_custody_transactions
                     or self._custody_unbound_sessions
+                    or self.pending_watchers
+                    or self._completion_tokens
+                    or not self._completion_queue_empty_for_rebind_locked()
                 ):
                     raise RuntimeError("I15 process factory coordinator changed with live custody")
             factory = ProcessRegistryZeroFactory(self, coordinator, runner=runner)

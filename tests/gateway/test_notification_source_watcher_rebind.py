@@ -7,6 +7,20 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _capture_terminal_history_before_third_runtime_entry(request):
+    """Attach a read-only per-session I15/native snapshot before the rebind regression enters."""
+    if request.node.name != "test_startup_watcher_task_creation_failure_retains_exact_descriptor":
+        yield
+        return
+    from tests.gateway.test_process_registry_terminal_history import _registry_session_snapshot
+    from tools import process_registry as process_registry_module
+
+    snapshot = _registry_session_snapshot(process_registry_module.process_registry)
+    request.node.user_properties.append(("i15_terminal_history_snapshot", json.dumps(snapshot)))
+    yield
+
+
 def test_startup_watcher_detach_rebinds_i10_source_for_each_profile(started_mux, monkeypatch):
     """A real startup detach must leave every profile readable without weakening identity checks."""
     from gateway.run_notifications import i10_source_snapshot
