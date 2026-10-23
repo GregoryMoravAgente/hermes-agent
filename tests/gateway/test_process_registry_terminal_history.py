@@ -240,7 +240,11 @@ async def test_real_terminal_history_allows_new_runtime_coordinator(
         async with runtime_owned_api(second_root, monkeypatch):
             retained = registry.get(session_id)
             assert retained is not None
-            assert retained.output_buffer.endswith("terminal-history-proof\n")
+            # Windows pipes preserve CRLF while POSIX preserves LF; the retained history must
+            # preserve the bytes, but this content assertion is newline-agnostic by platform.
+            assert retained.output_buffer.replace("\r\n", "\n").endswith(
+                "terminal-history-proof\n",
+            )
             assert terminal_history_snapshot(registry) == before_second
     finally:
         clear_session_vars(tokens)

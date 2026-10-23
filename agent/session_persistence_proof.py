@@ -1202,11 +1202,21 @@ def gateway_writer_proof_extends_prefix(previous: Any, proof: Any) -> bool:
         return False
     prefix_len = len(previous.row_ids)
     suffix_roles = proof.row_roles[prefix_len:]
+    prefix_roles = previous.row_roles
+    # A tool round's first proof legitimately ends at the assistant tool-call row;
+    # the following canonical flush extends it with the tool result.  Keep the
+    # prefix constrained to one user row followed by assistant/tool rows, rather
+    # than requiring the prefix to end at the user row.
+    prefix_valid = (
+        bool(prefix_roles)
+        and prefix_roles[0] == "user"
+        and all(role in {"assistant", "tool"} for role in prefix_roles[1:])
+    )
     return (
         prefix_len > 0
         and len(proof.row_ids) > prefix_len
         and bool(suffix_roles)
-        and previous.row_roles[-1:] == ("user",)
+        and prefix_valid
         and all(role in {"assistant", "tool"} for role in suffix_roles)
         and (proof.store_path, proof.session_id) == (previous.store_path, previous.session_id)
         and (proof.row_ids[:prefix_len], proof.row_snapshots[:prefix_len],

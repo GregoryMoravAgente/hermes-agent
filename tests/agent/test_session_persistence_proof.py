@@ -224,6 +224,104 @@ def test_prefix_repair_rejects_user_only_suffix():
     assert gateway_writer_proof_extends_prefix(prefix, assistant_suffix) is True
 
 
+def test_prefix_repair_accepts_tool_result_after_assistant_tool_call():
+    """A persisted assistant tool-call prefix may be extended by a durable tool-result row."""
+    from agent.session_persistence_proof import gateway_writer_proof_extends_prefix
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1, 2),
+        ("user-snapshot", "assistant-tool-snapshot"),
+        ("session", "session"), ("user", "assistant"), "prefix",
+    )
+    tool_result = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3),
+        ("user-snapshot", "assistant-tool-snapshot", "tool-result-snapshot"),
+        ("session", "session", "session"), ("user", "assistant", "tool"),
+        "tool-result",
+    )
+
+    assert gateway_writer_proof_extends_prefix(prefix, tool_result) is True
+
+
+def test_prefix_repair_accepts_a_long_tool_round_prefix():
+    """A longer user/assistant/tool prefix remains eligible for exact continuation."""
+    from agent.session_persistence_proof import gateway_writer_proof_extends_prefix
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3),
+        ("user-snapshot", "assistant-tool-snapshot", "tool-result-snapshot"),
+        ("session", "session", "session"), ("user", "assistant", "tool"), "prefix",
+    )
+    next_row = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3, 4),
+        ("user-snapshot", "assistant-tool-snapshot", "tool-result-snapshot", "assistant-snapshot"),
+        ("session", "session", "session", "session"),
+        ("user", "assistant", "tool", "assistant"), "next-row",
+    )
+
+    assert gateway_writer_proof_extends_prefix(prefix, next_row) is True
+
+
+def test_prefix_repair_rejects_invalid_long_prefix_roles():
+    """A later user row or a prefix without its initial user is never a continuation."""
+    from agent.session_persistence_proof import gateway_writer_proof_extends_prefix
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1, 2),
+        ("user-snapshot", "assistant-tool-snapshot"),
+        ("session", "session"), ("user", "assistant"), "prefix",
+    )
+    later_user = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3, 4),
+        ("user-snapshot", "assistant-tool-snapshot", "user-snapshot-2", "tool-result"),
+        ("session", "session", "session", "session"),
+        ("user", "assistant", "user", "tool"), "later-user",
+    )
+    prefix_without_user = SessionDBWriteProof(
+        "state.db", "session", (1, 2),
+        ("assistant-tool-snapshot", "tool-result-snapshot"),
+        ("session", "session"), ("assistant", "tool"), "missing-user-prefix",
+    )
+    proof_without_user = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3),
+        ("assistant-tool-snapshot", "tool-result-snapshot", "assistant-snapshot"),
+        ("session", "session", "session"), ("assistant", "tool", "assistant"),
+        "missing-user-continuation",
+    )
+
+    assert gateway_writer_proof_extends_prefix(prefix, later_user) is False
+    assert gateway_writer_proof_extends_prefix(prefix_without_user, proof_without_user) is False
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("row_ids", (99, 2, 3)),
+        ("row_snapshots", ("replaced-user-snapshot", "assistant-tool-snapshot", "tool-result-snapshot")),
+        ("row_sessions", ("replacement-session", "session", "session")),
+    ],
+    ids=["row-id", "row-snapshot", "row-session"],
+)
+def test_prefix_repair_rejects_replaced_prefix_identity(field, replacement):
+    """A copied/replaced earlier row cannot satisfy the exact continuation proof."""
+    from dataclasses import replace
+
+    from agent.session_persistence_proof import gateway_writer_proof_extends_prefix
+
+    prefix = SessionDBWriteProof(
+        "state.db", "session", (1, 2),
+        ("user-snapshot", "assistant-tool-snapshot"),
+        ("session", "session"), ("user", "assistant"), "prefix",
+    )
+    proof = SessionDBWriteProof(
+        "state.db", "session", (1, 2, 3),
+        ("user-snapshot", "assistant-tool-snapshot", "tool-result-snapshot"),
+        ("session", "session", "session"), ("user", "assistant", "tool"), "tool-result",
+    )
+
+    assert gateway_writer_proof_extends_prefix(prefix, replace(proof, **{field: replacement})) is False
+
+
 @pytest.mark.asyncio
 async def test_gateway_writer_noop_reuses_exact_proof_only_for_same_turn(tmp_path, monkeypatch):
     """A repeated gateway persist reuses the real readback proof without a second DB write."""

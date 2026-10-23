@@ -9,6 +9,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -426,7 +427,13 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self._save(candidate)
                     self.scope = candidate['scope']
                     self.journal = candidate
-                    self._record_replayed_compression_rows(entry, result)
+                    # The journal entry is also the nested payload passed to the RPC.  A
+                    # lost acknowledgement leaves that same object observable by callers
+                    # that retained the sent parameters; annotating it in place would alter
+                    # the payload digest of the already committed receipt and turn an exact
+                    # retry into an admission conflict.  Keep the wire entry immutable while
+                    # rebuilding the local managed-row witness.
+                    self._record_replayed_compression_rows(copy.deepcopy(entry), result)
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)

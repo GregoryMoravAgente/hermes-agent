@@ -643,14 +643,16 @@ def host_shutdown(supervisor, receipt: dict | None):
             "host_boot_id": receipt["host_boot_id"],
             "host_pid": receipt["host_pid"],
         }
+        # Keep the exact receipt object issued by the supervisor.  Re-copying the mapping here
+        # would sever the source-issued identity that the later evidence reader authenticates.
         producer.update({
-            "state": "terminal", "receipt": dict(receipt),
+            "state": "terminal", "receipt": receipt,
             "native_identity": native_identity,
             "terminal_identity": terminal_identity,
         })
         authority._i17_host_shutdown_receipt = producer["receipt"]
         authority._i17_host_terminal_identity = terminal_identity
-    supervisor._i17_terminal_receipt = dict(receipt)
+    supervisor._i17_terminal_receipt = receipt
     return True
 
 
