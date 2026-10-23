@@ -307,27 +307,32 @@ def _runtime(monkeypatch, tmp_path: Path, *, bind_authority_now: bool = True):
     # install_runtime_custody's production class has a definition-time default
     # (fence=hermes_cli.backend_retirement.retirement).  Patching that module global
     # alone cannot inject a fresh fence after runtime_custody imported it.  Keep the
-    # canonical coordinator implementation and type identity, but use a local subclass
-    # whose constructor passes this test's real RetirementFence explicitly.  The subclass
-    # is used only while initialize_gateway_runtime calls the constructor; every object
-    # consumed by production custody code remains an actual RuntimeCustodyCoordinator.
-    fence = backend_retirement.RetirementFence()
+    # canonical coordinator class identity and replace only its constructor default for
+    # this fixture.  A per-test subclass would be unsafe: lifecycle_custody is cached
+    # after the first bootstrap and would retain the previous subclass as its type check.
+    fresh_fence = backend_retirement.RetirementFence()
     canonical_coordinator = runtime_custody_module.RuntimeCustodyCoordinator
 
-    class _FreshFenceRuntimeCustodyCoordinator(canonical_coordinator):
-        def __init__(self, *, process_instance, authority_epoch, profile_scope=None):
-            super().__init__(
-                process_instance=process_instance,
-                authority_epoch=authority_epoch,
-                fence=fence,
-                profile_scope=profile_scope,
-            )
+    original_coordinator_init = canonical_coordinator.__init__
+    missing_fence = object()
 
-    monkeypatch.setattr(
-        runtime_custody_module,
-        "RuntimeCustodyCoordinator",
-        _FreshFenceRuntimeCustodyCoordinator,
-    )
+    def _fresh_fence_init(
+        coordinator,
+        *,
+        process_instance,
+        authority_epoch,
+        fence=missing_fence,
+        profile_scope=None,
+    ):
+        original_coordinator_init(
+            coordinator,
+            process_instance=process_instance,
+            authority_epoch=authority_epoch,
+            fence=fresh_fence if fence is missing_fence else fence,
+            profile_scope=profile_scope,
+        )
+
+    monkeypatch.setattr(canonical_coordinator, "__init__", _fresh_fence_init)
 
     home_token = set_hermes_home_override(home)
     resource = {
@@ -343,7 +348,7 @@ def _runtime(monkeypatch, tmp_path: Path, *, bind_authority_now: bool = True):
         "loop": None,
         "thread": None,
         "supervisors": [],
-            "fence": fence,
+            "fence": fresh_fence,
             "process_registry": None,
             "process_registry_binding": None,
     }
@@ -382,7 +387,7 @@ def _runtime(monkeypatch, tmp_path: Path, *, bind_authority_now: bool = True):
             hosted_tui_custody.bind_authority(
                 authority, runner=runner, coordinator=coordinator
             )
-        return runner, authority, coordinator, fence, home
+        return runner, authority, coordinator, fresh_fence, home
     except BaseException:
         _cleanup_i17_resource(resource, None)
         raise
