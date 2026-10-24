@@ -683,8 +683,11 @@ class TestGatewayRunRestartWatcherOuterPopenFallback:
 
 
 class TestCronSchedulerBashResolution:
-    """cron.scheduler_script must resolve bash via PATH (Git Bash on Windows) and,
-    when no bash exists, return an actionable error instead of a [WinError 2] crash."""
+    """The scheduler consumes the canonical resolver outcome without changing its argv/error contract.
+
+    These two original tests inject the resolver result rather than pretending to be a different
+    operating system. The real Windows resolver is covered separately below on a Windows host.
+    """
 
     def test_sh_script_uses_bash_found_on_path(self, tmp_path, monkeypatch):
         from cron import scheduler_script
@@ -692,8 +695,10 @@ class TestCronSchedulerBashResolution:
         script = tmp_path / "job.sh"
         script.write_text("echo hi\n", encoding="utf-8")
         found = str(tmp_path / "git" / "bin" / "bash.exe")
-        monkeypatch.setattr(scheduler_script.shutil, "which",
-                            lambda name: found if name == "bash" else None)
+        monkeypatch.setattr(
+            scheduler_script, "_resolve_script_bash",
+            lambda deadline=None: (found, None),
+        )
 
         argv, _overlay, error = scheduler_script._script_argv(script)
 
@@ -705,13 +710,30 @@ class TestCronSchedulerBashResolution:
 
         script = tmp_path / "job.sh"
         script.write_text("echo hi\n", encoding="utf-8")
-        real_isfile = os.path.isfile
-        monkeypatch.setattr(scheduler_script.shutil, "which", lambda name: None)
-        monkeypatch.setattr(scheduler_script.os.path, "isfile",
-                            lambda p: False if p == "/bin/bash" else real_isfile(p))
+        monkeypatch.setattr(
+            scheduler_script, "_resolve_script_bash",
+            lambda deadline=None: (None, None),
+        )
 
         argv, _overlay, error = scheduler_script._script_argv(script)
 
         assert argv is None
         assert "bash not found" in error
         assert "job.sh" in error
+
+
+@pytest.mark.platforms("windows")
+class TestCronSchedulerRealWindowsResolver:
+    """The native Windows job uses the real PM/Git-Bash resolver, not a fake platform flag."""
+
+    def test_real_windows_resolver_returns_a_non_stub_bash(self):
+        from cron.scheduler_script import _resolve_script_bash
+
+        bash, error = _resolve_script_bash()
+
+        assert error is None
+        assert bash and os.path.isfile(bash)
+        normalized = os.path.normcase(os.path.normpath(bash))
+        assert "\\system32\\" not in normalized
+        assert "\\windowsapps\\" not in normalized
+        assert normalized.endswith("\\bash.exe")

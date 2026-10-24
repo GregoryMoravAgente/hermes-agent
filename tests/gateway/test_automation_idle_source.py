@@ -71,6 +71,61 @@ async def _admit_real_i07_terminal(runner, authority, tmp_path, monkeypatch):
     return row['admission_id']
 
 
+async def _real_pending_i08_route_wake(tmp_path, monkeypatch):
+    """Build one real local route and its source-owned I08 pending root."""
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_automation_custody import automation_source_identity
+    from gateway.session_contract import Principal
+    from gateway.session_goal_tick_custody import reserve_tick
+    from gateway.session_local import _bypass_policy, create_local_session
+    from hermes_cli import tools_config
+
+    monkeypatch.setattr(tools_config, '_xai_credentials_present', lambda: False)
+    runner, entries = await _boot(tmp_path, monkeypatch)
+    authority = runner.session_authorities.launch
+    actor = Principal(
+        'i08-fixture', authority.profile_id,
+        frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture',
+    )
+    policy = _bypass_policy(
+        {'source': 'gui', 'cwd': str(tmp_path), 'model': 'fixture',
+         'provider': 'custom', 'toolsets': []},
+        private_secrets={},
+    )
+    ref = create_local_session(
+        authority, actor,
+        {'request_id': 'i08-pending-session', 'source': 'gui', 'cwd': str(tmp_path),
+         'model': 'fixture', 'toolsets': []},
+        trusted_policy=policy,
+    )
+    live = authority.sessions[ref.session_id]
+    entry = runner.session_store.lookup_by_session_key(live.route)
+    assert entry is not None
+    source_event = MessageEvent(
+        text='', source=live.source, internal=True, message_id='i08-source-identity',
+    )
+    request_id = 'i08-pending-root'
+    tick = reserve_tick(
+        authority,
+        request_id=request_id,
+        principal_id='automation:' + entry.session_key,
+        session_id=authority.logical_owner(entry.session_id),
+        source_identity=automation_source_identity(source_event, live.route),
+        kind='loop',
+        watcher_key=entry.session_key,
+    )
+    assert tick is not None and tick.handle is not None
+    return runner, entries, authority, live, tick.handle, request_id
+
+
+def _forget_pending_i08_route(authority, handle, request_id):
+    coordinator = authority._preservation_coordinator()
+    if coordinator is not None:
+        coordinator.mark_terminal(handle)
+    authority._preservation_forget_pending_root(handle)
+    authority._preservation_automation_roots.pop(request_id, None)
+
+
 @pytest.mark.asyncio
 async def test_two_profile_idle_automation_source_is_wired_at_close(tmp_path, monkeypatch):
     """A real multiplexed boot must close an untouched I07 source without fake traffic."""
@@ -109,6 +164,112 @@ async def test_two_profile_idle_automation_source_is_wired_at_close(tmp_path, mo
     finally:
         if receipt is not None and runner.runtime_custody.status()["state"] == "closing":
             assert runner.runtime_custody.abort_before_handoff(receipt) is None
+        assert await _close_boot(runner, entries) is True
+
+
+@pytest.mark.asyncio
+async def test_i08_route_wake_reuses_exact_pending_request_identity(tmp_path, monkeypatch):
+    """A retained source handle uses its reservation identity, not a new route digest."""
+    from gateway.session_automation import admit_route_wake
+
+    runner, entries, authority, live, handle, request_id = await _real_pending_i08_route_wake(
+        tmp_path, monkeypatch,
+    )
+    seen = []
+
+    async def capture(_adapter, _event, identity, **_kwargs):
+        seen.append(identity)
+
+    monkeypatch.setattr(authority, 'admit_automation', capture)
+    try:
+        assert await admit_route_wake(
+            runner, runner._adapter_for_source(live.source), live.source,
+            'loop tick', 'loop-tick', _preservation_handle=handle,
+        ) is True
+        assert seen == [request_id]
+    finally:
+        _forget_pending_i08_route(authority, handle, request_id)
+        assert await _close_boot(runner, entries) is True
+
+
+@pytest.mark.asyncio
+async def test_i08_route_wake_refuses_tampered_pending_request_id_without_release(tmp_path, monkeypatch):
+    from gateway.session_automation import admit_route_wake
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+
+    runner, entries, authority, live, handle, request_id = await _real_pending_i08_route_wake(
+        tmp_path, monkeypatch,
+    )
+    pending = authority._preservation_pending_roots[id(handle)]
+    entry = runner.session_store.lookup_by_session_key(live.route)
+    assert entry is not None
+    before = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
+    pending['request_id'] = 'i08-forged-request'
+    try:
+        with pytest.raises(RuntimeStoreError, match='preservation_owner_mismatch'):
+            await admit_route_wake(
+                runner, runner._adapter_for_source(live.source), live.source,
+                'loop tick', 'loop-tick', _preservation_handle=handle,
+            )
+        assert list_session_admissions(
+            authority.db, session_id=entry.session_id, pending_only=False,
+        ) == before
+        assert authority._preservation_automation_roots[request_id] is handle
+        assert authority._preservation_coordinator()._records[handle.lease.lease_id].state == 'accepted'
+    finally:
+        pending['request_id'] = request_id
+        _forget_pending_i08_route(authority, handle, request_id)
+        assert await _close_boot(runner, entries) is True
+
+
+@pytest.mark.asyncio
+async def test_i08_route_wake_refuses_tampered_pending_root_without_release(tmp_path, monkeypatch):
+    from gateway.session_automation import admit_route_wake
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, entries, authority, live, handle, request_id = await _real_pending_i08_route_wake(
+        tmp_path, monkeypatch,
+    )
+    pending = authority._preservation_pending_roots[id(handle)]
+    pending['handle'] = object()
+    try:
+        with pytest.raises(RuntimeStoreError, match='preservation_owner_mismatch'):
+            await admit_route_wake(
+                runner, runner._adapter_for_source(live.source), live.source,
+                'loop tick', 'loop-tick', _preservation_handle=handle,
+            )
+        assert authority._preservation_pending_roots[id(handle)]['handle'] is not handle
+        assert authority._preservation_coordinator()._records[handle.lease.lease_id].state == 'accepted'
+    finally:
+        pending['handle'] = handle
+        _forget_pending_i08_route(authority, handle, request_id)
+        assert await _close_boot(runner, entries) is True
+
+
+@pytest.mark.asyncio
+async def test_i08_route_wake_refuses_missing_pending_root_without_effect(tmp_path, monkeypatch):
+    from gateway.session_automation import admit_route_wake
+    from hermes_state_runtime import RuntimeStoreError
+    from hermes_state_runtime import list_session_admissions
+
+    runner, entries, authority, live, handle, request_id = await _real_pending_i08_route_wake(
+        tmp_path, monkeypatch,
+    )
+    authority._preservation_pending_roots.pop(id(handle), None)
+    try:
+        entry = runner.session_store.lookup_by_session_key(live.route)
+        assert entry is not None
+        before = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
+        with pytest.raises(RuntimeStoreError, match='preservation_owner_mismatch'):
+            await admit_route_wake(
+                runner, runner._adapter_for_source(live.source), live.source,
+                'loop tick', 'loop-tick', _preservation_handle=handle,
+            )
+        after = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
+        assert after == before
+        assert authority._preservation_coordinator()._records[handle.lease.lease_id].state == 'accepted'
+    finally:
+        _forget_pending_i08_route(authority, handle, request_id)
         assert await _close_boot(runner, entries) is True
 
 

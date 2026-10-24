@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+from contextvars import ContextVar
 import os
 import sys
 from pathlib import Path
@@ -644,13 +645,63 @@ def _write_guard_cache_atomic(cache_file: Path, content: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def bind_authority_runtime_custody(runner, authority):
+_LEGACY_HELPER_RESERVED_HOMES: ContextVar[set[Path] | None] = ContextVar(
+    "legacy_helper_reserved_homes", default=None
+)
+
+
+@pytest.fixture(autouse=True)
+def _legacy_helper_profile_lifecycle():
+    """Own exact locks acquired by the legacy authority helper for one test.
+
+    A number of older tests construct a real ``SessionAuthority`` directly and then call
+    ``bind_authority_runtime_custody`` without going through the public bootstrap.  The helper
+    may acquire the missing native profile lock for that test, but it must never make the
+    resolver believe a lock exists or release an unrelated fixture's owner.  A per-test
+    context keeps the acquired set local to the helper call chain, and teardown accepts only the
+    typed ``RELEASED`` result from the same retained owner descriptor.
+    """
+    token = _LEGACY_HELPER_RESERVED_HOMES.set(set())
+    try:
+        yield
+    finally:
+        homes = tuple(_LEGACY_HELPER_RESERVED_HOMES.get() or ())
+        failures = []
+        try:
+            if homes:
+                from gateway.runtime_ownership import ProfileReleaseOutcome, process_ownership
+
+                for home in reversed(homes):
+                    outcome = process_ownership.release_outcome(home)
+                    if outcome is not ProfileReleaseOutcome.RELEASED:
+                        failures.append(f"{home}: {outcome.value}")
+        finally:
+            _LEGACY_HELPER_RESERVED_HOMES.reset(token)
+        if failures:
+            raise RuntimeError(
+                "legacy helper profile cleanup was not proven: " + ", ".join(failures)
+            )
+
+
+def bind_authority_runtime_custody(runner, authority, *, require_physical_ownership=False):
     """Bind a real authority's epoch and identity to the test runner's custody seam."""
     from pathlib import Path
 
     from gateway.runtime_custody import install_runtime_custody
+    from gateway.runtime_ownership import canonical_home, process_ownership
 
-    home = str(Path(authority.db.db_path).resolve().parent)
+    home_path = Path(authority.db.db_path).resolve().parent
+    owned_home = canonical_home(home_path)
+    homes = _LEGACY_HELPER_RESERVED_HOMES.get()
+    if homes is not None and owned_home not in process_ownership.homes:
+        process_ownership.reserve([owned_home])
+        homes.add(owned_home)
+    if require_physical_ownership:
+        from gateway.runtime_custody_profiles import ProfileScopeResolver
+
+        if ProfileScopeResolver._physical_owner(home_path) is None:
+            raise RuntimeError("legacy API fixture requires the exact retained profile owner")
+    home = str(home_path)
     descriptor = dict(getattr(runner, 'session_runtime_descriptor', None) or {})
     descriptor.update({
         'instance_id': authority.instance_id,
@@ -660,6 +711,22 @@ def bind_authority_runtime_custody(runner, authority):
     })
     runner.session_runtime_descriptor = descriptor
     return install_runtime_custody(runner)
+
+
+@pytest.fixture
+def reserved_gateway_profile_home(tmp_path):
+    """Hold one exact native profile lock for a legacy API fixture."""
+    from gateway.runtime_ownership import ProfileReleaseOutcome, process_ownership
+
+    home = (tmp_path / "api-profile").resolve()
+    home.mkdir(mode=0o700)
+    process_ownership.reserve([home])
+    try:
+        yield home
+    finally:
+        outcome = process_ownership.release_outcome(home)
+        if outcome is not ProfileReleaseOutcome.RELEASED:
+            raise RuntimeError(f"legacy API profile cleanup was not proven: {outcome.value}")
 
 
 def _api_runtime_cleanup_readback(adapter, runner):

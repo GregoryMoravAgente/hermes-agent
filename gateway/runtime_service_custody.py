@@ -11,10 +11,13 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import hashlib
 import sqlite3
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from gateway.runtime_custody import CustodyHandle, CustodyRefusal, RuntimeCustodyCoordinator
 from gateway.runtime_sidecar_transport import required_reader_streams
+
+if TYPE_CHECKING:
+    from gateway.runtime_service_physical import ServiceProcessReceipt
 
 
 class ServiceCustodyError(RuntimeError):
@@ -398,9 +401,6 @@ def _canonical_store_path(authority: Any) -> str:
     if path is None:
         raise ServiceCustodyError("durable_store_identity_missing")
     return path
-
-
-from gateway.runtime_service_physical import ServiceProcessReceipt
 
 
 @dataclass
@@ -996,6 +996,7 @@ class ServiceLease:
         )
         if isinstance(handle, CustodyRefusal):
             raise ServiceCustodyError(handle.code)
+        from gateway.runtime_service_physical import ServiceProcessReceipt
         receipt = ServiceProcessReceipt(self, handle, f"{self.owner_id}:physical")
         self.physical = receipt
         registry = getattr(self.coordinator, "_i16_source_registry", None)
@@ -1027,6 +1028,7 @@ class ServiceLease:
         )
         if isinstance(handle, CustodyRefusal):
             raise ServiceCustodyError(handle.code)
+        from gateway.runtime_service_physical import ServiceProcessReceipt
         self.physical = ServiceProcessReceipt(self, handle, f"{self.owner_id}:physical")
         registry = getattr(self.coordinator, "_i16_source_registry", None)
         if registry is not None:
@@ -1072,6 +1074,7 @@ class ServiceLease:
         )
         if isinstance(handle, CustodyRefusal):
             raise ServiceCustodyError(handle.code)
+        from gateway.runtime_service_physical import ServiceProcessReceipt
         self.physical = ServiceProcessReceipt(self, handle, f"{self.owner_id}:physical")
         registry = getattr(self.coordinator, "_i16_source_registry", None)
         if registry is not None:

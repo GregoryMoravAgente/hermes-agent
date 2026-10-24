@@ -18,6 +18,7 @@ from gateway.session_classic_callback_waiters import (
     _classic_callback_waiter_slot,
 )
 from gateway.session_classic_graph_witness import graph_direct_native_row
+from gateway.session_recovery_native_binding import i10_native_recovery_row_is_bound
 
 
 logger = logging.getLogger(__name__)
@@ -1360,6 +1361,8 @@ def classic_callback_requirement(authority, admission_id, *, delivery_receipt=No
         if not _callback_row_matches(authority, row, handle, record, admission_id):
             return CLASSIC_CALLBACK_UNKNOWN
         return CLASSIC_CALLBACK_REQUIRED
+    if i10_native_recovery_row_is_bound(authority, row, consumer='startup'):
+        return CLASSIC_CALLBACK_NOT_REQUIRED
     from gateway.session_classic_custody import classic_row_is_direct
     if classic_row_is_direct(row):
         return CLASSIC_CALLBACK_REQUIRED if matched is not None else CLASSIC_CALLBACK_UNKNOWN

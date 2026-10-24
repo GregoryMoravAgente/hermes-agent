@@ -955,6 +955,54 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
+def _source_owned_route_wake_request_id(authority, handle):
+    """Read the request identity from an existing source-owned root or binding.
+
+    The pending-root dictionary is a mutable handoff cache, so it cannot authenticate its own
+    ``request_id``.  The coordinator record first authenticates the exact handle; then an already
+    bound descriptor/row supplies the typed request identity.  Before a durable row exists, the
+    source-owned root index is the only existing root-registration seam, and it must contain one
+    exact key for this handle.  No owner-id string parsing or caller-supplied identity is used.
+    """
+    if getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES:
+        return None
+    coordinator_getter = getattr(authority, '_preservation_coordinator', None)
+    coordinator = coordinator_getter() if callable(coordinator_getter) else None
+    records = getattr(coordinator, '_records', None)
+    lease_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+    record = records.get(lease_id) if isinstance(records, dict) else None
+    if record is None or getattr(record, 'handle', None) is not handle:
+        return None
+
+    binding_ids = []
+    bindings = getattr(authority, '_preservation_automation_bindings', None)
+    if isinstance(bindings, dict):
+        for binding in bindings.values():
+            if not isinstance(binding, dict) or binding.get('handle') is not handle:
+                continue
+            values = []
+            for container in (binding.get('descriptor'), binding.get('row')):
+                if not isinstance(container, dict) or 'request_id' not in container:
+                    return None
+                value = container.get('request_id')
+                if type(value) is not str or not value:
+                    return None
+                values.append(value)
+            if len(set(values)) != 1:
+                return None
+            binding_ids.append(values[0])
+    if binding_ids:
+        return binding_ids[0] if len(set(binding_ids)) == 1 else None
+
+    roots = getattr(authority, '_preservation_automation_roots', None)
+    if not isinstance(roots, dict):
+        return None
+    matches = [key for key, candidate in roots.items() if candidate is handle]
+    if len(matches) != 1 or type(matches[0]) is not str or not matches[0]:
+        return None
+    return matches[0]
+
+
 async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *,
                            _preservation_handle=None):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
@@ -968,7 +1016,32 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     entry = runner.session_store.lookup_by_session_key(key) if authority is not None else None
     if authority is None or entry is None:
         return False
-    identity = route_wake_identity(producer, key, text, metadata)
+    if _preservation_handle is None:
+        identity = route_wake_identity(producer, key, text, metadata)
+    else:
+        # A reserved I08/I07/I09 root already carries the source-issued request identity.  The
+        # route-wake digest is the producer's display identity, not a replacement for that
+        # pending lease tuple.  Reusing it with the retained handle makes strict pending-root
+        # validation fail (and, worse, invites callers to relax the tuple check).  Require the
+        # exact live pending root instead; missing, foreign, copied, and tampered roots remain a
+        # typed refusal before any payload or durable row is built.
+        pending_roots = getattr(authority, '_preservation_pending_roots', None)
+        pending = (
+            pending_roots.get(id(_preservation_handle))
+            if isinstance(pending_roots, dict) else None
+        )
+        source_request_id = _source_owned_route_wake_request_id(
+            authority, _preservation_handle,
+        )
+        identity = (
+            source_request_id
+            if (isinstance(pending, dict)
+                    and pending.get('handle') is _preservation_handle
+                    and pending.get('request_id') == source_request_id)
+            else None
+        )
+        if type(identity) is not str or not identity:
+            raise RuntimeStoreError('preservation_owner_mismatch')
     if source.platform == Platform.LOCAL:
         # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
         # the live session's own source object (``snapshot_local_automation`` checks identity).

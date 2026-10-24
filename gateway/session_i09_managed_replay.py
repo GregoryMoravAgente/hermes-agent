@@ -16,6 +16,16 @@ _PAYLOAD_FIELDS = frozenset({
     'text', 'finite', 'kanban_card_v1', '_automation_custody_v1', MANAGED_WORKER_FIELD,
 })
 
+_BUSINESS_PAYLOAD_FIELDS = ('text', 'finite', 'kanban_card_v1')
+
+
+def _business_payload(payload):
+    return {
+        key: payload[key]
+        for key in _BUSINESS_PAYLOAD_FIELDS
+        if key in payload
+    }
+
 
 def _check_kanban_card(source_identity, request_id, card):
     if card is None:
@@ -86,8 +96,11 @@ async def prepare_i09_payload(authority, ref, request_id, payload, handle, *,
         replay = _validate_replay_payload(
             authority, ref, existing, descriptor=descriptor, handle=handle,
             source_identity=source_identity, delivery_id=delivery_id)
-        if existing['status'] != 'terminal' and not managed:
-            raise RuntimeStoreError('managed_producer_binding_missing')
+        requested = dict(payload)
+        if kanban_card is not None:
+            requested['kanban_card_v1'] = dict(kanban_card)
+        if _business_payload(replay) != _business_payload(requested):
+            raise RuntimeStoreError('admission_conflict')
         return replay
     durable_payload = dict(payload)
     if kanban_card is not None:

@@ -9,7 +9,7 @@ import pytest
 
 
 def test_bare_posix_process_group_is_not_native_empty_proof() -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
 
     service = SimpleNamespace(unknown=False, coordinator=SimpleNamespace())
     handle = SimpleNamespace(owner_id="shell", owner_class="I16_turn_sidecars")

@@ -274,7 +274,7 @@ async def test_public_shell_reservation_refusal_reconciles_exact_owner_to_comple
     coordinator = authority._preservation_coordinator()
     from agent import shell_hook_custody
     from gateway import runtime_service_custody
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway.runtime_custody import CustodyRefusal
 
     refused = False

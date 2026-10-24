@@ -240,35 +240,29 @@ def test_external_worker_refuses_to_run_without_durable_ownership(
 
 
 def _stub_external_worker_launch(scheduler, monkeypatch):
-    """Fake Popen that acks the handoff and reports running -> completed.
+    """A Popen-backed handoff double that acks and reports running -> completed.
 
     Returns ``(spawned, payloads, handoff, get)`` for the caller's assertions.
     """
 
-    class FakeProcess:
-        returncode = None
-
-        def poll(self):
-            return self.returncode
-
-        def wait(self, timeout=None):
-            if self.returncode is None:
-                raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
-            return self.returncode
-
     spawned = []
     payloads = []
+    real_popen = subprocess.Popen
 
     def popen(command, **kwargs):
-        spawned.append((command, kwargs))
+        # Keep the scheduler's process object and its PID authoritative.  The
+        # ACK's PID is deliberately copied from this real Popen below; tests
+        # that exercise a foreign ACK use a separate, mismatched value.
+        process = real_popen([sys.executable, "-c", "pass"])
+        spawned.append((command, kwargs, process))
         payload_index = command.index("--external-worker-file") + 1
         payloads.append(json.loads(Path(command[payload_index]).read_text()))
         ack_index = command.index("--ack-file") + 1
         Path(command[ack_index]).write_text(
-            json.dumps({"pid": 4321, "execution_id": "exec-1"}),
+            json.dumps({"pid": process.pid, "execution_id": "exec-1"}),
             encoding="utf-8",
         )
-        return FakeProcess()
+        return process
 
     handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
     monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
@@ -470,9 +464,9 @@ def test_launch_external_worker_honors_ack_within_adoption_grace(
     monkeypatch.setattr(scheduler, "_running_worker_pids", {})
 
     assert scheduler._launch_external_cron_worker(job) is True
-    # The acknowledged path records the worker pid; the ownership-uncertain
-    # timeout path never does.
-    assert scheduler._running_worker_pids == {scheduler._inflight_key("job-cold"): 4321}
+    # The acknowledged path records the Popen identity; the ownership-uncertain
+    # timeout path never does.  An ACK number is not an ownership source.
+    assert scheduler._running_worker_pids == {scheduler._inflight_key("job-cold"): 999}
 
 
 def test_worker_dying_before_ack_names_its_stderr_cause(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import threading
 import weakref
@@ -629,6 +630,18 @@ def _assert_external_worker_physical_ownership(binding):
             assert proof["worker_job_membership"] == "transitive_no_breakaway_ancestry"
 
 
+def _assert_selected_worker_wait(captured, binding):
+    """Keep native wait proof mandatory where the real source launches an external worker."""
+    if os.name == "nt" or binding.child is not None:
+        assert len(captured.wait_admissions) == 1
+        assert captured.wait_admissions[0] is not None
+    else:
+        # POSIX may execute the managed body inline. There is no external Popen wait in that
+        # topology; the original terminal I12/ledger/body assertions below remain mandatory.
+        assert binding.child is None
+        assert captured.wait_admissions == []
+
+
 @pytest.mark.asyncio
 async def test_public_scheduler_tick_runs_managed_agent_and_releases_i12(
     runtime_owned_api_owner, monkeypatch, request,
@@ -654,9 +667,8 @@ async def test_public_scheduler_tick_runs_managed_agent_and_releases_i12(
             timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
         ) == 1
         assert len(captured) == 1
-        assert len(captured.wait_admissions) == 1
-        assert captured.wait_admissions[0] is not None
         binding = captured[0]
+        _assert_selected_worker_wait(captured, binding)
         from tests.waiting import async_wait_until
 
         await async_wait_until(
@@ -716,9 +728,8 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
         ) is True
 
     assert len(captured) == 1
-    assert len(captured.wait_admissions) == 1
-    assert captured.wait_admissions[0] is not None
     binding = captured[0]
+    _assert_selected_worker_wait(captured, binding)
     await _await_public_fire_custody_settlement(binding, deadline)
     record = _assert_terminal_i12(
         binding, job, executions, coordinator, owner_classes_before,

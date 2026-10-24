@@ -27,6 +27,7 @@ import ntpath
 import os
 import shutil
 import subprocess
+import time
 from collections.abc import Mapping
 
 from pm import paths
@@ -90,29 +91,42 @@ def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list
     return list(dict.fromkeys(candidates))
 
 
-def _bash_starts(candidate: str) -> bool:
+_PROBE_TIMEOUT = 5.0
+
+
+def _bash_starts(candidate: str, timeout: float = _PROBE_TIMEOUT) -> bool:
     """An existing bash.exe can still be broken or be a launcher stub."""
     try:
         return subprocess.run(
             [candidate, "-c", "exit 0"], stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             check=False,
         ).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
 
-def bash() -> str | None:
-    """Resolve the bash binary to use, or None if none is available."""
+def bash(deadline: float | None = None) -> str | None:
+    """Resolve the bash binary to use, or None if none is available.
+
+    ``deadline`` (a ``time.monotonic()`` value) is for callers with their own time budget, such as
+    cron scripts: each start probe gets at most the remaining time and none runs once it is spent,
+    so several broken installs cannot block past it."""
+    def starts(candidate: str) -> bool:
+        if deadline is None:
+            return _bash_starts(candidate)
+        remaining = deadline - time.monotonic()
+        return remaining > 0 and _bash_starts(candidate, min(_PROBE_TIMEOUT, remaining))
+
     staged = _staged_bash()
-    if staged and _bash_starts(staged):
+    if staged and starts(staged):
         return staged
 
     on_path = shutil.which("bash")
     if os.name == "nt":
         return next((c for c in windows_bash_candidates(on_path, os.environ)
-                     if os.path.isfile(c) and _bash_starts(c)), None)
+                     if os.path.isfile(c) and starts(c)), None)
     if on_path:
         return on_path
 

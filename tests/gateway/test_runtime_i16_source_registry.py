@@ -21,9 +21,9 @@ from gateway.runtime_service_custody import (
     DurableResultProof,
     ServiceCustodyError,
     ServiceLease,
-    ServiceProcessReceipt,
     service_for_external_parent,
 )
+from gateway.runtime_service_physical import ServiceProcessReceipt
 from hermes_cli.backend_retirement import RetirementFence
 
 

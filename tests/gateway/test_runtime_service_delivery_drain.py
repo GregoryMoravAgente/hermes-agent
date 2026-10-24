@@ -98,7 +98,7 @@ class _Coordinator:
 
 
 def _receipt(transaction: object, *, delivery: bool = False):
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
 
     coordinator = _Coordinator()
     handle = SimpleNamespace(

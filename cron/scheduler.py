@@ -3940,6 +3940,34 @@ def _recover_transferred_worker_handoff(
     wait and release; a synchronous wait failure is logged and re-raised as a
     typed error so the caller can preserve the existing bookkeeping path.
     """
+    wait_context = getattr(handoff_error, "wait_context", None)
+    if isinstance(wait_context, dict) and wait_context.get("legacy_unmanaged"):
+        # A standalone worker has no native custody object, but an ACK/read/release race can
+        # still leave its exact Popen and durable row in flight.  The admission context has
+        # already exited by the time the caller reaches this recovery hook; wait under the
+        # original profile without rediscovering a lock or minting a replacement owner.
+        try:
+            from cron.scheduler_provider import _profile_cron_scope
+
+            home = getattr(admission, "home", None)
+            profile_scope = (
+                _profile_cron_scope(home)
+                if home is not None else contextlib.nullcontext()
+            )
+            with profile_scope:
+                _wait_for_external_cron_worker(
+                    process=wait_context["process"],
+                    execution_id=wait_context["execution_id"],
+                    job_id=wait_context["job_id"],
+                    handoff_files=wait_context["handoff_files"],
+                    stderr_path=wait_context["stderr_path"],
+                    custody=None,
+                    dispatch_mode=wait_context["dispatch_mode"],
+                    admission=None,
+                )
+        except Exception as wait_error:
+            raise _ExternalWorkerPostHandoffWaitError(wait_error) from wait_error
+        return False
     # Once the exact worker reaper has retained the accepted lease, its registry-owned
     # settlement consumer—not the transferred-lock retry—owns the continuation.  The
     # jobs lock is already detached; entering the old retry path would either refuse or
@@ -4062,6 +4090,51 @@ def _wait_for_external_cron_worker(
             custody.observe_terminal()
 
 
+def _legacy_unmanaged_exit_requires_wait(
+    worker_custody, *, dispatch, worker_env: dict[str, str],
+) -> bool:
+    """Use the legacy waiter for an unmanaged child that exited before its ACK.
+
+    A scoped dispatch that lost its user bus is a launcher failure, not an adopted
+    worker.  Every other unmanaged exit still needs the exact Popen/ledger waiter;
+    this small predicate keeps that distinction out of the handoff state machine.
+    """
+    if worker_custody is not None:
+        return False
+    from tools.process_registry import scoped_spawn_lost_user_bus
+
+    return not (
+        dispatch.mode == "scoped"
+        and scoped_spawn_lost_user_bus(worker_env)
+    )
+
+
+def _legacy_pre_ack_exit_error(
+    wait_error: BaseException,
+    *,
+    process: subprocess.Popen,
+    execution_id: str,
+    stderr_tail: str,
+) -> Optional[_ExternalWorkerPostHandoffError]:
+    """Restore the direct-launch error only when no durable row exists.
+
+    A real handoff row must stay in the uncertain-owner waiter, even when its child
+    dies before publishing an ACK.  The legacy unit seam has a handoff marker but no
+    ledger row; only that proven no-row case may retain the historical stderr-rich
+    dispatch error.
+    """
+    try:
+        current = get_execution(execution_id)
+    except (OSError, sqlite3.Error):
+        return None
+    if current is not None:
+        return None
+    return _ExternalWorkerPostHandoffError(
+        "cron external worker exited before ownership acknowledgement "
+        f"(exit {process.poll()}){stderr_tail}"
+    )
+
+
 def _await_external_worker_handoff(
     process: subprocess.Popen, *, execution_id: str, job_id: str,
     payload_path: Path, ack_path: Path, stderr_path: Path, worker_custody,
@@ -4073,6 +4146,105 @@ def _await_external_worker_handoff(
     # a dispatch deadline shorter than the adoption grace made the two guards
     # around one handoff disagree.
     deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
+
+    def _legacy_wait_after_uncertain_handoff(
+        message: str, *, acknowledgement: Optional[dict] = None, cause=None,
+        pre_ack_exit: bool = False,
+    ) -> bool:
+        """Wait on the exact unmanaged child after every ambiguous handoff outcome."""
+        wait_context = {
+            "legacy_unmanaged": True,
+            "process": process,
+            "execution_id": execution_id,
+            "job_id": job_id,
+            "handoff_files": (payload_path, ack_path, stderr_path),
+            "stderr_path": stderr_path,
+            "custody": None,
+            "dispatch_mode": dispatch.mode,
+            "pre_ack_exit": pre_ack_exit,
+        }
+        if worker_custody is not None:
+            error = _ExternalWorkerPostHandoffError(message)
+            if cause is not None:
+                raise error from cause
+            raise error
+        if acknowledgement is not None:
+            # The ACK execution identity was checked above.  The spawned Popen is the only
+            # physical identity available in this deliberately unmanaged legacy lane; never
+            # turn an arbitrary ACK pid into an ownership proof or diagnostic owner.
+            _record_external_cron_worker(
+                job_id,
+                process.pid,
+                scope_isolated=dispatch.mode == "scoped",
+            )
+        current_admission = admission
+        released_status = None
+        if current_admission is not None:
+            try:
+                released = current_admission.release_after_handoff_retry()
+                released_status = getattr(released, "status", None)
+            except Exception as release_error:
+                error = _ExternalWorkerPostHandoffError(
+                    message,
+                    admission=current_admission,
+                    wait_context=wait_context,
+                )
+                raise error from release_error
+            if released_status != "released":
+                error = _ExternalWorkerPostHandoffError(
+                    message,
+                    admission=current_admission,
+                    wait_context=wait_context,
+                )
+                raise error
+        legacy_stderr_tail = ""
+        if pre_ack_exit:
+            from cron.scheduler_diagnostics import external_worker_stderr_tail
+
+            legacy_stderr_tail = external_worker_stderr_tail(stderr_path)
+        try:
+            return _wait_for_external_cron_worker(
+                process,
+                execution_id=execution_id,
+                job_id=job_id,
+                handoff_files=(payload_path, ack_path, stderr_path),
+                stderr_path=stderr_path,
+                custody=None,
+                dispatch_mode=dispatch.mode,
+                admission=None,
+            )
+        except _ExternalWorkerPostHandoffError as wait_error:
+            if pre_ack_exit:
+                # The legacy direct-launch contract names an observed pre-ACK
+                # exit and includes the worker's stderr.  A fixture may have a
+                # handoff marker without a durable execution row; in that case
+                # the generic adopted-worker reason would erase that evidence.
+                legacy_error = _legacy_pre_ack_exit_error(
+                    wait_error,
+                    process=process,
+                    execution_id=execution_id,
+                    stderr_tail=legacy_stderr_tail,
+                )
+                if legacy_error is not None:
+                    raise legacy_error from wait_error
+            # A successful release means this legacy wait owns no remaining admission
+            # state.  Do not hand the already-released lease back to run_one_job: that
+            # would enter _recover_transferred_worker_handoff, observe the same dead
+            # process a second time after the first wait terminalized the row, and
+            # replace the first stderr-rich error with the generic exit reason.
+            if current_admission is not None and released_status != "released":
+                wait_error.admission = current_admission
+                wait_error.wait_context = wait_context
+            raise
+        except Exception as wait_error:
+            if current_admission is not None and released_status != "released":
+                raise _ExternalWorkerPostHandoffError(
+                    message,
+                    admission=current_admission,
+                    wait_context=wait_context,
+                ) from wait_error
+            raise
+
     while time.monotonic() < deadline:
         if ack_path.exists():
             try:
@@ -4091,15 +4263,17 @@ def _await_external_worker_handoff(
                         ack_path,
                         exc_info=True,
                     )
-                raise _ExternalWorkerPostHandoffError(
-                    "external worker acknowledgement could not be authenticated"
-                ) from read_error
+                return _legacy_wait_after_uncertain_handoff(
+                    "external worker acknowledgement could not be authenticated",
+                    cause=read_error,
+                )
             try:
                 ack_path.unlink(missing_ok=True)
             except OSError as cleanup_error:
-                raise _ExternalWorkerPostHandoffError(
-                    "external worker acknowledgement cleanup failed"
-                ) from cleanup_error
+                return _legacy_wait_after_uncertain_handoff(
+                    "external worker acknowledgement cleanup failed",
+                    cause=cleanup_error,
+                )
             if (
                 not isinstance(acknowledgement, dict)
                 or acknowledgement.get("execution_id") != execution_id
@@ -4109,11 +4283,13 @@ def _await_external_worker_handoff(
                     "treating handoff as ownership-uncertain",
                     execution_id,
                 )
-                raise _ExternalWorkerPostHandoffError(
+                return _legacy_wait_after_uncertain_handoff(
                     "external worker acknowledgement identity mismatch")
             if worker_custody is None:
-                raise _ExternalWorkerPostHandoffError(
-                    "external worker handoff has no native custody binding")
+                return _legacy_wait_after_uncertain_handoff(
+                    "external worker handoff has no native custody binding",
+                    acknowledgement=acknowledgement,
+                )
             if getattr(admission, "source_key", None) != "worker" or (
                 getattr(admission, "parent", None) is not getattr(worker_custody, "parent", None)
             ):
@@ -4206,6 +4382,13 @@ def _await_external_worker_handoff(
                 # lane; the pre-handoff failure path is only valid for a still-claimed pending row.
                 raise _ExternalWorkerPostHandoffError(
                     "external worker exited before authenticated ownership acknowledgement")
+            if _legacy_unmanaged_exit_requires_wait(
+                worker_custody, dispatch=dispatch, worker_env=worker_env,
+            ):
+                return _legacy_wait_after_uncertain_handoff(
+                    "external worker exited before authenticated ownership acknowledgement",
+                    pre_ack_exit=True,
+                )
             from cron.scheduler_diagnostics import external_worker_stderr_tail
             stderr_tail = external_worker_stderr_tail(stderr_path)
             stderr_path.unlink(missing_ok=True)
@@ -4235,9 +4418,13 @@ def _await_external_worker_handoff(
         job_id,
         HANDOFF_ADOPTION_GRACE_SECONDS,
     )
-    # The child may already have adopted the row even though its ACK was late.
-    # Leave the exact owner in the post-handoff unknown lane, but first exit the
-    # admission context so its strict jobs lock cannot block that child.
+    # The child may already have adopted the row even though its ACK was late.  In the
+    # unmanaged lane, release the strict admission and let the existing waiter preserve the
+    # same Popen/row until terminalization; a managed lane keeps its existing typed error path.
+    if worker_custody is None:
+        return _legacy_wait_after_uncertain_handoff(
+            "external worker acknowledgement timed out before authenticated lock handoff"
+        )
     raise _ExternalWorkerPostHandoffError(
         "external worker acknowledgement timed out before authenticated lock handoff"
     )

@@ -3,6 +3,7 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from types import SimpleNamespace
 
 import jwt
@@ -82,7 +83,11 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False)
-    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='first')
+    # SessionStore resolves its SQLite handle through the active Hermes home.  Bind the
+    # authority to the actual DB parent rather than the fixture's logical scratch directory;
+    # the production scope resolver intentionally rejects an alias that does not own that DB.
+    profile_home = Path(store._db.db_path).resolve().parent
+    authority = await initialize_session_authority(runner, profile_id=str(profile_home), instance_id='first')
     bind_authority_runtime_custody(runner, authority)
 
     async def actor(session):
@@ -121,7 +126,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     assert _principal_digest({'provider': oauth.provider, 'issuer': oauth.issuer, 'user_id': oauth.user_id}) != _principal_digest(
         {'provider': oauth.provider, 'issuer': oauth.issuer + '/other', 'user_id': oauth.user_id})
     runner.adapters = {}
-    cold = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='second')
+    cold = await initialize_session_authority(runner, profile_id=str(profile_home), instance_id='second')
     bind_authority_runtime_custody(runner, cold)
     reconnect = await actor(oidc('user-a'))
     assert create_local_session(cold, reconnect, params) == ref

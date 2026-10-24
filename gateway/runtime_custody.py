@@ -22,7 +22,11 @@ from hermes_cli.backend_retirement import (
     retirement,
 )
 from hermes_state_runtime import RuntimeStoreError
-from gateway.runtime_custody_profiles import ProfileScopeResolver, ProfileScopeResult
+from gateway.runtime_custody_profiles import (
+    ProfileScopeResolver,
+    ProfileScopeResult,
+    bind_profile_scope_if_empty,
+)
 from gateway.runtime_custody_i17 import I17PreparedChildCustodyMixin
 from gateway.runtime_native_cleanup import (
     NativeCleanupCapability,
@@ -1867,6 +1871,15 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
             and existing._runtime_custody_registry is not registry
         ):
             raise RuntimeStoreError("runtime_custody_binding_collision")
+        # A coordinator created before any profile authority has no live scope resolver.  Bind
+        # one only through the coordinator's source-owned empty transition; an existing lease or
+        # close cannot be retrofitted and must remain under the old unscoped custody object.
+        if (
+            getattr(existing, "_profile_scope", None) is None
+            and (registry is not None or getattr(runner, "session_authority", None) is not None)
+            and not bind_profile_scope_if_empty(existing, runner)
+        ):
+            raise RuntimeStoreError("runtime_custody_binding_collision")
         bound_authorities = getattr(existing, "_runtime_custody_authorities", ())
         if any(
             not any(previous is current for current in authorities)
@@ -1888,7 +1901,11 @@ def install_runtime_custody(runner) -> RuntimeCustodyCoordinator:
         coordinator = RuntimeCustodyCoordinator(
             process_instance=descriptor.get("instance_id", ""),
             authority_epoch=descriptor.get("authority_epoch", 0),
-            profile_scope=ProfileScopeResolver(runner) if registry is not None else None,
+            profile_scope=(
+                ProfileScopeResolver(runner)
+                if registry is not None or getattr(runner, "session_authority", None) is not None
+                else None
+            ),
         )
     runner.runtime_custody = coordinator
     for authority in authorities:

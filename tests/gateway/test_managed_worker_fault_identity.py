@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.runtime_service_custody import ServiceProcessReceipt
+from gateway.runtime_service_physical import ServiceProcessReceipt
 
 
 class _Coordinator:

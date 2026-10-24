@@ -15,13 +15,13 @@ from hermes_state import SessionDB
 
 
 @pytest.fixture
-def session_db(tmp_path, monkeypatch):
+def session_db(reserved_gateway_profile_home, monkeypatch):
     # The process-registry scope fence authenticates the actual profile home.  Keep this
     # legacy fixture on its temporary profile so the real I03 process-custody path can open
     # and close the same scope; this is the supported pre-authority test topology, not a
     # synthetic owner flag.
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    db = SessionDB(tmp_path / "state.db")
+    monkeypatch.setenv("HERMES_HOME", str(reserved_gateway_profile_home))
+    db = SessionDB(reserved_gateway_profile_home / "state.db")
     try:
         yield db
     finally:
@@ -77,7 +77,9 @@ def _bind_session_adapter_runtime(adapter, session_db):
     )
     runner.session_authority = authority
     runner._adapter_for_source = lambda _source: adapter
-    coordinator = bind_authority_runtime_custody(runner, authority)
+    coordinator = bind_authority_runtime_custody(
+        runner, authority, require_physical_ownership=True,
+    )
     # Full gateway bootstrap binds the singleton process registry to this same coordinator;
     # retain that production seam for the explicit legacy fixture after authority routing is
     # cleared below.

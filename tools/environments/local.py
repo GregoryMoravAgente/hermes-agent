@@ -540,13 +540,14 @@ def restore_managed_env(env: dict) -> dict:
 
 
 # --- Shell discovery ---
-def _find_bash() -> str:
+def _find_bash(deadline: float | None = None) -> str:
     """Resolve the shell Hermes runs commands with. Owned by pm (the store
     is the authority on bundled bash); this is a thin wrapper over
-    pm.shell() for callers that need a bash binary."""
+    pm.shell() for callers that need a bash binary. ``deadline``: see
+    ``pm.shell.bash``."""
     import pm.shell
 
-    bash = pm.shell.bash()
+    bash = pm.shell.bash(deadline)
     if bash:
         return bash
     raise RuntimeError(

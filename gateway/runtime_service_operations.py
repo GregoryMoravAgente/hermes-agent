@@ -1152,7 +1152,7 @@ def reserve_physical(parent: ExternalProcessParent):
     if parent.turn_binding is not None:
         receipt = service.reserve_physical(parent.turn_binding)
     else:
-        from gateway.runtime_service_custody import ServiceProcessReceipt
+        from gateway.runtime_service_physical import ServiceProcessReceipt
         handle = _reserve_root(
             parent.coordinator, f"{parent.operation_id}:physical", profile_id=parent.profile_id,
             authority_epoch=parent.authority_epoch, parent=parent.root_handle,

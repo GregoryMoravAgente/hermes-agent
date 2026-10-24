@@ -35,6 +35,7 @@ env:
   ANTHROPIC_API_KEY: ''
   FAL_KEY: ''
   HERMES_TEST_FILE_RETRIES: '0'
+  HERMES_E2E_STRICT_ACCEPTANCE: '1'
   NATIVE_CUSTODY_FILES: |
     tests/tools/test_process_registry_windows_custody.py
     tests/tools/test_process_registry_native_scope_retry.py
@@ -91,6 +92,14 @@ env:
     tests/gateway/test_runtime_native_cleanup_sources.py
     tests/gateway/test_runtime_native_cleanup_profile.py
     tests/cron/test_cron_lock_handoff.py
+    tests/agent/test_subdirectory_hints.py
+    tests/agent/test_prompt_builder.py
+    tests/agent/test_context_references.py
+    tests/cron/test_cron_script.py
+    tests/tools/test_find_shell.py
+    tests/tools/test_windows_native_support.py
+    tests/e2e/core/windows/test_prompt_paths.py
+    tests/e2e/core/windows/test_cron_scripts.py
 
 jobs:
   native-custody:
@@ -251,13 +260,17 @@ jobs:
             stdout_native="$PROOF_NATIVE/rows/$stdout_name"
             event_native="$PROOF_NATIVE/rows/$event_name"
             junit_native="$PROOF_NATIVE/rows/$junit_name"
+            runner_options=()
+            case "$file" in
+              tests/e2e/core/windows/*) runner_options+=(--include-integration) ;;
+            esac
             set +e
             "$HERMES_PYTHON" "$REPO_NATIVE/scripts/ci/windows_native_custody.py" \
               --receipt "$event_native" \
               --stdout "$stdout_native" \
               --junit "$junit_native" \
               --outer-timeout 600 \
-              -- "$BASH_NATIVE" scripts/run_tests.sh -j 1 --file-timeout 300 --file-retries=0 \
+              -- "$BASH_NATIVE" scripts/run_tests.sh "${runner_options[@]}" -j 1 --file-timeout 300 --file-retries=0 \
               "$file" -- -v --tb=long -s "--junitxml=$junit_native"
             code=$?
             set -e
@@ -457,6 +470,33 @@ jobs:
               fault_parse_error = type(error).__name__
           required_faults_passed = all(fault_outcomes.get(name) == ["passed"] for name in required_fault_cases)
 
+          required_owner_cases = {
+              "tests/e2e/core/windows/test_prompt_paths.py": [
+                  "test_subdirectory_hint_reaches_model[native-backslash]",
+                  "test_agents_chain_labels_are_os_independent",
+                  "test_folder_reference_header_uses_one_separator",
+              ],
+              "tests/e2e/core/windows/test_cron_scripts.py": ["test_sh_script_job_runs_under_git_bash"],
+              "tests/tools/test_windows_native_support.py": ["test_real_windows_resolver_returns_a_non_stub_bash"],
+          }
+          owner_outcomes = {}
+          owner_parse_errors = {}
+          for file_name, required_names in required_owner_cases.items():
+              path = proof / "rows" / (file_name.replace("/", "__") + ".junit.xml")
+              outcomes = {}
+              try:
+                  for case in ET.parse(path).getroot().iter("testcase"):
+                      name = case.get("name")
+                      if name in required_names:
+                          outcomes.setdefault(name, []).append(next((kind for kind in ("failure", "error", "skipped") if case.find(kind) is not None), "passed"))
+              except (OSError, ET.ParseError) as error:
+                  owner_parse_errors[file_name] = type(error).__name__
+              owner_outcomes[file_name] = outcomes
+          required_owner_cases_passed = all(
+              owner_outcomes[file_name].get(name) == ["passed"]
+              for file_name, names in required_owner_cases.items() for name in names
+          )
+
           rows = [validate_row(row, proof / "rows") for row in read_rows(proof / "results.tsv")]
           seam_rows = read_rows(proof / "product-seam.tsv")
           seam = validate_row(seam_rows[0], proof) if len(seam_rows) == 1 else {"valid": False, "reason": "missing-product-seam-row"}
@@ -471,7 +511,7 @@ jobs:
           autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
           receipt = {
               "schema": "windows-native-custody-pr-v2",
-              "qualification_scope": "original38-and-joined55-regressions-r23",
+              "qualification_scope": "original38-and-joined63-owner-regressions-r24",
               "full_native38_qualification": False,
               "whole_source_pm_base_tools_unchanged": whole_environment_equal,
               "whole_source_file_count": len(environment_before["source"]),
@@ -504,6 +544,10 @@ jobs:
                   "required_native_fault_outcomes": fault_outcomes,
                   "native_fault_junit_error": fault_parse_error,
                   "all_required_native_fault_cases_passed": required_faults_passed,
+                  "required_owner_fix_cases": required_owner_cases,
+                  "required_owner_fix_outcomes": owner_outcomes,
+                  "owner_fix_junit_errors": owner_parse_errors,
+                  "all_required_owner_fix_cases_passed": required_owner_cases_passed,
               },
               "product_seam": seam,
               "runner_controls": {
@@ -526,6 +570,7 @@ jobs:
           }
           valid = all((
               required_faults_passed,
+              required_owner_cases_passed,
               whole_environment_equal,
               receipt["source"]["head_matches"],
               receipt["source"]["status_clean_before"],

@@ -25,8 +25,8 @@ from gateway.runtime_custody import RuntimeCustodyCoordinator
 from gateway.runtime_service_custody import (
     ServiceCustodyError,
     ServiceLease,
-    ServiceProcessReceipt,
 )
+from gateway.runtime_service_physical import ServiceProcessReceipt
 from hermes_cli.backend_retirement import RetirementFence
 from tests.agent.test_api_content_sidecar import _FakeAgent
 

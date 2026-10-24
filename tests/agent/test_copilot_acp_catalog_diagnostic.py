@@ -13,7 +13,8 @@ from typing import Any
 
 import pytest
 
-from gateway.runtime_service_custody import RuntimeCustodyCoordinator, ServiceProcessReceipt
+from gateway.runtime_service_custody import RuntimeCustodyCoordinator
+from gateway.runtime_service_physical import ServiceProcessReceipt
 from tests.agent.test_copilot_acp_failure_retention import (
     test_external_catalog_physical_close_unknown_retries_same_receipt as _run_original_catalog_test,
 )

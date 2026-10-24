@@ -1,7 +1,7 @@
 """Native process and reader receipt for one canonical I16 service lease.
 
 This sibling keeps the physical witness beside the service custody contract without
-creating a second ledger.  The source module re-exports ``ServiceProcessReceipt``.
+creating a second ledger.  ``ServiceProcessReceipt`` is defined here.
 """
 
 from __future__ import annotations

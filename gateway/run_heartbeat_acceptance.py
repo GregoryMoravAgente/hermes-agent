@@ -80,11 +80,20 @@ async def admit_heartbeat(runner, adapter, source, session_id, route):
     identity = json.dumps(
         ['heartbeat', session_id, state.created_at, state.fire_count + 1], separators=(',', ':'))
     principal_id = 'automation:' + route
+    # The pending I08 root must carry the same source-issued identity that admit_automation will
+    # recompute from the actual event/source pair.  A route label is not authenticated provenance;
+    # retaining it here made the strict pending-root check reject every real heartbeat admission.
+    from gateway.session_automation_custody import automation_source_identity
+    source_event = MessageEvent(
+        text='', source=source, internal=True, message_id=identity,
+        metadata={'gateway_session_key': route, 'gateway_session_id': session_id},
+    )
+    source_identity = automation_source_identity(source_event, route)
     if coordinator is not None and not callable(getattr(authority, '_preservation_automation_root', None)):
         raise RuntimeStoreError('runtime_custody_unavailable')
     tick = (reserve_tick(
         authority, request_id=identity, principal_id=principal_id, session_id=owner,
-        source_identity='heartbeat:' + route, kind='heartbeat', watcher_key=route,
+        source_identity=source_identity, kind='heartbeat', watcher_key=route,
     ) if coordinator is not None else None)
     handle = tick.handle if tick is not None else None
     prompt = manager.due_prompt()

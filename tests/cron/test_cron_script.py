@@ -263,6 +263,87 @@ class TestRunJobScript:
         assert env["VIRTUAL_ENV"] == str(venv)
         assert str(site_packages) in env["PYTHONPATH"]
 
+    @pytest.mark.platforms("windows")
+    def test_sh_script_never_resolves_to_the_wsl_stub_bash(self, cron_env, tmp_path, monkeypatch):
+        """A ``.sh`` cron script must not be launched through ``C:\\Windows\\System32\\bash.exe``.
+
+        That path is the WSL stub launcher, not a shell: on a host whose default WSL distro has
+        no ``/bin/bash`` it dies with ``execvpe(/bin/bash) failed`` while Git Bash is installed
+        and healthy. Regression for the bare ``shutil.which("bash")`` lookup, which picked the
+        stub because ``Git\\cmd`` is the only Git dir on a native PATH and ships no ``bash.exe``.
+        """
+        from cron.scheduler_script import _script_argv
+        from tools.environments import local as local_env
+
+        git_bash = r"C:\Program Files\Git\bin\bash.exe"
+        monkeypatch.setattr("shutil.which", lambda name: r"C:\Windows\System32\bash.exe")
+        monkeypatch.setattr(local_env, "_find_bash", lambda deadline=None: git_bash)
+        script = tmp_path / "job.sh"
+        script.write_text("echo hi\n", encoding="utf-8")
+
+        argv, _env, err = _script_argv(script)
+
+        assert err is None
+        assert argv[0] == git_bash
+
+    @pytest.mark.platforms("windows")
+    def test_sh_script_without_git_bash_reports_the_reason(self, cron_env, tmp_path, monkeypatch):
+        """No usable Git Bash → the actionable message, and the ticker is not raised into."""
+        from cron.scheduler_script import _script_argv
+        from tools.environments import local as local_env
+
+        def _no_bash(deadline=None):
+            raise RuntimeError(
+                "No shell found. Hermes needs bash (Git for Windows on Windows). "
+                "Run `hermes pm install` or reinstall the bundle."
+            )
+
+        monkeypatch.setattr(local_env, "_find_bash", _no_bash)
+        script = tmp_path / "job.sh"
+        script.write_text("echo hi\n", encoding="utf-8")
+
+        argv, _env, err = _script_argv(script)
+
+        assert argv is None
+        assert err and "No shell found" in err
+        # The resolver's remedy stands alone; generic install advice after it would contradict it.
+        assert "install Git for Windows" not in err
+
+    @pytest.mark.platforms("windows")
+    def test_bash_probes_share_the_script_timeout(self, cron_env, monkeypatch):
+        """Probing broken Git Bash installs runs inside the configured script budget: each probe
+        gets only the remaining time, probing stops when it is spent, and the job is never
+        launched afterwards (the tick lock is held for the whole resolution)."""
+        import time
+
+        import cron.scheduler_script as sched_script
+        from pm import shell
+
+        clock = [1000.0]
+        probes = []
+
+        def hung_probe(candidate, timeout=5.0):
+            probes.append(timeout)
+            clock[0] += timeout  # a broken bash.exe that never answers
+            return False
+
+        monkeypatch.setattr(time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(sched_script, "_get_script_timeout", lambda: 7)
+        monkeypatch.setattr(shell, "_staged_bash", lambda: None)
+        monkeypatch.setattr(shell, "windows_bash_candidates",
+                            lambda on_path, env: [rf"C:\Git{i}\bin\bash.exe" for i in range(4)])
+        monkeypatch.setattr(shell.os.path, "isfile", lambda p: True)
+        monkeypatch.setattr(shell, "_bash_starts", hung_probe)
+        launched = []
+        monkeypatch.setattr(sched_script.subprocess, "Popen", lambda *a, **kw: launched.append(a))
+        (cron_env / "scripts" / "job.sh").write_text("echo hi\n", encoding="utf-8")
+
+        ok, out = sched_script._run_job_script("job.sh")
+
+        assert sum(probes) <= 7 and len(probes) < 4
+        assert not ok and "timed out" in out
+        assert not launched
+
     def test_bootstrap_argv_makes_pth_editable_installs_importable(self, cron_env, tmp_path):
         """The bootstrap must process .pth files — the whole reason the
         overlay mode exists is that PYTHONPATH alone cannot (editable

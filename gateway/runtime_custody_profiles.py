@@ -200,3 +200,46 @@ def profile_scope_valid_for_handle(coordinator: Any, handle: Any) -> bool:
         require_serving=False, allow_retiring=True,
         physical_owner_epoch=physical_owner_epoch,
     )
+
+
+def bind_profile_scope_if_empty(coordinator: Any, runner: Any) -> bool:
+    """Attach one live profile resolver only across an empty source-owned transition."""
+    with coordinator._lock:
+        if coordinator._profile_scope is not None:
+            return True
+        empty = all((
+            coordinator._state == "open",
+            coordinator._close is None,
+            coordinator._fence.active_count() == 0,
+            coordinator._fence.pending_child_count() == 0,
+            coordinator._fence._close is None,
+            coordinator._fence._committed is False,
+            not coordinator._records,
+            not coordinator._completed,
+            not coordinator._completed_handles,
+            not coordinator._rebound_terminal_roots,
+            not coordinator._rebound_successor_witnesses,
+            not coordinator._children_by_parent,
+            not coordinator._pending_children_by_parent,
+            not coordinator._secondary_children_by_parent,
+            not coordinator._secondary_parents_by_child,
+            not coordinator._bound_parent_by_child,
+            not coordinator._source_rebind_bindings,
+            coordinator._post_open_transition is None,
+            coordinator._completed_post_open_transition is None,
+            coordinator._native_cleanup_plan is None,
+            coordinator._native_cleanup_capability is None,
+            coordinator._native_cleanup_pending_participants == (),
+            coordinator._native_cleanup_state == "not_started",
+            coordinator._native_cleanup_reason is None,
+            coordinator._native_cleanup_in_progress is False,
+            coordinator._native_ack is False,
+            coordinator._receipt_id is None,
+            not getattr(coordinator, "_runtime_custody_authorities", ()),
+            not getattr(coordinator, "_runtime_custody_source_graphs", ()),
+            all(state == "unwired" for state in coordinator._owner_state.values()),
+        ))
+        if not empty:
+            return False
+        coordinator._profile_scope = ProfileScopeResolver(runner)
+        return True

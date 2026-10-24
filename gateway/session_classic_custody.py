@@ -1566,7 +1566,8 @@ class ClassicCustodyMixin:
             candidates.append((key, record))
         if not candidates:
             if classic_row_is_direct(row):
-                return None, 'classic_owner_unknown'
+                from gateway.session_recovery_native_binding import i10_native_recovery_row_is_bound
+                return (None, None) if i10_native_recovery_row_is_bound(self, row, consumer='startup') else (None, 'classic_owner_unknown')
             return None, None
         if len(candidates) != 1:
             for key, _record in candidates:

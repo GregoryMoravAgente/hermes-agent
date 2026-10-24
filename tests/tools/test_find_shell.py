@@ -108,14 +108,14 @@ class TestFindBashCollapsedToPmShell:
         """_find_bash returns whatever pm.shell() resolves (store bash or
         provisioned PATH)."""
         monkeypatch.setattr(
-            "pm.shell.bash", lambda: r"C:\store\tools\git-x\usr\bin\bash.exe"
+            "pm.shell.bash", lambda deadline=None: r"C:\store\tools\git-x\usr\bin\bash.exe"
         )
         assert _find_bash() == r"C:\store\tools\git-x\usr\bin\bash.exe"
 
     def test_raises_when_pm_shell_finds_nothing(self, monkeypatch):
         """A store with no bash (and no PATH bash) surfaces a clear error
         pointing at `hermes pm install` instead of hunting locations."""
-        monkeypatch.setattr("pm.shell.bash", lambda: None)
+        monkeypatch.setattr("pm.shell.bash", lambda deadline=None: None)
         with pytest.raises(RuntimeError) as exc_info:
             _find_bash()
         assert "No shell found" in str(exc_info.value)

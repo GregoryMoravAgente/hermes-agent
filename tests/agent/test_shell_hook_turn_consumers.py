@@ -30,7 +30,7 @@ globals()["shell_runtime"] = _shell_runtime_fixture
 @pytest.mark.asyncio
 async def test_managed_shell_hook_uses_canonical_turn_writer_and_finalizer(monkeypatch, shell_runtime):
     runtime = shell_runtime
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
 
     durable_calls = []
     original_record = ServiceProcessReceipt.record_result_durable

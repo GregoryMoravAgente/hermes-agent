@@ -87,7 +87,7 @@ class _WindowsTransaction:
 
 
 def _receipt(process: object, transaction: object):
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
 
     receipt = ServiceProcessReceipt(
         SimpleNamespace(), SimpleNamespace(owner_id="retry-owner"), "retry-owner",
@@ -100,7 +100,7 @@ def _receipt(process: object, transaction: object):
 
 
 def test_retained_windows_retry_waits_same_process_then_drains_same_job(monkeypatch) -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway import runtime_service_physical
 
     clock = _Clock()
@@ -130,7 +130,7 @@ def test_retained_windows_retry_waits_same_process_then_drains_same_job(monkeypa
 def test_retained_windows_retry_refuses_unknown_or_foreign_job_transition(
     monkeypatch, failed_scope_observation: str,
 ) -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway import runtime_service_physical
 
     clock = _Clock()
@@ -162,7 +162,7 @@ def test_retained_windows_retry_refuses_unknown_or_foreign_job_transition(
 
 
 def test_retained_windows_retry_rejects_late_success_after_shared_deadline(monkeypatch) -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway import runtime_service_physical
 
     clock = _Clock()
@@ -188,7 +188,7 @@ def test_retained_windows_retry_rejects_late_success_after_shared_deadline(monke
 
 
 def test_retained_windows_retry_keeps_same_handles_when_native_close_fails(monkeypatch) -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway import runtime_service_physical
 
     clock = _Clock()
@@ -226,7 +226,7 @@ def test_retained_windows_retry_refuses_foreign_process_without_touching_transac
 
 
 def test_retained_windows_retry_timeout_keeps_same_transaction(monkeypatch) -> None:
-    from gateway.runtime_service_custody import ServiceProcessReceipt
+    from gateway.runtime_service_physical import ServiceProcessReceipt
     from gateway import runtime_service_physical
 
     class _TimeoutProcess(_DelayedProcess):
