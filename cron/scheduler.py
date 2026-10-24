@@ -4059,6 +4059,8 @@ def _launch_external_cron_worker_effect(job: dict, admission) -> bool:
     repo_root = Path(__file__).resolve().parent.parent
     worker_env = pin_hermes_tree_on_pythonpath(worker_env, repo_root)
     worker_env[WORKER_MARKER] = "1"
+    if os.environ.get("_AGC_NATIVE_DIAGNOSTIC") == "1":
+        worker_env["_AGC_NATIVE_DIAGNOSTIC"] = "1"
     try:
         stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         try:
@@ -4240,7 +4242,13 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False)
+                # R12 diagnostic-only current-thread observer, after authenticated ACK.
+                if os.environ.get("_AGC_NATIVE_DIAGNOSTIC") == "1":
+                    from _native_cron_diagnostic import observe_acknowledged_worker
+                    with observe_acknowledged_worker():
+                        completed = run_one_job(job, adapters=None, loop=None, verbose=False)
+                else:
+                    completed = run_one_job(job, adapters=None, loop=None, verbose=False)
                 # Successful return: the worker recorded its outcome. If it raises,
                 # retain fd 2's pathname until the waiter consumes the traceback.
                 with contextlib.suppress(OSError):

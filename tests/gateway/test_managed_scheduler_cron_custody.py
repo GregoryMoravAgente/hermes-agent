@@ -725,10 +725,12 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
                 if stderr_file.is_file():
                     with stderr_file.open('rb') as stream:
                         stream.seek(0, 2)
+                        if stream.tell() > 65536:
+                            print('NATIVE_CRON_STDERR_TRUNCATED=1', flush=True)
                         stream.seek(max(0, stream.tell() - 65536))
                         snapshot = stream.read(65536).decode('utf-8', errors='replace')
                     for line in snapshot.splitlines():
-                        if line.startswith('NATIVE_SCRIPT_STAGE='):
+                        if line.startswith(('NATIVE_SCRIPT_STAGE=', 'NATIVE_CRON_PHASE=')):
                             print(line, flush=True)
 
     assert len(captured) == 1
