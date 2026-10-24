@@ -139,7 +139,12 @@ def _install_i13_observer(monkeypatch, request):
     """Record scalar results at existing I13 seams; every wrapper calls the source once."""
     from cron import executions, runtime_custody, scheduler
 
-    captured = []
+    class _ObservedBindings(list):
+        def __init__(self):
+            super().__init__()
+            self.wait_admissions = []
+
+    captured = _ObservedBindings()
     events = []
     event_lock = threading.Lock()
     thread_scope = threading.local()
@@ -325,7 +330,7 @@ def _install_i13_observer(monkeypatch, request):
 
     @wraps(wait_body)
     def observe_wait_body(
-        process, *, execution_id, stderr_path=None, custody=None, dispatch_mode=None,
+        process, *, execution_id, stderr_path=None, custody=None, dispatch_mode=None, admission=None,
     ):
         previous = current_scope()
         started = getattr(custody, "_worker_started_at", None) if custody is not None else None
@@ -343,6 +348,7 @@ def _install_i13_observer(monkeypatch, request):
             "ack": None,
         }
         thread_scope.context = context
+        captured.wait_admissions.append(admission)
         try:
             return wait_body(
                 process,
@@ -350,6 +356,7 @@ def _install_i13_observer(monkeypatch, request):
                 stderr_path=stderr_path,
                 custody=custody,
                 dispatch_mode=dispatch_mode,
+                admission=admission,
             )
         finally:
             restore_scope(previous)
@@ -647,6 +654,8 @@ async def test_public_scheduler_tick_runs_managed_agent_and_releases_i12(
             timeout=max(0.0, deadline - asyncio.get_running_loop().time()),
         ) == 1
         assert len(captured) == 1
+        assert len(captured.wait_admissions) == 1
+        assert captured.wait_admissions[0] is not None
         binding = captured[0]
         from tests.waiting import async_wait_until
 
@@ -707,6 +716,8 @@ async def test_public_fire_due_runs_real_script_child_and_releases_i12(
         ) is True
 
     assert len(captured) == 1
+    assert len(captured.wait_admissions) == 1
+    assert captured.wait_admissions[0] is not None
     binding = captured[0]
     await _await_public_fire_custody_settlement(binding, deadline)
     record = _assert_terminal_i12(
