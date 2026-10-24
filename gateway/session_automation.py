@@ -459,10 +459,21 @@ def check_i09_automation(authority, ref, row):
     payload = row.get('payload') if isinstance(row, dict) else None
     descriptor = authority._preservation_automation_row_descriptor(row)
     kanban_card = payload.get('kanban_card_v1') if isinstance(payload, dict) else None
-    allowed = ({'text', '_automation_custody_v1'},
-               {'text', 'finite', '_automation_custody_v1'},
-               {'text', 'kanban_card_v1', '_automation_custody_v1'},
-               {'text', 'finite', 'kanban_card_v1', '_automation_custody_v1'})
+    managed_fields = set()
+    managed_marker = payload.get('managed_worker_v1') if isinstance(payload, dict) else None
+    if managed_marker is not None:
+        from gateway.session_operator import MANAGED_WORKER_DESCRIPTOR, MANAGED_WORKER_FIELD
+        if managed_marker != MANAGED_WORKER_DESCRIPTOR:
+            raise RuntimeStoreError('permission_denied')
+        from gateway.session_managed_worker import managed_policy
+        if (not callable(getattr(authority.runner, '_adapter_for_source', None))
+                or managed_policy(authority, ref) is None):
+            raise RuntimeStoreError('permission_denied')
+        managed_fields.add(MANAGED_WORKER_FIELD)
+    allowed = ({'text', '_automation_custody_v1'} | managed_fields,
+               {'text', 'finite', '_automation_custody_v1'} | managed_fields,
+               {'text', 'kanban_card_v1', '_automation_custody_v1'} | managed_fields,
+               {'text', 'finite', 'kanban_card_v1', '_automation_custody_v1'} | managed_fields)
     card_valid = kanban_card is None
     if kanban_card is not None:
         # The dispatcher marker is source-owned and must remain the exact task/run tuple that

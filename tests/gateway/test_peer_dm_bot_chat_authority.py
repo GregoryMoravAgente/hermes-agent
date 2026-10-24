@@ -631,3 +631,138 @@ async def test_ordinary_cli_session_rejects_a_copied_bot_projection(headless_pee
     from gateway.platforms.api_server_run_peer import peer_source_kind
     assert bot_chat_tip(headless_peer.authority, ordinary_session_id) is None
     assert peer_source_kind(headless_peer.authority, ordinary_projection) is None
+
+
+@pytest.mark.asyncio
+async def test_reset_bot_chat_peer_turn_uses_the_validated_current_local_target(headless_peer):
+    session_id = await _create_headless_peer_bot_chat(headless_peer)
+    route = headless_peer.authority.sessions[session_id].route
+    reset_entry = headless_peer.authority.runner.session_store.reset_session(route)
+    assert reset_entry is not None and reset_entry.session_id != session_id
+
+    from gateway.platforms.api_server_bot_chat import reset_local_bot_chat_target
+    assert reset_local_bot_chat_target(headless_peer.authority.runner, session_id) == reset_entry.session_id
+
+    response = await headless_peer.cli.post(
+        f'/api/sessions/{session_id}/chat', json={'message': 'after reset'})
+    body = await response.json()
+    assert response.status == 200, body
+    assert body['message']['content'] == 'pong', body
+    assert headless_peer.executed == [(session_id, 'automation:' + route, 'after reset')]
+    # This fixture's executor returns ``pong`` but deliberately does not write message rows.  The
+    # durable custody assertion is the admission target: the stable logical Bot Chat owns the row,
+    # while the route itself remains pinned to the validated physical reset child.
+    with headless_peer.authority.db._read_ctx() as conn:
+        admission = conn.execute(
+            'SELECT target_session_id, status FROM session_admissions ORDER BY seq DESC LIMIT 1'
+        ).fetchone()
+    assert admission is not None and tuple(admission) == (session_id, 'terminal'), admission
+    current = headless_peer.authority.runner.session_store.lookup_by_session_key(route)
+    assert current is not None and current.session_id == reset_entry.session_id
+
+
+@pytest.mark.asyncio
+async def test_reset_bot_chat_never_falls_back_when_live_handoff_disappears(headless_peer, monkeypatch):
+    session_id = await _create_headless_peer_bot_chat(headless_peer)
+    route = headless_peer.authority.sessions[session_id].route
+    assert headless_peer.authority.runner.session_store.reset_session(route) is not None
+
+    async def no_handoff(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(headless_peer.adapter, '_admit_to_live_bot_chat', no_handoff)
+    response = await headless_peer.cli.post(
+        f'/api/sessions/{session_id}/chat', json={'message': 'must not run locally'})
+    body = await response.json()
+    assert response.status == 409, body
+    assert body['error']['code'] == 'session_retired', body
+    assert headless_peer.executed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('witness', ('copied_title', 'foreign_receipt', 'missing_lineage', 'stale_route'))
+async def test_reset_bot_chat_requires_exact_profile_lineage_and_route(headless_peer, monkeypatch, witness):
+    session_id = await _create_headless_peer_bot_chat(headless_peer)
+    route = headless_peer.authority.sessions[session_id].route
+    reset_entry = headless_peer.authority.runner.session_store.reset_session(route)
+    assert reset_entry is not None
+
+    from gateway.platforms import api_server_bot_chat
+    from gateway import session_local_recovery
+    from gateway.session_local_recovery import owned_receipt
+    if witness == 'copied_title':
+        copied = dict(headless_peer.authority.db.get_session_by_title('Bot Chat'))
+        copied['id'] = 'copied-bot-chat'
+        monkeypatch.setattr(
+            headless_peer.authority.db, 'get_session_by_title', lambda _title: copied)
+    elif witness in {'foreign_receipt', 'missing_lineage'}:
+        receipt, source, stored_route, stored_entry = owned_receipt(headless_peer.authority, session_id)
+        corrupted = dict(receipt)
+        if witness == 'foreign_receipt':
+            corrupted['profile_id'] = 'foreign-profile'
+        else:
+            corrupted['lineage'] = []
+        monkeypatch.setattr(
+            session_local_recovery, 'owned_receipt',
+            lambda *_args, **_kwargs: (corrupted, source, stored_route, stored_entry),
+        )
+    else:
+        monkeypatch.setattr(
+            headless_peer.authority.runner.session_store, 'lookup_by_session_key',
+            lambda _route: SimpleNamespace(session_id='stale-foreign-target'),
+        )
+
+    assert api_server_bot_chat.reset_local_bot_chat_target(
+        headless_peer.authority.runner, session_id) is None
+    response = await headless_peer.cli.post(
+        f'/api/sessions/{session_id}/chat', json={'message': 'refuse stale handoff'})
+    body = await response.json()
+    assert response.status == 409, body
+    assert body['error']['code'] == 'session_retired', body
+    assert headless_peer.executed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('witness', ('foreign_receipt', 'missing_lineage', 'stale_route'))
+async def test_peer_source_kind_requires_reset_witness_when_tip_is_logical_root(
+        headless_peer, monkeypatch, witness):
+    """A reset root must not normalize from a tip lookup without its physical witness."""
+    session_id = await _create_headless_peer_bot_chat(headless_peer)
+    route = headless_peer.authority.sessions[session_id].route
+    reset_entry = headless_peer.authority.runner.session_store.reset_session(route)
+    assert reset_entry is not None and reset_entry.session_id != session_id
+
+    from gateway.platforms.api_server_bot_chat import bot_chat_tip
+    from gateway.platforms.api_server_run_peer import peer_source_kind
+
+    tip = bot_chat_tip(headless_peer.authority, session_id)
+    assert tip is not None and tip.get('id') == session_id, tip
+    record = {
+        'session_id': session_id,
+        '_api_producer_phase': 'bot_i02',
+        '_api_producer_source': 'bot_chat',
+        'principal_id': tip.get('user_id'),
+    }
+    assert peer_source_kind(headless_peer.authority, record) == 'bot_room'
+
+    from gateway import session_local_recovery
+    from gateway.session_local_recovery import owned_receipt
+    if witness in {'foreign_receipt', 'missing_lineage'}:
+        receipt, source, stored_route, stored_entry = owned_receipt(
+            headless_peer.authority, session_id)
+        corrupted = dict(receipt)
+        if witness == 'foreign_receipt':
+            corrupted['profile_id'] = 'foreign-profile'
+        else:
+            corrupted['lineage'] = []
+        monkeypatch.setattr(
+            session_local_recovery, 'owned_receipt',
+            lambda *_args, **_kwargs: (corrupted, source, stored_route, stored_entry),
+        )
+    else:
+        monkeypatch.setattr(
+            headless_peer.authority.runner.session_store, 'lookup_by_session_key',
+            lambda _route: SimpleNamespace(session_id='stale-foreign-target'),
+        )
+
+    assert peer_source_kind(headless_peer.authority, record) is None

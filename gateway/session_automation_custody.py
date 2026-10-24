@@ -788,6 +788,87 @@ class AutomationCustodyMixin:
     """
     def _register_automation_source_graph(self, coordinator=None):
         return register_automation_source_graph(self, coordinator)
+    def _preservation_automation_handle_is_canonical(self, handle):
+        if getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES:
+            return True
+        roots = getattr(self, '_preservation_automation_roots', None)
+        if not isinstance(roots, dict):
+            return False
+        coordinator = self._preservation_coordinator()
+        lease_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+        records = getattr(coordinator, '_records', None) if coordinator is not None else None
+        record = records.get(lease_id) if isinstance(records, dict) else None
+        direct_root = any(value is handle for value in roots.values())
+        if not direct_root and isinstance(records, dict) and record is not None:
+            # An I08 child is authentic only through its exact canonical parent.
+            parent_id = getattr(getattr(handle, 'lease', None), 'parent_lease_id', None)
+            parent_record = records.get(parent_id)
+            parent_handle = getattr(parent_record, 'handle', None)
+            direct_root = any(value is parent_handle for value in roots.values())
+        return (
+            direct_root
+            and record is not None
+            and getattr(record, 'handle', None) is handle
+            and getattr(handle, 'profile_id', None) == self.profile_id
+            and getattr(handle, 'authority_epoch', None) == self.epoch
+            and getattr(handle, 'process_instance', None) == self.instance_id
+            and getattr(handle, 'coordinator_id', None) == getattr(coordinator, '_coordinator_id', None)
+            and getattr(record, 'state', None) in {'accepted', 'finalizing', 'unknown'})
+
+    def _preservation_automation_identity_matches(
+            self, handle, *, request_id, principal_id, session_id, source_identity,
+            delivery_id=None):
+        """Match every retained root descriptor before an existing root can be reused."""
+        if not self._preservation_automation_handle_is_canonical(handle):
+            return False
+        pending = self._preservation_pending_roots.get(id(handle))
+        retained = []
+        if pending is not None:
+            retained.append(('pending', pending))
+        for binding in getattr(self, '_preservation_automation_bindings', {}).values():
+            if isinstance(binding, dict) and binding.get('handle') is handle:
+                retained.append(('binding', binding))
+        if not retained:
+            return False
+        for kind, value in retained:
+            if kind == 'pending':
+                if (value.get('handle') is not handle
+                        or value.get('request_id') != request_id
+                        or value.get('principal_id') != principal_id
+                        or value.get('session_id') != session_id
+                        or value.get('source_identity') != source_identity):
+                    return False
+                stored_delivery = value.get('delivery_id')
+            else:
+                descriptor = value.get('descriptor')
+                if not _automation_descriptor_complete(descriptor):
+                    return False
+                if any(descriptor.get(field) != expected for field, expected in {
+                    'request_id': request_id,
+                    'principal_id': principal_id,
+                    'session_id': session_id,
+                    'source_identity': source_identity,
+                    'profile_id': self.profile_id,
+                }.items()):
+                    return False
+                bound_row = value.get('row')
+                if isinstance(bound_row, dict) and any(
+                        bound_row.get(field) != expected for field, expected in {
+                            'request_id': request_id,
+                            'principal_id': principal_id,
+                            'target_session_id': session_id,
+                        }.items()):
+                    return False
+                stored_delivery = value.get('delivery_id')
+                if stored_delivery is None:
+                    stored_delivery = descriptor.get('delivery_id')
+            # Omitted delivery ids preserve a retained id; a new id never reuses this root.
+            if stored_delivery is None:
+                if delivery_id is not None:
+                    return False
+            elif delivery_id is not None and stored_delivery != delivery_id:
+                return False
+        return True
 
     def _preservation_automation_root(self, *, request_id, principal_id, session_id,
                                       source_identity, delivery_id=None,
@@ -825,37 +906,56 @@ class AutomationCustodyMixin:
         existing = self._preservation_automation_roots.get(root_key)
         coordinator = self._preservation_coordinator()
         if existing is not None and coordinator is not None:
-            record = getattr(coordinator, '_records', {}).get(
-                getattr(getattr(existing, 'lease', None), 'lease_id', None))
-            if record is not None and record.handle is existing:
-                if (existing.owner_class != owner_class
-                        or existing.profile_id != self.profile_id
-                        or existing.authority_epoch != self.epoch
-                        or existing.owner_id != self._automation_owner_id(
-                            owner_class, session_id, request_id)):
-                    raise RuntimeStoreError('preservation_owner_mismatch')
-                if record.state == 'unknown':
-                    reconciled = coordinator.reconcile_unknown(
-                        existing, owner_id=existing.owner_id, profile_id=self.profile_id,
-                        process_instance=self.instance_id, authority_epoch=self.epoch,
-                    )
-                    if reconciled is not None:
-                        raise RuntimeStoreError(getattr(reconciled, 'code', 'custody_unknown'))
-                self._route_wake_inbound_seen |= owner_class == 'I07_automation_route_wakes'
-                self._preservation_pending_root(
-                    request_id, existing, principal_id=principal_id, session_id=session_id,
-                    source_identity=source_identity, delivery_id=delivery_id,
+            records = getattr(coordinator, '_records', None)
+            record = records.get(
+                getattr(getattr(existing, 'lease', None), 'lease_id', None)
+            ) if isinstance(records, dict) else None
+            if record is None or record.handle is not existing:
+                # A source-owned root with a missing/replaced coordinator record is not a stale
+                # cache entry that can be swapped for a fresh lease.  Retain the opaque mapping
+                # and refuse so a lost/unknown root cannot silently acquire a new owner.
+                raise RuntimeStoreError('preservation_custody_unknown')
+            if (existing.owner_class != owner_class
+                    or existing.profile_id != self.profile_id
+                    or existing.authority_epoch != self.epoch
+                    or existing.owner_id != self._automation_owner_id(
+                        owner_class, session_id, request_id)):
+                raise RuntimeStoreError('preservation_owner_mismatch')
+            if not self._preservation_automation_identity_matches(
+                    existing, request_id=request_id, principal_id=principal_id,
+                    session_id=session_id, source_identity=source_identity,
+                    delivery_id=delivery_id):
+                raise RuntimeStoreError('preservation_owner_mismatch')
+            if record.state == 'unknown':
+                reconciled = coordinator.reconcile_unknown(
+                    existing, owner_id=existing.owner_id, profile_id=self.profile_id,
+                    process_instance=self.instance_id, authority_epoch=self.epoch,
                 )
-                return existing
-            self._preservation_automation_roots.pop(root_key, None)
+                if reconciled is not None:
+                    raise RuntimeStoreError(getattr(reconciled, 'code', 'custody_unknown'))
+            self._route_wake_inbound_seen |= owner_class == 'I07_automation_route_wakes'
+            self._preservation_pending_root(
+                request_id, existing, principal_id=principal_id, session_id=session_id,
+                source_identity=source_identity, delivery_id=delivery_id,
+            )
+            return existing
         owner_id = self._automation_owner_id(owner_class, session_id, request_id)
         handle = self._preservation_root(owner_class, owner_id)
         self._route_wake_inbound_seen |= owner_class == 'I07_automation_route_wakes'
+        # This is the sole fresh-root birth seam.  _preservation_root returned the exact
+        # coordinator-owned handle above; seal its complete source tuple before publishing the
+        # root map.  The ordinary pending-root setter remains strict for every existing, bound,
+        # or rehomed handle and cannot be used as a canonical-handle-only overwrite path.
+        self._preservation_pending_roots[id(handle)] = {
+            'handle': handle,
+            'owner_class': owner_class,
+            'principal_id': principal_id,
+            'session_id': session_id,
+            'request_id': request_id,
+            'source_identity': source_identity,
+            'delivery_id': delivery_id,
+        }
         self._preservation_automation_roots[root_key] = handle
-        self._preservation_pending_root(
-            request_id, handle, principal_id=principal_id, session_id=session_id,
-            source_identity=source_identity, delivery_id=delivery_id,
-        )
         return handle
 
     def _automation_owner_id(self, owner_class, session_id, request_id):
@@ -933,8 +1033,12 @@ class AutomationCustodyMixin:
         # A restarted authority may already have rebound this exact row to a current handle.
         # Validate that retained binding before accepting the durable row's old descriptor epoch;
         # a scalar epoch match alone must never mint or transfer custody.
+        allow_terminal = isinstance(row, dict) and row.get('status') == 'terminal'
         if binding is not None and (
-                handle is None or not self._preservation_automation_row_matches(row, handle)):
+                handle is None
+                or not self._preservation_automation_handle_is_canonical(handle)
+                or not self._preservation_automation_row_matches(
+                    row, handle, allow_terminal=allow_terminal)):
             raise RuntimeStoreError('preservation_owner_unmapped')
         if (not isinstance(row, dict)
                 or (binding is None and row.get('owner_epoch') != (descriptor or {}).get('authority_epoch'))):
@@ -1203,16 +1307,70 @@ class AutomationCustodyMixin:
 
     def _preservation_pending_root(self, request_id, handle, *, principal_id, session_id,
                                    source_identity=None, delivery_id=None):
-        if handle is not None:
-            self._preservation_pending_roots[id(handle)] = {
+        if handle is None:
+            return
+        owner_class = getattr(handle, 'owner_class', None)
+        existing = self._preservation_pending_roots.get(id(handle))
+        if owner_class in _AUTOMATION_OWNER_CLASSES:
+            if (not isinstance(source_identity, str) or not source_identity
+                    or not self._preservation_automation_handle_is_canonical(handle)):
+                raise RuntimeStoreError('preservation_owner_mismatch')
+            if existing is not None:
+                if not self._preservation_automation_identity_matches(
+                        handle, request_id=request_id, principal_id=principal_id,
+                        session_id=session_id, source_identity=source_identity,
+                        delivery_id=delivery_id):
+                    raise RuntimeStoreError('preservation_owner_mismatch')
+            else:
+                bindings = getattr(self, '_preservation_automation_bindings', {})
+                bound = any(isinstance(value, dict) and value.get('handle') is handle
+                            for value in bindings.values())
+                rehome = next((value for value in getattr(
+                    self, '_preservation_automation_rehomes', {}).values()
+                    if isinstance(value, dict) and value.get('handle') is handle), None)
+                if rehome is None:
+                    # Once pending state has been consumed, only the exact retained binding may
+                    # re-enter this seam.  A canonical opaque handle by itself carries no
+                    # principal/source/request tuple and must never be allowed to overwrite it.
+                    if (not bound
+                            or not self._preservation_automation_identity_matches(
+                                handle, request_id=request_id, principal_id=principal_id,
+                                session_id=session_id, source_identity=source_identity,
+                                delivery_id=delivery_id)):
+                        raise RuntimeStoreError('preservation_owner_mismatch')
+                else:
+                    if any(rehome.get(field) != expected for field, expected in {
+                            'principal_id': principal_id, 'request_id': request_id,
+                            'source_identity': source_identity,
+                        }.items()):
+                        raise RuntimeStoreError('preservation_owner_mismatch')
+                    if rehome.get('new_session_id') != session_id:
+                        raise RuntimeStoreError('preservation_owner_mismatch')
+                    retained_delivery = rehome.get('delivery_id')
+                    if (retained_delivery is not None
+                            and delivery_id not in (None, retained_delivery)):
+                        raise RuntimeStoreError('preservation_owner_mismatch')
+            if delivery_id is None and existing is not None:
+                delivery_id = existing.get('delivery_id')
+            if delivery_id is None and existing is None:
+                if rehome is not None:
+                    delivery_id = rehome.get('delivery_id')
+                else:
+                    binding = next((value for value in getattr(
+                        self, '_preservation_automation_bindings', {}).values()
+                        if isinstance(value, dict) and value.get('handle') is handle), None)
+                    if isinstance(binding, dict):
+                        delivery_id = binding.get('delivery_id') or (
+                            binding.get('descriptor') or {}).get('delivery_id')
+        self._preservation_pending_roots[id(handle)] = {
                 'handle': handle,
-                'owner_class': handle.owner_class,
+                'owner_class': owner_class,
                 'principal_id': principal_id,
                 'session_id': session_id,
                 'request_id': request_id,
                 'source_identity': source_identity,
                 'delivery_id': delivery_id,
-            }
+        }
 
     async def _submit_i09_automation(self, actor, ref, request_id, payload, handle, *,
                                       source_identity, delivery_id=None, descriptor=None,
@@ -1236,17 +1394,12 @@ class AutomationCustodyMixin:
                 descriptor, handle=handle, request_id=request_id,
                 principal_id=actor.subject, session_id=ref.session_id,
                 source_identity=source_identity, delivery_id=delivery_id)
-            durable_payload = dict(payload)
-            if kanban_card is not None:
-                if (not isinstance(source_identity, str) or not source_identity.startswith('kanban:')
-                        or not isinstance(kanban_card, dict)
-                        or set(kanban_card) != {'board', 'task_id', 'run_id'}
-                        or not isinstance(kanban_card['board'], str)
-                        or not isinstance(kanban_card['task_id'], str)
-                        or type(kanban_card['run_id']) is not int):
-                    raise RuntimeStoreError('invalid_params')
-                durable_payload['kanban_card_v1'] = dict(kanban_card)
-            durable_payload['_automation_custody_v1'] = descriptor
+            from gateway.session_i09_managed_replay import prepare_i09_payload
+            durable_payload = await prepare_i09_payload(
+                self, ref, request_id, payload, handle, descriptor=descriptor,
+                source_identity=source_identity, delivery_id=delivery_id,
+                kanban_card=kanban_card,
+            )
             admitted = partial(self._admitted, ref, None)
             def committed(row):
                 if handle is not None:
@@ -1317,7 +1470,12 @@ class AutomationCustodyMixin:
             if (pending is None or pending.get('handle') is not handle
                     or row.get('principal_id') != pending.get('principal_id')
                     or row.get('target_session_id') != pending.get('session_id')
-                    or row.get('request_id') != pending.get('request_id')):
+                    or row.get('request_id') != pending.get('request_id')
+                    or pending.get('source_identity') != descriptor.get('source_identity')
+                    or ((pending.get('delivery_id') is None)
+                        != (descriptor.get('delivery_id') is None))
+                    or (pending.get('delivery_id') is not None
+                        and pending.get('delivery_id') != descriptor.get('delivery_id'))):
                 self._preservation_mark_unknown(admission_id, 'unmapped_writer')
                 raise RuntimeStoreError('preservation_owner_unmapped')
         recovered_queued = bool(binding and binding.get('successor')
@@ -1372,7 +1530,12 @@ class AutomationCustodyMixin:
                 pending.get('handle') is not handle
                 or pending.get('principal_id') != row.get('principal_id')
                 or pending.get('request_id') != row.get('request_id')
-                or pending.get('session_id') != row.get('target_session_id')):
+                or pending.get('session_id') != row.get('target_session_id')
+                or pending.get('source_identity') != descriptor.get('source_identity')
+                or ((pending.get('delivery_id') is None)
+                    != (descriptor.get('delivery_id') is None))
+                or (pending.get('delivery_id') is not None
+                    and pending.get('delivery_id') != descriptor.get('delivery_id'))):
             self._preservation_mark_unknown(admission_id, 'unmapped_writer')
             raise RuntimeStoreError('preservation_owner_unmapped')
         self._preservation_automation_bindings[admission_id] = {
@@ -1580,65 +1743,24 @@ class AutomationCustodyMixin:
         return True
 
     def _preservation_prepare_automation_rehome(self, admission_id, row, new_session_id):
-        """Hold one queued wake's I07 root while its durable row moves to a fresh route."""
-        coordinator = self._preservation_coordinator()
-        handle = self._preservation_handles.get(admission_id)
-        descriptor = self._preservation_automation_row_descriptor(row)
-        if (coordinator is None or handle is None
-                or getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES
-                or not isinstance(row, dict) or row.get('status') != 'queued'
-                or not isinstance(new_session_id, str) or not new_session_id
-                or not self._preservation_automation_row_matches(row, handle)
-                or not isinstance(descriptor, dict)):
-            raise RuntimeStoreError('preservation_owner_unmapped')
-        if admission_id in self._preservation_children:
-            raise RuntimeStoreError('preservation_owner_unmapped')
-        rehome = {
-            'handle': handle,
-            'principal_id': row.get('principal_id'),
-            'request_id': row.get('request_id'),
-            'source_identity': descriptor.get('source_identity'),
-            'delivery_id': descriptor.get('delivery_id'),
-            'new_session_id': new_session_id,
-        }
-        self._preservation_automation_rehomes[admission_id] = rehome
-        return rehome
+        from gateway.session_automation_rehome import prepare_automation_rehome
+
+        return prepare_automation_rehome(self, admission_id, row, new_session_id)
 
     def _preservation_abort_automation_rehome(self, admission_id):
-        self._preservation_automation_rehomes.pop(admission_id, None)
+        from gateway.session_automation_rehome import abort_automation_rehome
+
+        return abort_automation_rehome(self, admission_id)
+
+    def _preservation_rehome_source_matches(self, admission_id, handle, rehome):
+        from gateway.session_automation_rehome import rehome_source_matches
+
+        return rehome_source_matches(self, admission_id, handle, rehome)
 
     def _preservation_finish_automation_rehome(self, admission_id):
-        """Move a validated I07 root into the pending tuple for its new durable row."""
-        rehome = self._preservation_automation_rehomes.get(admission_id)
-        if rehome is None:
-            return None
-        handle = rehome.get('handle')
-        coordinator = self._preservation_coordinator()
-        if coordinator is None:
-            require = getattr(self, '_require_preservation_coordinator', None)
-            coordinator = require() if callable(require) else None
-            if coordinator is None:
-                raise RuntimeStoreError('runtime_custody_unavailable')
-        if (handle is None
-                or getattr(handle, 'owner_class', None) not in _AUTOMATION_OWNER_CLASSES
-                or getattr(handle, 'profile_id', None) != self.profile_id
-                or getattr(handle, 'authority_epoch', None) != self.epoch
-                or getattr(handle, 'process_instance', None)
-                != getattr(coordinator, 'process_instance', None)
-                or getattr(handle, 'process_instance', None) != self.instance_id
-                or getattr(handle, 'coordinator_id', None)
-                != getattr(coordinator, '_coordinator_id', None)
-                or getattr(coordinator, '_parent', lambda _handle: None)(handle) is None):
-            raise RuntimeStoreError('preservation_owner_unmapped')
-        self._preservation_automation_rehomes.pop(admission_id, None)
-        self._preservation_handles.pop(admission_id, None)
-        self._preservation_automation_bindings.pop(admission_id, None)
-        self._preservation_pending_root(
-            rehome['request_id'], handle,
-            principal_id=rehome['principal_id'], session_id=rehome['new_session_id'],
-            source_identity=rehome['source_identity'], delivery_id=rehome['delivery_id'],
-        )
-        return handle
+        from gateway.session_automation_rehome import finish_automation_rehome
+
+        return finish_automation_rehome(self, admission_id)
 
     def _preservation_forget_pending_root(self, handle):
         if handle is None:
@@ -1691,6 +1813,23 @@ class AutomationCustodyMixin:
         if record.get('admission_id') not in (None, admission_id):
             self._preservation_operation_unknown(key, 'unmapped_writer')
             raise RuntimeStoreError('preservation_owner_unmapped')
+        root = getattr(self, '_preservation_handles', {}).get(admission_id)
+        if getattr(root, 'owner_class', None) in _AUTOMATION_OWNER_CLASSES:
+            try:
+                from hermes_state_runtime import get_session_admission
+                row = get_session_admission(self.db, admission_id=admission_id)
+            except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+                row = None
+            descriptor = self._preservation_automation_row_descriptor(row)
+            binding = getattr(self, '_preservation_automation_bindings', {}).get(admission_id)
+            if (not isinstance(row, dict)
+                    or not _automation_descriptor_complete(descriptor)
+                    or descriptor.get('source_identity') != record.get('source_identity')
+                    or not isinstance(binding, dict)
+                    or binding.get('handle') is not root
+                    or binding.get('source_identity') != descriptor.get('source_identity')):
+                self._preservation_operation_unknown(key, 'unmapped_writer')
+                raise RuntimeStoreError('preservation_owner_unmapped')
         record['admission_id'] = admission_id
         self._preservation_automation_children[admission_id] = key
 
@@ -1743,13 +1882,23 @@ class AutomationCustodyMixin:
 
     def _preservation_release_automation_unaccepted(self, child_key, handle):
         """Release the exact pre-row child/root after an explicit absent-row refusal."""
+        child_released = True
         if child_key is not None:
-            self._preservation_operation_release_unaccepted(child_key)
+            child_released = self._preservation_operation_release_unaccepted(child_key)
+            if not child_released:
+                # A failed child release is an accepted/unknown custody boundary, not an absent
+                # row. Keep both indexes so the exact child can be reconciled; never release the
+                # parent or publish a no-send/refusal while that child remains live.
+                if handle is not None:
+                    coordinator = self._preservation_coordinator()
+                    if coordinator is not None:
+                        coordinator.mark_unknown(handle, 'read_failed')
+                return False
             for admission_id, operation_key in list(self._preservation_automation_children.items()):
                 if operation_key == child_key:
                     self._preservation_automation_children.pop(admission_id, None)
         if handle is None:
-            return
+            return child_released
         coordinator = self._preservation_coordinator()
         if coordinator is None:
             require = getattr(self, '_require_preservation_coordinator', None)
@@ -1757,13 +1906,17 @@ class AutomationCustodyMixin:
             if coordinator is None:
                 raise RuntimeStoreError('runtime_custody_unavailable')
         result = coordinator.release_unaccepted(handle)
-        if result is None or getattr(result, 'code', None) == 'stale_lease':
+        # A stale/foreign refusal cannot prove that this exact root was never accepted.  Retain
+        # the root/index for reconciliation; only the source-issued ``None`` result permits the
+        # public no-effect path to forget it.
+        if result is None:
             for key, value in list(self._preservation_automation_roots.items()):
                 if value is handle:
                     self._preservation_automation_roots.pop(key, None)
             self._preservation_forget_pending_root(handle)
-        else:
-            coordinator.mark_unknown(handle, 'read_failed')
+            return True
+        coordinator.mark_unknown(handle, 'read_failed')
+        return False
 
     def _preservation_mark_finalizing(self, admission_id, finalizer_id):
         coordinator = self._preservation_coordinator()

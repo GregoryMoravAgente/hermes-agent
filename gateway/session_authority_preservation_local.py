@@ -185,6 +185,7 @@ class SessionAuthorityPreservationLocalMixin:
                 descriptor = self._preservation_automation_row_descriptor(row)
                 self._preservation_automation_bindings[admission_id] = {
                     'handle': handle,
+                    'row': dict(row),
                     'descriptor': dict(descriptor or {}),
                     'source_identity': (descriptor or {}).get('source_identity'),
                     'delivery_id': (descriptor or {}).get('delivery_id'),

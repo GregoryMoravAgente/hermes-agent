@@ -121,6 +121,65 @@ def _pin_bot_generation(authority, record, *, admission_id, request_id, field,
     return row
 
 
+def _prepare_bot_custody(authority, *, request_id, principal_id, session_id, source_identity,
+                         delivery_id):
+    """Reserve the exact I07/I06 pair for one Bot admission before its FIFO write.
+
+    A retry is a new durable admission, not a new delivery.  Keeping this reservation in the
+    same preparation seam as the initial admission makes the retry's source graph explicit while
+    allowing the canonical ``admit_automation`` writer to bind the child before scheduling.
+    """
+    automation_root = authority._preservation_automation_root(
+        request_id=request_id, principal_id=principal_id, session_id=session_id,
+        source_identity=source_identity, delivery_id=delivery_id,
+    )
+    child_key = None
+    if automation_root is not None:
+        try:
+            child_key = authority._preservation_operation_start(
+                'I06_busy_followup_delivery', principal_id=principal_id, session_id=session_id,
+                operation='bot-delivery', request_id=request_id, generation='pre-admission',
+                source_identity=source_identity, parent_handle=automation_root,
+            )
+        except BaseException as exc:
+            if isinstance(exc, RuntimeStoreError) and exc.reason == 'preservation_custody_unknown':
+                # An exact pre-admission child already marked UNKNOWN is not a refusal and cannot
+                # be replaced by a sibling retry. Preserve its parent/child graph for recovery.
+                coordinator = authority._preservation_coordinator()
+                if coordinator is not None:
+                    coordinator.mark_unknown(automation_root, 'read_failed')
+                raise
+            # The root was reserved before the child reservation.  A failed child reservation has
+            # no durable admission to reconcile, so release this exact root; if release itself is
+            # uncertain the coordinator must retain it as unknown rather than minting a successor.
+            try:
+                authority._preservation_release_automation_unaccepted(None, automation_root)
+            except BaseException:
+                logging.getLogger(__name__).exception('Unaccepted Bot custody release failed')
+                coordinator = authority._preservation_coordinator()
+                if coordinator is not None:
+                    coordinator.mark_unknown(automation_root, 'join_failed')
+            raise
+    return automation_root, child_key
+
+
+def prepare_bot_retry_custody(authority, *, identity, principal_id, session_id, source_identity):
+    """Reserve custody for the derived retry identity without creating a second mailbox pin."""
+    if (not isinstance(identity, str) or not identity.startswith('bot:')
+            or not isinstance(principal_id, str) or not principal_id
+            or not isinstance(session_id, str) or not session_id
+            or not isinstance(source_identity, str) or not source_identity):
+        raise RuntimeStoreError('invalid_params')
+    # Keep the retry root distinct in the source-owned delivery-key index.  The durable request id
+    # remains the exact retry identity, while the map key is only the delivery suffix consumed by
+    # the existing Bot root witness.
+    delivery_id = identity[4:]
+    return _prepare_bot_custody(
+        authority, request_id=identity, principal_id=principal_id, session_id=session_id,
+        source_identity=source_identity, delivery_id=delivery_id,
+    )
+
+
 def prepare_bot_admission(authority, actor, home, root, key, message, ref, live, entry,
                           author=None, legacy=None, notification_category='result'):
     from gateway.session_automation import automation_notification_metadata, automation_source_identity
@@ -136,28 +195,10 @@ def prepare_bot_admission(authority, actor, home, root, key, message, ref, live,
         event.metadata['turn_author'] = dict(author)
     principal_id = 'automation:' + entry.session_key
     source_identity = automation_source_identity(event, entry.session_key)
-    automation_root = authority._preservation_automation_root(
-        request_id='bot:' + key, principal_id=principal_id, session_id=ref.session_id,
-        source_identity=source_identity, delivery_id=key)
-    child_key = None
-    if automation_root is not None:
-        try:
-            child_key = authority._preservation_operation_start(
-                'I06_busy_followup_delivery', principal_id=principal_id, session_id=ref.session_id,
-                operation='bot-delivery', request_id='bot:' + key, generation='pre-admission',
-                source_identity=source_identity, parent_handle=automation_root)
-        except BaseException:
-            # The root was reserved before the child reservation.  A failed child reservation has
-            # no durable admission to reconcile, so release this exact root; if release itself is
-            # uncertain the coordinator must retain it as unknown rather than minting a successor.
-            try:
-                authority._preservation_release_automation_unaccepted(None, automation_root)
-            except BaseException:
-                logging.getLogger(__name__).exception('Unaccepted Bot custody release failed')
-                coordinator = authority._preservation_coordinator()
-                if coordinator is not None:
-                    coordinator.mark_unknown(automation_root, 'join_failed')
-            raise
+    automation_root, child_key = _prepare_bot_custody(
+        authority, request_id='bot:' + key, principal_id=principal_id, session_id=ref.session_id,
+        source_identity=source_identity, delivery_id=key,
+    )
     custody = (authority._preservation_automation_descriptor(
         automation_root, request_id='bot:' + key, principal_id=principal_id, session_id=ref.session_id,
         source_identity=source_identity, delivery_id=key) if automation_root is not None else None)
@@ -211,7 +252,10 @@ async def _retain_committed_bot_pin(authority, home, key, ref, record, event=Non
     """Persist the exact admission id when the canonical writer committed before an error."""
     try:
         from gateway.session_bot import _admission_at
-        admission_id = _admission_at(authority, ref.session_id, 'bot:' + key)
+        admission_id = _admission_at(
+            authority, ref.session_id, 'bot:' + key,
+            principal_id=record.get('admission_principal_id'),
+        )
         if admission_id is None:
             return
         row = get_session_admission(authority.db, admission_id=admission_id)
@@ -292,6 +336,86 @@ def _stamp_bot_callback_identity(authority, child_key, row):
         'request_id': record['request_id'],
         'source_identity': record['source_identity'],
     }
+
+
+def _mark_bot_pair_unknown(authority, child_key, root_handle, reason='read_failed'):
+    """Retain both exact Bot leases when the admission boundary cannot be authenticated."""
+    if child_key is not None:
+        authority._preservation_operation_unknown(child_key, reason)
+    if root_handle is not None:
+        coordinator = authority._preservation_coordinator()
+        if coordinator is not None:
+            coordinator.mark_unknown(root_handle, reason)
+
+
+def _bot_child_is_unaccepted(authority, child_key, root_handle):
+    operations = getattr(authority, '_preservation_operations', None)
+    record = operations.get(child_key) if isinstance(operations, dict) else None
+    children = getattr(authority, '_preservation_automation_children', None)
+    children = children if isinstance(children, dict) else {}
+    return (
+        isinstance(record, dict)
+        and record.get('admission_id') is None
+        and record.get('parent_handle') is root_handle
+        and record.get('unknown') is not True
+        and not any(value == child_key for value in children.values())
+    )
+
+
+def _bind_or_release_bot_child(authority, *, child_key, root_handle, receipt, record=None):
+    """Bind only a live row, or release an exact pre-claim cancellation.
+
+    The receipt status is only an acknowledgement snapshot. The durable row and operation record
+    are re-read here so a terminal race cannot release a child that was already accepted.
+    """
+    if child_key is None:
+        return True
+    admission_id = getattr(receipt, 'admission_id', None)
+    row = get_session_admission(authority.db, admission_id=admission_id)
+    operations = getattr(authority, '_preservation_operations', None)
+    operation = operations.get(child_key) if isinstance(operations, dict) else None
+    if not isinstance(row, dict) or not isinstance(operation, dict):
+        _mark_bot_pair_unknown(authority, child_key, root_handle)
+        raise RuntimeStoreError('preservation_custody_unknown')
+    expected = record
+    if expected is None:
+        from gateway.session_automation_custody import row_descriptor
+        expected = {
+            'session_id': row.get('target_session_id'),
+            'admission_principal_id': row.get('principal_id'),
+            'automation_custody': row_descriptor(row),
+        }
+    try:
+        _validate_bot_admission_row(
+            authority, expected, row, admission_id=admission_id,
+            request_id=operation.get('request_id'), require_custody=True,
+        )
+    except RuntimeStoreError:
+        _mark_bot_pair_unknown(authority, child_key, root_handle)
+        raise RuntimeStoreError('preservation_custody_unknown')
+    if row.get('status') != 'terminal':
+        handles = getattr(authority, '_preservation_handles', None)
+        if not isinstance(handles, dict) or handles.get(admission_id) is not root_handle:
+            _mark_bot_pair_unknown(authority, child_key, root_handle)
+            raise RuntimeStoreError('preservation_custody_unknown')
+        if not authority._preservation_operation_bind_admission(
+                child_key, admission_id, expected_parent=root_handle):
+            _mark_bot_pair_unknown(authority, child_key, root_handle)
+            raise RuntimeStoreError('preservation_custody_unknown')
+        authority._preservation_bind_automation_child(admission_id, child_key)
+        _stamp_bot_callback_identity(authority, child_key, row)
+        return True
+    no_effect = row.get('outcome') in {'cancelled', 'rejected'} and row.get('generation') is None
+    if no_effect and _bot_child_is_unaccepted(authority, child_key, root_handle):
+        if authority._preservation_operation_release_unaccepted(child_key):
+            children = getattr(authority, '_preservation_automation_children', None)
+            if isinstance(children, dict):
+                for admission_id, operation_key in list(children.items()):
+                    if operation_key == child_key:
+                        children.pop(admission_id, None)
+            return False
+    _mark_bot_pair_unknown(authority, child_key, root_handle)
+    raise RuntimeStoreError('preservation_custody_unknown')
 
 
 def _bot_row_signature(row):
@@ -547,17 +671,19 @@ async def _admit_bot_row(authority, home, key, ref, live, event, record, child_k
             request_id='bot:' + key, receipt_epoch=getattr(receipt, 'authority_epoch', None),
             require_custody=True,
         )
-        if (child_key is not None and getattr(receipt, 'status', None) != 'terminal'
-                and authority._preservation_handles.get(receipt.admission_id) is automation_root):
-            authority._preservation_operation_bind_admission(
-                child_key, receipt.admission_id, expected_parent=automation_root)
-            authority._preservation_bind_automation_child(receipt.admission_id, child_key)
-            _stamp_bot_callback_identity(authority, child_key, row)
-        elif child_key is not None:
-            authority._preservation_operation_release_unaccepted(child_key)
+        if child_key is not None:
+            bound = _bind_or_release_bot_child(
+                authority, child_key=child_key, root_handle=automation_root,
+                receipt=receipt, record=record,
+            )
+            if not bound and not authority._preservation_release_automation_unaccepted(
+                    None, automation_root):
+                raise RuntimeStoreError('preservation_custody_unknown')
     except RuntimeStoreError as exc:
         await _retain_committed_bot_pin(authority, home, key, ref, record, event)
-        if _admission_at(authority, ref.session_id, 'bot:' + key) is not None:
+        if _admission_at(
+                authority, ref.session_id, 'bot:' + key,
+                principal_id=record.get('admission_principal_id')) is not None:
             if child_key is not None:
                 authority._preservation_operation_unknown(child_key, 'read_failed')
             if automation_root is not None:
@@ -584,7 +710,9 @@ async def _admit_bot_row(authority, home, key, ref, live, event, record, child_k
         # The ordered writer may still commit after a cancelled caller. Reconcile the exact row
         # before deciding whether either lease can be released.
         await _retain_committed_bot_pin(authority, home, key, ref, record, event)
-        if _admission_at(authority, ref.session_id, 'bot:' + key) is None:
+        if _admission_at(
+                authority, ref.session_id, 'bot:' + key,
+                principal_id=record.get('admission_principal_id')) is None:
             if child_key is not None:
                 authority._preservation_operation_unknown(child_key, 'join_failed')
             if automation_root is not None:
@@ -607,6 +735,52 @@ async def commit_bot_admission(authority, home, key, ref, live, event, record, c
         authority, home, key, ref, live, event, record, child_key, automation_root, legacy,
         peer_custody=peer_custody, peer_parent=peer_parent,
     )
+
+
+async def commit_bot_retry_admission(
+        authority, live, event, identity, record, automation_root, child_key,
+):
+    """Commit one derived retry and reconcile the exact root/child pair on every outcome."""
+    from gateway.session_bot import _admission_at
+
+    principal_id = record.get('admission_principal_id')
+    session_id = record.get('session_id')
+    try:
+        kwargs = ({'_preservation_handle': automation_root,
+                   '_preservation_child_key': child_key} if automation_root is not None else {})
+        receipt = await authority.admit_automation(
+            authority.runner._adapter_for_source(live.source), event, identity, **kwargs,
+        )
+        bound = _bind_or_release_bot_child(
+            authority, child_key=child_key, root_handle=automation_root,
+            receipt=receipt,
+        )
+        if not bound and not authority._preservation_release_automation_unaccepted(
+                None, automation_root):
+            raise RuntimeStoreError('preservation_custody_unknown')
+        return receipt
+    except RuntimeStoreError as exc:
+        committed = _admission_at(
+            authority, session_id, identity, principal_id=principal_id,
+        )
+        if committed is not None:
+            _mark_bot_pair_unknown(authority, child_key, automation_root)
+            raise
+        released = authority._preservation_release_automation_unaccepted(
+            child_key, automation_root,
+        ) if automation_root is not None or child_key is not None else True
+        if not released:
+            raise RuntimeStoreError('preservation_custody_unknown') from exc
+        raise
+    except BaseException:
+        committed = _admission_at(
+            authority, session_id, identity, principal_id=principal_id,
+        )
+        _mark_bot_pair_unknown(
+            authority, child_key, automation_root,
+            'read_failed' if committed is not None else 'join_failed',
+        )
+        raise
 
 
 def _managed_bot_projection_binding(authority, admission_id, record):

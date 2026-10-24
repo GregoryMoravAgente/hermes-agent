@@ -11,6 +11,7 @@ session as an API conversation (``run_api_turn``) would be a second writer and i
 import asyncio
 import logging
 from pathlib import Path
+import sqlite3
 from types import SimpleNamespace
 import uuid
 
@@ -113,6 +114,68 @@ def _reset_local_title_owner(db, title, include_hidden, source=None):
     return [row] if len(lineage) > 1 else []
 
 
+def reset_local_bot_chat_target(runner, session_id):
+    """Return the current physical target for one reset LOCAL Bot Chat, or ``None``.
+
+    The API path addresses the stable creation id, while a local reset moves the route to a
+    child and keeps that creation id in the authority FIFO.  A retired row is not a general
+    permission to resume: every witness below must still belong to the active profile, the
+    canonical titled Bot Chat, and the receipt's validated reset lineage.  This is deliberately
+    read-only; a missing or stale witness leaves the ordinary retired-session fence in place.
+    """
+    authority = _authority(runner)
+    if (authority is None or type(session_id) is not str or not session_id
+            or getattr(authority, 'retiring', False) or getattr(authority, 'retired', False)):
+        return None
+    try:
+        authority._require_admission_open()
+        db = authority.db
+        row = db.get_session(session_id)
+        titled = db.get_session_by_title('Bot Chat')
+        if (row is None or titled is None or titled.get('id') != session_id
+                or row.get('title') != 'Bot Chat'
+                or row.get('end_reason') != 'session_reset'
+                or row.get('ended_at') is None):
+            return None
+
+        # ``owned_receipt`` authenticates the receipt's profile, logical id, LOCAL source, route,
+        # stored physical row and principal before the lineage validator is consulted.
+        from gateway.session_local_recovery import owned_receipt
+        receipt, source, route, entry = owned_receipt(authority, session_id)
+        lineage = receipt.get('lineage')
+        if (receipt.get('profile_id') != authority.profile_id
+                or receipt.get('session_id') != session_id
+                or not isinstance(lineage, list) or len(lineage) < 2
+                or lineage[0] != session_id or lineage[-1] != entry.session_id):
+            return None
+        from hermes_state_local_lineage import validate_local_lineage
+        with db._read_ctx() as conn:
+            target_id = validate_local_lineage(conn, receipt)
+        if target_id != entry.session_id or target_id not in lineage:
+            return None
+        target = db.get_session(target_id)
+        if target is None or target.get('end_reason') is not None:
+            return None
+
+        from gateway.config import Platform
+        live = authority.sessions.get(session_id)
+        if (getattr(source, 'platform', None) != Platform.LOCAL
+                or live is None or getattr(live, 'route', None) != route
+                or getattr(live, 'source', None) is None
+                or live.source.to_dict() != source.to_dict()):
+            return None
+        store = getattr(authority.runner, 'session_store', None)
+        current = store.lookup_by_session_key(route) if store is not None else None
+        if current is None or current.session_id != target_id:
+            return None
+        return target_id
+    except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError, ValueError,
+            sqlite3.Error):
+        # A malformed/cross-profile/caught-up receipt is not an opportunity to run the local API
+        # agent against the retired row.  The caller retains the standard 409 fence.
+        return None
+
+
 def bot_chat_tip(authority, session_id):
     """The canonical Bot Chat's tip row when *session_id* is in its lineage, else None."""
     db = authority.db
@@ -123,6 +186,25 @@ def bot_chat_tip(authority, session_id):
     if not tip or db.get_compression_tip(session_id) != tip:
         return None
     return db.get_session(tip)
+
+
+def _peer_delivery_target(runner, authority, session_id, logical_target):
+    """Return ``(physical entry, reset pending, valid)`` for one pinned peer delivery.
+
+    The admission row remains keyed to ``logical_target``. A reset only changes the route's
+    physical target, and the existing reset witness is the sole source of that replacement.
+    """
+    live_target = authority.sessions.get(logical_target)
+    target_entry = (
+        runner.session_store.lookup_by_session_key(live_target.route)
+        if live_target is not None and getattr(live_target, 'route', None) else None)
+    reset_target = reset_local_bot_chat_target(runner, session_id)
+    reset_row = authority.db.get_session(session_id)
+    reset_pending = bool(reset_row and reset_row.get('end_reason') == 'session_reset')
+    if reset_pending and (reset_target is None or target_entry is None
+                          or target_entry.session_id != reset_target):
+        return target_entry, True, False
+    return target_entry, reset_pending, True
 
 
 def _reject_nonlocal_peer_turn(authority, tip, custody, home, key):
@@ -193,6 +275,31 @@ async def _prepare_peer_bot_chat(authority, tip, custody, home):
     return actor, tip, None
 
 
+def _prepare_peer_delivery_parent(
+        authority, custody, home, key, target_entry, target_id, reset_pending,
+):
+    """Reserve the exact API parent for the already validated logical/physical target."""
+    if custody is None:
+        return None, None, True
+    parent_handle = authority._preservation_root('I02_api_session_turn', f'api-peer:{key}')
+    if reset_pending:
+        if parent_handle is None:
+            custody.mark_unknown('peer_parent_unmapped')
+            return None, None, False
+    elif parent_handle is None or target_entry is None or target_entry.session_id != target_id:
+        if parent_handle is not None:
+            authority._preservation_release_unaccepted(parent_handle)
+        custody.mark_unknown('peer_parent_unmapped')
+        return None, (home, {
+            'status': 'failed', 'delivery_id': key,
+            'reason': 'peer_parent_unmapped',
+        }), False
+    authority._preservation_pending_root(
+        'bot:' + key, parent_handle,
+        principal_id='automation:' + target_entry.session_key, session_id=target_id)
+    return parent_handle, None, True
+
+
 async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     """``(profile home, receipt)`` when *session_id* is the Bot Chat and the turn was admitted to its
     FIFO; None when the target is any other session (the caller runs it as an API turn)."""
@@ -218,26 +325,17 @@ async def admit_peer_turn(runner, session_id, message, author, *, custody=None):
     # Pin the target selected above.  This lets the existing deliver() target gate detect a
     # concurrent title rotation instead of silently sending the peer turn to another session.
     target_id = authority.logical_owner(tip['id'])
-    params['session_id'] = target_id
+    target_entry, reset_pending, target_valid = _peer_delivery_target(
+        runner, authority, session_id, target_id)
+    if not target_valid:
+        return None
+    params['session_id'] = target_entry.session_id if reset_pending else target_id
 
-    parent_handle = None
-    if custody is not None:
-        parent_handle = authority._preservation_root('I02_api_session_turn', f'api-peer:{key}')
-        live_target = authority.sessions.get(target_id)
-        target_entry = (
-            runner.session_store.lookup_by_session_key(live_target.route)
-            if live_target is not None and getattr(live_target, 'route', None) else None)
-        if parent_handle is None or target_entry is None or target_entry.session_id != target_id:
-            if parent_handle is not None:
-                authority._preservation_release_unaccepted(parent_handle)
-            custody.mark_unknown('peer_parent_unmapped')
-            return home, {
-                'status': 'failed', 'delivery_id': key,
-                'reason': 'peer_parent_unmapped',
-            }
-        authority._preservation_pending_root(
-            'bot:' + key, parent_handle,
-            principal_id='automation:' + target_entry.session_key, session_id=target_id)
+    parent_handle, parent_failure, parent_valid = _prepare_peer_delivery_parent(
+        authority, custody, home, key, target_entry, target_id, reset_pending,
+    )
+    if not parent_valid:
+        return parent_failure
 
     if custody is not None:
         refusal = custody.mark_admission_started()

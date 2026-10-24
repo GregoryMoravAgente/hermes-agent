@@ -55,6 +55,7 @@ env:
     tests/agent/transports/test_codex_physical_custody.py
     tests/gateway/test_runtime_service_native_close_identity.py
     tests/cron/test_cron_owner_custody.py
+    tests/cron/test_cron_reaper_continuation.py
     tests/gateway/test_managed_api_detached_cron_custody.py
     tests/gateway/test_managed_scheduler_cron_custody.py
     tests/hermes_state/test_checked_close_retention.py
@@ -470,7 +471,7 @@ jobs:
           autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
           receipt = {
               "schema": "windows-native-custody-pr-v2",
-              "qualification_scope": "original38-and-joined54-regressions-r15",
+              "qualification_scope": "original38-and-joined55-regressions-r23",
               "full_native38_qualification": False,
               "whole_source_pm_base_tools_unchanged": whole_environment_equal,
               "whole_source_file_count": len(environment_before["source"]),

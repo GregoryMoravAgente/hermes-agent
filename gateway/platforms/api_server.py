@@ -143,7 +143,7 @@ from gateway.platforms import api_server_room_grants as _room_grants
 from gateway.platforms import api_server_runs as _api_runs
 from gateway.platforms.api_server_openai_routes import OpenAICompatRoutesMixin
 from gateway.platforms.api_server_memory_sessions import ApiServerMemorySessions
-from gateway.platforms.api_server_bot_chat import reset_local_title_owner
+from gateway.platforms.api_server_bot_chat import reset_local_bot_chat_target, reset_local_title_owner
 from gateway.platforms.api_server_session_chat import retired_session_error, session_chat_user_message
 from gateway.platforms.base import (
     MEDIA_TAG_CLEANUP_RE, BasePlatformAdapter, SendResult, _terminal_sentinel_start, is_network_accessible,
@@ -3279,8 +3279,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if err:
             return None, err
         retired_error = retired_session_error(session)
+        reset_bot_chat_target = None
         if retired_error is not None:
-            return None, retired_error
+            reset_bot_chat_target = reset_local_bot_chat_target(self.gateway_runner, session_id)
+            if reset_bot_chat_target is None:
+                return None, retired_error
         body, err = await self._read_json_body(request)
         if err:
             return None, err
@@ -3337,7 +3340,10 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return {
             "gateway_session_key": gateway_session_key, "session_id": session_id, "body": body,
             "user_message": user_message, "runtime_request": runtime_request,
-            "lock_active": lock_active, "run_kwargs": run_kwargs}, None
+            "lock_active": lock_active, "run_kwargs": run_kwargs,
+            "reset_bot_chat_handoff": reset_bot_chat_target is not None,
+            "retired_session": session if reset_bot_chat_target is not None else None,
+        }, None
 
     @staticmethod
     def _session_headers(session_id: str, gateway_session_key: Optional[str]) -> dict[str, str]:
@@ -3424,6 +3430,12 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return handed_off
         api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
+        if ctx.get("reset_bot_chat_handoff"):
+            # A validated reset may proceed only through the Bot Chat's current LOCAL owner.  If
+            # that owner disappeared or failed its exact route check between preflight and
+            # admission, preserve the retired-session fence; never run the generic API agent on
+            # the retired logical row.
+            return retired_session_error(ctx["retired_session"])
         gateway_session_key = ctx["gateway_session_key"]
         session_id = ctx["session_id"]
         history = await self._conversation_history_for_session(session_id)
@@ -3480,6 +3492,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
             return handed_off
         api_server_live_bot.release_peer_custody(self, handoff_id, handoff_custody)
+        if ctx.get("reset_bot_chat_handoff"):
+            return retired_session_error(ctx["retired_session"])
         gateway_session_key, session_id = ctx["gateway_session_key"], ctx["session_id"]
         user_message, runtime_request = ctx["user_message"], ctx["runtime_request"]
         runtime_meta = self._sanitize_runtime_metadata(

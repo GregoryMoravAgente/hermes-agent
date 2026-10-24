@@ -10,10 +10,11 @@ from gateway.runtime_custody import CustodyRefusal
 def peer_source_kind(authority: Any, record: dict[str, Any]):
     """Return the authenticated producer kind for a peer record.
 
-    The peer Bot Chat is stored as a local GUI or CLI-owned session.  Its canonical route is
-    still the Bot Chat FIFO, so the storage surface is normalized to ``bot_room`` only after the
-    existing Bot Chat lineage lookup proves that exact session is the titled Bot Chat tip.  A
-    plain GUI or CLI session never receives this normalization.
+    The peer Bot Chat is stored as a local GUI, CLI, or normalized LOCAL-owned session. Its
+    canonical route is still the Bot Chat FIFO, so the storage surface is normalized to
+    ``bot_room`` only after the existing Bot Chat lineage lookup proves that exact session is the
+    titled Bot Chat tip. A plain GUI, CLI, or LOCAL session never receives this normalization
+    without that proof.
     """
     db = getattr(authority, "db", None)
     if db is None or not isinstance(record, dict):
@@ -21,11 +22,29 @@ def peer_source_kind(authority: Any, record: dict[str, Any]):
     session_id = record.get("session_id")
     session = getattr(db, "get_session", lambda _id: None)(session_id)
     source = session.get("source") if isinstance(session, dict) else None
+    reset_target = None
+    if isinstance(session, dict) and session.get("end_reason") == "session_reset":
+        # A reset root is intentionally excluded from the compression-tip chain, so a
+        # ``bot_chat_tip`` read can still return the logical root.  That does not prove that
+        # the route's physical target is live: require the source-owned reset witness before
+        # either normalized or local/API source paths can be accepted.
+        try:
+            from gateway.platforms.api_server_bot_chat import reset_local_bot_chat_target
+            reset_target = reset_local_bot_chat_target(
+                getattr(authority, "runner", None), session_id)
+        except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError,
+                ValueError, sqlite3.Error):
+            return None
+        if reset_target is None:
+            return None
     if source in {"bot_room", "api_server"}:
         return source
     # Headless owner creation uses the existing CLI source; the Bot Chat tip and producer
     # metadata checks below still authenticate this route before it is normalized.
-    if source not in {"gui", "cli"}:
+    # A production API-created Bot Chat is normalized to the LOCAL source when its policy-owned
+    # reset child is published.  It is safe to accept that source only through the exact Bot Chat
+    # tip/lineage and producer metadata checks below; a plain local row never reaches this branch.
+    if source not in {"gui", "cli", "local"}:
         return None
     if (record.get("_api_producer_phase") != "bot_i02"
             or record.get("_api_producer_source") != "bot_chat"):
@@ -36,8 +55,22 @@ def peer_source_kind(authority: Any, record: dict[str, Any]):
     except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError,
             ValueError, sqlite3.Error):
         return None
-    if not isinstance(tip, dict) or tip.get("id") != session_id:
+    if not isinstance(tip, dict):
         return None
+    if tip.get("id") != session_id:
+        # The admission remains keyed to the logical reset root. Authenticate the physical tip
+        # through the same profile/receipt/lineage/route witness used by the handoff; never rekey
+        # the durable custody record to the child merely to satisfy this source check.
+        if reset_target is None:
+            try:
+                from gateway.platforms.api_server_bot_chat import reset_local_bot_chat_target
+                reset_target = reset_local_bot_chat_target(
+                    getattr(authority, "runner", None), session_id)
+            except (AttributeError, KeyError, LookupError, OSError, RuntimeError, TypeError,
+                    ValueError, sqlite3.Error):
+                return None
+        if reset_target != tip.get("id"):
+            return None
     # The mailbox projection may omit both principal fields after it has been published.  When
     # the authenticated actor survives that projection, it must still be the current Bot Chat tip
     # owner; the canonical admission row below remains the source of the producer principal.

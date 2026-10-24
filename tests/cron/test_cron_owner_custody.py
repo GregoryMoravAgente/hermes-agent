@@ -1,6 +1,7 @@
 """Causal I12/I13/I14 custody tests over the existing cron ledger and gateway coordinator."""
 from __future__ import annotations
 
+import copy
 import json
 import os
 import subprocess
@@ -1290,3 +1291,194 @@ def test_i13_direct_popen_identity_probe():
             except (BrokenPipeError, OSError, ValueError):
                 pass
         process.wait(timeout=5)
+
+
+@pytest.mark.skipif(
+    sys.platform == "win32"
+    and getattr(__import__("cron.jobs", fromlist=["msvcrt"]), "msvcrt", None) is None,
+    reason="strict cross-process jobs lock backend unavailable",
+)
+def test_i13_detached_reaper_continues_exact_worker_lease_without_second_admission(
+    custody_runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """The accepted I12/I13 worker reaper never reacquires the detached profile lock."""
+    import time
+
+    from cron import executions
+    from cron.runtime_custody import reserve_execution
+    from cron.scheduler_detached_worker import reap_terminal_worker_in_background
+    from gateway.runtime_cron_source_registry import CronAdmissionLease, CronSourceRegistry
+    from tests.waiting import wait_until
+
+    coordinator, _executions, db = custody_runtime
+    binding = reserve_execution(
+        owner_class="I12_cron_fire", job_id="job-reaper-continuation",
+        source="builtin", required=True,
+    )
+    row = executions.create_execution(
+        "job-reaper-continuation", source="builtin", execution_id=binding.owner_id,
+    )
+    binding.bind_execution_record(row)
+    worker = binding.reserve_external_worker()
+    assert executions.mark_execution_handoff_pending(binding.execution_id) is not None
+
+    script = textwrap.dedent(
+        f"""
+        import json
+        import os
+        import sys
+        from pathlib import Path
+        import cron.executions as e
+
+        e.EXECUTIONS_FILE = Path({str(db)!r})
+        adopted = e.adopt_claimed_execution({binding.execution_id!r})
+        assert adopted is not None
+        print(json.dumps({{
+            "execution_id": {binding.execution_id!r},
+            "pid": os.getpid(),
+            "process_started_at": adopted["process_started_at"],
+        }}), flush=True)
+        assert e.finish_execution(
+            {binding.execution_id!r}, success=True, delivery_outcome="delivered",
+        ) is not None
+        assert sys.stdin.read(1) == "x"
+        """
+    )
+    process = subprocess.Popen(
+        [_windows_base_executable(), "-c", script],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        text=True, env=_windows_base_environment(),
+    )
+    worker.bind_process(process)
+    assert process.stdout is not None
+    acknowledgement = json.loads(process.stdout.readline())
+
+    registry = CronSourceRegistry(coordinator)
+    # Keep the production registry's active-lease/close bookkeeping and exact
+    # lock transfer. Only the closed-world bootstrap is supplied by this
+    # source fixture; production startup populates it from real entrypoints.
+    monkeypatch.setattr(registry, "_validate_admission_locked", lambda *_args: None)
+    monkeypatch.setattr(registry, "_validate_graph_locked", lambda: True)
+    admission = CronAdmissionLease(
+        registry, "worker", tmp_path, parent=binding,
+    )
+
+    try:
+        with admission:
+            worker.activate_external_worker(acknowledgement, process)
+            worker.expect_reaper()
+            # A copied worker, a replacement process, and a new unentered lease
+            # cannot launder the original parent/child/native identity.
+            assert admission.bind_external_worker_custody(copy.copy(worker), process) is False
+            assert admission.bind_external_worker_custody(worker, object()) is False
+            replacement = CronAdmissionLease(
+                registry, "worker", tmp_path, parent=binding,
+            )
+            assert replacement.bind_external_worker_custody(worker, process) is False
+            assert admission.bind_external_worker_custody(worker, process) is True
+            assert admission.detach_jobs_lock_after_handoff().detached is True
+
+            original_handle = worker.handle
+            worker.handle = object()
+            assert admission.retain_detached_worker_reaper(worker, process) is False
+            worker.handle = original_handle
+            original_native_job = getattr(worker, "_native_job", None)
+            if original_native_job is not None:
+                worker._native_job = object()
+                assert admission.retain_detached_worker_reaper(worker, process) is False
+                worker._native_job = original_native_job
+            original_parent_process = getattr(binding, "_process", None)
+            original_parent_pid = getattr(binding, "_bound_process_pid", None)
+            original_parent_started = getattr(binding, "_bound_process_started_at", None)
+            with binding._lock:
+                binding._process = object()
+                binding._bound_process_pid = -1
+                binding._bound_process_started_at = "foreign-parent-start"
+            assert admission.retain_detached_worker_reaper(worker, process) is False
+            with binding._lock:
+                binding._process = original_parent_process
+                binding._bound_process_pid = original_parent_pid
+                binding._bound_process_started_at = original_parent_started
+            assert admission.confirm_detached_worker_settlement(worker, process) is False
+
+            observer_completed = Event()
+
+            def observer_failure() -> bool:
+                observed = worker.observe_terminal()
+                observer_completed.set()
+                return False if observed is True else observed
+
+            reaper = reap_terminal_worker_in_background(
+                process,
+                on_done=observer_failure,
+                custody=worker,
+                admission=admission,
+            )
+            worker.bind_reaper(reaper)
+            assert admission.mark_detached_worker_reaper_terminal(worker, process) is False
+
+            # Finish the actual child while the outer admission is still entered.  A
+            # callback failure must not release the exact source lease or permit a second
+            # admission, even though the native reaper has already completed.
+            assert process.stdin is not None
+            process.stdin.write("x")
+            process.stdin.flush()
+            process.stdin.close()
+            reaper.join(timeout=5)
+            assert not reaper.is_alive()
+            assert observer_completed.wait(timeout=5)
+            assert admission.active is True
+            assert registry._active_leases.get(admission.lease_id) is admission
+            assert admission._reaper_settlement_confirmed is False
+            assert admission.release_detached_worker_reaper(worker, process).status == "refused"
+
+        # The outer context closes its local ContextVars, but the exact source lease remains
+        # retained until a later source-owned terminal receipt confirms the observer result.
+        assert admission.active is True
+        assert admission.confirm_detached_worker_settlement(worker, process) is True
+        release = admission.release_detached_worker_reaper(worker, process)
+        assert release.status == "reaper_pending"
+        assert registry.begin_close(1, deadline=time.monotonic() + 5) is True
+        wait_until(
+            lambda: not admission.active,
+            timeout=5,
+            what="exact cron reaper source lease release",
+        )
+        assert worker.settled is True
+        assert binding.settled is True
+        assert admission.lease_id not in registry._active_leases
+    finally:
+        if process.poll() is None:
+            if process.stdin is not None:
+                try:
+                    process.stdin.write("x")
+                    process.stdin.flush()
+                    process.stdin.close()
+                except (BrokenPipeError, OSError, ValueError):
+                    pass
+            process.wait(timeout=5)
+
+
+def test_i13_post_handoff_wait_preserves_exact_recovery_context(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The typed post-handoff error must retain its same-lease recovery payload."""
+    from cron import scheduler
+
+    admission = object()
+    wait_context = {"process": object(), "execution_id": "synthetic-execution"}
+    expected = scheduler._ExternalWorkerPostHandoffError(
+        "observer failed", admission=admission, wait_context=wait_context,
+    )
+
+    def _body(*_args, **_kwargs):
+        raise expected
+
+    monkeypatch.setattr(scheduler, "_wait_for_external_cron_worker_body", _body)
+    with pytest.raises(scheduler._ExternalWorkerPostHandoffError) as caught:
+        scheduler._wait_for_external_cron_worker(
+            object(), execution_id="synthetic-execution", admission=admission,
+        )
+    assert caught.value is expected
+    assert caught.value.admission is admission
+    assert caught.value.wait_context is wait_context

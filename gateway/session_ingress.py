@@ -544,8 +544,13 @@ async def execute_admission(authority, ref, row):
         managed_binding = None
         managed_binding_token = None
         try:
+            route_row = row
+            if (not _managed_process_route(row)
+                    and '_automation_custody_v1' in (row.get('payload') or {})):
+                from gateway.session_i09_managed_replay import managed_i09_route_row
+                route_row = managed_i09_route_row(authority, ref, row)
             managed_binding, managed_binding_token = _bind_process_route(
-                authority, ref, row, require_managed=True,
+                authority, ref, route_row, require_managed=True,
             )
             return await admit_managed(authority, ref, row, policy, managed_binding)
         finally:

@@ -99,7 +99,10 @@ def _record_shape_error(path, record):
 
 def _is_pre_admission_pin(path, record):
     """The ``ambiguous`` pin ``_admit`` writes before it admits: no admission id, never refused."""
-    return (record.get('status') == 'ambiguous' and not _record_admission_id(record) and 'refused' not in record
+    retry = record.get('retry')
+    return (record.get('status') == 'ambiguous' and not _record_admission_id(record)
+            and 'refused' not in record
+            and not (isinstance(retry, dict) and retry.get('unknown') is True)
             and _canonical_record_error(path, record, ('profile_home', 'session_id', 'principal_id')) is None)
 
 
@@ -179,12 +182,18 @@ async def _scan_owner_receipts(authority, home):
 def _pin_committed(authority, record, request_id):
     """Whether the pin's admission may have committed: a live row, or a deleted target (its
     admissions moved to retired receipts keyed by the route principal the pin never recorded)."""
-    if _admission_at(authority, record['session_id'], request_id) is not None:
+    principal_id = _admission_principal(authority, record)
+    if _admission_at(
+            authority, record['session_id'], request_id, principal_id=principal_id) is not None:
         return True
-    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    if not isinstance(principal_id, str) or not principal_id:
+        return False
+    from hermes_state_terminal import identity_key
     with authority.db._read_ctx() as conn:
-        return conn.execute('SELECT 1 FROM state_meta WHERE key=?',
-                            (RETIRED_PREFIX + record['session_id'],)).fetchone() is not None
+        return conn.execute(
+            'SELECT 1 FROM state_meta WHERE key=?',
+            (identity_key(principal_id, record['session_id'], request_id),),
+        ).fetchone() is not None
 
 
 def _legacy_order(path, record):
@@ -426,13 +435,46 @@ def _expired_outcome(authority, record):
 def _retry_admission(authority, record):
     """The delivery's one retry admission id, read from the FIFO by its derived identity, so every
     reader (an in-memory record, the receipt file, an owner restart) follows the same retry."""
-    return _admission_at(authority, record['session_id'], _retry_identity(record['delivery_id']))
+    principal_id = _admission_principal(authority, record)
+    return _admission_at(
+        authority, record['session_id'], _retry_identity(record['delivery_id']),
+        principal_id=principal_id,
+    )
 
 
-def _admission_at(authority, session_id, request_id):
+def _admission_principal(authority, record):
+    """Read the exact Bot principal, using its canonical admission row when a public result omits it."""
+    principal_id = record.get('admission_principal_id') or (
+        record.get('automation_custody') or {}).get('principal_id')
+    if isinstance(principal_id, str) and principal_id:
+        return principal_id
+    admission_id = _record_admission_id(record)
+    delivery_id = record.get('delivery_id')
+    session_id = record.get('session_id')
+    if (not isinstance(admission_id, str) or not admission_id
+            or not isinstance(delivery_id, str) or not delivery_id
+            or not isinstance(session_id, str) or not session_id):
+        return None
+    request_id = record.get('admission_request_id') or ('bot:' + delivery_id)
+    if request_id != 'bot:' + delivery_id:
+        return None
+    row = get_session_admission(authority.db, admission_id=admission_id)
+    if (not isinstance(row, dict) or row.get('target_session_id') != session_id
+            or row.get('request_id') != request_id):
+        return None
+    principal_id = row.get('principal_id')
+    return principal_id if isinstance(principal_id, str) and principal_id else None
+
+
+def _admission_at(authority, session_id, request_id, *, principal_id):
+    if not isinstance(principal_id, str) or not principal_id:
+        return None
     with authority.db._read_ctx() as conn:
-        row = conn.execute('SELECT admission_id FROM session_admissions WHERE target_session_id=? AND request_id=?',
-                           (session_id, request_id)).fetchone()
+        row = conn.execute(
+            'SELECT admission_id FROM session_admissions '
+            'WHERE principal_id=? AND target_session_id=? AND request_id=?',
+            (principal_id, session_id, request_id),
+        ).fetchone()
     return row[0] if row else None
 
 
@@ -485,7 +527,10 @@ def _result(authority, record):
             field='retry_execution_generation', require_custody=False,
         )
         retry_generation = retry_row.get('generation') if isinstance(retry_row, dict) else None
-    if retry_id:
+    retry_state = record.get('retry') or {}
+    if retry_state.get('unknown') and not retry_id:
+        status, reply = 'ambiguous', ''
+    elif retry_id:
         status, reply = _admission_outcome(authority, retry_id)
     else:
         status, reply = _admission_outcome(authority, admission_id, record)
@@ -533,6 +578,13 @@ def _delivery_result(authority, record):
     return result
 
 
+async def _retain_retry_custody_unknown(home, record, identity):
+    """Persist an ambiguous retry without turning an unproven release into a public refusal."""
+    record['retry'] = {'identity': identity, 'unknown': True}
+    record.update(status='ambiguous', reply='')
+    await write_receipt(home, record)
+
+
 def peer_wait_admission(authority, record):
     """``(admission_id, interim)`` a live waiter must follow; ``(None, False)`` once the delivery
     settled for good. The retry, once admitted, is the only admission whose future fires again.
@@ -563,7 +615,8 @@ def _retry_eligible(authority, record):
     admission SETTLED ``failed`` with a committed result whose error classifies transient (429/5xx/
     context overflow). queued/started/unknown admissions never qualify — unknown execution is never
     replayed — and the retry itself is never retried."""
-    if (record.get('retry') or {}).get('refused') or _retry_admission(authority, record):
+    retry_state = record.get('retry') or {}
+    if retry_state.get('refused') or retry_state.get('unknown') or _retry_admission(authority, record):
         return False
     admission_id = _record_admission_id(record)
     row = get_session_admission(authority.db, admission_id=admission_id)
@@ -616,21 +669,55 @@ async def _maybe_retry(authority, home, path, record):
         return
     event = MessageEvent(text=record['message'], source=live.source, internal=True,
         message_id=identity, metadata={'gateway_session_key': live.route, 'gateway_session_id': entry.session_id})
-    from gateway.session_automation import automation_notification_metadata
+    from gateway.session_automation import automation_notification_metadata, automation_source_identity
     event.metadata.update(automation_notification_metadata(record))
     if record.get('author') is not None:
         event.metadata['turn_author'] = dict(record['author'])
+    source_identity = automation_source_identity(event, entry.session_key)
+    from gateway.session_bot_custody import (
+        commit_bot_retry_admission, prepare_bot_retry_custody,
+    )
+    try:
+        retry_root, retry_child = prepare_bot_retry_custody(
+            authority, identity=identity, principal_id='automation:' + entry.session_key,
+            session_id=ref.session_id, source_identity=source_identity,
+        )
+    except RuntimeStoreError as exc:
+        if exc.reason == 'preservation_custody_unknown':
+            await _retain_retry_custody_unknown(home, record, identity)
+            return
+        # A managed retry cannot fall back to an ownerless execution.  The original admission is
+        # already terminal, so publish a typed retry refusal while retaining the original receipt.
+        record['retry'] = {'identity': identity, 'refused': exc.reason}
+        await write_receipt(home, record)
+        return
     record['retry'] = {'identity': identity}
     record.update(status='queued', reply='')
-    await write_receipt(home, record)
     try:
-        receipt = await authority.admit_automation(authority.runner._adapter_for_source(live.source), event, identity)
+        await write_receipt(home, record)
+    except BaseException:
+        # The mailbox write may have crossed its filesystem boundary before raising. Retain the
+        # exact retry pair as UNKNOWN rather than releasing a root that a later owner could copy.
+        if retry_child is not None:
+            authority._preservation_operation_unknown(retry_child, 'read_failed')
+        if retry_root is not None:
+            authority._preservation_coordinator().mark_unknown(retry_root, 'read_failed')
+        raise
+    try:
+        receipt = await commit_bot_retry_admission(
+            authority, live, event, identity, record, retry_root, retry_child,
+        )
     except RuntimeStoreError as exc:
-        if exc.reason != 'queue_full':
-            raise
-        # Nothing was admitted: keep the delivery pending (as for a drain) so the next wake or
-        # delivery performs the same derived retry once the FIFO has room.
-        record.update(status='claimed', reply='')
+        if exc.reason == 'preservation_custody_unknown':
+            await _retain_retry_custody_unknown(home, record, identity)
+            return
+        if exc.reason == 'queue_full':
+            # Nothing was admitted: keep the delivery pending (as for a drain) so the next wake or
+            # delivery performs the same derived retry once the FIFO has room.
+            record.update(status='claimed', reply='')
+            return
+        record['retry'] = {'identity': identity, 'refused': exc.reason}
+        await write_receipt(home, record)
         return
     record.update(_result(authority, record))
     if record['status'] in {'queued', 'claimed'}:

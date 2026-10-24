@@ -11,6 +11,7 @@ It is deliberately a source registry, not another ledger.  Durable execution row
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import contextlib
 import hashlib
@@ -172,14 +173,430 @@ class CronAdmissionLease:
         self._handoff_transfer: Any = None
         self._context_transferred = False
         self._handoff_retry_registered = False
-        # A thread.start() exception does not prove that the native start had no
-        # effect.  Keep this explicit audit state until the registered consumer
-        # itself reports entry; never use ident/is_alive as a no-effect proof.
+        # A thread.start() exception is ambiguous; retain this state until the consumer
+        # reports entry, never using ident/is_alive as a no-effect proof.
         self._handoff_retry_start_status = "not_started"
-
+        # The external worker reaper continues this accepted worker lease; it must not
+        # create a second producer lease after the original jobs lock is detached.
+        self._accepted_worker_custody: Any = None
+        self._accepted_worker_process: Any = None
+        self._accepted_worker_identity: dict[str, Any] | None = None
+        self._reaper_retained = False
+        self._reaper_completed = False
+        self._reaper_release_requested = False
+        self._reaper_settlement_confirmed = False
+        self._reaper_outer_exited = False
+        self._reaper_retry_registered = False
+        self._reaper_retry_start_status = "not_started"
+        self._reaper_retry_consumer_status = "not_registered"
+        self._reaper_retry_stop = False
+        self._reaper_retry_thread_done = threading.Event()
+        self._reaper_retry_thread_done.set()
+        self._reaper_retry_thread: threading.Thread | None = None
+        self._reaper_retry_callback: Any = None
+        self._reaper_lock = threading.RLock()
     @property
     def active(self) -> bool:
-        return self._entered > 0 and not self._released
+        return (
+            (self._entered > 0 or self._reaper_retained)
+            and not self._released
+        )
+
+    @staticmethod
+    def _worker_reaper_identity(custody: Any, process: Any) -> dict[str, Any] | None:
+        """Capture source-owned I12/I13 handles, records, process, and native Job."""
+        parent = getattr(custody, "parent", None)
+        coordinator = getattr(custody, "coordinator", None)
+        parent_handle = getattr(parent, "handle", None)
+        worker_handle = getattr(custody, "handle", None)
+        if (
+            parent is None
+            or coordinator is None
+            or parent_handle is None
+            or worker_handle is None
+            or getattr(custody, "_process", None) is not process
+            or hasattr(worker_handle, "reservation")
+        ):
+            return None
+        try:
+            parent_lease_id = parent_handle.lease.lease_id
+            worker_lease_id = worker_handle.lease.lease_id
+        except AttributeError:
+            return None
+        with parent._lock:
+            parent_process = getattr(parent, "_process", None)
+            parent_pid = getattr(parent, "_bound_process_pid", None)
+            parent_started = getattr(parent, "_bound_process_started_at", None)
+            parent_physical_fields = CronAdmissionLease._worker_reaper_physical_fields(parent)
+        with custody._lock:
+            native_job = getattr(custody, "_native_job", None)
+            native_job_identity = getattr(custody, "_native_job_identity", None)
+            native_job_proven = getattr(custody, "_native_job_proven", False)
+            worker_pid = getattr(custody, "_worker_pid", None)
+            worker_started = getattr(custody, "_worker_started_at", None)
+            bound_pid = getattr(custody, "_bound_process_pid", None)
+            bound_started = getattr(custody, "_bound_process_started_at", None)
+            worker_physical_fields = CronAdmissionLease._worker_reaper_physical_fields(custody)
+        with coordinator._lock:
+            records = getattr(coordinator, "_records", None)
+            if not isinstance(records, dict):
+                return None
+            parent_record = records.get(parent_lease_id)
+            worker_record = records.get(worker_lease_id)
+        if parent_record is None or worker_record is None:
+            return None
+        return {
+            "coordinator": coordinator,
+            "parent": parent,
+            "custody": custody,
+            "parent_handle": parent_handle,
+            "worker_handle": worker_handle,
+            "parent_record": parent_record,
+            "worker_record": worker_record,
+            "parent_lease_id": parent_lease_id,
+            "worker_lease_id": worker_lease_id,
+            "parent_process": parent_process,
+            "parent_pid": parent_pid,
+            "parent_started": parent_started,
+            "parent_physical_fields": parent_physical_fields,
+            "parent_physical_presence": tuple(value is not None for value in parent_physical_fields),
+            "process": process,
+            "worker_pid": worker_pid,
+            "worker_started": worker_started,
+            "bound_pid": bound_pid,
+            "bound_started": bound_started,
+            "native_job": native_job,
+            "native_job_identity": native_job_identity,
+            "native_job_proven": native_job_proven,
+            "worker_physical_fields": worker_physical_fields,
+            "worker_physical_presence": tuple(value is not None for value in worker_physical_fields),
+            "worker_reaper_bound": False,
+            "parent_handle_fields": (
+                parent_handle.owner_class, parent_handle.owner_id,
+                parent_handle.profile_id, parent_handle.authority_epoch,
+                parent_handle.process_instance, parent_handle.close_generation,
+                parent_handle.coordinator_id,
+            ),
+            "worker_handle_fields": (
+                worker_handle.owner_class, worker_handle.owner_id,
+                worker_handle.profile_id, worker_handle.authority_epoch,
+                worker_handle.process_instance, worker_handle.close_generation,
+                worker_handle.coordinator_id,
+            ),
+        }
+    @staticmethod
+    def _worker_reaper_handle_fields(handle: Any) -> tuple[Any, ...] | None:
+        try:
+            return (
+                handle.owner_class, handle.owner_id, handle.profile_id,
+                handle.authority_epoch, handle.process_instance,
+                handle.close_generation, handle.coordinator_id,
+            )
+        except AttributeError:
+            return None
+    @staticmethod
+    def _worker_reaper_physical_fields(binding: Any) -> tuple[Any, ...]:
+        from cron.scheduler_detached_worker import _cron_worker_reaper_physical_fields
+
+        return _cron_worker_reaper_physical_fields(binding)
+    @staticmethod
+    def _worker_reaper_physical_matches(
+        binding: Any, expected: tuple[Any, ...] | None,
+        *, reaper_bound: bool = True, expected_presence: tuple[bool, ...] | None = None,
+    ) -> bool:
+        from cron.scheduler_detached_worker import _cron_worker_reaper_physical_matches
+
+        return _cron_worker_reaper_physical_matches(
+            binding,
+            expected,
+            reaper_bound=reaper_bound,
+            expected_presence=expected_presence,
+        )
+    def _reaper_identity_matches(
+        self, custody: Any, process: Any, *, terminal: bool = False,
+    ) -> bool:
+        snapshot = self._accepted_worker_identity
+        if not isinstance(snapshot, dict):
+            return False
+        if (
+            self.source_key != "worker"
+            or self._released
+            or snapshot.get("parent") is not self.parent
+            or snapshot.get("custody") is not custody
+            or snapshot.get("process") is not process
+            or getattr(custody, "parent", None) is not self.parent
+            or getattr(self.parent, "child", None) is not custody
+            or getattr(custody, "_process", None) is not process
+        ):
+            return False
+        parent = snapshot.get("parent")
+        with parent._lock:
+            if (
+                getattr(parent, "_process", None) is not snapshot.get("parent_process")
+                or getattr(parent, "_bound_process_pid", None) != snapshot.get("parent_pid")
+                or getattr(parent, "_bound_process_started_at", None)
+                != snapshot.get("parent_started")
+                or getattr(parent, "coordinator", None) is not snapshot.get("coordinator")
+            ):
+                return False
+            if not self._worker_reaper_physical_matches(
+                parent, snapshot.get("parent_physical_fields"),
+                expected_presence=snapshot.get("parent_physical_presence"),
+            ):
+                return False
+        parent_handle = getattr(self.parent, "handle", None)
+        worker_handle = getattr(custody, "handle", None)
+        if (
+            parent_handle is not snapshot.get("parent_handle")
+            or worker_handle is not snapshot.get("worker_handle")
+            or self._worker_reaper_handle_fields(parent_handle)
+            != snapshot.get("parent_handle_fields")
+            or self._worker_reaper_handle_fields(worker_handle)
+            != snapshot.get("worker_handle_fields")
+        ):
+            return False
+        coordinator = snapshot.get("coordinator")
+        if getattr(custody, "coordinator", None) is not coordinator:
+            return False
+        with custody._lock:
+            if (
+                getattr(custody, "_process", None) is not process
+                or getattr(custody, "_native_job", None) is not snapshot.get("native_job")
+                or getattr(custody, "_native_job_identity", None)
+                is not snapshot.get("native_job_identity")
+                or getattr(custody, "_native_job_proven", False)
+                is not snapshot.get("native_job_proven")
+                or getattr(custody, "_worker_pid", None) != snapshot.get("worker_pid")
+                or getattr(custody, "_worker_started_at", None)
+                != snapshot.get("worker_started")
+                or getattr(custody, "_bound_process_pid", None)
+                != snapshot.get("bound_pid")
+                or getattr(custody, "_bound_process_started_at", None)
+                != snapshot.get("bound_started")
+            ):
+                return False
+            if not self._worker_reaper_physical_matches(
+                custody, snapshot.get("worker_physical_fields"),
+                reaper_bound=snapshot.get("worker_reaper_bound", False),
+                expected_presence=snapshot.get("worker_physical_presence"),
+            ):
+                return False
+            if terminal:
+                if getattr(custody, "_native_job", None) is not None and (
+                    getattr(custody, "_native_job_closed_identity", None)
+                    is not snapshot.get("native_job")
+                ):
+                    return False
+                proof = getattr(custody, "_scope_proof", None)
+                if snapshot.get("native_job") is not None and (
+                    not isinstance(proof, dict) or proof.get("scope_empty") is not True
+                ):
+                    return False
+        if terminal:
+            try:
+                if process.poll() is None:
+                    return False
+            except (AttributeError, OSError, ValueError):
+                return False
+        with coordinator._lock:
+            if terminal:
+                completed = getattr(coordinator, "_completed_handles", None)
+                return (
+                    isinstance(completed, Mapping)
+                    and completed.get(snapshot["parent_lease_id"])
+                    is snapshot["parent_handle"]
+                    and completed.get(snapshot["worker_lease_id"])
+                    is snapshot["worker_handle"]
+                )
+            records = getattr(coordinator, "_records", None)
+            return (
+                isinstance(records, dict)
+                and records.get(snapshot["parent_lease_id"])
+                is snapshot["parent_record"]
+                and records.get(snapshot["worker_lease_id"])
+                is snapshot["worker_record"]
+            )
+
+    def bind_external_worker_custody(self, custody: Any, process: Any) -> bool:
+        """Bind the source lease to the exact activated I13 worker before detach."""
+        with self._reaper_lock:
+            if self._entered != 1 or self._jobs_lock_detached:
+                return False
+            if getattr(custody, "_reaper_expected", False) is not True:
+                return False
+            if self._accepted_worker_custody is None:
+                snapshot = self._worker_reaper_identity(custody, process)
+                if snapshot is None:
+                    return False
+                self._accepted_worker_identity = snapshot
+                if not self._reaper_identity_matches(custody, process):
+                    self._accepted_worker_identity = None
+                    return False
+            if self._accepted_worker_custody is not None:
+                return (
+                    self._accepted_worker_custody is custody
+                    and self._accepted_worker_process is process
+                    and self._reaper_identity_matches(custody, process)
+                )
+            self._accepted_worker_custody = custody
+            self._accepted_worker_process = process
+            return True
+
+    def bind_detached_worker_reaper(
+        self, custody: Any, process: Any, reaper: Any,
+    ) -> bool:
+        with self._reaper_lock:
+            snapshot = self._accepted_worker_identity
+            if (not self._reaper_retained or snapshot is None or
+                self._accepted_worker_custody is not custody or
+                self._accepted_worker_process is not process or reaper is None):
+                return False
+            if not self._worker_reaper_physical_matches(
+                custody, snapshot.get("worker_physical_fields"),
+                reaper_bound=False,
+                expected_presence=snapshot.get("worker_physical_presence"),
+            ):
+                return False
+            updated = list(self._worker_reaper_physical_fields(custody))
+            updated[2] = reaper
+            presence = list(snapshot.get("worker_physical_presence", ()))
+            if len(presence) != len(updated):
+                return False
+            presence[2] = True
+            snapshot.update(
+                worker_physical_fields=tuple(updated),
+                worker_physical_presence=tuple(presence),
+                worker_reaper_bound=True,
+            )
+            return True
+
+    def rollback_detached_worker_reaper_bind(
+        self, custody: Any, process: Any, reaper: Any,
+    ) -> bool:
+        with self._reaper_lock:
+            snapshot = self._accepted_worker_identity
+            fields = None if snapshot is None else snapshot.get("worker_physical_fields")
+            if (snapshot is None or self._accepted_worker_custody is not custody or
+                self._accepted_worker_process is not process or
+                not snapshot.get("worker_reaper_bound") or fields is None or
+                fields[2] is not reaper):
+                return False
+            presence = list(snapshot.get("worker_physical_presence", ()))
+            if len(presence) != len(fields):
+                return False
+            restored = list(fields)
+            restored[2] = None
+            snapshot["worker_physical_fields"] = tuple(restored)
+            presence[2] = False
+            snapshot["worker_physical_presence"] = tuple(presence)
+            snapshot["worker_reaper_bound"] = False
+            return True
+    def retain_detached_worker_reaper(self, custody: Any, process: Any) -> bool:
+        """Retain this accepted worker lease for one native reaper continuation."""
+        with self._reaper_lock:
+            if self._reaper_retained or self._reaper_completed or self._reaper_outer_exited:
+                return False
+            if (
+                self._entered != 1
+                or not self._jobs_lock_detached
+                or self._jobs_lock_handoff_pending
+                or not self._reaper_identity_matches(custody, process)
+                or self._accepted_worker_custody is not custody
+                or self._accepted_worker_process is not process
+            ):
+                return False
+            self._reaper_retained = True
+            self._reaper_release_requested = False
+            return True
+    def mark_detached_worker_reaper_terminal(self, custody: Any, process: Any) -> bool:
+        """Record only a real native wait completion for the retained worker."""
+        with self._reaper_lock:
+            if (
+                not self._reaper_retained
+                or not self._reaper_identity_matches(custody, process)
+                or self._accepted_worker_custody is not custody
+                or self._accepted_worker_process is not process
+            ):
+                return False
+            try:
+                if process.poll() is None:
+                    return False
+            except (AttributeError, OSError, ValueError):
+                return False
+            self._reaper_completed = True
+            return True
+    def confirm_detached_worker_settlement(self, custody: Any, process: Any) -> bool:
+        """Accept only source-issued terminal receipts for both I13 and its I12 parent."""
+        with self._reaper_lock:
+            if (
+                not self._reaper_retained
+                or not self._reaper_completed
+                or not self._reaper_identity_matches(custody, process, terminal=True)
+            ):
+                return False
+            snapshot = self._accepted_worker_identity
+            if not isinstance(snapshot, dict):
+                return False
+            parent = snapshot.get("parent")
+            for binding in (custody, parent):
+                if getattr(binding, "settled", False) is not True:
+                    return False
+                with binding._lock:
+                    if (
+                        getattr(binding, "_settled", False) is not True
+                        or getattr(binding, "_unknown", True) is not False
+                    ):
+                        return False
+            self._reaper_settlement_confirmed = True
+            return True
+    def _finish_detached_worker_reaper_release(self) -> bool:
+        from cron.scheduler_detached_worker import _cron_finish_detached_worker_reaper_release
+
+        return _cron_finish_detached_worker_reaper_release(self)
+    def release_detached_worker_reaper(
+        self, custody: Any, process: Any,
+    ) -> CronAdmissionHandoffOutcome:
+        """Return pending until the outer context has closed, then release exactly once."""
+        with self._reaper_lock:
+            if (
+                not self._reaper_retained
+                or not self._reaper_completed
+                or not self._reaper_settlement_confirmed
+                or not self._reaper_identity_matches(custody, process, terminal=True)
+                or self._accepted_worker_custody is not custody
+                or self._accepted_worker_process is not process
+            ):
+                return CronAdmissionHandoffOutcome("refused", self.source_key, self._lock_key)
+            if self._reaper_release_requested:
+                return CronAdmissionHandoffOutcome(
+                    "reaper_pending", self.source_key, self._lock_key,
+                )
+            self._reaper_release_requested = True
+        if self._finish_detached_worker_reaper_release():
+            return CronAdmissionHandoffOutcome("released", self.source_key, self._lock_key)
+        return CronAdmissionHandoffOutcome("reaper_pending", self.source_key, self._lock_key)
+    def register_detached_worker_reaper_retry(self, retry: Any) -> bool:
+        """Register one source-owned settlement retry for this exact retained reaper.
+
+        The retry is only a consumer of the already-retained lease.  It may retry the
+        source callback/receipt, but it cannot create an admission, reacquire the jobs
+        lock, or replace the captured parent/worker/native identities.
+        """
+        if self.registry is None or not callable(retry):
+            return False
+        register = getattr(self.registry, "_register_reaper_retry", None)
+        if not callable(register):
+            return False
+        return bool(register(self, retry))
+    def stop_detached_worker_reaper_retry(self, reason: str) -> None:
+        with self._reaper_lock:
+            self._reaper_retry_stop = True
+            self._reaper_retry_start_status = f"unknown:{reason}"
+    def reconcile_detached_worker_reaper_retry(self) -> bool:
+        if self.registry is None:
+            return False
+        recover = getattr(self.registry, "_recover_reaper_retry", None)
+        return bool(callable(recover) and recover(self))
 
     def __enter__(self) -> CronAdmissionLease:
         if self._released:
@@ -219,6 +636,34 @@ class CronAdmissionLease:
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         if self._handoff_owner is not self:
+            return
+        if self._reaper_retained:
+            # The detached worker owns the accepted continuation, not a new
+            # worker_reaper admission.  Close this thread's ContextVar
+            # generators while retaining only the exact registry lease.
+            if self._entered > 1:
+                self._entered -= 1
+                return
+            if not self._entered:
+                return
+            self._entered = 0
+            lock_context = self._lock_context
+            store_context = self._store_context
+            try:
+                if lock_context is not None:
+                    lock_context.__exit__(exc_type, exc_value, traceback)
+            finally:
+                try:
+                    if store_context is not None:
+                        store_context.__exit__(exc_type, exc_value, traceback)
+                finally:
+                    self._lock_context = None
+                    self._store_context = None
+                    self._reaper_outer_exited = True
+            if self.registry is not None:
+                with self.registry._lock:
+                    self.registry._lease_condition.notify_all()
+            self._finish_detached_worker_reaper_release()
             return
         if self._jobs_lock_handoff_pending:
             # Preserve the live context, descriptor, and registry active-lease
@@ -349,6 +794,12 @@ class CronAdmissionLease:
 
     def release_after_handoff_retry(self) -> CronAdmissionHandoffOutcome:
         """Close a lease after a pending handoff has detached successfully."""
+        if self._reaper_retained:
+            # The native reaper, not the old transferred-lock retry path, owns
+            # release after its exact process/custody completion.
+            return CronAdmissionHandoffOutcome(
+                "reaper_pending", self.source_key, self._lock_key,
+            )
         if (
             self._handoff_owner is not self
             or self._jobs_lock_handoff_pending
@@ -440,6 +891,7 @@ class CronSourceRegistry:
         self._lease_condition = threading.Condition(self._lock)
         self._active_leases: dict[int, CronAdmissionLease] = {}
         self._handoff_retry_threads: dict[int, threading.Thread] = {}
+        self._reaper_retry_threads: dict[int, threading.Thread] = {}
         self._runner: Any = None
 
     @property
@@ -694,6 +1146,7 @@ class CronSourceRegistry:
         """
         if not callable(on_detached):
             return False
+
         with self._lock:
             if self._active_leases.get(lease.lease_id) is not lease:
                 return False
@@ -775,6 +1228,106 @@ class CronSourceRegistry:
             logger.exception("Cron worker retained-lock lifecycle retry could not start")
             return False
 
+    def _recover_reaper_retry(self, lease: CronAdmissionLease) -> bool:
+        from cron.scheduler_detached_worker import _cron_recover_reaper_retry
+
+        return _cron_recover_reaper_retry(self, lease)
+    def _register_reaper_retry(
+        self, lease: CronAdmissionLease, retry: Any, *,
+        name: str = "cron-reaper-settlement-retry", interval: float = 2.0,
+    ) -> bool:
+        """Own one settlement consumer for an already-retained worker reaper."""
+        if not callable(retry):
+            return False
+        with self._lock:
+            if self._active_leases.get(lease.lease_id) is not lease:
+                return False
+            if not lease._reaper_retained:
+                return False
+            if lease._reaper_retry_consumer_status == "ambiguous":
+                return False
+            existing = self._reaper_retry_threads.get(lease.lease_id)
+            if existing is not None and existing.is_alive():
+                return lease._reaper_retry_consumer_status in {"starting", "active"}
+            if lease._reaper_retry_registered:
+                return lease._reaper_retry_consumer_status == "active"
+            lease._reaper_retry_registered = True
+            lease._reaper_retry_consumer_status = "starting"
+            lease._reaper_retry_stop = False
+            lease._reaper_retry_thread_done.clear()
+            lease._reaper_retry_callback = retry
+        def _retry_loop() -> None:
+            try:
+                with self._lock:
+                    if lease._reaper_retry_consumer_status == "ambiguous":
+                        return
+                    lease._reaper_retry_consumer_status = "active"
+                    if lease._reaper_retry_start_status == "unknown":
+                        lease._reaper_retry_start_status = "started_after_ambiguous"
+                    else:
+                        lease._reaper_retry_start_status = "started"
+                while (
+                    lease.active
+                    and lease._reaper_retained
+                    and not lease._reaper_retry_stop
+                ):
+                    if lease._reaper_settlement_confirmed:
+                        return
+                    try:
+                        if retry() is True:
+                            return
+                    except BaseException:
+                        logger.exception(
+                            "Cron worker retained-reaper settlement retry failed; "
+                            "same lease remains owned",
+                        )
+                    time.sleep(max(0.05, float(interval)))
+            finally:
+                with self._lock:
+                    current = self._reaper_retry_threads.get(lease.lease_id)
+                    if current is threading.current_thread():
+                        self._reaper_retry_threads.pop(lease.lease_id, None)
+                    if lease._reaper_retry_consumer_status != "ambiguous":
+                        lease._reaper_retry_registered = False
+                        lease._reaper_retry_consumer_status = "finished"
+                    lease._reaper_retry_thread_done.set()
+                    self._lease_condition.notify_all()
+
+        try:
+            from agent.memory_provider import spawn_context_thread
+
+            thread = spawn_context_thread(_retry_loop, name=name)
+            with self._lock:
+                if self._active_leases.get(lease.lease_id) is not lease:
+                    lease._reaper_retry_registered = False
+                    lease._reaper_retry_consumer_status = "unavailable"
+                    lease._reaper_retry_thread_done.set()
+                    return False
+                self._reaper_retry_threads[lease.lease_id] = thread
+                lease._reaper_retry_thread = thread
+            try:
+                thread.start()
+            except BaseException:
+                with self._lock:
+                    lease._reaper_retry_start_status = "unknown"
+                    lease._reaper_retry_consumer_status = "ambiguous"
+                    lease._reaper_retry_stop = True
+                    lease._reaper_retry_thread_done.set()
+                logger.exception(
+                    "Cron worker reaper settlement retry start was ambiguous; "
+                    "same lease remains retained",
+                )
+                return False
+            return True
+        except BaseException:
+            with self._lock:
+                self._reaper_retry_threads.pop(lease.lease_id, None)
+                lease._reaper_retry_registered = False
+                lease._reaper_retry_consumer_status = "unavailable"
+                lease._reaper_retry_thread_done.set()
+            logger.exception("Cron worker reaper settlement retry could not start")
+            return False
+
     def _leave_lease(self, lease: CronAdmissionLease) -> None:
         try:
             try:
@@ -818,6 +1371,17 @@ class CronSourceRegistry:
 
     def _wait_for_active_leases_locked(self, deadline: float | None) -> bool:
         while self._active_leases:
+            finished_reapers = tuple(lease for lease in self._active_leases.values()
+                                     if lease._reaper_release_requested and
+                                     lease._reaper_retry_thread_done.is_set())
+            if finished_reapers:
+                self._lock.release()
+                try:
+                    for lease in finished_reapers:
+                        lease._finish_detached_worker_reaper_release()
+                finally:
+                    self._lock.acquire()
+                continue
             if deadline is None:
                 self._lease_condition.wait()
                 continue

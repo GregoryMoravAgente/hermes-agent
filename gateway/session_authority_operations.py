@@ -1711,6 +1711,21 @@ class PreservationOperationsMixin:
             return self._preservation_operation_retry_local_compression(
                 key, existing, source_proof,
                 parent_handles if parent_handles is not None else parent_handle)
+        # A Bot retry can be observed twice before the canonical admission writer returns.  The
+        # exact pre-admission tuple and opaque parent have already matched above, so reuse the one
+        # child reservation instead of treating the second observation as a stale generation.  An
+        # unknown reservation is deliberately not reusable: its physical outcome must remain
+        # UNKNOWN rather than minting a sibling child.
+        if (
+            owner_class == 'I06_busy_followup_delivery'
+            and admission_id is None
+            and generation == 'pre-admission'
+            and existing.get('admission_id') is None
+            and existing.get('generation') == 'pre-admission'
+        ):
+            if existing.get('unknown'):
+                raise RuntimeStoreError('preservation_custody_unknown')
+            return key
         if self._preservation_operation_current_admission(existing) is None:
             raise RuntimeStoreError('stale_generation')
         if not existing.get('unknown'):
@@ -1896,19 +1911,39 @@ class PreservationOperationsMixin:
             coordinator.mark_unknown(parent, reason)
     def _preservation_operation_release_unaccepted(self, key):
         if key is None:
-            return
+            return True
         record = self._preservation_operations.get(key)
         coordinator = self._preservation_coordinator()
         if record is None:
-            return
+            # Absence is not proof that an accepted child was never created.  Callers that need
+            # an absent-row refusal must retain the surrounding root as UNKNOWN.
+            return False
         if coordinator is None:
             self._require_preservation_coordinator()
-            return
-        result = coordinator.release_unaccepted(record['handle'])
-        if result is None or result.code == 'stale_lease':
-            self._preservation_operations.pop(key, None)
-        else:
+            return False
+        admission_ids = record.get('admission_ids')
+        admission_bound = (
+            record.get('admission_id') is not None
+            or (isinstance(admission_ids, (list, tuple, set)) and bool(admission_ids))
+            or bool(record.get('admission_bindings'))
+        )
+        if record.get('unknown') is True or admission_bound:
+            # A bound/unknown operation is no longer an unaccepted reservation.  Even if a
+            # concurrent row read later disappears, releasing its coordinator handle as a
+            # pre-admission refusal would discard accepted custody.  Retain the exact handle.
+            record['unknown'] = True
             coordinator.mark_unknown(record['handle'], 'read_failed')
+            return False
+        result = coordinator.release_unaccepted(record['handle'])
+        # Only the coordinator's source-issued ``None`` result proves that this exact handle was
+        # released before admission.  A stale/foreign refusal is not evidence of no effect: keep
+        # the operation retained and mark it UNKNOWN so a copied lease cannot become a no-send.
+        if result is None:
+            self._preservation_operations.pop(key, None)
+            return True
+        record['unknown'] = True
+        coordinator.mark_unknown(record['handle'], 'read_failed')
+        return False
     def _preservation_operation_completed_local_compression(self, key, record):
         source = record.get('source_witness') if isinstance(record, dict) else None
         parents = self._local_compression_parent_handles(record)

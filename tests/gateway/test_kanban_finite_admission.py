@@ -119,6 +119,28 @@ def kanban_owner(tmp_path, monkeypatch):
 _CONFIG = {'model': {'default': 'loop-model', 'provider': 'custom'}, 'platform_toolsets': {'cli': ['terminal']}}
 
 
+def _rewrite_kanban_admission_payload(db, row, payload):
+    from hermes_state_keys import admission_fingerprint
+
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+    digest = admission_fingerprint(
+        canonical_target=row['target_session_id'],
+        payload={'input': payload, 'intent': row['intent']},
+    )
+    db._execute_write(lambda conn: conn.execute(
+        'UPDATE session_admissions SET payload_json=?, payload_digest=? WHERE admission_id=?',
+        (encoded, digest, row['admission_id'])))
+
+
+def _kanban_admission_snapshot(db, admission_id):
+    with db._read_ctx() as conn:
+        row = conn.execute(
+            'SELECT payload_json, payload_digest, status, outcome FROM session_admissions WHERE admission_id=?',
+            (admission_id,),
+        ).fetchone()
+    return tuple(row) if row is not None else None
+
+
 @pytest.mark.parametrize('mode', ['deny', 'approve'])
 def test_durable_kanban_admission_preserves_headless_policy_in_worker(kanban_owner, mode):
     from gateway.session_contract import SessionRef
@@ -216,6 +238,215 @@ def test_kanban_retry_replays_the_same_authenticated_descriptor(kanban_owner):
                                             pending_only=False)
             assert len(rows) == 1
             assert rows[0]['payload']['_automation_custody_v1'] == descriptor
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_terminal_kanban_replay_requires_exact_terminal_witness(kanban_owner):
+    """A real terminal row replays without reopening custody; copied/stale/unknown witnesses refuse."""
+    from dataclasses import replace
+
+    from gateway.session_kanban import run_task
+    from hermes_state_runtime import (
+        RuntimeStoreError,
+        claim_session_input,
+        get_session_admission,
+        list_session_admissions,
+        settle_session_input,
+    )
+
+    owner = kanban_owner(_CONFIG)
+    authority = owner.authority
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            queued = get_session_admission(
+                authority.db, admission_id=first['receipt']['admission_id'],
+            )
+            assert queued['status'] == 'queued'
+            claimed = claim_session_input(
+                authority.db, epoch=authority.epoch,
+                session_id=queued['target_session_id'], head=queued['admission_id'],
+            )
+            assert claimed['status'] == 'started'
+            terminal = settle_session_input(
+                authority.db, epoch=authority.epoch,
+                admission_id=claimed['admission_id'], generation=claimed['generation'],
+                outcome='completed', result={'text': 'terminal replay witness'},
+            )
+            assert terminal['status'] == 'terminal'
+            before = _kanban_admission_snapshot(authority.db, terminal['admission_id'])
+            handle = authority._preservation_handles[terminal['admission_id']]
+            assert authority._preservation_automation_row_matches(
+                terminal, handle, allow_terminal=True,
+            )
+
+            # All three are typed copies/replacements, not caller-supplied custody booleans.  The
+            # row matcher must reject them before any retry effect, even though their fields look
+            # close to the exact source-owned handle.
+            for invalid_handle in (
+                replace(handle, owner_id=f'{handle.owner_id}:replaced'),
+                replace(handle, authority_epoch=authority.epoch + 1),
+                replace(handle, profile_id=f'{handle.profile_id}:foreign'),
+            ):
+                assert not authority._preservation_automation_row_matches(
+                    terminal, invalid_handle, allow_terminal=True,
+                )
+
+            expected_source = terminal['payload']['_automation_custody_v1']['source_identity']
+            foreign = dict(terminal)
+            foreign['payload'] = dict(terminal['payload'])
+            foreign['payload']['_automation_custody_v1'] = dict(
+                terminal['payload']['_automation_custody_v1'],
+                source_identity='kanban:foreign-terminal',
+            )
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                authority._preservation_i09_descriptor_for_row(
+                    foreign, source_identity=expected_source,
+                )
+
+            stale = dict(terminal, owner_epoch=authority.epoch + 1)
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                authority._preservation_i09_descriptor_for_row(
+                    stale, source_identity=expected_source,
+                )
+
+            unknown = dict(terminal, status='unknown', generation=None)
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                authority._preservation_i09_descriptor_for_row(
+                    unknown, source_identity=expected_source,
+                )
+
+            # This is the public retry path over the exact source-produced terminal row.  It must
+            # return the existing admission, not create a new root or execute the card again.
+            replay = await run_task(owner.connection, owner.params)
+            assert replay['session_id'] == first['session_id']
+            assert replay['receipt']['admission_id'] == first['receipt']['admission_id']
+            assert replay['receipt']['status'] == 'terminal'
+            assert _kanban_admission_snapshot(authority.db, terminal['admission_id']) == before
+            assert len(list_session_admissions(
+                authority.db, session_id=terminal['target_session_id'], pending_only=False,
+            )) == 1
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_i09_admission_stamps_the_existing_managed_worker_descriptor(kanban_owner):
+    """The trusted I09 producer uses the same managed route marker as local submission."""
+    from gateway.session_kanban import run_task
+    from gateway.session_operator import MANAGED_WORKER_DESCRIPTOR, MANAGED_WORKER_FIELD
+    from hermes_state_runtime import list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            assert row['payload'][MANAGED_WORKER_FIELD] == MANAGED_WORKER_DESCRIPTOR
+            assert '_automation_custody_v1' in row['payload']
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_i09_missing_managed_descriptor_stays_refused_before_worker_route(kanban_owner):
+    """A copied/missing route marker cannot turn an I09 row into a managed worker admission."""
+    from gateway.runtime_service_custody import ServiceCustodyError
+    from gateway.session_contract import SessionRef
+    from gateway.session_ingress import _bind_process_route
+    from gateway.session_kanban import run_task
+    from gateway.session_operator import MANAGED_WORKER_FIELD
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            missing = dict(row, payload={key: value for key, value in row['payload'].items()
+                                         if key != MANAGED_WORKER_FIELD})
+            with pytest.raises(ServiceCustodyError, match='managed_producer_binding_missing'):
+                _bind_process_route(owner.authority,
+                                    SessionRef(owner.authority.profile_id, first['session_id']),
+                                    missing, require_managed=True)
+            with pytest.raises(RuntimeStoreError, match='invalid_params'):
+                await owner.authority._submit_i09_automation(
+                    owner.connection.actor,
+                    SessionRef(owner.authority.profile_id, first['session_id']),
+                    'kanban:forged',
+                    {'text': 'x', MANAGED_WORKER_FIELD: {'producer_process_mode': 'managed_turn'}},
+                    None,
+                    source_identity='kanban:forged',
+                )
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_pre_r27_markerless_i09_replay_preserves_canonical_payload(kanban_owner):
+    """A legacy row retries by its original digest; managed routing is not a payload migration."""
+    from gateway.session_kanban import run_task
+    from gateway.session_operator import MANAGED_WORKER_FIELD
+    from hermes_state_runtime import list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            legacy_payload = dict(row['payload'])
+            legacy_payload.pop(MANAGED_WORKER_FIELD, None)
+            _rewrite_kanban_admission_payload(owner.authority.db, row, legacy_payload)
+            before = _kanban_admission_snapshot(owner.authority.db, row['admission_id'])
+            retry = await run_task(owner.connection, owner.params)
+            after = _kanban_admission_snapshot(owner.authority.db, row['admission_id'])
+            assert retry == first
+            assert after == before
+            [replayed] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                                 pending_only=False)
+            assert MANAGED_WORKER_FIELD not in replayed['payload']
+        finally:
+            await owner.close()
+
+    asyncio.run(scenario())
+
+
+def test_pre_r27_markerless_i09_replay_refuses_foreign_source(kanban_owner):
+    """A markerless legacy row with a copied source identity never becomes a managed retry."""
+    from gateway.session_kanban import run_task
+    from gateway.session_operator import MANAGED_WORKER_FIELD
+    from hermes_state_runtime import RuntimeStoreError, list_session_admissions
+
+    owner = kanban_owner(_CONFIG)
+
+    async def scenario():
+        try:
+            first = await run_task(owner.connection, owner.params)
+            [row] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                             pending_only=False)
+            legacy_payload = dict(row['payload'])
+            legacy_payload.pop(MANAGED_WORKER_FIELD, None)
+            legacy_payload['_automation_custody_v1'] = dict(
+                legacy_payload['_automation_custody_v1'], source_identity='kanban:foreign-row')
+            _rewrite_kanban_admission_payload(owner.authority.db, row, legacy_payload)
+            with pytest.raises(RuntimeStoreError, match='preservation_owner_unmapped'):
+                await run_task(owner.connection, owner.params)
+            [retained] = list_session_admissions(owner.authority.db, session_id=first['session_id'],
+                                                 pending_only=False)
+            assert retained['payload'] == legacy_payload
         finally:
             await owner.close()
 

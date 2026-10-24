@@ -3583,30 +3583,50 @@ def _run_one_job_body(
             custody.observe_terminal()
 
 
-def _start_external_worker_reaper(process: subprocess.Popen, custody=None):
+def _start_external_worker_reaper(
+    process: subprocess.Popen, custody=None, admission=None,
+):
     """Register a real reaper before terminal reconciliation can observe a fast child."""
     from cron.scheduler_detached_worker import reap_terminal_worker_in_background
 
-    if custody is not None:
+    if custody is not None and admission is None:
         custody.expect_reaper()
     callback_ready = threading.Event() if custody is not None else None
 
-    def _on_reaped() -> None:
+    def _on_reaped() -> bool:
         # The detached notifier may observe a fast exit before bind_reaper returns.  Gate only
         # the callback, never the scheduler caller: custody is bound first and then the exact
         # reaper/Job handles remain available to the asynchronous terminal observation.
-        if callback_ready is not None:
-            callback_ready.wait()
-        if custody is not None:
-            custody.observe_terminal()
+        observed = False
+        try:
+            if callback_ready is not None:
+                callback_ready.wait()
+        finally:
+            if custody is not None:
+                observed = custody.observe_terminal()
+        return observed
 
     try:
         reaper = reap_terminal_worker_in_background(
             process, on_done=(_on_reaped if custody is not None else None),
-            custody=custody,
+            custody=custody, admission=admission,
         )
         if custody is not None:
-            custody.bind_reaper(reaper)
+            if admission is not None and not admission.bind_detached_worker_reaper(
+                custody, process, reaper,
+            ):
+                custody.mark_unknown("reaper_identity_unavailable")
+                raise RuntimeError("external worker reaper identity could not be bound")
+            try:
+                custody.expect_reaper()
+                custody.bind_reaper(reaper)
+            except BaseException:
+                if admission is not None:
+                    admission.rollback_detached_worker_reaper_bind(
+                        custody, process, reaper,
+                    )
+                custody.mark_unknown("reaper_identity_unavailable")
+                raise
     finally:
         if callback_ready is not None:
             callback_ready.set()
@@ -3620,6 +3640,7 @@ def _wait_for_external_cron_worker_body(
     stderr_path: Optional[Path] = None,
     custody=None,
     dispatch_mode: Optional[str] = None,
+    admission=None,
 ) -> bool:
     """Preserve ``run_one_job``'s synchronous contract after handoff.
 
@@ -3640,7 +3661,7 @@ def _wait_for_external_cron_worker_body(
         """Start one retained-root reaper before terminal reconciliation."""
         nonlocal reaper_started
         if not reaper_started:
-            _start_external_worker_reaper(process, custody)
+            _start_external_worker_reaper(process, custody, admission)
             reaper_started = True
 
     def _split_worker_active() -> Optional[bool]:
@@ -3797,6 +3818,7 @@ def _schedule_external_worker_handoff_retry(
                         stderr_path=stderr_path,
                         custody=custody,
                         dispatch_mode=dispatch_mode,
+                        admission=admission,
                     )
                 except Exception as wait_error:
                     logger.exception(
@@ -3918,6 +3940,25 @@ def _recover_transferred_worker_handoff(
     wait and release; a synchronous wait failure is logged and re-raised as a
     typed error so the caller can preserve the existing bookkeeping path.
     """
+    # Once the exact worker reaper has retained the accepted lease, its registry-owned
+    # settlement consumer—not the transferred-lock retry—owns the continuation.  The
+    # jobs lock is already detached; entering the old retry path would either refuse or
+    # create a competing waiter.
+    if (
+        getattr(admission, "_reaper_retained", False)
+        and getattr(admission, "_reaper_retry_registered", False)
+    ):
+        logger.warning(
+            "Cron worker %s retained its exact reaper lease for source-owned settlement retry",
+            execution_id,
+        )
+        return True
+    if getattr(admission, "_reaper_retained", False):
+        logger.error(
+            "Cron worker %s retained its exact reaper lease without a settlement consumer",
+            execution_id,
+        )
+        raise handoff_error
     wait_context = getattr(handoff_error, "wait_context", None)
     if isinstance(wait_context, dict) and _schedule_external_worker_handoff_retry(
         admission,
@@ -3952,7 +3993,7 @@ def _recover_transferred_worker_handoff(
                 else contextlib.nullcontext()
             )
             with profile_scope:
-                _wait_for_external_cron_worker(**wait_context)
+                _wait_for_external_cron_worker(admission=admission, **wait_context)
     except Exception as wait_error:
         logger.exception(
             "Cron external worker %s failed during transferred handoff wait",
@@ -3977,14 +4018,33 @@ def _wait_for_external_cron_worker(
     stderr_path: Optional[Path] = None,
     custody=None,
     dispatch_mode: Optional[str] = None,
+    admission=None,
 ) -> bool:
+    wait_context = {
+        "process": process,
+        "execution_id": execution_id,
+        "job_id": job_id,
+        "handoff_files": handoff_files,
+        "stderr_path": stderr_path,
+        "custody": custody,
+        "dispatch_mode": dispatch_mode,
+    }
     try:
         return _wait_for_external_cron_worker_body(
             process, execution_id=execution_id, stderr_path=stderr_path, custody=custody,
             dispatch_mode=dispatch_mode,
+            admission=admission,
         )
+    except _ExternalWorkerPostHandoffError as wait_error:
+        if wait_error.admission is None:
+            wait_error.admission = admission
+        if wait_error.wait_context is None:
+            wait_error.wait_context = wait_context
+        raise
     except Exception as wait_error:
-        raise _ExternalWorkerPostHandoffError(str(wait_error)) from wait_error
+        raise _ExternalWorkerPostHandoffError(
+            str(wait_error), admission=admission, wait_context=wait_context,
+        ) from wait_error
     finally:
         if job_id is not None:
             _key = _inflight_key(job_id)
@@ -4074,6 +4134,10 @@ def _await_external_worker_handoff(
             if admission is None or not hasattr(admission, "detach_jobs_lock_after_handoff"):
                 raise _ExternalWorkerPostHandoffError(
                     "external worker handoff has no authenticated admission lease")
+            if not admission.bind_external_worker_custody(worker_custody, process):
+                worker_custody.mark_unknown("foreign_custody")
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker source custody binding failed")
             handoff = admission.detach_jobs_lock_after_handoff()
             if not getattr(handoff, "detached", False):
                 # Keep the exact child custody.  A pending unlock retains the
@@ -4119,6 +4183,7 @@ def _await_external_worker_handoff(
                 stderr_path=stderr_path,
                 custody=worker_custody,
                 dispatch_mode=dispatch.mode,
+                admission=admission,
             )
         returncode = process.poll()
         if returncode is not None:
@@ -4133,7 +4198,8 @@ def _await_external_worker_handoff(
                 return _wait_for_external_cron_worker(
                     process, execution_id=execution_id, job_id=job_id,
                     handoff_files=(payload_path, stderr_path), stderr_path=stderr_path,
-                    custody=worker_custody, dispatch_mode=dispatch.mode)
+                    custody=worker_custody, dispatch_mode=dispatch.mode,
+                    admission=admission)
             if reconciliation == "unknown":
                 # The row may have been adopted or side effects may have started even though the
                 # ready file never authenticated.  Keep the execution in the post-handoff unknown
