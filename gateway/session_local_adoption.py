@@ -52,6 +52,26 @@ def _managed(authority):
     return hasattr(authority.runner, 'session_authorities')
 
 
+def _logical_owner(authority, sid):
+    """Return the LOCAL admission owner for a physical compression segment.
+
+    The route may expose the newest physical transcript after a rotation, but the
+    policy receipt and FIFO remain keyed by the logical root.  Recovery callers can
+    arrive with the physical id (notably a cold first read), so resolve that id at
+    the managed-adoption boundary.  ``logical_owner`` only follows the durable
+    compression lineage; a fork or an unrelated row therefore remains its own id.
+    """
+    if type(sid) is not str or not sid:
+        raise RuntimeStoreError('storage_unavailable')
+    try:
+        owner = authority.logical_owner(sid)
+    except (AttributeError, KeyError, LookupError, OSError, TypeError, ValueError):
+        raise RuntimeStoreError('storage_unavailable') from None
+    if type(owner) is not str or not owner:
+        raise RuntimeStoreError('storage_unavailable')
+    return owner
+
+
 def _due(authority, sid, *, strict=False):
     """Return the persisted receipt and exact untracked children, or refuse the catch-up."""
     from gateway.session_local_recovery import owned_receipt
@@ -263,6 +283,10 @@ async def _run_managed(authority, prepared, *, finish, write_effect=True):
 async def adopt_before_restore(authority, sid, *, tracked=True):
     """Commit *sid*'s due catch-up in a worker, so the restore that follows only reads."""
     if _managed(authority):
+        # A SessionStore route can already name the compressed physical tip while
+        # its LOCAL policy receipt is still owned by the lineage root.  Never ask
+        # ``owned_receipt`` to authenticate that tip as a new owner.
+        sid = _logical_owner(authority, sid)
         retained, prepared = _resume_managed(authority, sid)
         if retained:
             if prepared is None:
@@ -321,6 +345,8 @@ def schedule_adoption(authority, sid, receipt):
     pending = getattr(authority, '_local_adoptions', None)
     if pending is None:
         pending = authority._local_adoptions = {}
+    if _managed(authority):
+        sid = _logical_owner(authority, sid)
     if sid in pending and not pending[sid].done():
         return
     logger.info('Local session %s: committing its compression catch-up off the owner loop', sid)

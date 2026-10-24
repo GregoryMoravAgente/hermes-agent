@@ -25,10 +25,14 @@ async def test_queue_full_refusal_withdraws_the_pin_and_the_retry_admits(bot):
     with pytest.raises(RuntimeStoreError, match='queue_full'):
         await deliver(bot.connection, dict(id=KEY, profile='default', message='ping'))
     assert read_delivery_result(bot.home, KEY) is None
-    control = Principal('uid:1000', 'default', frozenset({'session:submit', 'session:read', 'session:control'}), 'native')
+    # The fixture serves its temporary home as the authority profile.  Exercise the public
+    # cancellation route with that authenticated profile identity; a hard-coded ``default``
+    # profile is a cross-profile request and is correctly refused before it can drain the FIFO.
+    control = Principal('uid:1000', authority.profile_id,
+                        frozenset({'session:submit', 'session:read', 'session:control'}), 'native')
     for row in fillers:
         with contextlib.suppress(RuntimeStoreError):
-            await authority.cancel_queued(control, SessionRef('default', bot.chat), row['admission_id'])
+            await authority.cancel_queued(control, SessionRef(authority.profile_id, bot.chat), row['admission_id'])
     retried = await deliver(bot.connection, dict(id=KEY, profile='default', message='ping'))
     assert 'error' not in retried and retried['admission_id']
     assert [r['request_id'] for r in list_session_admissions(authority.db, session_id=bot.chat)] == ['bot:' + KEY]

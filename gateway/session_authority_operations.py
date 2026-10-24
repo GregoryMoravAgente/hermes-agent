@@ -1,3 +1,5 @@
+# health: allow FILE_LINES -- the delayed I07/I06 release boundary keeps authenticated binding,
+# native handle, durable-row, and child-operation checks together as one fail-closed seam.
 """Lease-backed operation helpers for the gateway session authority.
 
 The mixin keeps the I03/I05/I06/I11 operation bookkeeping topical while the
@@ -462,12 +464,16 @@ class PreservationOperationsMixin:
         if result is not None:
             # An accepted I06 follow-up may still be bound to this I04 after its
             # durable row completes.  Its own finalizer will retry the parent.
-            if parent is not None and result.code != 'custody_pending':
+            if parent is not None and getattr(result, 'code', None) != 'custody_pending':
                 coordinator.mark_unknown(parent, 'lease_release_failed')
-            return False
+            # Preserve the typed refusal so the caller can distinguish a temporary
+            # sibling dependency from a real child-release failure.  The former must
+            # re-arm the exact FIFO watcher, not fail the public completion.
+            return result
         self._preservation_children.pop(admission_id, None)
         return True
 
+    # health: allow CC -- release retains typed child, callback, sidecar, and native identity refusals.
     def _preservation_release_terminal(self, admission_id, *, terminal_receipt=None):
         """Release child then root only after typed delivery and API-child evidence are visible."""
         can_release, early_result, completion, api_required, sidecars = (
@@ -502,7 +508,11 @@ class PreservationOperationsMixin:
             completion.fail('api_parent_release_missing')
             self._preservation_mark_unknown(admission_id, 'api_parent_release_missing')
             return False
-        if not self._preservation_terminalize_child(admission_id, coordinator, parent):
+        child_result = self._preservation_terminalize_child(admission_id, coordinator, parent)
+        if child_result is not True:
+            if getattr(child_result, 'code', None) == 'custody_pending':
+                self._preservation_watch_fifo_close(admission_id)
+                return False
             if completion is not None:
                 completion.fail('api_child_release_failed')
             return False
@@ -520,6 +530,13 @@ class PreservationOperationsMixin:
                     return False
             result = coordinator.mark_terminal(parent)
             if result is not None:
+                if getattr(result, 'code', None) == 'custody_pending':
+                    # The direct delivery finalizer can finish before the exact FIFO child.  Keep
+                    # the authenticated I07 root live and let the existing child task re-enter
+                    # this same release boundary; a temporary dependency is not a completion
+                    # failure and must not poison the durable receipt.
+                    self._preservation_watch_fifo_close(admission_id)
+                    return False
                 if completion is not None:
                     completion.fail('api_parent_release_failed')
                 return False
@@ -596,32 +613,184 @@ class PreservationOperationsMixin:
                 not isinstance(row, dict) or row.get('admission_id') != admission_id):
             return False
         handles = getattr(self, '_preservation_handles', None)
-        children = getattr(self, '_preservation_children', None)
         handle = binding.get('handle')
-        child = children.get(admission_id) if isinstance(children, dict) else None
-        if (not isinstance(handles, dict) or handles.get(admission_id) is not handle
-                or child is None or not hasattr(child, 'lease')):
+        if not isinstance(handles, dict) or handles.get(admission_id) is not handle:
+            return False
+        coordinator = self._preservation_coordinator()
+        has_children = getattr(coordinator, '_has_children', None)
+        parent_id = getattr(getattr(handle, 'lease', None), 'lease_id', None)
+        operations = getattr(self, '_preservation_operations', None)
+        child_operations = ()
+        if isinstance(operations, dict):
+            child_operations = tuple(
+                (key, record) for key, record in operations.items()
+                if isinstance(record, dict)
+                and record.get('parent_handle') is handle
+                and record.get('owner_class') in {
+                    'I04_fifo_turn_execution', 'I06_busy_followup_delivery',
+                }
+                and record.get('unknown') is not True
+            )
+        if (not callable(has_children) or not parent_id
+                or not has_children(parent_id) or not child_operations):
             return False
         session_id = row.get('target_session_id') if isinstance(row, dict) else None
         if not isinstance(session_id, str) or not session_id:
             session_id = descriptor.get('session_id')
         sessions = getattr(self, 'sessions', None)
         live = sessions.get(session_id) if isinstance(sessions, dict) else None
+        candidates = []
+        delivery_id = descriptor.get('delivery_id')
+        watchers = getattr(self, '_bot_reply_watchers', None)
+        watcher = watchers.get(delivery_id) if isinstance(watchers, dict) else None
+        if (isinstance(watcher, tuple) and len(watcher) >= 2
+                and watcher[0] == admission_id
+                and not watcher[1].done()
+                and callable(getattr(watcher[1], 'add_done_callback', None))):
+            candidates.append(('bot_reply', watcher[1], watcher))
         task = getattr(live, 'task', None)
-        if task is None or not callable(getattr(task, 'add_done_callback', None)):
+        if (task is not None and callable(getattr(task, 'add_done_callback', None))
+                and not task.done()
+                and not any(task is candidate[1] for candidate in candidates)):
+            candidates.append(('session', task, None))
+        if not candidates:
             return False
-        if binding.get('fifo_close_task') is not None:
-            return True
-        binding['fifo_close_task'] = task
+        registered = binding.setdefault('fifo_close_tasks', {})
+        if not isinstance(registered, dict):
+            return False
+        watched_handle = handle
+        watched_binding = binding
+        watched_children = child_operations
 
-        def retry(_done):
+        def retry(_done, *, source, watcher_snapshot):
+            current_binding = getattr(self, '_preservation_automation_bindings', {}).get(admission_id)
+            current_handles = getattr(self, '_preservation_handles', {})
+            current_live = getattr(self, 'sessions', {}).get(session_id)
+            current_operations = getattr(self, '_preservation_operations', {})
+            current_children = tuple(
+                (key, record) for key, record in current_operations.items()
+                if isinstance(record, dict)
+                and record.get('parent_handle') is watched_handle
+                and record.get('owner_class') in {
+                    'I04_fifo_turn_execution', 'I06_busy_followup_delivery',
+                }
+                and record.get('unknown') is not True
+            ) if isinstance(current_operations, dict) else ()
+            current_watcher = None
+            if source == 'bot_reply':
+                current_watchers = getattr(self, '_bot_reply_watchers', {})
+                current_watcher = (current_watchers.get(delivery_id)
+                                   if isinstance(current_watchers, dict) else None)
+                watcher_is_current = current_watcher is watcher_snapshot
+                # ``session_bot._watch_reply`` installs its cleanup callback before this
+                # callback.  A normal task completion therefore removes the map entry before
+                # the FIFO retry callback runs.  The captured tuple is the source-issued
+                # identity for that completion; accept the missing map entry only when the
+                # exact captured task is the callback argument.  A replacement tuple remains
+                # visible and is checked below, so it cannot borrow the completed task's lease.
+                watcher_completed_after_cleanup = (
+                    current_watcher is None
+                    and isinstance(watcher_snapshot, tuple)
+                    and len(watcher_snapshot) >= 3
+                    and watcher_snapshot[0] == admission_id
+                    and watcher_snapshot[1] is _done
+                )
+                watcher_is_retry = False
+                if (not watcher_is_current and isinstance(current_watcher, tuple)
+                        and len(current_watcher) >= 3
+                        and current_watcher[0] != admission_id):
+                    # The only permitted replacement is the source-owned derived retry.  It
+                    # must be a different durable row for this delivery, with the exact new
+                    # waiter future installed in the authority map; a copied tuple/task under
+                    # the same binding is not an authenticated continuation.
+                    from hermes_state_runtime import get_session_admission
+                    original_row = get_session_admission(
+                        self.db, admission_id=admission_id,
+                    )
+                    retry_row = get_session_admission(
+                        self.db, admission_id=current_watcher[0],
+                    ) if isinstance(current_watcher[0], str) else None
+                    expected_request = 'bot:' + str(delivery_id) + ':retry'
+                    watcher_is_retry = (
+                        isinstance(original_row, dict)
+                        and original_row.get('status') == 'terminal'
+                        and original_row.get('outcome') == 'failed'
+                        and isinstance(retry_row, dict)
+                        and retry_row.get('request_id') == expected_request
+                        and retry_row.get('target_session_id') == original_row.get('target_session_id')
+                        and retry_row.get('principal_id') == original_row.get('principal_id')
+                        and retry_row.get('owner_epoch') == original_row.get('owner_epoch')
+                        and retry_row.get('status') in {'queued', 'started'}
+                        and current_watcher[1] is not _done
+                        and not current_watcher[1].done()
+                        and getattr(self, 'waiters', {}).get(current_watcher[0]) is current_watcher[2]
+                    )
+                watcher_is_current = (
+                    watcher_is_current or watcher_is_retry or watcher_completed_after_cleanup
+                )
+                if watcher_is_current and current_watcher is watcher_snapshot:
+                    watcher_is_current = (
+                        len(current_watcher) >= 3
+                        and current_watcher[0] == admission_id
+                        and current_watcher[1] is _done
+                        and current_watcher[2] is watcher_snapshot[2]
+                    )
+            if (current_binding is not watched_binding
+                    or current_binding.get('handle') is not watched_handle
+                    or current_handles.get(admission_id) is not watched_handle
+                    or source == 'session' and getattr(current_live, 'task', None) is not _done
+                    or source == 'bot_reply' and not watcher_is_current
+                    or len(current_children) != len(watched_children)
+                    or any(current_operations.get(key) is not record
+                           for key, record in watched_children)):
+                return
+            registered = current_binding.get('fifo_close_tasks')
+            if isinstance(registered, dict):
+                registered.pop(id(_done), None)
+                if current_binding.get('fifo_close_task') is _done:
+                    current_binding['fifo_close_task'] = None
             try:
-                self._preservation_release_terminal(admission_id)
+                from hermes_state_runtime import get_session_admission
+                for watched_child_key, watched_child_record in watched_children:
+                    child_admission_id = watched_child_record.get('admission_id')
+                    child_row = get_session_admission(
+                        self.db, admission_id=child_admission_id,
+                    ) if isinstance(child_admission_id, str) else None
+                    child_terminal = (
+                        isinstance(child_row, dict)
+                        and child_row.get('status') == 'terminal'
+                        and child_row.get('admission_id') == child_admission_id
+                        and child_row.get('owner_epoch') == watched_child_record.get(
+                            'authority_epoch', self.epoch)
+                        and child_row.get('principal_id') == watched_child_record.get('principal_id')
+                        and child_row.get('target_session_id') == watched_child_record.get('session_id')
+                        and child_row.get('request_id') == watched_child_record.get(
+                            'admission_request_id', watched_child_record.get('request_id'))
+                        and (watched_child_record.get('generation') is None
+                             or child_row.get('generation') == watched_child_record.get('generation'))
+                    )
+                    if not child_terminal:
+                        return
+                for watched_child_key, _watched_child_record in watched_children:
+                    if not self._preservation_operation_terminal(
+                            watched_child_key, 'fifo-close:' + admission_id):
+                        return
+                released = self._preservation_release_terminal(admission_id)
+                if released is False:
+                    self._preservation_watch_fifo_close(admission_id)
             except BaseException:  # health: allow BLE001 -- failed re-entry retains custody unknown
                 self._preservation_mark_unknown(admission_id, 'join_failed')
 
-        task.add_done_callback(retry)
-        return True
+        for source, task, watcher_snapshot in candidates:
+            if id(task) in registered:
+                continue
+            registered[id(task)] = task
+            task.add_done_callback(
+                lambda done, source=source, watcher_snapshot=watcher_snapshot:
+                    retry(done, source=source, watcher_snapshot=watcher_snapshot)
+            )
+        binding['fifo_close_task'] = candidates[0][1]
+        return bool(registered)
 
     def _preservation_root(self, owner_class, owner_id):
         coordinator = self._preservation_coordinator()
@@ -1768,6 +1937,17 @@ class PreservationOperationsMixin:
             return (isinstance(completed, dict) and completed.get(lease_id) == 'terminal'
                     and isinstance(records, dict) and lease_id not in records)
 
+    def _preservation_operation_retire(self, key, record):
+        """Retire one exact operation and its bound automation-child index together."""
+        self._preservation_operations.pop(key, None)
+        if not isinstance(record, dict) or record.get('owner_class') != 'I06_busy_followup_delivery':
+            return
+        admission_id = record.get('admission_id')
+        children = getattr(self, '_preservation_automation_children', None)
+        if (isinstance(admission_id, str) and isinstance(children, dict)
+                and children.get(admission_id) == key):
+            children.pop(admission_id, None)
+
     def _preservation_operation_terminal(self, key, finalizer_id):
         if key is None:
             return False
@@ -1776,18 +1956,18 @@ class PreservationOperationsMixin:
         if record is None:
             return False
         if record.get('terminal') is True:
-            self._preservation_operations.pop(key, None)
+            self._preservation_operation_retire(key, record)
             return True
         if coordinator is None:
             self._require_preservation_coordinator()
             return False
         if self._preservation_operation_completed_local_compression(key, record):
-            self._preservation_operations.pop(key, None)
+            self._preservation_operation_retire(key, record)
             return True
         finalized = coordinator.mark_finalizing(record['handle'], finalizer_id)
         if finalized is not None:
             if self._preservation_operation_completed_local_compression(key, record):
-                self._preservation_operations.pop(key, None)
+                self._preservation_operation_retire(key, record)
                 return True
             self._preservation_operation_unknown(key, 'read_failed')
             return False
@@ -1804,11 +1984,11 @@ class PreservationOperationsMixin:
                         and getattr(bridge, 'admission_id', None) == record.get('admission_id')
                         and getattr(owner, '_classic_custody_authority', None) is self):
                     bridge.retired_operation_record = record
-            self._preservation_operations.pop(key, None)
+            self._preservation_operation_retire(key, record)
             return True
         if result.code == 'stale_lease' and self._preservation_operation_completed_local_compression(
                 key, record):
-            self._preservation_operations.pop(key, None)
+            self._preservation_operation_retire(key, record)
             return True
         if result.code != 'stale_lease':
             self._preservation_operation_unknown(key, 'lease_release_failed')

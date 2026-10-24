@@ -16,6 +16,7 @@ import pytest
 from hermes_cli import main as cli_main, update_cmd, update_receipt
 from hermes_cli.update_inventory import UpdatePlan
 from hermes_cli.update_cmd import _sync_with_upstream_if_needed
+from hermes_cli._launchers import runtime_command
 
 
 def git(root, *args):
@@ -138,7 +139,11 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
         return found.stdout.strip() or '<no upstream>'
 
     def fault(command, *args, **kwargs):
-        assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
+        selected_python = runtime_command(t.clone, code='pass')[0]
+        assert (
+            Path(command[0]).name.lower() in {'git', 'git.exe'}
+            or command[0] in {sys.executable, selected_python}
+        ), command
         assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
         # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
         # the commit resolved from `refs/remotes/upstream/main` now, m2) vs the origin fast-forward.
@@ -336,9 +341,14 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
     def guard(command, args, kwargs, call):
         nonlocal fetched, failed
         command = list(map(str, command))
-        assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
         cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
         assert cwd in {t.clone, t.origin}, (command, cwd)
+        # Stash restoration may validate imports through the install-bound PM interpreter.
+        # Keep this exact selection distinct from the Git transport faults below.
+        if command[0] == runtime_command(t.clone, code='pass')[0]:
+            assert command[1:3] == ['-I', '-c'], command
+            return call(command, *args, **kwargs)
+        assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
         assert 'push' not in command and 'pull' not in command, command
         git_calls.append(command)
         if transport == 'no-git':

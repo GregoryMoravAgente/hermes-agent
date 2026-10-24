@@ -327,3 +327,106 @@ def physical_proof_session(binding: Any, proof: Any) -> str | None:
     if isinstance(binding, ClassicWriterBinding) and session_id == root:
         return root
     return None
+
+
+def preflight_physical_proof_session(binding: Any, proof: Any) -> str | None:
+    """Authenticate a managed proof before the in-memory route CAS.
+
+    ``physical_proof_session`` intentionally requires the live route to already point at the
+    proof's physical tip.  Compression publication has the opposite ordering: the durable
+    lineage names the new tip while the gateway route still names its parent.  This read-only
+    witness validates the same binding/profile/native scope and the canonical lineage without
+    accepting a route change as evidence.
+    """
+    session_id = getattr(proof, "session_id", None)
+    root = getattr(binding, "session_id", None)
+    authority = getattr(binding, "authority", None)
+    profile_id = getattr(binding, "profile_id", None)
+    store_path = canonical_store_path(authority)
+    if (
+        type(session_id) is not str or not session_id
+        or type(root) is not str or not root
+        or type(profile_id) is not str or not profile_id
+        or store_path is None
+        or getattr(proof, "store_path", None) != store_path
+        or getattr(authority, "profile_id", None) != profile_id
+        or getattr(binding, "authority_epoch", None) != getattr(authority, "epoch", None)
+        or getattr(binding, "process_instance", None) != getattr(authority, "instance_id", None)
+    ):
+        return None
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+        from gateway.session_classic_custody import ClassicWriterBinding
+    except (ImportError, AttributeError):
+        return None
+    if isinstance(binding, ClassicWriterBinding):
+        return root if session_id == root else None
+    if not isinstance(binding, TurnCustodyBinding):
+        return None
+    if _profile_scope_witness(binding) is None:
+        return None
+    db = getattr(authority, "db", None)
+    try:
+        validated = _validated_lineage(db, authority, binding, profile_id, root, session_id)
+    except (
+        AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        json.JSONDecodeError, sqlite3.Error,
+    ):
+        return None
+    return session_id if validated is not None else None
+
+
+def retained_physical_proof_session(binding: Any, proof: Any) -> str | None:
+    """Validate an exact managed proof after a later compression tip moved.
+
+    The first proof publication remains strict: ``physical_proof_session`` must see the worker's
+    own tip.  Its delivery finalizer can run after a descendant has moved the live route, however;
+    in that case accept only the same stored proof when its session is still on the authenticated
+    current lineage and the current route still resolves to that lineage's live tip.  Siblings,
+    resets, copied rows, and replaced routes remain refusals.
+    """
+    session_id = getattr(proof, "session_id", None)
+    root = getattr(binding, "session_id", None)
+    authority = getattr(binding, "authority", None)
+    store_path = canonical_store_path(authority)
+    if (
+        type(session_id) is not str or not session_id
+        or type(root) is not str or not root
+        or store_path is None
+        or getattr(proof, "store_path", None) != store_path
+    ):
+        return None
+    try:
+        from gateway.runtime_service_custody import TurnCustodyBinding
+        from gateway.session_contract import SessionRef
+    except (ImportError, AttributeError):
+        return None
+    if not isinstance(binding, TurnCustodyBinding):
+        return None
+    # Retained proofs may name an older physical child, but they still require the exact
+    # retained I04 parent and profile-lock/native-owner incarnation.  Those validators are
+    # independent of the current compression tip and must not be bypassed by this fallback.
+    if not _turn_binding_custody_matches(binding) or _profile_scope_witness(binding) is None:
+        return None
+    db = getattr(authority, "db", None)
+    if db is None or not _binding_row_matches(db, binding, root):
+        return None
+    try:
+        lineage = tuple(db.get_compression_lineage(root))
+        if (
+            not lineage
+            or session_id not in lineage
+            or len(set(lineage)) != len(lineage)
+            or _lineage_rows(db, lineage) is None
+            or db.get_compression_tip(root) != lineage[-1]
+            or authority.physical_target(SessionRef(getattr(binding, "profile_id", None), root))
+            != lineage[-1]
+            or _current_route(authority, root, lineage[-1]) is None
+        ):
+            return None
+    except (
+        AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError,
+        json.JSONDecodeError, sqlite3.Error,
+    ):
+        return None
+    return session_id

@@ -3,10 +3,14 @@ import asyncio
 from dataclasses import replace
 import json
 import os
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 
 import pytest
+
+from tests.gateway.managed_cancellation_helpers import real_managed_claim
 
 
 def assignment(tmp_path, monkeypatch, *, finite=True, unattended=False, yolo=False):
@@ -136,13 +140,17 @@ def test_committed_surface_crosses_the_bootstrap_validated_and_one_turn_only(tmp
 @pytest.mark.asyncio
 async def test_stop_during_environment_preparation_prevents_bootstrap(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
+    fixture, binding, authority, ref, row, _live = await real_managed_claim(
+        tmp_path, monkeypatch, 'stop-during-environment'
+    )
     started, release = threading.Event(), threading.Event()
     frames = []
     def env(authority):
         started.set()
         assert release.wait(5)
-    class Worker:
+    class Worker(managed.ManagedWorker):
         def __init__(self, process):
+            super().__init__(process)
             self.stop = asyncio.Event()
             self.stop_cause = None
         def interrupt(self):
@@ -153,23 +161,23 @@ async def test_stop_during_environment_preparation_prevents_bootstrap(tmp_path, 
             raise RuntimeStoreError('managed_worker_stopped')
         def close(self): pass
     monkeypatch.setattr(managed, '_worker_env', env)
-    monkeypatch.setattr(managed.subprocess, 'Popen', lambda *a, **k: object())
+    class Child(subprocess.Popen):
+        def __init__(self, args, **kwargs):
+            super().__init__([sys.executable, '-c', 'import sys; sys.stdin.buffer.read()'], **kwargs)
+    monkeypatch.setattr(managed.subprocess, 'Popen', Child)
     monkeypatch.setattr(managed, 'ManagedWorker', Worker)
-    authority = SimpleNamespace(profile_id='profile', pending_stops={}, pending_results={})
-    def adopt(sid, generation, worker):
-        if authority.pending_stops.pop(sid, None) == generation:
-            worker.interrupt()
-    authority.adopt_agent = adopt
-    ref = SimpleNamespace(session_id='sid')
-    row = {'admission_id': 'adm', 'generation': 3}
-    task = asyncio.create_task(managed.execute_managed(authority, ref, row, None))
-    assert await asyncio.to_thread(started.wait, 5)
-    authority.pending_stops['sid'] = 3
-    release.set()
-    await asyncio.wait_for(task, 5)
-    assert not frames
-    assert authority.pending_results['adm']['result']['interrupted'] is True
-    assert not authority.pending_stops
+    try:
+        task = asyncio.create_task(managed.execute_managed(authority, ref, row, None, binding))
+        assert await asyncio.to_thread(started.wait, 5)
+        authority.pending_stops[ref.session_id] = row['generation']
+        release.set()
+        await asyncio.wait_for(task, 5)
+        assert not frames
+        assert authority.pending_results[binding.admission_id]['result']['interrupted'] is True
+        assert not authority.pending_stops
+    finally:
+        release.set()
+        fixture.cleanup()
 
 
 def test_shared_tool_events_bound_large_content_without_losing_error_or_path():

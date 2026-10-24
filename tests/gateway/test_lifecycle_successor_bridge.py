@@ -129,7 +129,7 @@ if mode == "b-retry-first":
     process_ownership.close()
     os._exit(0)
 
-if adopted is True and mode in {"b-ready", "b-forged", "b-wrong-served", "b-foreign-peer", "b-stale-owner", "b-replaced-control"}:
+if adopted is True and mode in {"b-ready", "b-forged", "b-wrong-served", "b-foreign-peer", "b-stale-owner", "b-replaced-control", "b-replaced-after-identify"}:
     async def _roundtrip():
         from gateway.control_socket import GatewayControlServer
         from gateway.lifecycle_handoff import _control_endpoint_identity
@@ -162,15 +162,47 @@ if adopted is True and mode in {"b-ready", "b-forged", "b-wrong-served", "b-fore
         if not await server.start():
             raise RuntimeError("control server did not start")
         try:
-            if mode != "b-replaced-control":
+            if mode == "b-replaced-after-identify":
+                import gateway.control_socket as control_socket
+
+                loop = asyncio.get_running_loop()
+                identify_calls = 0
+                original_identify = control_socket._identify_gateway_with_control_socket_identity
+
+                async def replace_after_middle_identify():
+                    nonlocal server
+                    await server.stop()
+                    server = GatewayControlServer(home, verb_handlers={"identify": lambda: payload})
+                    if not await server.start():
+                        raise RuntimeError("replacement control server did not start")
+
+                def identify_with_replacement(*args, **kwargs):
+                    nonlocal identify_calls
+                    response = original_identify(*args, **kwargs)
+                    identify_calls += 1
+                    if identify_calls == 2:
+                        replacement = asyncio.run_coroutine_threadsafe(
+                            replace_after_middle_identify(), loop,
+                        )
+                        replacement.result(timeout=5)
+                    return response
+
+                control_socket._identify_gateway_with_control_socket_identity = identify_with_replacement
+                try:
+                    ready = await asyncio.to_thread(record_successor_ready_from_control, runner, home)
+                finally:
+                    control_socket._identify_gateway_with_control_socket_identity = original_identify
+                _emit(f"identify_calls={identify_calls}")
+                assert identify_calls == 3, identify_calls
+            elif mode != "b-replaced-control":
                 ready = await asyncio.to_thread(record_successor_ready_from_control, runner, home)
             else:
-                before = _control_endpoint_identity(home)
+                before = await asyncio.to_thread(_control_endpoint_identity, home)
                 await server.stop()
                 server = GatewayControlServer(home, verb_handlers={"identify": lambda: payload})
                 if not await server.start():
                     raise RuntimeError("replacement control server did not start")
-                after = _control_endpoint_identity(home)
+                after = await asyncio.to_thread(_control_endpoint_identity, home)
                 ready = record_successor_ready(
                     home, runner, payload, control_before=before, control_after=after,
                 )
@@ -284,7 +316,7 @@ def test_prepared_recovery_and_failed_successor_retry_reuse_lineage(tmp_path):
     assert journal["attempts"][1]["authority_epoch"] > journal["attempts"][0]["authority_epoch"]
 
 
-@pytest.mark.parametrize("mode", ["b-wrong-served", "b-foreign-peer", "b-stale-owner", "b-replaced-control"])
+@pytest.mark.parametrize("mode", ["b-wrong-served", "b-foreign-peer", "b-stale-owner", "b-replaced-control", "b-replaced-after-identify"])
 def test_successor_refuses_changed_runtime_owner_or_control_identity(tmp_path, mode):
     home = tmp_path / "home"
     _run_child(home, "a-clean", 1)

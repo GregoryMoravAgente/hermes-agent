@@ -7,6 +7,7 @@ provider, and installed acceptance remain separate proof boundaries.
 
 import asyncio
 from dataclasses import replace
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -33,8 +34,13 @@ def _parent(coordinator, admission_id):
     )
 
 
-async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
-    """Build one actual claimed SessionAuthority admission for custody-boundary tests."""
+async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True, include_worker_runtime=False):
+    """Build one actual claimed SessionAuthority admission for custody-boundary tests.
+
+    ``include_worker_runtime`` starts the real control/API listeners and runner lifecycle for a
+    child that uses the authenticated ``WorkerRPC`` persistence path.  The default stays the
+    lighter authority-only fixture used by the other parent-edge tests.
+    """
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
@@ -61,6 +67,9 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
     reserved = False
     runner = None
     authority = None
+    runtime_control = None
+    runtime_api = None
+    runtime_started = False
     handed_off = False
 
     def close_resources():
@@ -74,6 +83,22 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             if reserved:
                 process_ownership.close()
             reset_hermes_home_override(home_token)
+
+    async def cleanup_runtime_resources():
+        nonlocal runtime_control, runtime_api, runtime_started
+        try:
+            if runtime_started:
+                await runner.stop()
+                runtime_started = False
+            elif runtime_api is not None:
+                from gateway.run_api import stop_gateway_api
+                await stop_gateway_api(runtime_api)
+            if runtime_control is not None:
+                await runtime_control.stop()
+                runtime_control = None
+            runtime_api = None
+        finally:
+            close_resources()
 
     try:
         process_ownership.reserve([home])
@@ -134,20 +159,48 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             )
 
         async def claim(request_id):
-            # Use the real native producer: it reserves/binds the I01 parent around the durable
-            # admission before the FIFO claim can reserve its exact I04 child.
-            native_event = MessageEvent(text=request_id, source=source, message_id=request_id)
-            receipt = await admit_native_with_source_handoff(native_event)
-            assert receipt.status == "queued"
-            ref = receipt.ref
+            if include_worker_runtime:
+                # The authenticated WorkerRPC adoption ticket is bound to the local OS principal.
+                # Exercise the public local submission path for this mode so its durable principal
+                # matches the ticket's exact peer identity; messaging admissions intentionally keep
+                # their transport principal and are covered by the default native path below.
+                from gateway.session_local import create_local_session
+                from gateway.session_contract import Principal, Submission
+
+                local_principal = f"uid:{os.getuid()}"
+                actor = Principal(
+                    local_principal, authority.profile_id,
+                    frozenset({'session:create', 'session:submit', 'session:control'}),
+                    'managed-worker-fixture',
+                )
+                ref = create_local_session(authority, actor, {
+                    'request_id': f"worker-session-{request_id}", 'source': 'cli',
+                    'cwd': str(tmp_path), 'model': 'm', 'toolsets': [],
+                })
+                receipt = await authority.submit(
+                    actor, Submission(request_id, ref, {'text': request_id}, 'queue'),
+                )
+                assert receipt.status == "queued"
+            else:
+                # Use the real native producer: it reserves/binds the I01 parent around the durable
+                # admission before the FIFO claim can reserve its exact I04 child.
+                native_event = MessageEvent(text=request_id, source=source, message_id=request_id)
+                receipt = await admit_native_with_source_handoff(native_event)
+                assert receipt.status == "queued"
+                ref = receipt.ref
             live = authority.sessions[ref.session_id]
             row, _first = await authority._claim_next(ref, live)
             assert isinstance(row, dict) and row["status"] == "started"
             row = get_session_admission(authority.db, admission_id=row["admission_id"])
             assert row is not None
             assert row["target_session_id"] == ref.session_id
-            assert row["payload"]["native_text_v1"]["producer_process_mode"] == "managed_turn"
-            assert isinstance(row["principal_id"], str) and row["principal_id"].startswith("messaging:")
+            if not include_worker_runtime:
+                assert row["payload"]["native_text_v1"]["producer_process_mode"] == "managed_turn"
+            assert isinstance(row["principal_id"], str)
+            if include_worker_runtime:
+                assert row["principal_id"] == f"uid:{os.getuid()}"
+            else:
+                assert row["principal_id"].startswith("messaging:")
             assert row["owner_epoch"] == authority.epoch
             assert row["generation"] == live.event_stream.execution["execution_generation"]
             assert live.event_stream.execution["admission_id"] == row["admission_id"]
@@ -171,6 +224,26 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
             probe_row = get_session_admission(authority.db, admission_id=probe_row["admission_id"])
             assert probe_row is not None
             probe_binding = admission_binding(authority, probe_ref, probe_row)
+
+        if include_worker_runtime:
+            from gateway.control_socket import GatewayControlServer
+            from gateway.run_runtime import (
+                publish_gateway_runtime_ready, start_gateway_runtime_api,
+            )
+            from tests.gateway.conftest import _runtime_owned_identify
+
+            runtime_control = GatewayControlServer(
+                home, verb_handlers={'identify': lambda: _runtime_owned_identify(runner)},
+            )
+            runtime_control.ticket_store = runner.session_ticket_store
+            runner.session_control_server = runtime_control
+            if not await runtime_control.start():
+                raise RuntimeError("worker-runtime control server did not start")
+            runtime_api = await start_gateway_runtime_api(runner)
+            if not await runner.start():
+                raise RuntimeError("worker-runtime gateway runner did not start")
+            publish_gateway_runtime_ready(runner)
+            runtime_started = True
 
         async def run_real_admission(
             session, writer, text, *, fail_delivery=False, use_native_waiter=True,
@@ -247,6 +320,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
         fixture = SimpleNamespace(
             runner=runner, authority=authority, adapter=adapter, live=None, ref=None, claim=claim,
             run_real_admission=run_real_admission, cleanup=close_resources, binding=probe_binding,
+            cleanup_async=cleanup_runtime_resources,
             admit_native_with_source_handoff=admit_native_with_source_handoff,
             finalizer_calls=0,
         )
@@ -254,7 +328,7 @@ async def real_runtime_binding(tmp_path, monkeypatch, *, include_probe=True):
         return fixture
     finally:
         if not handed_off:
-            close_resources()
+            await cleanup_runtime_resources()
 
 
 def test_request_terminalization_removes_both_parent_edges_atomically():

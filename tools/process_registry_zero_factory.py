@@ -505,11 +505,17 @@ class ProcessRegistryZeroFactory:
         except (AttributeError, RuntimeError, TypeError):
             return False
 
-    def _inventory(self) -> tuple[tuple[Any, ...], str | None]:
+    def _inventory(
+        self, registrations: tuple[_ProfileRegistration, ...] = (),
+    ) -> tuple[tuple[Any, ...], str | None]:
         try:
             with self.registry._lock:
                 running = tuple(self.registry._running.values())
                 finished = tuple(self.registry._finished.values())
+                registered_epochs = frozenset(
+                    (registration.profile_id, registration.authority_epoch)
+                    for registration in registrations
+                )
                 terminal_history_ids = frozenset(
                     session.id
                     for session in finished
@@ -517,7 +523,18 @@ class ProcessRegistryZeroFactory:
                         session,
                         completion_tokens=self.registry._completion_tokens,
                         pending_watchers=self.registry.pending_watchers,
-                        live_coordinator=self.coordinator,
+                        # A terminal session from a retired profile epoch is history once the
+                        # successor registration has replaced that profile's source fence.  A
+                        # terminal session from a currently registered epoch remains current
+                        # custody and must continue to block a zero-work claim.
+                        live_coordinator=(
+                            self.coordinator
+                            if (
+                                getattr(session, "profile_id", None),
+                                getattr(session, "authority_epoch", None),
+                            ) in registered_epochs
+                            else None
+                        ),
                     )
                 )
                 foreground = tuple(self.registry._foreground_custody_transactions.items())
@@ -562,7 +579,7 @@ class ProcessRegistryZeroFactory:
                         )
                         self._observation = result
                         return result
-                inventory, reason = self._inventory()
+                inventory, reason = self._inventory(registrations)
                 if reason is not None:
                     result = ProcessRegistryZeroObservation("unknown", reason, close_generation, registrations)
                     self._observation = result

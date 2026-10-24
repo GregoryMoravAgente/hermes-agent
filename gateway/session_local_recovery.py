@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import sqlite3
 
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
@@ -493,6 +494,14 @@ def _local_adoption_handle(authority, row):
         handle = ensure_recovery_root(authority, row, consumer='local_recovery')
     if handle is None:
         raise RuntimeStoreError('unknown_execution')
+    bindings = getattr(authority, '_i10_recovery_bindings', None)
+    if (
+        isinstance(bindings, dict)
+        and getattr(handle, 'owner_class', None) == 'I10_startup_recovery_handoff'
+    ):
+        binding = bindings.get(admission_id)
+        if not isinstance(binding, dict) or binding.get('handle') is not handle:
+            raise RuntimeStoreError('unknown_execution')
     from gateway.session_recovery_custody import refresh_binding
     current = get_session_admission(authority.db, admission_id=admission_id)
     if not isinstance(current, dict) or not refresh_binding(authority, current):
@@ -500,12 +509,14 @@ def _local_adoption_handle(authority, row):
     return handle
 
 
-def local_adoption_parents(authority, sid):
+def local_adoption_parents(authority, sid, *, require_no_unknown=False):
     """Return every exact active local I10 parent in durable FIFO order."""
     _registry(authority)
     _rows, active, local, policy_source = _active_local_rows(authority, sid)
     if any(_local_recovery_kind(row, policy_source) != 'local' for row in active):
         raise RuntimeStoreError('preservation_owner_unmapped')
+    if require_no_unknown and any(row.get('status') == 'unknown' for row in active):
+        raise RuntimeStoreError('unknown_execution')
     if _local_adoption_fences(authority, sid):
         raise RuntimeStoreError('storage_unavailable')
     handles = []
@@ -519,6 +530,37 @@ def local_adoption_parents(authority, sid):
             )
         raise
     return _reconcile_local_parents(authority, tuple(handles)) if handles else ()
+
+
+def reconcile_local_parents_after_unknown(authority, sid, resolved_admission_id):
+    """Reconcile queued LOCAL I10 parents after one durable unknown resolution.
+
+    The resolution write is already committed when this runs.  Only the exact current terminal
+    admission may open this path; any other active unknown, foreign payload, stale binding, or
+    source fence leaves the retained handles UNKNOWN and returns without failing the resolution RPC.
+    """
+    try:
+        policy_source = _local_policy_source(authority, sid)
+        if policy_source not in _LOCAL_POLICY_SOURCES:
+            return False
+        resolved = get_session_admission(authority.db, admission_id=resolved_admission_id)
+        if (
+            not isinstance(resolved, dict)
+            or resolved.get('admission_id') != resolved_admission_id
+            or resolved.get('target_session_id') != sid
+            or resolved.get('status') != 'terminal'
+            or _local_recovery_kind(resolved, policy_source) != 'local'
+        ):
+            return False
+        parents = local_adoption_parents(authority, sid, require_no_unknown=True)
+        return bool(parents)
+    except (AttributeError, LookupError, OSError, RuntimeError, sqlite3.Error, TypeError, ValueError) as exc:
+        # Durable resolution remains valid even when its later custody rebind cannot be proven.
+        # The retained handle is intentionally left UNKNOWN for a later exact retry.
+        logging.getLogger(__name__).warning(
+            'Local parent reconciliation deferred: %s', type(exc).__name__,
+        )
+        return False
 
 
 def local_adoption_parent(authority, sid):

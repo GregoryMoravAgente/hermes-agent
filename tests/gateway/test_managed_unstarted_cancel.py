@@ -7,9 +7,8 @@ import threading
 
 import pytest
 
-from gateway.session_contract import Submission
 from hermes_state_runtime import get_session_admission
-from tests.gateway.test_session_authority_cancel_settlement import _authority, ACTOR, REF
+from tests.gateway.managed_cancellation_helpers import real_managed_queue
 from tests.waiting import async_wait_until
 
 
@@ -17,7 +16,10 @@ from tests.waiting import async_wait_until
 @pytest.mark.parametrize('phase', ['environment', 'spawn', 'hello'])
 async def test_cancel_before_worker_reservation_settles_interrupted(tmp_path, monkeypatch, phase):
     from gateway import session_managed_worker as managed
-    db, authority = _authority(tmp_path, monkeypatch)
+    from gateway.runtime_service_custody import admission_binding
+    fixture, authority, receipt = await real_managed_queue(tmp_path, monkeypatch, 'cancelled-startup')
+    db = authority.db
+    ref = receipt.ref
     entered, release = threading.Event(), threading.Event()
     children = []
     original_spawn = subprocess.Popen
@@ -42,27 +44,31 @@ async def test_cancel_before_worker_reservation_settles_interrupted(tmp_path, mo
     monkeypatch.setattr(managed.subprocess, 'Popen', spawn)
     monkeypatch.setattr(managed.ManagedWorker, 'next_frame', next_frame)
     async def execute(owner, ref, row):
-        return await managed.execute_managed(owner, ref, row, policy=None)
+        binding = admission_binding(owner, ref, row)
+        return await managed.execute_managed(owner, ref, row, policy=None, binding=binding)
     monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
-    with db:
-        receipt = await authority.submit(ACTOR, Submission('cancelled-startup', REF, {'text': 'work'}, 'queue'))
-        task = authority.sessions['s'].task
-        try:
+    try:
+        with db:
+            task = asyncio.create_task(authority._drain(ref))
             assert await asyncio.to_thread(entered.wait, 5)
             task.cancel()
             release.set()
             await asyncio.wait_for(task, 10)
             row = get_session_admission(db, admission_id=receipt.admission_id)
             assert row['status'] == 'terminal' and row['outcome'] == 'interrupted'
-            assert authority.sessions['s'].event_stream.execution == {}
+            assert authority.sessions[ref.session_id].event_stream.execution == {}
             if phase != 'environment':
                 await async_wait_until(lambda: children and all(child.poll() is not None for child in children),
                                        timeout=10, what='the managed worker child exited')
             assert db._read_one('SELECT COUNT(*) FROM worker_executions')[0] == 0
-        finally:
-            release.set()
+    finally:
+        release.set()
+        if 'task' in locals():
             await asyncio.gather(task, return_exceptions=True)
-            for child in children:
-                if child.poll() is None:
-                    child.kill()
-                child.wait(timeout=5)
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+        # The fixture binds HERMES_HOME with a ContextVar.  Close it in this
+        # coroutine, before the test task's context is torn down.
+        fixture.cleanup()

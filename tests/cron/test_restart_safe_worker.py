@@ -1125,7 +1125,13 @@ def test_gateway_tool_run_without_adapter_objects_hands_off(monkeypatch):
 
     assert scheduler.run_one_job(job, adapters=None) is True
 
-    created.assert_called_once_with("tool-job", source="direct", scheduled_instant=None)
+    from gateway.runtime_cron_source_registry import CronAdmissionLease
+
+    admission = created.call_args.kwargs.get("admission")
+    assert isinstance(admission, CronAdmissionLease)
+    assert admission.active is False
+    created.assert_called_once_with(
+        "tool-job", source="direct", scheduled_instant=None, admission=admission)
     assert job["execution_id"] == "exec-tool"
     launch.assert_called_once_with(job)
     run.assert_not_called()

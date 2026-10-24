@@ -227,7 +227,10 @@ async def test_start_gateway_replace_reaps_old_gateway_children_posix(
         },
     )
     monkeypatch.setattr(
-        "gateway.status._get_process_start_time", lambda pid: 0 if pid == 42 else None
+        # ``gateway.run.os.getpid`` is fixed to synthetic replacement PID 100 below.  The
+        # physical custody witness needs a deterministic start fingerprint for that PID;
+        # returning None would correctly make registration refuse as foreign custody.
+        "gateway.status._get_process_start_time", lambda _pid: 0
     )
     monkeypatch.setattr(
         "gateway.status_scoped_locks.release_all_scoped_locks", lambda **kwargs: 0

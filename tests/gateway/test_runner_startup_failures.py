@@ -200,7 +200,10 @@ async def test_start_gateway_replace_aborts_when_force_killed_pid_still_alive(
         },
     )
     monkeypatch.setattr(
-        "gateway.status._get_process_start_time", lambda pid: 0 if pid == 42 else None
+        # Keep the old target and synthetic replacement PID physically identifiable.  A missing
+        # fingerprint must still refuse ownership; this fixture supplies the deterministic value
+        # needed by the source-owned reservation witness.
+        "gateway.status._get_process_start_time", lambda _pid: 0
     )
     # _pid_exists never goes False — the force-kill did not take.
     monkeypatch.setattr("gateway.status._pid_exists", lambda pid: True)
@@ -307,7 +310,10 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
         },
     )
     monkeypatch.setattr(
-        "gateway.status._get_process_start_time", lambda pid: 0 if pid == 42 else None
+        # Keep the old target and synthetic replacement PID physically identifiable.  A missing
+        # fingerprint must still refuse ownership; this fixture supplies the deterministic value
+        # needed by the source-owned reservation witness.
+        "gateway.status._get_process_start_time", lambda _pid: 0
     )
     monkeypatch.setattr(
         "gateway.status_scoped_locks.release_all_scoped_locks",
@@ -374,7 +380,10 @@ async def test_start_gateway_replace_clears_marker_on_permission_denied(
         },
     )
     monkeypatch.setattr(
-        "gateway.status._get_process_start_time", lambda pid: 0 if pid == 42 else None
+        # Keep the old target and synthetic replacement PID physically identifiable.  A missing
+        # fingerprint must still refuse ownership; this fixture supplies the deterministic value
+        # needed by the source-owned reservation witness.
+        "gateway.status._get_process_start_time", lambda _pid: 0
     )
     monkeypatch.setattr("gateway.status.write_takeover_marker", write_marker)
     monkeypatch.setattr("gateway.status.terminate_pid", raise_permission)

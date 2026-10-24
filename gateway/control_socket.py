@@ -35,6 +35,7 @@ _MAX_UNIX_PATH = 100  # sun_path limit is 104 on macOS/BSD, 108 on Linux; margin
 _MAX_REQUEST_BYTES = 64 * 1024
 _MAX_RESPONSE_BYTES = 512 * 1024
 _DEFAULT_CLIENT_TIMEOUT = 2.0
+_INTERNAL_IDENTITY_PARAM = "_include_control_socket_identity"
 
 
 def _home_hash(home: Path) -> str:
@@ -298,9 +299,32 @@ class GatewayControlServer:
                 self._fallback_root.rmdir()
             self._fallback_root = None
 
+    def _control_socket_identity(self) -> dict[str, int] | None:
+        """Return the live POSIX listener identity, not the replaceable path identity.
+
+        The filesystem entry for a Unix socket can reuse its inode and ctime when a listener is
+        stopped and rebound in one event-loop turn.  The listening descriptor remains owned by this
+        server, so its kernel ``fstat`` identity is the actual incarnation witness.  Named-pipe
+        callers keep their existing native peer/SID contract; this field is intentionally absent
+        there until the Windows native server exposes an equivalent handle identity.
+        """
+        if self._server is None or _IS_WINDOWS:
+            return None
+        try:
+            sockets = self._server.sockets or []
+            if not sockets:
+                return None
+            info = os.fstat(sockets[0].fileno())
+            if type(info.st_ino) is not int or info.st_ino <= 0:
+                return None
+            return {"device": int(info.st_dev), "inode": int(info.st_ino)}
+        except (OSError, ValueError):
+            return None
+
     def handle_request_line(self, raw: bytes, peer_subject: Optional[str] = None) -> bytes:
         """One JSON request line -> one JSON response line. Never raises (shared by POSIX + pipe)."""
         request_id: Any = None
+        verb: Any = None
         try:
             request = json.loads(raw.decode("utf-8"))
             if not isinstance(request, dict):
@@ -329,6 +353,27 @@ class GatewayControlServer:
                             "result": handler(params) if wants_params else handler()}
         except Exception as exc:
             response = {"ok": False, "error": f"{type(exc).__name__}: {exc}", "protocol": CONTROL_PROTOCOL_VERSION}
+        if verb == "identify" and response.get("ok") is True:
+            result = response.get("result")
+            if isinstance(result, dict):
+                # The server owns this field even when a test or extension supplies an identify
+                # handler.  A caller must never be able to copy a prior listener's identity. Copy
+                # the handler result: public identify callers own the historical shape and must not
+                # observe an internal attestation field merely because the server is instrumented.
+                result = dict(result)
+                include_socket_identity = (
+                    isinstance(request.get("params"), dict)
+                    and request["params"].get(_INTERNAL_IDENTITY_PARAM) is True
+                )
+                if not include_socket_identity:
+                    result.pop("control_socket_identity", None)
+                else:
+                    socket_identity = self._control_socket_identity()
+                    if socket_identity is None:
+                        result.pop("control_socket_identity", None)
+                    else:
+                        result["control_socket_identity"] = socket_identity
+                response["result"] = result
         if request_id is not None:
             response["id"] = request_id
         try:
@@ -495,6 +540,15 @@ def _windows_pipe_exchange(home: Path, request: bytes, timeout: float) -> Option
 def identify_gateway(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:
     """Convenience wrapper: ``identify`` the gateway serving ``home``."""
     return query_gateway_control(home, "identify", timeout=timeout)
+
+
+def _identify_gateway_with_control_socket_identity(
+    home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT,
+) -> Optional[dict[str, Any]]:
+    """Internal lifecycle attestation; the public identify shape remains unchanged."""
+    return query_gateway_control(
+        home, "identify", params={_INTERNAL_IDENTITY_PARAM: True}, timeout=timeout,
+    )
 
 
 def pause_gateway_for_update(home: Path, *, timeout: float = _DEFAULT_CLIENT_TIMEOUT) -> Optional[dict[str, Any]]:

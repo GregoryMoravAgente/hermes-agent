@@ -11,6 +11,7 @@ import pytest
 from gateway.control_socket import (
     CONTROL_PROTOCOL_VERSION,
     GatewayControlServer,
+    _identify_gateway_with_control_socket_identity,
     identify_gateway,
     query_gateway_control,
     resolve_client_socket_path,
@@ -282,6 +283,35 @@ def test_default_identify_payload_shape(home: Path, monkeypatch):
         "external",
         "manual",
     }
+
+
+def test_internal_socket_identity_is_opt_in_and_server_owned(home: Path):
+    async def scenario():
+        server = GatewayControlServer(
+            home,
+            verb_handlers={
+                "identify": lambda: {
+                    "pid": 4242,
+                    "control_socket_identity": {"device": 1, "inode": 2},
+                },
+            },
+        )
+        assert await server.start()
+        try:
+            public = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: identify_gateway(home)
+            )
+            internal = await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _identify_gateway_with_control_socket_identity(home)
+            )
+            return public, internal
+        finally:
+            await server.stop()
+
+    public, internal = _run(scenario())
+    assert public == {"pid": 4242}
+    assert internal["pid"] == 4242
+    assert internal["control_socket_identity"]["inode"] != 2
 
 
 # ---------------------------------------------------------------------------

@@ -267,6 +267,16 @@ def _execute_job_now(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
     """Run a job now, outside the scheduler tick: claim via ``claim_job_for_fire`` (the ticker's
     CAS, so a concurrent tick cannot double-fire and next_run_at advances), then fire through
     the shared ``run_one_job`` body. Returns {"claimed", "success", "error"}."""
+    # Refuse an in-process duplicate before entering the strict source admission lease.  The
+    # accepted runner still rechecks this through ``try_register_running_job`` after its durable
+    # claim; this preflight only prevents a direct caller from waiting on the live run's jobs lock
+    # and thereby blocking the caller's own cancellation/release path.
+    try:
+        from cron.scheduler import is_job_running
+        if is_job_running(job["id"]):
+            return {"claimed": False, "success": False, "error": _ALREADY_RUNNING_ERROR}
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        logger.debug("Cron in-process liveness check failed; continuing to claim", exc_info=True)
     claimed_job, err = _claim_for_manual_run(job["id"], "immediate run")
     return err if err is not None else _run_claimed_job(claimed_job, extra_prompt=extra_prompt)
 

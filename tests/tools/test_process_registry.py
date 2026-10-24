@@ -2494,7 +2494,7 @@ class TestSystemdCgroupIsolation:
         ), patch("subprocess.Popen") as pipe_spawn, patch(
             "tools.process_registry._stop_systemd_unit", return_value=False
         ) as stop_unit:
-            with pytest.raises(RuntimeError, match="could not be reaped"):
+            with pytest.raises(RuntimeError, match="PTY wrapper failed after scope creation"):
                 registry.spawn_local("codex", cwd="/tmp", use_pty=True)
 
         stop_unit.assert_called_once()

@@ -97,14 +97,12 @@ async def test_a_committed_pin_recovers_after_restart_and_adopts_the_exact_row(b
 
     from gateway import session_bot
     from gateway.config import GatewayConfig
-    from gateway.runtime_custody import RuntimeCustodyCoordinator
     from gateway.runtime_ownership import process_ownership
     from gateway.session import SessionStore
     from gateway.session_authority import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.session_bot_custody import _reconcile_unknown_bot_handles
     from gateway.session_automation_custody import row_descriptor
-    from hermes_cli.backend_retirement import RetirementFence
     from hermes_state import SessionDB
     from hermes_state_runtime import (adopt_worker_execution, get_session_admission,
         register_worker_execution)
@@ -126,19 +124,25 @@ async def test_a_committed_pin_recovers_after_restart_and_adopts_the_exact_row(b
     committed_id = first['_committed_admission_id']
 
     monkeypatch.setattr(type(bot.authority), 'admit_automation', real)
+    # Hand the real profile lock to the replacement authority.  ``reserve`` is idempotent, so
+    # calling it while the fixture still owns the lock would not exercise a restart at all.
+    assert process_ownership.release(bot.home)
     process_ownership.reserve([bot.home], purpose='bot-restart-test')
     db = None
     try:
         store = SessionStore(bot.home / 'sessions', GatewayConfig())
         db = SessionDB(db_path=bot.home / 'state.db')
+        store._db = db
         runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
                                  _evict_cached_agent=lambda route: None)
         runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
         authority = await initialize_session_authority(
-            runner, profile_id='default', instance_id='restarted', db=db)
-        runner.runtime_custody = RuntimeCustodyCoordinator(
-            process_instance=authority.instance_id, authority_epoch=authority.epoch,
-            fence=RetirementFence())
+            runner, profile_id=bot.authority.profile_id, instance_id='restarted', db=db)
+        # Recreate the same source-owned runtime binding used by the fixture.  A new authority
+        # may adopt the durable row, but only after its actual profile/epoch/coordinator graph is
+        # installed; constructing a bare coordinator would turn the restart into scalar adoption.
+        from tests.gateway.conftest import bind_authority_runtime_custody
+        bind_authority_runtime_custody(runner, authority)
         authority._schedule = lambda ref: None
 
         await session_bot.recover_bot_deliveries(authority)
@@ -189,7 +193,6 @@ async def test_a_committed_pin_recovers_after_restart_and_adopts_the_exact_row(b
         store = locals().get('store')
         if store is not None and getattr(store, '_db', None) is not None:
             store._db.close()
-        process_ownership.release(bot.home)
 
 @pytest.mark.parametrize('epoch_field', ['authority_epoch', '_committed_authority_epoch'])
 @pytest.mark.asyncio

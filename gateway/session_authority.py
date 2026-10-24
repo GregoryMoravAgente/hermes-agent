@@ -1251,6 +1251,11 @@ class SessionAuthority(
         # owed to (a turn fenced unknown already released its delivery waiter), exactly once.
         from gateway.session_ingress import deliver_resolved
         await deliver_resolved(self, admission_id, owed=prepared is not None and row['owner_epoch'] == self.epoch)
+        from gateway.config import Platform
+        live = self.sessions.get(ref.session_id)
+        if live is not None and getattr(live.source, 'platform', None) == Platform.LOCAL:
+            from gateway.session_local_recovery import reconcile_local_parents_after_unknown
+            reconcile_local_parents_after_unknown(self, ref.session_id, admission_id)
         self._publish_pending(ref)
         self._schedule(ref)
         return self._receipt(row)

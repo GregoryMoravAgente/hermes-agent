@@ -9,6 +9,7 @@ import asyncio
 import base64
 import contextlib
 import contextvars
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import json
@@ -426,7 +427,13 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self._save(candidate)
                     self.scope = candidate['scope']
                     self.journal = candidate
-                    self._record_replayed_compression_rows(entry, result)
+                    # The journal entry is also the nested payload passed to the RPC.  A
+                    # lost acknowledgement leaves that same object observable by callers
+                    # that retained the sent parameters; annotating it in place would alter
+                    # the payload digest of the already committed receipt and turn an exact
+                    # retry into an admission conflict.  Keep the wire entry immutable while
+                    # rebuilding the local managed-row witness.
+                    self._record_replayed_compression_rows(copy.deepcopy(entry), result)
                     results.append(result)
             except Exception as exc:
                 self.failure = str(exc)
@@ -508,11 +515,17 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         if metadata is None:
             return None
         admission_id = metadata.get('admission_id')
+        # The bootstrap custody metadata binds the admission/session/generation;
+        # the worker's adopted scope is the authoritative execution/epoch header.
+        execution_id = self.scope.get('execution_id')
+        authority_epoch = self.scope.get('epoch')
         store_path = metadata.get('store_path')
         generation = metadata.get('generation')
         session_id = self.scope.get('session_id')
         if (
             type(admission_id) is not str or not admission_id
+            or type(execution_id) is not str or not execution_id
+            or type(authority_epoch) is not int or authority_epoch < 1
             or type(store_path) is not str or not store_path
             or type(generation) is not int or generation < 1
             or type(session_id) is not str or not session_id
@@ -558,6 +571,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             'store_path': store_path,
             'session_id': session_id,
             'admission_id': admission_id,
+            'execution_id': execution_id,
+            'authority_epoch': authority_epoch,
             'execution_generation': generation,
             'row_ids': [row_id for row_id, _role, _snapshot in turn_rows],
             'row_snapshots': [snapshot for _row_id, _role, snapshot in turn_rows],

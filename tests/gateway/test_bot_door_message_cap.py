@@ -27,7 +27,11 @@ async def test_long_cron_report_is_admitted_and_relayed_dm_stays_capped(bot):
                            timeout=10, what='the cron report to settle')
     assert (await asyncio.to_thread(read_delivery_result, bot.home, KEY))['message'] == message
 
-    relayed = Principal('uid:1000', 'default', frozenset({'session:submit', 'session:read'}), 'relay')
+    # The authority is profile-scoped to its temporary home.  ``default`` remains the wire
+    # profile alias in the request below, but the authenticated principal must carry the
+    # authority's canonical profile identity so delivery reaches the size-cap guard.
+    relayed = Principal('uid:1000', bot.authority.profile_id,
+                        frozenset({'session:submit', 'session:read'}), 'relay')
     author = {'id': 'bot:conn/peer', 'name': 'peer', 'is_bot': True}
     connection = type(bot.connection)(authority=bot.authority, actor=relayed)
     with pytest.raises(RuntimeStoreError, match='invalid_params'):

@@ -133,11 +133,9 @@ class TestCronjobRunExecutesImmediately:
             extra_prompt=None,
         )
 
-    def test_execute_job_now_delivers_through_owner_profile_adapters(self):
+    def test_execute_job_now_delivers_through_owner_profile_adapters(self, tmp_path):
         """Under multiplex a manual run fired from a secondary profile must deliver through THAT
         profile's adapters, not the default profile's ``runner.adapters`` (wrong Telegram bot)."""
-        from pathlib import Path
-
         default_adapters = {"telegram": object()}
         work_adapters = {"telegram": object()}
         gateway_loop = object()
@@ -147,10 +145,12 @@ class TestCronjobRunExecutesImmediately:
             _adapters_for_profile=lambda profile: work_adapters if profile == "work" else default_adapters,
         )
         completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        profile_home = tmp_path / "profiles" / "work"
+        profile_home.mkdir(parents=True)
 
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
              patch("gateway.run._gateway_runner_ref", return_value=runner), \
-             patch("hermes_constants.get_hermes_home", return_value=Path("/srv/hermes/profiles/work")), \
+             patch("hermes_constants.get_hermes_home", return_value=profile_home), \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=completed):
             res = _execute_job_now(dict(_JOB))
@@ -158,12 +158,10 @@ class TestCronjobRunExecutesImmediately:
         assert res["success"] is True
         assert m_run.call_args.kwargs["adapters"] is work_adapters
 
-    def test_execute_job_now_grants_a_shared_bot_satellite_only_its_routed_targets(self):
+    def test_execute_job_now_grants_a_shared_bot_satellite_only_its_routed_targets(self, tmp_path):
         """A credentialless satellite that posts through the primary's bot gets the ticker's
         route-restricted view (``SharedRouteAdapters``), never the whole primary adapter map: an
         unrouted target is a miss (fail closed), the routed one resolves the primary adapter."""
-        from pathlib import Path
-
         from cron.scheduler_preflight import SharedRouteAdapters
         from gateway.profile_routing import ProfileRoute
 
@@ -176,10 +174,12 @@ class TestCronjobRunExecutesImmediately:
         )
         route = ProfileRoute(name="ops", platform="telegram", profile="keeper", chat_id="-100")
         completed = {"id": "job-run-1", "last_status": "ok", "last_error": None}
+        profile_home = tmp_path / "profiles" / "keeper"
+        profile_home.mkdir(parents=True)
 
         with patch("tools.cronjob_tools.claim_job_for_fire", return_value={**_JOB, "fire_claim": {"by": "manual-owner"}}), \
              patch("gateway.run._gateway_runner_ref", return_value=runner), \
-             patch("hermes_constants.get_hermes_home", return_value=Path("/srv/hermes/profiles/keeper")), \
+             patch("hermes_constants.get_hermes_home", return_value=profile_home), \
              patch("cron.scheduler_preflight._primary_profile_routes_for_current_home", return_value=[route]), \
              patch("cron.scheduler.run_one_job", return_value=True) as m_run, \
              patch("tools.cronjob_tools.get_job", return_value=completed):

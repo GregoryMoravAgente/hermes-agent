@@ -248,6 +248,7 @@ class CronOwnerBinding:
         self._native_job = None
         self._native_job_identity = None
         self._native_job_proven = False
+        self._native_job_closed_identity = None
         # In-process script writers are tracked separately from detached worker processes.
         # A process exit alone is insufficient while stdout/stderr writers may still hold the
         # completion pipe; the runner records an explicit post-exit pipe-close observation.
@@ -591,7 +592,25 @@ class CronOwnerBinding:
         except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
             self.mark_unknown("worker_scope_unproven")
             return False
+        with self._lock:
+            self._native_job_closed_identity = native_job
         return True
+
+    def _stored_native_job_matches(self, process: Any) -> bool:
+        """Consume the same close receipt after settlement, never a replacement Job."""
+        with self._lock:
+            job = self._native_job
+            if self._settled and job is not None:
+                return (
+                    process is self._process
+                    and self._native_job_identity is job
+                    and self._native_job_closed_identity is job
+                    and self._native_job_proven is True
+                    and self._scope_proof is not None
+                    and self._scope_proof.get("scope_empty") is True
+                )
+            return self._native_job_binding_matches(
+                job, self._native_job_identity, self._native_job_proven, process)
 
     def _windows_trampoline_worker_matches(
         self, record_pid: int, record_started_at: int, process: Any,
@@ -721,14 +740,11 @@ class CronOwnerBinding:
             bound_pid = self._bound_process_pid
             process = self._process
             native_job = self._native_job
-            native_job_proven = self._native_job_proven
-            native_job_identity = self._native_job_identity
             scope_proof = dict(self._scope_proof) if self._scope_proof is not None else None
             expected_scope = self._scope_unit
         if active_pid != record_pid or active_started_at != record_started_at:
             return False
-        if not self._native_job_binding_matches(
-            native_job, native_job_identity, native_job_proven, process):
+        if not self._stored_native_job_matches(process):
             return False
         if dispatch_mode == "scoped":
             return (
@@ -1300,6 +1316,17 @@ class CronOwnerBinding:
         if record.get("status") == "unknown":
             self.mark_unknown("foreign_custody")
             return False
+        if self.owner_class == "I13_external_cron_worker" and (
+            record.get("id") != self.execution_id
+            or record.get("job_id") != self.job_id
+            or record.get("source") != self.source
+            or not self._stored_active_worker_matches(
+                record.get("pid"), record.get("process_started_at"), self._dispatch_mode)
+        ):
+            # The reaper is an independent terminal observer. It must enforce the
+            # same authenticated tuple as the synchronous waiter before release.
+            self.mark_unknown("foreign_custody")
+            return False
         # A queued outcome is a real durable delivery obligation, not a terminal publication.
         if record.get("delivery_outcome") == "queued":
             return False
@@ -1354,21 +1381,22 @@ class CronOwnerBinding:
             return False
         if not self._wait_for_native_ownership_to_drain():
             return False
-        if not self._close_native_job():
-            return False
         with self._lock:
             if self._settled or self._unknown:
                 return self._settled
-        finalizer_id = f"cron:{self.owner_class}:{self.owner_id}:terminal"
-        refusal = self.coordinator.mark_finalizing(self.handle, finalizer_id)
-        if refusal is not None:
-            self.mark_unknown("lease_release_failed")
-            return False
-        refusal = self.coordinator.mark_terminal(self.handle)
-        if refusal is not None:
-            self.mark_unknown("lease_release_failed")
-            return False
-        with self._lock:
+            # Publish native close and coordinator terminality together. A waiter
+            # cannot observe the closed Job between these two exact effects.
+            if not self._close_native_job():
+                return False
+            finalizer_id = f"cron:{self.owner_class}:{self.owner_id}:terminal"
+            refusal = self.coordinator.mark_finalizing(self.handle, finalizer_id)
+            if refusal is not None:
+                self.mark_unknown("lease_release_failed")
+                return False
+            refusal = self.coordinator.mark_terminal(self.handle)
+            if refusal is not None:
+                self.mark_unknown("lease_release_failed")
+                return False
             self._settled = True
             scope_proof = dict(self._scope_proof) if self._scope_proof is not None else None
         if self.owner_class == "I13_external_cron_worker" and scope_proof is not None and self.execution_id:

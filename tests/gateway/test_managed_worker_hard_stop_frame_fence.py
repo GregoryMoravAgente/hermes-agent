@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session_contract import Principal, SessionRef
 from tests.gateway.test_managed_turn_contract import assignment
 
 
@@ -76,6 +75,7 @@ for line in sys.stdin.buffer:
     for i in range(20):
         send({'type': 'delta', 'text': str(i)})
     send({'type': 'bogus'})
+    sys.stdin.buffer.read()
     break
 """
 
@@ -83,44 +83,40 @@ for line in sys.stdin.buffer:
 @pytest.mark.platforms("linux")
 def test_worker_frames_read_no_ledger_per_frame(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
-    from gateway.session_authority import LiveSession, SessionAuthority
-    from gateway.session_contract import Submission
     from gateway.session_policy import build_policy
-    from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
-
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(db_path=tmp_path / 'state.db')
-    db.create_session('s', source='test')
-    runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
-                             _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
-                                 epoch=begin_runtime_epoch(db, instance_id='i'))
-    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
-    ref = SessionRef('owned', 's')
-    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
-
-    class Child(subprocess.Popen):
-        def __init__(self, args, **kw):
-            super().__init__([sys.executable, '-c', CHILD], **kw)
-    monkeypatch.setattr(managed.subprocess, 'Popen', Child)
-    policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
     log = []
-    real_rows, real_publish = authority._pending_rows, authority.publish_execution
-    monkeypatch.setattr(authority, '_pending_rows', lambda *a, **k: log.append('ledger') or real_rows(*a, **k))
-    monkeypatch.setattr(authority, 'publish_execution', lambda *a, **k: log.append('delta') or real_publish(*a, **k))
+    from hermes_state_runtime import get_session_admission
+    from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
 
     async def scenario():
-        await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
-        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
-        authority._stamp_claim(ref, live, row)  # the drain's claim stamp
-        log.clear()
-        with pytest.raises(managed.ManagedExecutionUnknown):  # the closing bogus frame revokes the worker
-            async with asyncio.timeout(30):
-                await managed.execute_managed(authority, ref, row, policy)
-    with db:
-        asyncio.run(scenario())
+        fixture = await real_runtime_binding(tmp_path, monkeypatch, include_probe=False)
+        try:
+            binding = await fixture.claim('frame-fence')
+            authority = fixture.authority
+            ref = SimpleNamespace(session_id=binding.session_id, profile_id=binding.profile_id)
+            row = get_session_admission(authority.db, admission_id=binding.admission_id)
+            assert row is not None
+
+            class Child(subprocess.Popen):
+                def __init__(self, args, **kw):
+                    super().__init__([sys.executable, '-c', CHILD], **kw)
+            monkeypatch.setattr(managed.subprocess, 'Popen', Child)
+            policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
+            real_rows, real_publish = authority._pending_rows, authority.publish_execution
+            monkeypatch.setattr(
+                authority, '_pending_rows', lambda *a, **k: log.append('ledger') or real_rows(*a, **k)
+            )
+            monkeypatch.setattr(
+                authority, 'publish_execution', lambda *a, **k: log.append('delta') or real_publish(*a, **k)
+            )
+            log.clear()
+            with pytest.raises(managed.ManagedExecutionUnknown):  # the closing bogus frame revokes the worker
+                async with asyncio.timeout(30):
+                    await managed.execute_managed(authority, ref, row, policy, binding)
+        finally:
+            fixture.cleanup()
+
+    asyncio.run(scenario())
     assert log.count('delta') == 20, log
     first, last = log.index('delta'), len(log) - 1 - log[::-1].index('delta')
     frames = log[first:last + 1]

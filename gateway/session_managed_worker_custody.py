@@ -15,7 +15,7 @@ import os
 import subprocess
 from typing import Any
 
-from gateway.runtime_service_custody import DurableResultProof
+from gateway.runtime_service_custody import DurableResultProof, _durable_result_rows_match
 from gateway.runtime_sidecar_sources import SidecarOwner, reserve_managed_sidecar
 
 
@@ -287,21 +287,21 @@ class ManagedWorkerCustody:
 
         return release_before_effect(self.owner)
 
-    def record_finish_proof(self, payload: Any) -> None:
-        """Stage a typed proof produced by the worker's receipt/readback path."""
+    @staticmethod
+    def _finish_proof_from_payload(payload: Any) -> DurableResultProof:
+        """Decode the exact source-produced managed finish proof without side effects."""
         if not isinstance(payload, dict):
-            self.mark_unknown("durable_result_proof_missing")
             raise ManagedWorkerCustodyError("durable_result_proof_missing")
         fields = (
-            "store_path", "session_id", "admission_id", "execution_generation",
+            "store_path", "session_id", "admission_id", "execution_id", "authority_epoch",
+            "execution_generation",
             "row_ids", "row_snapshots", "row_sessions", "row_roles", "payload_digest",
             "result_row_ids",
         )
         if set(payload) != set(fields):
-            self.mark_unknown("durable_result_proof_invalid")
             raise ManagedWorkerCustodyError("durable_result_proof_invalid")
         try:
-            proof = DurableResultProof(
+            return DurableResultProof(
                 store_path=payload["store_path"], session_id=payload["session_id"],
                 admission_id=payload["admission_id"],
                 execution_generation=payload["execution_generation"],
@@ -311,11 +311,82 @@ class ManagedWorkerCustody:
                 result_row_ids=tuple(payload["result_row_ids"]),
             )
         except (KeyError, TypeError, ValueError):
-            self.mark_unknown("durable_result_proof_invalid")
             raise ManagedWorkerCustodyError("durable_result_proof_invalid") from None
-        if proof.store_path != self.store_path or proof.admission_id != self.binding.admission_id:
-            self.mark_unknown("durable_result_identity_mismatch")
+
+    def preflight_finish_proof(self, payload: Any) -> DurableResultProof:
+        """Authenticate a finish proof before any route or receipt mutation.
+
+        The worker-created row snapshots are the durable source evidence.  This method is
+        deliberately pure: callers that reject a compression route must not mark the native
+        receipt unknown merely because a copied or truncated proof was offered.
+        """
+        proof = self._finish_proof_from_payload(payload)
+        from gateway.session_turn_physical_tip import canonical_store_path
+        current_store_path = canonical_store_path(self.binding.authority)
+        if (
+            type(current_store_path) is not str
+            or type(proof.store_path) is not str
+            or proof.store_path != current_store_path
+            or self.store_path != current_store_path
+            or proof.store_path != self.store_path
+            or type(proof.session_id) is not str
+            or not proof.session_id
+            or type(proof.admission_id) is not str
+            or not proof.admission_id
+            or proof.admission_id != self.binding.admission_id
+            or type(payload["execution_id"]) is not str
+            or payload["execution_id"] != f"admission-worker:{self.binding.admission_id}"
+            or type(payload["authority_epoch"]) is not int
+            or payload["authority_epoch"] < 1
+            or payload["authority_epoch"] != self.binding.authority_epoch
+            or type(payload["execution_generation"]) is not int
+            or payload["execution_generation"] < 1
+            or payload["execution_generation"] != self.binding.execution_generation
+            or type(proof.execution_generation) is not int
+        ):
             raise ManagedWorkerCustodyError("durable_result_identity_mismatch")
+        try:
+            self.service.validate_binding(self.binding)
+            self.service._request_for_admission(self.binding.admission_id, self.request)
+            physical = self.physical
+            source_match = getattr(physical, "_managed_source_identity_matches", None)
+            if (
+                self.service.unknown
+                or physical is None
+                or physical.service is not self.service
+                or physical.process is None
+                or physical.state in {"reserved", "unknown", "closed", "released"}
+                or not self.owner.effect_observed
+                or not callable(source_match)
+                or source_match() is not True
+                or (
+                    physical.transaction is not None
+                    and getattr(physical.transaction, "process", None) is not physical.process
+                )
+                or (
+                    physical.ephemeral_process
+                    and not isinstance(physical.managed_witness, dict)
+                )
+            ):
+                raise ManagedWorkerCustodyError("physical_receipt_identity_mismatch")
+            from gateway.session_turn_physical_tip import preflight_physical_proof_session
+            if preflight_physical_proof_session(self.binding, proof) != proof.session_id:
+                raise ManagedWorkerCustodyError("durable_result_identity_mismatch")
+            if not _durable_result_rows_match(self.binding.authority.db, proof):
+                raise ManagedWorkerCustodyError("durable_result_identity_mismatch")
+        except ManagedWorkerCustodyError:
+            raise
+        except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError):
+            raise ManagedWorkerCustodyError("durable_result_identity_mismatch") from None
+        return proof
+
+    def record_finish_proof(self, payload: Any) -> None:
+        """Commit a proof that already passed the pure source/readback preflight."""
+        try:
+            proof = self.preflight_finish_proof(payload)
+        except ManagedWorkerCustodyError as exc:
+            self.mark_unknown(str(exc))
+            raise
         try:
             self.service.record_result_durable(self.binding, self.request, proof)
             self.binding.authority._preservation_release_sidecar(

@@ -10,8 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from gateway.session_contract import SessionRef
 from tests.gateway.restart_test_helpers import make_restart_runner
+from tests.gateway.test_runtime_service_parent_edges import real_runtime_binding
 from tests.waiting import async_wait_until
 
 
@@ -39,34 +39,76 @@ async def test_drain_counts_managed_turns_and_the_timeout_path_stops_them(tmp_pa
 
 
 @pytest.mark.platforms("linux")
-def test_settlement_stops_a_silent_managed_worker_instead_of_waiting_unbounded(monkeypatch):
+def test_settlement_stops_a_silent_managed_worker_instead_of_waiting_unbounded(tmp_path, monkeypatch):
     """The reviewer's probe: a started managed admission whose child never answers. Settlement sends
     Stop, the turn settles interrupted through its own path, and nothing waits on HELLO_SECONDS."""
     from gateway import run_runtime
     from gateway import session_managed_worker as managed
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_policy import build_policy
     original = subprocess.Popen
 
     def silent_child(args, **kwargs):
         return original([sys.executable, '-c', 'import time\nwhile True: time.sleep(1)'], **kwargs)
     monkeypatch.setattr(managed.subprocess, 'Popen', silent_child)
-    ref = SessionRef('profile', 's')
-    live = SimpleNamespace(task=None, route='r', event_stream=SimpleNamespace(execution={}))
-    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={}, sessions={'s': live},
-                                check_approval_generation=lambda *a: None, pending_stops={}, adopted={},
-                                adopt_agent=lambda session_id, generation, worker: None)
-    runner = SimpleNamespace(session_authority=authority)
-    authority.runner = runner  # settle also hard-stops in-process turns through the runner
-    row = {'admission_id': 'adm', 'principal_id': 'owner', 'generation': 3, 'payload': {'text': 'go'}}
 
     async def scenario():
-        live.task = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
-        await async_wait_until(lambda: 's' in getattr(authority, '_managed_workers', {}),
-                               what='the managed worker to register')
-        async with asyncio.timeout(15):
-            await run_runtime.settle_gateway_runtime(runner)
-        return live.task
+        fixture = await real_runtime_binding(tmp_path, monkeypatch, include_probe=False)
+        try:
+            authority = fixture.authority
+            runner = fixture.runner
+            source = fixture.adapter.build_source(
+                chat_id='15551234567@s.whatsapp.net',
+                user_id='15551234567@s.whatsapp.net',
+                chat_type='dm',
+            )
+            receipt = await fixture.admit_native_with_source_handoff(
+                MessageEvent(text='silent-worker', source=source, message_id='silent-worker'),
+            )
+            assert receipt.status == 'queued'
+            ref = receipt.ref
+            admission_id = receipt.admission_id
+            live = authority.sessions[ref.session_id]
+            # Keep the real production admission wrapper while selecting the managed
+            # route with a typed policy fixture; the WhatsApp source used to create
+            # this binding is not itself a managed-worker launch surface.
+            managed_policy = build_policy(
+                {'cwd': str(tmp_path), 'model': 'm'},
+                {'gateway': {'managed_workers': True}},
+                profile_terminal=False,
+            )
+            monkeypatch.setattr(managed, 'managed_policy', lambda *_args: managed_policy)
+            executed = {}
+            original_execute_claimed = authority._execute_claimed
 
-    task = asyncio.run(scenario())
-    assert task.done() and not task.cancelled() and task.result() == ''
-    assert authority.pending_results['adm']['result']['interrupted'] is True
-    assert authority._managed_workers == {}
+            async def capture_execute_claimed(execute_ref, execute_live, execute_row):
+                result = await original_execute_claimed(execute_ref, execute_live, execute_row)
+                executed['result'] = result
+                executed['pending'] = authority.pending_results.get(execute_row['admission_id'])
+                return result
+
+            monkeypatch.setattr(authority, '_execute_claimed', capture_execute_claimed)
+            # Exercise the production claim wrapper: it owns the execution stamp
+            # finalizer while the shutdown path supervises the real managed child.
+            # Calling execute_managed directly would require a test-only mirror of
+            # the wrapper's lifecycle cleanup and would not prove the drain contract.
+            live.task = asyncio.create_task(authority._drain(ref))
+            await async_wait_until(lambda: ref.session_id in getattr(authority, '_managed_workers', {}),
+                               what='the managed worker to register')
+            async with asyncio.timeout(15):
+                await run_runtime.settle_gateway_runtime(runner)
+            task = live.task
+            assert task.done() and not task.cancelled()
+            assert executed['result'][0] == ''
+            assert executed['pending']['result']['interrupted'] is True
+            settled = authority.db._read_one(
+                'SELECT status, outcome FROM session_admissions WHERE admission_id=?',
+                (admission_id,),
+            )
+            assert settled is not None and tuple(settled) == ('terminal', 'interrupted')
+            assert admission_id not in authority.pending_results
+            assert authority._managed_workers == {}
+        finally:
+            fixture.cleanup()
+
+    asyncio.run(scenario())

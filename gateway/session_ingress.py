@@ -948,9 +948,35 @@ async def _finish_preservation_sidecar_delivery(
         not automation_binding
         and can_stage_api_sidecar_delivery(authority, admission_id, delivery_receipt)
     )
+    # Native/API callers can consume the result through their waiter or event stream without
+    # creating a platform delivery entry.  A managed sidecar has nevertheless crossed its
+    # durable-result fence and must run the same source-owned physical/request finalizer before
+    # the I04 parent is released.  Treating this typed ``no_delivery`` observation as a missing
+    # finalizer leaves the sidecar in ``readers_active`` and parks every FIFO successor.
+    no_delivery_with_durable_sidecar = (
+        isinstance(delivery_receipt, DeliveryReceipt)
+        and delivery_receipt.admission_id == admission_id
+        and delivery_receipt.attempted is False
+        and delivery_receipt.delivered is False
+        and delivery_receipt.reason == 'no_delivery'
+        and delivery_receipt.effect_state == 'none'
+        and any(
+            entry.get('admission_id') == admission_id
+            and entry.get('result_durable') is True
+            for entry in getattr(authority, '_preservation_sidecars', {}).values()
+            if isinstance(entry, dict)
+        )
+    )
+    typed_delivery = (
+        isinstance(delivery_receipt, DeliveryReceipt)
+        and delivery_receipt.admission_id == admission_id
+    )
     finalizer_outcome = None
     if (physical_delivery or (not automation_binding and (
-            getattr(delivery_receipt, 'delivered', False) or waiter_delivered or api_result_pending))):
+            typed_delivery and delivery_receipt.delivered
+            or waiter_delivered
+            or api_result_pending
+            or no_delivery_with_durable_sidecar))):
         finalizer_outcome = preservation_delivery_outcome(authority, admission_id)
         if finalizer_outcome == 'delivery_finalize_failed':
             retried = await retry_preservation_delivery(

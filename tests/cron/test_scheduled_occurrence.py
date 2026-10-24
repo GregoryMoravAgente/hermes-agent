@@ -104,6 +104,10 @@ def test_ledger_migration_and_completion_identity(tmp_path, monkeypatch):
 
     db = tmp_path / 'executions.db'
     monkeypatch.setattr(executions, 'EXECUTIONS_FILE', db)
+    # Provider admission resolves the active profile from HERMES_HOME before entering the
+    # jobs-store context. Keep that source-owned profile identical to the temporary store used
+    # below, rather than letting the host's launch profile replace it.
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path / 'cron'))
     # Pre-migration schema, not initialized by the implementation under test.
     with sqlite3.connect(db) as conn:
         conn.execute('''CREATE TABLE executions (

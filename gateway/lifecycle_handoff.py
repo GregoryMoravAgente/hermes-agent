@@ -837,7 +837,11 @@ def _read_pid_marker(home: Path) -> tuple[bool, dict[str, Any] | None]:
 
 def _control_endpoint_identity(home: Path) -> dict[str, Any] | None:
     try:
-        from gateway.control_socket import resolve_client_socket_path, windows_pipe_name
+        from gateway.control_socket import (
+            _identify_gateway_with_control_socket_identity,
+            resolve_client_socket_path,
+            windows_pipe_name,
+        )
 
         path = windows_pipe_name(home) if os.name == "nt" else resolve_client_socket_path(home)
         identity: dict[str, Any] = {"transport": "windows-pipe" if os.name == "nt" else "unix"}
@@ -861,6 +865,18 @@ def _control_endpoint_identity(home: Path) -> dict[str, Any] | None:
                         "3i", peer.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
                     )[0]
                     identity["peer_birth"] = _birth(identity["peer_pid"])
+            payload = _identify_gateway_with_control_socket_identity(home)
+            socket_identity = payload.get("control_socket_identity") if isinstance(payload, Mapping) else None
+            if not isinstance(socket_identity, Mapping):
+                return None
+            listener_device = socket_identity.get("device")
+            listener_inode = socket_identity.get("inode")
+            if type(listener_device) is not int or type(listener_inode) is not int or listener_inode <= 0:
+                return None
+            identity.update({
+                "listener_device": listener_device,
+                "listener_inode": listener_inode,
+            })
         elif path is not None:
             from gateway.runtime_bootstrap_windows import probe_runtime_control_peer
 
@@ -882,13 +898,22 @@ def _control_observation(
         return None
     if payload is not None:
         identity.update({"pid": payload.get("pid"), "start_time": payload.get("start_time")})
+        if os.name != "nt":
+            socket_identity = payload.get("control_socket_identity")
+            if not isinstance(socket_identity, Mapping):
+                return None
+            if (
+                identity.get("listener_device") != socket_identity.get("device")
+                or identity.get("listener_inode") != socket_identity.get("inode")
+            ):
+                return None
     return identity if identity.get("endpoint") else None
 
 
 def _control_endpoint_key(identity: Mapping[str, Any]) -> tuple[Any, ...]:
     return tuple(identity.get(key) for key in (
         "transport", "endpoint", "device", "inode", "mode", "ctime_ns", "peer_pid", "peer_birth",
-        "peer_subject",
+        "peer_subject", "listener_device", "listener_inode",
     ))
 
 
@@ -1033,10 +1058,10 @@ def _record_successor_from_control(
     if handoff.get("state") != "released" or not _validate_handoff_integrity(handoff):
         return False
     try:
-        from gateway.control_socket import identify_gateway
+        from gateway.control_socket import _identify_gateway_with_control_socket_identity
 
         control_before = _control_endpoint_identity(home)
-        payload = identify_gateway(home)
+        payload = _identify_gateway_with_control_socket_identity(home)
         control_after = _control_endpoint_identity(home)
     except BaseException:  # health: allow BLE001 -- control roundtrip failure stays UNKNOWN
         return _mark_current_successor_unknown(home, "control_roundtrip_failed")

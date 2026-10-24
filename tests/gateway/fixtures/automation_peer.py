@@ -110,7 +110,8 @@ async def probe(root, base, mode):
     try:
         async with websockets.serve(connector, '127.0.0.1', 0) as relay:
             url = f'http://127.0.0.1:{model.server_port}/v1'
-            cfg = {'gateway': {'multiplex_profiles': False},
+            cfg = {'_config_version': 12,
+                'gateway': {'multiplex_profiles': False},
                 'model': {'provider': 'custom', 'default': 'local-fixture', 'base_url': url},
                 'streaming': {'enabled': False}, 'terminal': {'cwd': str(home)},
                 'approvals': {'mode': 'off'},

@@ -591,6 +591,200 @@ def _execution_tip(db, execution_id):
     return row[0] if row else None
 
 
+def _preflight_managed_compression_route(custody, proof):
+    """Run the pure proof gate while the source-owned service/receipt is still live."""
+    service = getattr(custody, 'service', None)
+    if service is None or getattr(service, 'unknown', False) is True:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    preflight = getattr(custody, 'preflight_finish_proof', None)
+    if not callable(preflight) or preflight(proof) is None:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+
+
+def _managed_compression_route_headers_valid(
+    authority, admission, scope, proof, expected_session, execution_id, generation, epoch,
+    admission_id, store_path,
+):
+    """Check the immutable route/proof header fields without touching live custody."""
+    if not isinstance(admission, dict):
+        return False
+    return all((
+        scope.get('profile_id') == authority.profile_id,
+        type(execution_id) is str,
+        bool(execution_id),
+        type(generation) is int,
+        generation >= 1,
+        type(epoch) is int,
+        epoch == authority.epoch,
+        type(admission_id) is str,
+        bool(admission_id),
+        type(store_path) is str,
+        bool(store_path),
+        type(proof.get('store_path')) is str,
+        proof.get('store_path') == store_path,
+        admission.get('target_session_id') == expected_session,
+        type(admission.get('generation')) is int,
+        admission.get('generation') == generation,
+        type(admission.get('owner_epoch')) is int,
+        admission.get('owner_epoch') == epoch,
+        admission.get('status') == 'started',
+        type(proof.get('admission_id')) is str,
+        proof.get('admission_id') == admission_id,
+        type(proof.get('execution_id')) is str,
+        proof.get('execution_id') == execution_id,
+        type(proof.get('authority_epoch')) is int,
+        proof.get('authority_epoch') == epoch,
+        type(proof.get('execution_generation')) is int,
+        proof.get('execution_generation') == generation,
+    ))
+
+
+def _managed_compression_lineage_valid(
+    authority, ref, expected, target, execution_id, generation, epoch, admission_id,
+):
+    """Read the durable worker/admission lineage without changing the live route."""
+    import sqlite3
+    try:
+        with authority.db._read_ctx() as conn:
+            worker = conn.execute(
+                'SELECT session_id,kind,owner_epoch,generation,status '
+                'FROM worker_executions WHERE execution_id=?', (execution_id,),
+            ).fetchone()
+            admission_row = conn.execute(
+                'SELECT target_session_id,lineage_json,owner_epoch,generation,status '
+                'FROM session_admissions WHERE admission_id=?', (admission_id,),
+            ).fetchone()
+        if worker is None or admission_row is None:
+            return False
+        if not all((
+            worker['session_id'] == target,
+            worker['kind'] == 'compute',
+            type(worker['owner_epoch']) is int,
+            worker['owner_epoch'] == epoch,
+            type(worker['generation']) is int,
+            worker['generation'] == generation,
+            worker['status'] in {'running', 'terminal'},
+            admission_row['target_session_id'] == ref.session_id,
+            type(admission_row['owner_epoch']) is int,
+            admission_row['owner_epoch'] == epoch,
+            type(admission_row['generation']) is int,
+            admission_row['generation'] == generation,
+            admission_row['status'] == 'started',
+        )):
+            return False
+        admission_lineage = json.loads(admission_row['lineage_json'])
+        if not isinstance(admission_lineage, list) or any(
+            type(item) is not str or not item for item in admission_lineage
+        ):
+            return False
+        lineage = tuple(authority.db.get_compression_lineage(ref.session_id))
+        continuation = _continuation_path(authority.db, expected, target)
+        return all((
+            lineage,
+            lineage[0] == ref.session_id,
+            lineage[-1] == target,
+            tuple(admission_lineage) == lineage,
+            authority.db.get_compression_tip(ref.session_id) == target,
+            continuation is not None,
+            continuation[0] == expected,
+            continuation[-1] == target,
+        ))
+    except (OSError, TypeError, ValueError, KeyError, sqlite3.Error):
+        return False
+
+
+def _advance_managed_compression_route(
+    authority, ref, admission, scope, proof, *, binding=None, custody=None,
+):
+    """CAS-advance the owner route for an authenticated managed compression child.
+
+    The worker-side ``compression.publish`` transaction moves the durable execution and
+    admission lineage, but it cannot mutate the gateway process's in-memory route.  The
+    physical-tip witness therefore needs one owner-side reconciliation before durable proof
+    settlement.  Every check here is source-owned identity; a stale, foreign, or replaced
+    child remains UNKNOWN rather than becoming a route mutation.
+    """
+    if not isinstance(proof, dict):
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    if not isinstance(scope, dict):
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    expected = scope.get('session_id')
+    target = proof.get('session_id')
+    if type(expected) is not str or not expected or type(target) is not str or not target:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    if target == expected:
+        return
+    execution_id = scope.get('execution_id')
+    generation = scope.get('generation')
+    epoch = scope.get('epoch')
+    admission_id = admission.get('admission_id') if isinstance(admission, dict) else None
+    try:
+        from gateway.runtime_service_custody import (
+            ServiceCustodyError, TurnCustodyBinding, admission_binding, validate_turn_binding,
+        )
+        if binding is None:
+            binding = admission_binding(authority, ref, admission)
+        if (
+            not isinstance(binding, TurnCustodyBinding)
+            or binding.authority is not authority
+            or binding.admission_id != admission_id
+            or binding.session_id != ref.session_id
+        ):
+            raise RuntimeStoreError('managed_compression_route_unknown')
+        validate_turn_binding(binding)
+        if custody is None:
+            raise RuntimeStoreError('managed_compression_route_unknown')
+        service = getattr(custody, 'service', None)
+        if service is None or getattr(service, 'binding', None) is not binding:
+            raise RuntimeStoreError('managed_compression_route_unknown')
+        service.validate_binding(binding)
+    except (AttributeError, KeyError, RuntimeError, ServiceCustodyError, TypeError, ValueError):
+        raise RuntimeStoreError('managed_compression_route_unknown') from None
+    from gateway.session_turn_physical_tip import canonical_store_path
+    store_path = canonical_store_path(authority)
+    if not _managed_compression_route_headers_valid(
+        authority, admission, scope, proof, ref.session_id, execution_id, generation, epoch,
+        admission_id, store_path,
+    ):
+        raise RuntimeStoreError('managed_compression_route_unknown')
+
+    # The route CAS is an effect.  Authenticate the worker's exact source-produced row
+    # snapshots, digest, binding, and native receipt before changing the in-memory tip.  This
+    # preflight is pure; malformed/copy proofs therefore leave both the route and receipt maps
+    # untouched.  The final physical receipt check still runs during ordinary settlement.
+    try:
+        _preflight_managed_compression_route(custody, proof)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        raise RuntimeStoreError('managed_compression_route_unknown') from None
+
+    if not _managed_compression_lineage_valid(
+        authority, ref, expected, target, execution_id, generation, epoch, admission_id,
+    ):
+        raise RuntimeStoreError('managed_compression_route_unknown')
+
+    store = getattr(getattr(authority, 'runner', None), 'session_store', None)
+    live = (getattr(authority, 'sessions', {}) or {}).get(ref.session_id)
+    route = getattr(live, 'route', None)
+    if store is None or type(route) is not str or not route:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    entry = store.lookup_by_session_key(route)
+    current = getattr(entry, 'session_id', None) if entry is not None else None
+    if current == target:
+        return
+    if current != expected:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+    # The durable lineage/readback above may yield to a source retirement or receipt
+    # replacement.  Re-run the pure proof gate synchronously at the final effect boundary so
+    # the CAS never relies on an earlier live-service/native snapshot.
+    try:
+        _preflight_managed_compression_route(custody, proof)
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        raise RuntimeStoreError('managed_compression_route_unknown') from None
+    switched = store.advance_compression_session(route, expected, target)
+    if switched is None or getattr(switched, 'session_id', None) != target:
+        raise RuntimeStoreError('managed_compression_route_unknown')
+
+
 def _continuation_path(db, start, tip):
     """Ids from *start* to *tip* when *tip* reaches *start* through compression continuations only, else None."""
     path, current = [tip], tip
@@ -848,6 +1042,10 @@ async def execute_managed(authority, ref, row, policy, binding=None):
                 # The receipt remains attached to the same process/readers until
                 # native scope close is observable.  The authority finalizer later
                 # performs complete_delivery after I04 terminalization.
+                await asyncio.to_thread(
+                    _advance_managed_compression_route,
+                    authority, ref, row, scope, proof, binding=binding, custody=custody,
+                )
                 await settle_managed_worker(worker, process, custody, proof)
                 worker_closed = True
                 accepted = _with_stop_cause(accepted, worker)

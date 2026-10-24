@@ -210,6 +210,8 @@ def test_i17_host_evidence_uses_retained_native_identity_after_supervisor_mutati
         hosted_tui_custody._capture_host_shutdown_identity(supervisor)
         receipt = supervisor.shutdown()
         assert hosted_tui_custody.host_shutdown(supervisor, receipt) is True
+        # Profile evidence requires the real source-owned intake-close transition.
+        assert hosted_tui_custody.close_profile(authority) is True
         supervisor._host_generation += 1
         supervisor._host_boot_id = "foreign-after-close"
         assert hosted_tui_custody._profile_host_evidence(authority)[0] is True

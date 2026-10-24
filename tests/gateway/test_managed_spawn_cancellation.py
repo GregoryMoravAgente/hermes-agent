@@ -3,14 +3,18 @@ import asyncio
 import subprocess
 import sys
 import threading
-from types import SimpleNamespace
 
 import pytest
 
+from tests.gateway.managed_cancellation_helpers import real_managed_claim
+
 
 @pytest.mark.asyncio
-async def test_cancelled_spawn_reaps_late_child(monkeypatch):
+async def test_cancelled_spawn_reaps_late_child(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
+    fixture, binding, authority, ref, row, _live = await real_managed_claim(
+        tmp_path, monkeypatch, 'unstarted'
+    )
     entered, release, created = (threading.Event() for _ in range(3))
     original = subprocess.Popen
     children = []
@@ -23,14 +27,12 @@ async def test_cancelled_spawn_reaps_late_child(monkeypatch):
         return child
     monkeypatch.setattr(managed.subprocess, 'Popen', spawn)
     monkeypatch.setattr(managed, '_worker_env', lambda authority: None)
-    authority = SimpleNamespace(profile_id='profile', pending_results={})
-    task = asyncio.create_task(managed.execute_managed(
-        authority, SimpleNamespace(session_id='s'), {'admission_id': 'unstarted'}, None))
     try:
+        task = asyncio.create_task(managed.execute_managed(authority, ref, row, None, binding))
         assert await asyncio.to_thread(entered.wait, 5)
         task.cancel()
         assert await task == ''
-        assert authority.pending_results['unstarted']['result']['interrupted'] is True
+        assert authority.pending_results[binding.admission_id]['result']['interrupted'] is True
         release.set()
         assert await asyncio.to_thread(created.wait, 5)
         await asyncio.to_thread(children[0].wait, 5)
@@ -42,3 +44,4 @@ async def test_cancelled_spawn_reaps_late_child(monkeypatch):
             child.wait(timeout=5)
             child.stdin.close()
             child.stdout.close()
+        fixture.cleanup()

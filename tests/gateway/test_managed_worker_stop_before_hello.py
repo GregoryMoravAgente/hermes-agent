@@ -8,12 +8,13 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
-from gateway.session_contract import Principal, SessionRef
+from gateway.session_contract import Principal
+from tests.gateway.managed_cancellation_helpers import real_managed_claim, real_managed_queue
 from tests.waiting import async_wait_until
 
 
 @pytest.mark.platforms("linux")
-def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch):
+def test_stop_before_hello_terminates_child_and_settles_interrupted(tmp_path, monkeypatch):
     from gateway import session_managed_worker as managed
     spawned = []
     original = subprocess.Popen
@@ -24,25 +25,29 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
         spawned.append(child)
         return child
     monkeypatch.setattr(managed.subprocess, 'Popen', wedged_child)
-    ref = SessionRef('profile', 'session')
     checks = []
-    authority = SimpleNamespace(profile_id='profile', pending_results={}, waiters={},
-        adopt_agent=lambda session_id, generation, worker: None,
-        authorize=lambda actor, ref, cap: checks.append(cap),
-        check_approval_generation=lambda session_id, generation: checks.append(generation))
-    row = {'admission_id': 'adm', 'principal_id': 'owner', 'generation': 3, 'payload': {'text': 'go'}}
-    actor = Principal('owner', 'profile', frozenset({'session:control'}), 'transport')
 
     async def scenario():
-        turn = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
-        await async_wait_until(lambda: ref.session_id in getattr(authority, '_managed_workers', {}),
-                               timeout=10, what='the managed worker to be registered')
-        assert managed.interrupt_managed(authority, actor, ref, 3) is True
-        async with asyncio.timeout(10):
-            return await turn
-    assert asyncio.run(scenario()) == ''
-    assert checks == ['session:control', 3]
-    assert authority.pending_results['adm']['result']['interrupted'] is True
+        fixture, binding, authority, ref, row, _live = await real_managed_claim(
+            tmp_path, monkeypatch, 'stop-before-hello'
+        )
+        actor = Principal('owner', authority.profile_id, frozenset({'session:control'}), 'transport')
+        authority.authorize = lambda actor, ref, cap: checks.append(cap)
+        authority.check_approval_generation = lambda session_id, generation: checks.append(generation)
+        try:
+            turn = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None, binding=binding))
+            await async_wait_until(lambda: ref.session_id in getattr(authority, '_managed_workers', {}),
+                                   timeout=10, what='the managed worker to be registered')
+            assert managed.interrupt_managed(authority, actor, ref, row['generation']) is True
+            async with asyncio.timeout(10):
+                return await turn, fixture, authority, binding, ref, row
+        finally:
+            fixture.cleanup()
+    # The fixture itself owns the profile home and native process lease; it is closed in scenario.
+    result, _fixture, authority, binding, ref, row = asyncio.run(scenario())
+    assert result == ''
+    assert checks == ['session:control', row['generation']]
+    assert authority.pending_results[binding.admission_id]['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers
     child = spawned[0]
     assert child.poll() is not None and not psutil.pid_exists(child.pid) or psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE
@@ -73,24 +78,10 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
     from ever receiving its bootstrap; the admission settles interrupted, never as a late turn."""
     import threading
     from gateway import session_managed_worker as managed
-    from gateway.session_authority import LiveSession, SessionAuthority
-    from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import build_policy
-    from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
-
-    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = SessionDB(db_path=tmp_path / 'state.db')
-    db.create_session('s', source='test')
-    runner = SimpleNamespace(_draining=False, _cached_agent_for=lambda route: None,
-                             _adapter_for_source=lambda source: None)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
-                                 epoch=begin_runtime_epoch(db, instance_id='i'))
-    authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
-    ref = SessionRef('owned', 's')
-    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    from gateway.runtime_service_custody import admission_binding
+    from hermes_state_runtime import get_session_admission
     received = tmp_path / 'received.jsonl'
 
     class Child(subprocess.Popen):
@@ -104,21 +95,46 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
         assert release.wait(10)
     monkeypatch.setattr(managed, '_worker_env', barrier)
     policy = build_policy({'cwd': str(tmp_path), 'model': 'm'}, {}, profile_terminal=False)
+    captured = {}
 
     async def scenario():
-        await authority.submit(actor, Submission('turn', ref, {'text': 'go'}, 'queue'))
-        row = claim_session_input(db, epoch=authority.epoch, session_id='s')
-        turn = asyncio.create_task(managed.execute_managed(authority, ref, row, policy))
-        assert await asyncio.to_thread(entered.wait, 10)
-        stopped = await AuthorityConnection.interrupt(SimpleNamespace(authority=authority, actor=actor), ref,
-                                                      {'execution_generation': row['generation']})
-        assert stopped['execution_state'] == 'running'
-        release.set()
-        async with asyncio.timeout(20):
-            return row, await turn
-    with db:
-        row, response = asyncio.run(scenario())
-    assert response == ''
-    assert authority.pending_results[row['admission_id']]['result']['interrupted'] is True
+        fixture, authority, receipt = await real_managed_queue(tmp_path, monkeypatch, 'stop-before-spawn')
+        try:
+            ref = receipt.ref
+
+            async def execute(owner, claimed_ref, row):
+                binding = admission_binding(owner, claimed_ref, row)
+                response = await managed.execute_managed(owner, claimed_ref, row, policy, binding)
+                captured['response'] = response
+                captured['result'] = owner.pending_results[row['admission_id']]['result'].copy()
+                return response
+
+            monkeypatch.setattr('gateway.session_finite.execute_finite_admission', execute)
+            turn = asyncio.create_task(authority._drain(ref))
+            assert await asyncio.to_thread(entered.wait, 10)
+            row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+            assert row is not None and row['status'] == 'started'
+            # The control principal is the one that actually admitted this row;
+            # a synthetic human principal is not a valid I05 owner.
+            actor = Principal(row['principal_id'], authority.profile_id,
+                              frozenset({'session:submit', 'session:control'}), 'cli')
+            stopped = await AuthorityConnection.interrupt(
+                SimpleNamespace(authority=authority, actor=actor), ref,
+                {'execution_generation': row['generation']},
+            )
+            assert stopped['execution_state'] == 'running'
+            release.set()
+            async with asyncio.timeout(20):
+                await turn
+            return row, authority
+        finally:
+            release.set()
+            if 'turn' in locals():
+                await asyncio.gather(turn, return_exceptions=True)
+            fixture.cleanup()
+
+    row, authority = asyncio.run(scenario())
+    assert captured['response'] == ''
+    assert captured['result']['interrupted'] is True
     assert not received.exists() or 'bootstrap' not in received.read_text(), received.read_text()
-    assert 's' not in authority.pending_stops
+    assert row['target_session_id'] not in authority.pending_stops

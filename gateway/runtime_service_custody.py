@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass, field
+import hashlib
 import sqlite3
 from typing import Any
 
@@ -315,6 +316,80 @@ class DurableResultProof:
     row_roles: tuple[str, ...]
     payload_digest: str
     result_row_ids: tuple[int, ...] = ()
+
+
+def _durable_result_rows_match(db: Any, proof: DurableResultProof) -> bool:
+    """Re-read the exact transcript rows carried by a managed result proof.
+
+    Managed settlement stores the structured result separately from the transcript.  In
+    particular, its compact result intentionally has no ``messages`` member; requiring that
+    presentation-only field makes a valid managed writer look like a lost result after a
+    compression rotation.  The writer proof already contains the canonical row ids, roles,
+    sessions, and SQLite snapshots, so validate those source-owned rows directly instead.
+    """
+    row_ids = tuple(getattr(proof, "row_ids", ()))
+    row_snapshots = tuple(getattr(proof, "row_snapshots", ()))
+    row_sessions = tuple(getattr(proof, "row_sessions", ()))
+    row_roles = tuple(getattr(proof, "row_roles", ()))
+    result_row_ids = tuple(getattr(proof, "result_row_ids", ()))
+    session_id = getattr(proof, "session_id", None)
+    if (
+        type(session_id) is not str or not session_id
+        or not row_ids or len(set(row_ids)) != len(row_ids)
+        or len(row_snapshots) != len(row_ids)
+        or len(row_sessions) != len(row_ids)
+        or len(row_roles) != len(row_ids)
+        or not result_row_ids
+        or any(type(row_id) is not int or row_id <= 0 for row_id in row_ids)
+        or any(type(row_id) is not int or row_id <= 0 for row_id in result_row_ids)
+        or len(set(result_row_ids)) != len(result_row_ids)
+        or any(row_id not in row_ids for row_id in result_row_ids)
+        or len(result_row_ids) >= len(row_ids)
+        or tuple(row_ids[-len(result_row_ids):]) != result_row_ids
+        or row_roles[-len(result_row_ids) - 1] != "user"
+        or any(role not in {"assistant", "tool"} for role in row_roles[-len(result_row_ids):])
+        or any(session != session_id for session in row_sessions)
+        or any(role not in {"user", "assistant", "tool"} for role in row_roles)
+        or any(type(snapshot) is not str or not snapshot for snapshot in row_snapshots)
+        or type(getattr(proof, "payload_digest", None)) is not str
+        or not proof.payload_digest
+    ):
+        return False
+    reader = getattr(db, "_read_all", None)
+    if not callable(reader):
+        return False
+    placeholders = ",".join("?" for _ in row_ids)
+    try:
+        rows = reader(
+            f"SELECT * FROM messages WHERE session_id = ? AND id IN ({placeholders})",
+            (session_id, *row_ids),
+        )
+        by_id = {row["id"]: row for row in rows if row["id"] in row_ids}
+        from agent.transcript_repair import transcript_row_snapshot
+        for row_id, expected_session, expected_role, expected_snapshot in zip(
+            row_ids, row_sessions, row_roles, row_snapshots,
+        ):
+            row = by_id.get(row_id)
+            if (
+                row is None
+                or row["session_id"] != expected_session
+                or row["role"] != expected_role
+                or type(row["active"]) is not int
+                or row["active"] != 1
+                or transcript_row_snapshot(row) != expected_snapshot
+            ):
+                return False
+        digest_input = "\n".join(
+            f"{row_id}:{expected_session}:{expected_role}:{expected_snapshot}"
+            for row_id, expected_session, expected_role, expected_snapshot in zip(
+                row_ids, row_sessions, row_roles, row_snapshots,
+            )
+        )
+        if hashlib.sha256(digest_input.encode("utf-8")).hexdigest() != proof.payload_digest:
+            return False
+    except (AttributeError, KeyError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        return False
+    return True
 
 
 def _canonical_store_path(authority: Any) -> str:
@@ -711,6 +786,11 @@ class ServiceLease:
             and physical.unknown_reason in {"delivery_failed", "delivery_finalize_failed"}
         )
         _require_terminal_binding(binding, allow_unknown_parent=retryable_unknown)
+        # Scalar fields are not an ownership proof at the terminal boundary.  A copied
+        # dataclass can carry every same value while no longer being the binding captured by
+        # this service lease; refuse it before any physical/result readback effect.
+        if self.binding is not binding:
+            raise ServiceCustodyError("preservation_owner_mismatch")
         self._validate_service_identity(binding)
         if (
             physical is None
@@ -743,8 +823,15 @@ class ServiceLease:
         ):
             raise ServiceCustodyError("physical_receipt_identity_mismatch")
         proof = physical.durable_proofs.get(lease_id)
-        from gateway.session_turn_physical_tip import physical_proof_session
+        from gateway.session_turn_physical_tip import (
+            physical_proof_session, retained_physical_proof_session,
+        )
         physical_session_id = physical_proof_session(binding, proof)
+        if physical_session_id is None and proof is not None and self.physical is not None:
+            # The exact receipt was authenticated when its durable proof was recorded.  A later
+            # compression may have moved the live route, so revalidate that retained proof on the
+            # current lineage instead of requiring the newer tip to equal an older process.
+            physical_session_id = retained_physical_proof_session(binding, proof)
         if (
             proof is None
             or physical_session_id is None
@@ -761,14 +848,7 @@ class ServiceLease:
             raise ServiceCustodyError("preservation_result_unknown") from exc
         if not isinstance(result, dict) or not isinstance(result.get("result"), dict):
             raise ServiceCustodyError("preservation_result_unknown")
-        stored_messages = result["result"].get("messages")
-        if (
-            not isinstance(stored_messages, list)
-            or not stored_messages
-            or any(not isinstance(message, dict) or type(message.get("_row_id")) is not int
-                   or message.get("_row_id") <= 0 for message in stored_messages)
-            or tuple(message["_row_id"] for message in stored_messages) != proof.result_row_ids
-        ):
+        if not _durable_result_rows_match(binding.authority.db, proof):
             raise ServiceCustodyError("durable_result_identity_mismatch")
         return lease_id
 

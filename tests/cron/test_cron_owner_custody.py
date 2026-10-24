@@ -143,7 +143,10 @@ def test_i12_queued_delivery_wakes_only_after_existing_delivery_ledger_settles(c
     assert binding.settled
 
 
-def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(custody_runtime):
+@pytest.mark.parametrize("stale_terminal_birth", [False, True])
+def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(
+    custody_runtime, stale_terminal_birth,
+):
     _coordinator, executions, db = custody_runtime
     from cron.runtime_custody import reserve_execution
 
@@ -184,6 +187,15 @@ def test_i13_real_external_worker_ack_process_and_terminal_are_one_identity(cust
     worker.bind_reaper(reaper)
     reaper.join(timeout=5)
     assert not reaper.is_alive()
+    if stale_terminal_birth:
+        # The reaper is a terminal observer even if the synchronous waiter is
+        # delayed. It may not release a changed tuple after a real child exit.
+        worker._worker_started_at += 1
+        assert worker.observe_terminal() is False
+        assert worker._unknown is True
+        assert worker.settled is False
+        assert binding.settled is False
+        return
     assert worker.observe_terminal()
     assert binding.observe_terminal()
     assert binding.settled
