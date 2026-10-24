@@ -10,6 +10,7 @@ import json
 import logging
 import shutil
 import sys
+import stat
 import threading
 import time
 import os
@@ -141,6 +142,52 @@ class CronJobsLockUnavailable(RuntimeError):
     behaviour.  Claim/admission paths use this typed refusal so a sibling process can never be
     mistaken for an in-process-only owner.
     """
+
+
+@dataclass(frozen=True)
+class _CronJobsLockHandoff:
+    """Typed result for the one-way external-worker lock handoff.
+
+    ``detached`` means both the OS lock and the descriptor were released.  A
+    pending result deliberately leaves the exact descriptor in the thread-local
+    state so the admission lease can retain the same ownership witness.  A
+    retained result is a refusal after the exact descriptor stopped matching
+    its path/native identity; it is still owned by the admission lease and must
+    remain retryable, never silently released or converted into a new lock.
+    This is intentionally not a boolean: callers must not turn an unlock error
+    or identity race into an authenticated handoff.
+    """
+
+    status: str
+    key: str
+    transfer: Any = None
+
+    @property
+    def detached(self) -> bool:
+        return self.status == "detached"
+
+    @property
+    def pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def retained(self) -> bool:
+        return self.status == "retained"
+
+
+@dataclass
+class _CronJobsLockTransfer:
+    """Exact lock descriptor transferred out of a closed admission context."""
+
+    key: str
+    path: Path
+    inode: tuple[int, int]
+    native_identity: tuple[int, int] | None
+    fd: Any
+    owner: Any
+    unlocked: bool = False
+    closed: bool = False
+    operation_lock: Any = field(default_factory=threading.RLock, repr=False)
 
 
 _cron_store_override: ContextVar[Optional[_CronStorePaths]] = ContextVar(
@@ -308,6 +355,7 @@ def _release_flock(lock_fd) -> None:
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         elif msvcrt is not None:
+            lock_fd.seek(0)
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
     except OSError:
         pass
@@ -322,13 +370,14 @@ def _release_flock_checked(lock_fd) -> bool:
         if fcntl is not None:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
         elif msvcrt is not None:
+            lock_fd.seek(0)
             msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)
-    except OSError:
+    except (OSError, ValueError):
         released = False
     if released:
         try:
             lock_fd.close()
-        except OSError:
+        except (OSError, ValueError):
             released = False
     return released
 
@@ -346,6 +395,202 @@ def _jobs_lock_states() -> dict[str, dict[str, Any]]:
     return states
 
 
+def _lock_native_identity(lock_fd) -> tuple[int, int] | None:
+    try:
+        fd = int(lock_fd.fileno())
+        native = int(msvcrt.get_osfhandle(fd)) if msvcrt is not None else fd
+        return fd, native
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None
+
+
+def _lock_file_identity_matches(state: dict[str, Any], lock_fd) -> bool:
+    """Revalidate the exact regular path, inode, and native descriptor before detach."""
+    path = state.get("lock_path")
+    expected_inode = state.get("lock_inode")
+    expected_native = state.get("native_identity")
+    if not isinstance(path, Path) or not isinstance(expected_inode, tuple):
+        return False
+    if _lock_native_identity(lock_fd) != expected_native:
+        return False
+    try:
+        path_stat = os.lstat(path)
+        fd_stat = os.fstat(lock_fd.fileno())
+        if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
+            return False
+        current_inode = (int(path_stat.st_dev), int(path_stat.st_ino))
+        fd_inode = (int(fd_stat.st_dev), int(fd_stat.st_ino))
+        return current_inode == expected_inode and fd_inode == expected_inode
+    except (OSError, ValueError):
+        return False
+
+
+def _transfer_identity_matches(transfer: _CronJobsLockTransfer) -> bool:
+    if transfer.closed or transfer.fd is None:
+        return False
+    if _lock_native_identity(transfer.fd) != transfer.native_identity:
+        return False
+    try:
+        path_stat = os.lstat(transfer.path)
+        fd_stat = os.fstat(transfer.fd.fileno())
+        if not stat.S_ISREG(path_stat.st_mode) or not stat.S_ISREG(fd_stat.st_mode):
+            return False
+        current_inode = (int(path_stat.st_dev), int(path_stat.st_ino))
+        fd_inode = (int(fd_stat.st_dev), int(fd_stat.st_ino))
+        return current_inode == transfer.inode and fd_inode == transfer.inode
+    except (OSError, ValueError):
+        return False
+
+
+def _release_handoff_transfer(transfer: _CronJobsLockTransfer) -> _CronJobsLockHandoff:
+    """Release an exact transferred descriptor with separate unlock/close stages."""
+    with transfer.operation_lock:
+        if transfer.closed or transfer.fd is None:
+            return _CronJobsLockHandoff("refused", transfer.key, transfer)
+        if not transfer.unlocked:
+            if not _transfer_identity_matches(transfer):
+                # The exact descriptor still belongs to this transfer, but its
+                # path/native witness no longer authenticates the original
+                # lock.  Keep it retained for a later source-owned retry;
+                # closing or recreating a lock here would lose custody.
+                return _CronJobsLockHandoff("retained", transfer.key, transfer)
+            try:
+                if fcntl is not None:
+                    fcntl.flock(transfer.fd, fcntl.LOCK_UN)
+                elif msvcrt is not None:
+                    transfer.fd.seek(0)
+                    msvcrt.locking(transfer.fd.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover - strict acquisition cannot reach this backend
+                    return _CronJobsLockHandoff("refused", transfer.key, transfer)
+            except (OSError, ValueError):
+                return _CronJobsLockHandoff("pending", transfer.key, transfer)
+            transfer.unlocked = True
+        try:
+            transfer.fd.close()
+        except (OSError, ValueError):
+            # The OS lock is already unlocked; retain the open descriptor so a later
+            # retry closes this exact native handle without unlocking twice.
+            return _CronJobsLockHandoff("pending", transfer.key, transfer)
+        transfer.closed = True
+        transfer.fd = None
+        return _CronJobsLockHandoff("detached", transfer.key, transfer)
+
+
+def _transfer_jobs_lock_handoff(
+    *, expected_key: str | None, expected_token: Any, expected_owner: Any,
+) -> _CronJobsLockHandoff:
+    """Move a pending descriptor out of thread-local lock state for later retry."""
+    key = _jobs_lock_key()
+    if not isinstance(expected_key, str) or expected_key != key:
+        return _CronJobsLockHandoff("refused", key)
+    state = _jobs_lock_states().get(key)
+    if (
+        state is None
+        or int(state.get("depth", 0)) != 1
+        or state.get("token") is not expected_token
+        or state.get("owner") is not expected_owner
+        or not state.get("handoff_pending", False)
+    ):
+        return _CronJobsLockHandoff("refused", key)
+    transfer = state.get("handoff_transfer")
+    if not isinstance(transfer, _CronJobsLockTransfer) or transfer.owner is not expected_owner:
+        return _CronJobsLockHandoff("refused", key)
+    state["transferred"] = True
+    state["lock_fd"] = None
+    return _CronJobsLockHandoff("transferred", key, transfer)
+
+
+def _retry_transferred_jobs_lock(
+    transfer: _CronJobsLockTransfer, *, expected_owner: Any,
+) -> _CronJobsLockHandoff:
+    if not isinstance(transfer, _CronJobsLockTransfer) or transfer.owner is not expected_owner:
+        return _CronJobsLockHandoff("refused", getattr(transfer, "key", ""), transfer)
+    return _release_handoff_transfer(transfer)
+
+
+def _bind_jobs_lock_handoff_owner(
+    *, expected_key: str | None, expected_token: Any, owner: Any,
+) -> bool:
+    """Bind one live lease object, not a copied key/token pair, to the lock state."""
+    key = _jobs_lock_key()
+    state = _jobs_lock_states().get(key)
+    if (
+        not isinstance(expected_key, str)
+        or expected_key != key
+        or state is None
+        or int(state.get("depth", 0)) != 1
+        or state.get("token") is not expected_token
+    ):
+        return False
+    bound = state.get("owner")
+    if bound is None:
+        state["owner"] = owner
+        return True
+    return bound is owner
+
+
+def _detach_jobs_lock_for_handoff(
+    *, expected_key: str | None, expected_token: Any = None, expected_owner: Any = None,
+) -> _CronJobsLockHandoff:
+    """Detach one exact, strictly acquired jobs lock for an authenticated child handoff.
+
+    The admission lease remains entered while the external worker runs; only the
+    cross-process byte-range lock is transferred.  This helper is intentionally
+    private and refuses every ambiguous state (wrong profile, nested lock,
+    degraded lock, already detached lock, or a missing descriptor).
+    """
+    key = _jobs_lock_key()
+    if (
+        not isinstance(expected_key, str)
+        or expected_key != key
+        or expected_token is None
+        or expected_owner is None
+    ):
+        return _CronJobsLockHandoff("refused", key)
+    state = _jobs_lock_states().get(key)
+    if state is None or int(state.get("depth", 0)) != 1:
+        return _CronJobsLockHandoff("refused", key)
+    if state.get("token") is not expected_token:
+        return _CronJobsLockHandoff("refused", key)
+    if state.get("owner") is not expected_owner:
+        return _CronJobsLockHandoff("refused", key)
+    if state.get("detached") or not state.get("cross_process_acquired", False):
+        return _CronJobsLockHandoff("refused", key)
+    lock_fd = state.get("lock_fd")
+    if lock_fd is None or getattr(lock_fd, "closed", False):
+        return _CronJobsLockHandoff("refused", key)
+    if not _lock_file_identity_matches(state, lock_fd):
+        return _CronJobsLockHandoff("refused", key)
+    transfer = state.get("handoff_transfer")
+    if transfer is None:
+        transfer = _CronJobsLockTransfer(
+            key=key,
+            path=state["lock_path"],
+            inode=state["lock_inode"],
+            native_identity=state["native_identity"],
+            fd=lock_fd,
+            owner=expected_owner,
+        )
+        state["handoff_transfer"] = transfer
+    result = _release_handoff_transfer(transfer)
+    if result.pending or result.retained:
+        # Keep the descriptor and state untouched.  The outer admission lease
+        # retains the live context for an exact same-fd retry.  A retained
+        # identity refusal is deliberately distinct from an unlock retry, but
+        # follows the same ownership path so context exit cannot strand it.
+        state["handoff_pending"] = True
+        return result
+    # A refusal with no retryable live transfer was rejected before ownership
+    # moved.  Do not leave the state marked pending: the owning context must
+    # perform its ordinary cleanup, and a fresh admission must be possible.
+    state["handoff_pending"] = False
+    if result.detached:
+        state["lock_fd"] = None
+        state["detached"] = True
+        state["cross_process_acquired"] = False
+    return result
+
+
 @contextlib.contextmanager
 @_writer_custody
 def _jobs_lock(*, strict: bool = False):
@@ -356,17 +601,38 @@ def _jobs_lock(*, strict: bool = False):
     state = states.get(key)
     depth = int(state.get("depth", 0)) if state is not None else 0
     if depth:
+        if state.get("detached", False):
+            # The outer admission is still a source lease, but it no longer
+            # owns an OS lock.  Never let a nested writer mistake its depth for
+            # a real cross-process lock; it must run after the lease exits.
+            raise CronJobsLockUnavailable("cron_jobs_lock_detached")
+        if state.get("handoff_pending", False):
+            raise CronJobsLockUnavailable("cron_jobs_lock_handoff_pending")
         if strict and not state.get("cross_process_acquired", False):
             raise CronJobsLockUnavailable("cron_jobs_lock_unavailable")
         state["depth"] = depth + 1
         try:
-            yield
+            yield state.get("token")
         finally:
             state["depth"] -= 1
         return
 
     with _jobs_file_lock:
-        state = {"depth": 1, "cross_process_acquired": False, "load_stamp": None}
+        state = {
+            "depth": 1,
+            "cross_process_acquired": False,
+            "load_stamp": None,
+            "lock_fd": None,
+            "detached": False,
+            "handoff_pending": False,
+            "token": object(),
+            "owner": None,
+            "lock_path": None,
+            "lock_inode": None,
+            "native_identity": None,
+            "handoff_transfer": None,
+            "transferred": False,
+        }
         states[key] = state
         # jobs.json stamp as of this section's load_jobs(): lets _save_jobs_unlocked skip the
         # shrink-merge parse when the file provably hasn't changed. Reset on entry/exit so stale
@@ -377,7 +643,11 @@ def _jobs_lock(*, strict: bool = False):
         try:
             try:
                 ensure_dirs()
-                lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8-sig")
+                lock_path = _jobs_lock_file()
+                # This is an advisory lock file, not a BOM-bearing data file.  A
+                # UTF-8 BOM makes the first byte observable to a child that
+                # reopens the exact path, so keep the descriptor byte-stable.
+                lock_fd = open(lock_path, "a+", encoding="utf-8")
                 lock_fd.seek(0)
                 acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
                 if acquired is not True:
@@ -398,20 +668,47 @@ def _jobs_lock(*, strict: bool = False):
                     state["cross_process_acquired"] = False
                 else:
                     state["cross_process_acquired"] = True
+                    state["lock_fd"] = lock_fd
+                    try:
+                        path_stat = os.lstat(lock_path)
+                        os.fstat(lock_fd.fileno())
+                        state["lock_path"] = Path(lock_path)
+                        state["lock_inode"] = (
+                            int(path_stat.st_dev), int(path_stat.st_ino),
+                        )
+                        state["native_identity"] = _lock_native_identity(lock_fd)
+                    except (OSError, ValueError):
+                        state["lock_path"] = None
+                        state["lock_inode"] = None
+                        state["native_identity"] = None
             except OSError as e:
                 if strict:
+                    if lock_fd is not None:
+                        with contextlib.suppress(OSError, ValueError):
+                            lock_fd.close()
+                        lock_fd = None
                     raise CronJobsLockUnavailable("cron_jobs_lock_unavailable") from e
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
                 state["cross_process_acquired"] = False
             try:
-                yield
+                yield state["token"]
             finally:
-                if lock_fd is not None:
-                    _release_flock(lock_fd)
+                active_state = states.get(key)
+                if active_state is not None and active_state.get("transferred", False):
+                    states.pop(key, None)
+                elif active_state is None or not active_state.get("handoff_pending", False):
+                    if active_state is not None and not active_state.get("detached", False):
+                        active_fd = active_state.get("lock_fd") or lock_fd
+                        if active_fd is not None:
+                            _release_flock(active_fd)
+                    states.pop(key, None)
         finally:
-            states.pop(key, None)
+            # A pending authenticated handoff deliberately retains the
+            # generator state and descriptor for the lease's same-fd retry.
+            if not states.get(key, {}).get("handoff_pending", False):
+                states.pop(key, None)
 
 
 @contextlib.contextmanager

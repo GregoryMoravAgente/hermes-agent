@@ -2878,10 +2878,34 @@ def run_one_job(
             stage = "failed after handoff" if post_handoff else "dispatch failed"
             error = f"Restart-safe cron worker {stage}: {handoff_error}"
             if post_handoff:
+                pending_admission = getattr(handoff_error, "admission", None)
+                if pending_admission is not None:
+                    try:
+                        if _recover_transferred_worker_handoff(
+                            handoff_error,
+                            admission=pending_admission,
+                            execution_id=execution_id,
+                            job=job,
+                            adapters=adapters,
+                            loop=loop,
+                        ):
+                            return True
+                    except _ExternalWorkerPostHandoffWaitError as wait_failure:
+                        handoff_error = wait_failure.wait_error
+                        error = str(wait_failure)
                 from cron.scheduler_worker_failure import record_unknown_worker_outcome
+                from cron.scheduler_provider import _profile_cron_scope
 
-                if record_unknown_worker_outcome(job, error=str(handoff_error), adapters=adapters, loop=loop):
-                    return True
+                profile_scope = (
+                    _profile_cron_scope(pending_admission.home)
+                    if getattr(pending_admission, "home", None) is not None
+                    else contextlib.nullcontext()
+                )
+                with profile_scope:
+                    if record_unknown_worker_outcome(
+                        job, error=str(handoff_error), adapters=adapters, loop=loop,
+                    ):
+                        return True
             logger.error("Job '%s': %s", job["id"], error)
             claim = job.get("fire_claim")
             owner = str(claim.get("by") or "") if isinstance(claim, dict) else ""
@@ -3727,8 +3751,221 @@ def _wait_for_external_cron_worker_body(
         raise RuntimeError(f"{reason}{stderr_tail}")
 
 
+_CRON_LOCK_HANDOFF_RETRY_SECONDS = 2.0
+
+
+def _schedule_external_worker_handoff_retry(
+    admission, *, process, execution_id: str, job_id: str,
+    handoff_files: tuple[Path, ...], stderr_path: Path, custody,
+    dispatch_mode: Optional[str], job: dict, adapters=None, loop=None,
+) -> bool:
+    """Register one source-owned later-thread retry for a transferred lock.
+
+    A registry-backed lease owns the retry lifecycle until the exact descriptor
+    detaches.  The bounded context-thread fallback remains for legacy/unmanaged
+    test doubles, but it never reports a terminal outcome while the descriptor
+    is still retained.
+    """
+    # The continuation is valid only after the owning context has actually
+    # transferred its descriptor.  Scheduling while __exit__ still owns the
+    # thread-local lock state would make the later thread see a false refusal
+    # and strand the original generator/RLock.
+    if (
+        getattr(admission, "registry", None) is None
+        or getattr(admission, "_handoff_transfer", None) is None
+        or getattr(admission, "_context_transferred", False) is not True
+    ):
+        return False
+
+    def _finish_after_detach() -> None:
+        """Wait and book the outcome under the owning profile scope."""
+        try:
+            from cron.scheduler_provider import _profile_cron_scope
+
+            profile_scope = (
+                _profile_cron_scope(admission.home)
+                if getattr(admission, "home", None) is not None
+                else contextlib.nullcontext()
+            )
+            with profile_scope:
+                try:
+                    _wait_for_external_cron_worker(
+                        process,
+                        execution_id=execution_id,
+                        job_id=job_id,
+                        handoff_files=handoff_files,
+                        stderr_path=stderr_path,
+                        custody=custody,
+                        dispatch_mode=dispatch_mode,
+                    )
+                except Exception as wait_error:
+                    logger.exception(
+                        "Cron external worker %s failed during transferred handoff wait",
+                        execution_id,
+                    )
+                    try:
+                        from cron.scheduler_worker_failure import record_unknown_worker_outcome
+
+                        # This ledger/error bookkeeping must resolve the same
+                        # profile as the transferred jobs descriptor; the full
+                        # profile scope remains active for the whole callback.
+                        record_unknown_worker_outcome(
+                            job, error=str(wait_error), adapters=adapters, loop=loop,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Cron external worker %s unknown-outcome bookkeeping failed",
+                            execution_id,
+                        )
+        finally:
+            released = admission.release_after_handoff_retry()
+            if getattr(released, "status", None) != "released":
+                logger.error(
+                    "Cron external worker %s retained its source lease after terminal wait",
+                    execution_id,
+                )
+
+    registry = getattr(admission, "registry", None)
+    register_retry = getattr(registry, "_register_handoff_retry", None)
+    if callable(register_retry):
+        try:
+            # The real CronSourceRegistry owns one persistent lifecycle thread
+            # per retained lease and rejects duplicate registrations.
+            return bool(register_retry(
+                admission,
+                _finish_after_detach,
+                name=f"cron-lock-handoff-retry-{execution_id[:12]}",
+                interval=_CRON_LOCK_HANDOFF_RETRY_SECONDS,
+            ))
+        except Exception:
+            logger.exception(
+                "Cron external worker %s could not register its source lifecycle retry",
+                execution_id,
+            )
+
+    from agent.memory_provider import spawn_context_thread
+
+    def _continue() -> None:
+        try:
+            deadline = time.monotonic() + _CRON_LOCK_HANDOFF_RETRY_SECONDS
+            while time.monotonic() < deadline:
+                retry = admission.retry_jobs_lock_after_handoff()
+                if getattr(retry, "detached", False):
+                    _finish_after_detach()
+                    return
+                if not getattr(admission, "_jobs_lock_handoff_pending", False):
+                    logger.error(
+                        "Cron external worker %s transferred-lock retry lost its retained state: %s",
+                        execution_id, getattr(retry, "status", "refused"),
+                    )
+                    return
+                time.sleep(0.05)
+            logger.error(
+                "Cron external worker %s retained its transferred jobs-lock lease after %.1fs",
+                execution_id, _CRON_LOCK_HANDOFF_RETRY_SECONDS,
+            )
+        except Exception:
+            # A later lifecycle failure must retain the exact admission/descriptor
+            # rather than converting an opaque retry exception into a fresh lock
+            # or a false terminal outcome.  The registry remains the retry owner.
+            logger.exception(
+                "Cron external worker %s transferred-lock lifecycle retry failed; "
+                "source lease remains retained",
+                execution_id,
+            )
+
+    try:
+        thread = spawn_context_thread(
+            _continue, name=f"cron-lock-handoff-retry-{execution_id[:12]}",
+        )
+        thread.start()
+    except Exception:
+        logger.exception(
+            "Cron external worker %s could not start its transferred-lock retry",
+            execution_id,
+        )
+        return False
+    return True
+
+
 class _ExternalWorkerPostHandoffError(RuntimeError):
     """The waiter failed after the worker was spawned and may own the execution."""
+
+    def __init__(
+        self, message: str, *, admission=None, wait_context=None,
+    ):
+        super().__init__(message)
+        self.admission = admission
+        self.wait_context = wait_context
+
+
+class _ExternalWorkerPostHandoffWaitError(RuntimeError):
+    """A terminal wait failed after the transferred lease was detached."""
+
+    def __init__(self, wait_error: Exception):
+        self.wait_error = wait_error
+        super().__init__(f"Restart-safe cron worker failed after handoff: {wait_error}")
+
+
+def _recover_transferred_worker_handoff(
+    handoff_error: _ExternalWorkerPostHandoffError,
+    *, admission, execution_id: str, job: dict, adapters=None, loop=None,
+) -> bool:
+    """Retry one retained worker lease, then wait/book it under its profile scope.
+
+    The caller remains responsible for the final unknown-outcome record.  A
+    registry-owned retry returns ``True`` because its lifecycle thread owns the
+    wait and release; a synchronous wait failure is logged and re-raised as a
+    typed error so the caller can preserve the existing bookkeeping path.
+    """
+    wait_context = getattr(handoff_error, "wait_context", None)
+    if isinstance(wait_context, dict) and _schedule_external_worker_handoff_retry(
+        admission,
+        job=job,
+        adapters=adapters,
+        loop=loop,
+        **wait_context,
+    ):
+        logger.warning(
+            "Cron worker %s deferred transferred jobs-lock retry to its "
+            "source lifecycle thread",
+            execution_id,
+        )
+        return True
+
+    retry = admission.retry_jobs_lock_after_handoff()
+    if not getattr(retry, "detached", False):
+        logger.error(
+            "Cron worker %s retains its jobs-lock handoff lease: %s",
+            execution_id,
+            getattr(retry, "status", "refused"),
+        )
+        raise handoff_error
+
+    try:
+        if isinstance(wait_context, dict):
+            from cron.scheduler_provider import _profile_cron_scope
+
+            profile_scope = (
+                _profile_cron_scope(admission.home)
+                if getattr(admission, "home", None) is not None
+                else contextlib.nullcontext()
+            )
+            with profile_scope:
+                _wait_for_external_cron_worker(**wait_context)
+    except Exception as wait_error:
+        logger.exception(
+            "Cron external worker %s failed during transferred handoff wait",
+            execution_id,
+        )
+        raise _ExternalWorkerPostHandoffWaitError(wait_error) from wait_error
+    finally:
+        released = admission.release_after_handoff_retry()
+        if getattr(released, "status", None) != "released":
+            raise RuntimeError(
+                "external worker jobs-lock lease could not be released after retry"
+            ) from handoff_error
+    return False
 
 
 def _wait_for_external_cron_worker(
@@ -3768,7 +4005,7 @@ def _wait_for_external_cron_worker(
 def _await_external_worker_handoff(
     process: subprocess.Popen, *, execution_id: str, job_id: str,
     payload_path: Path, ack_path: Path, stderr_path: Path, worker_custody,
-    dispatch, worker_env: dict[str, str], scope_unit: Optional[str] = None,
+    dispatch, worker_env: dict[str, str], admission, scope_unit: Optional[str] = None,
 ) -> bool:
     """Authenticate one external worker or preserve the exact uncertain-owner lane."""
     # Same window the dead-owner recovery ledger grants a pending handoff: a cold
@@ -3780,23 +4017,29 @@ def _await_external_worker_handoff(
         if ack_path.exists():
             try:
                 acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
-            except Exception:
+            except Exception as read_error:
                 logger.exception(
                     "Cron external worker %s published an unreadable acknowledgement; "
                     "treating handoff as ownership-uncertain",
                     execution_id,
                 )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    custody=worker_custody,
-                    dispatch_mode=dispatch.mode,
-                )
-            finally:
+                try:
+                    ack_path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(
+                        "Could not remove unreadable cron worker acknowledgement %s",
+                        ack_path,
+                        exc_info=True,
+                    )
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker acknowledgement could not be authenticated"
+                ) from read_error
+            try:
                 ack_path.unlink(missing_ok=True)
+            except OSError as cleanup_error:
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker acknowledgement cleanup failed"
+                ) from cleanup_error
             if (
                 not isinstance(acknowledgement, dict)
                 or acknowledgement.get("execution_id") != execution_id
@@ -3806,31 +4049,56 @@ def _await_external_worker_handoff(
                     "treating handoff as ownership-uncertain",
                     execution_id,
                 )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    custody=worker_custody,
-                    dispatch_mode=dispatch.mode,
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker acknowledgement identity mismatch")
+            if worker_custody is None:
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker handoff has no native custody binding")
+            if getattr(admission, "source_key", None) != "worker" or (
+                getattr(admission, "parent", None) is not getattr(worker_custody, "parent", None)
+            ):
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker parent/admission custody mismatch")
+            try:
+                worker_custody.activate_external_worker(
+                    acknowledgement, process, dispatch_mode=dispatch.mode, scope_unit=scope_unit)
+            except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as activation_error:
+                # The worker may have adopted the row even when its acknowledgement is
+                # malformed or foreign; the exact custody stays unknown and
+                # no fallback runs.  Exit the parent lease before recovery;
+                # waiting here would retain the OS jobs lock and recreate
+                # the same parent/child cycle.
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker ownership activation failed"
+                ) from activation_error
+            if admission is None or not hasattr(admission, "detach_jobs_lock_after_handoff"):
+                raise _ExternalWorkerPostHandoffError(
+                    "external worker handoff has no authenticated admission lease")
+            handoff = admission.detach_jobs_lock_after_handoff()
+            if not getattr(handoff, "detached", False):
+                # Keep the exact child custody.  A pending unlock retains the
+                # entered admission and descriptor for a same-fd retry.  An
+                # identity-race refusal is a separate retained outcome, but it
+                # follows the same owned retry path.  Never wait while either
+                # state still owns the OS lock.
+                status = getattr(handoff, "status", "refused")
+                retained = status in {"pending", "retained"}
+                raise _ExternalWorkerPostHandoffError(
+                    f"external worker jobs-lock handoff {status}",
+                    admission=admission if retained else None,
+                    wait_context=(
+                        {
+                            "process": process,
+                            "execution_id": execution_id,
+                            "job_id": job_id,
+                            "handoff_files": (payload_path, stderr_path),
+                            "stderr_path": stderr_path,
+                            "custody": worker_custody,
+                            "dispatch_mode": dispatch.mode,
+                        }
+                        if retained else None
+                    ),
                 )
-            if worker_custody is not None:
-                try:
-                    worker_custody.activate_external_worker(
-                        acknowledgement, process, dispatch_mode=dispatch.mode, scope_unit=scope_unit)
-                except (AttributeError, OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
-                    # The worker may have adopted the row even when its acknowledgement is
-                    # malformed or foreign; the exact custody stays unknown and no fallback runs.
-                    return _wait_for_external_cron_worker(
-                        process,
-                        execution_id=execution_id,
-                        job_id=job_id,
-                        handoff_files=(payload_path, stderr_path),
-                        stderr_path=stderr_path,
-                        custody=worker_custody,
-                        dispatch_mode=dispatch.mode,
-                    )
             logger.info(
                 "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
                 job_id,
@@ -3901,14 +4169,11 @@ def _await_external_worker_handoff(
         job_id,
         HANDOFF_ADOPTION_GRACE_SECONDS,
     )
-    return _wait_for_external_cron_worker(
-        process,
-        execution_id=execution_id,
-        job_id=job_id,
-        handoff_files=(payload_path, ack_path, stderr_path),
-        stderr_path=stderr_path,
-        custody=worker_custody,
-        dispatch_mode=dispatch.mode,
+    # The child may already have adopted the row even though its ACK was late.
+    # Leave the exact owner in the post-handoff unknown lane, but first exit the
+    # admission context so its strict jobs lock cannot block that child.
+    raise _ExternalWorkerPostHandoffError(
+        "external worker acknowledgement timed out before authenticated lock handoff"
     )
 
 
@@ -4108,6 +4373,7 @@ def _launch_external_cron_worker_effect(job: dict, admission) -> bool:
         process, execution_id=execution_id, job_id=job_id,
         payload_path=payload_path, ack_path=ack_path, stderr_path=stderr_path,
         worker_custody=worker_custody, dispatch=dispatch, worker_env=worker_env,
+        admission=admission,
         scope_unit=scope_unit,
     )
 

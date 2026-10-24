@@ -91,6 +91,34 @@ class CronCloseOutcome:
 
 
 @dataclass(frozen=True)
+class CronAdmissionHandoffOutcome:
+    """Truthful result of transferring only a strict jobs lock to a child.
+
+    The source admission and native custody remain active for the whole worker
+    lifetime.  ``pending`` retains the original lease/descriptor; ``retained``
+    is a truthful identity-race refusal that retains that same descriptor for a
+    later source-owned retry.  Neither is an authorization to continue waiting
+    while the parent still owns a lock.
+    """
+
+    status: str
+    source_key: str
+    lock_key: str | None = None
+
+    @property
+    def detached(self) -> bool:
+        return self.status == "detached"
+
+    @property
+    def pending(self) -> bool:
+        return self.status == "pending"
+
+    @property
+    def retained(self) -> bool:
+        return self.status == "retained"
+
+
+@dataclass(frozen=True)
 class CronAbortCapability:
     """Exact cron source participant for one coordinator-issued reversible abort."""
 
@@ -136,6 +164,18 @@ class CronAdmissionLease:
         self._lock_context = None
         self._entered = 0
         self._released = False
+        self._lock_key: str | None = None
+        self._lock_token: Any = None
+        self._handoff_owner: Any = self
+        self._jobs_lock_detached = False
+        self._jobs_lock_handoff_pending = False
+        self._handoff_transfer: Any = None
+        self._context_transferred = False
+        self._handoff_retry_registered = False
+        # A thread.start() exception does not prove that the native start had no
+        # effect.  Keep this explicit audit state until the registered consumer
+        # itself reports entry; never use ident/is_alive as a no-effect proof.
+        self._handoff_retry_start_status = "not_started"
 
     @property
     def active(self) -> bool:
@@ -154,12 +194,23 @@ class CronAdmissionLease:
                 jobs.use_cron_store(self.home) if self.home is not None else contextlib.nullcontext()
             )
             self._store_context.__enter__()
+            lock_entered = False
             try:
                 self._lock_context = jobs._jobs_lock(strict=True)
-                self._lock_context.__enter__()
+                self._lock_token = self._lock_context.__enter__()
+                lock_entered = True
+                self._lock_key = jobs._jobs_lock_key()
+                if not jobs._bind_jobs_lock_handoff_owner(
+                    expected_key=self._lock_key, expected_token=self._lock_token,
+                    owner=self,
+                ):
+                    raise CronSourceGraphError("cron_admission_lock_owner_mismatch")
             except BaseException:
+                if lock_entered and self._lock_context is not None:
+                    self._lock_context.__exit__(*sys.exc_info())
                 self._store_context.__exit__(*sys.exc_info())
                 self._store_context = None
+                self._lock_context = None
                 raise
         else:
             self.registry._enter_lease(self)
@@ -167,6 +218,34 @@ class CronAdmissionLease:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
+        if self._handoff_owner is not self:
+            return
+        if self._jobs_lock_handoff_pending:
+            # Preserve the live context, descriptor, and registry active-lease
+            # entry for an exact same-fd retry.  Releasing here would make the
+            # child/parent ownership state unrecoverable after a transient
+            # Windows unlock failure.
+            from cron import jobs
+
+            transfer_result = jobs._transfer_jobs_lock_handoff(
+                expected_key=self._lock_key, expected_token=self._lock_token,
+                expected_owner=self,
+            )
+            if getattr(transfer_result, "status", None) != "transferred":
+                return
+            self._handoff_transfer = getattr(transfer_result, "transfer", None)
+            lock_context = self._lock_context
+            store_context = self._store_context
+            try:
+                if lock_context is not None:
+                    lock_context.__exit__(exc_type, exc_value, traceback)
+            finally:
+                if store_context is not None:
+                    store_context.__exit__(exc_type, exc_value, traceback)
+                self._lock_context = None
+                self._store_context = None
+                self._context_transferred = True
+            return
         if self._entered > 1:
             self._entered -= 1
             return
@@ -183,6 +262,102 @@ class CronAdmissionLease:
         else:
             self.registry._leave_lease(self)
         self._released = True
+
+    def detach_jobs_lock_after_handoff(self) -> CronAdmissionHandoffOutcome:
+        """Transfer only the strict jobs lock after exact worker authentication.
+
+        This is deliberately limited to the external-worker source.  The
+        lease remains active, so source close and coordinator custody still wait
+        for the same process/Job/reader to settle.
+        """
+        if (
+            self._handoff_owner is not self
+            or self.source_key != "worker"
+            or self._released
+            or self._entered != 1
+        ):
+            return CronAdmissionHandoffOutcome("refused", self.source_key, self._lock_key)
+        if self._jobs_lock_detached:
+            return CronAdmissionHandoffOutcome("refused", self.source_key, self._lock_key)
+        if self.registry is None:
+            from cron import jobs
+
+            if self._handoff_transfer is not None:
+                result = jobs._retry_transferred_jobs_lock(
+                    self._handoff_transfer, expected_owner=self)
+            else:
+                store_context = (
+                    jobs.use_cron_store(self.home)
+                    if self.home is not None else contextlib.nullcontext()
+                )
+                with store_context:
+                    result = jobs._detach_jobs_lock_for_handoff(
+                        expected_key=self._lock_key, expected_token=self._lock_token,
+                        expected_owner=self)
+        else:
+            result = self.registry._detach_lease_jobs_lock(self)
+        transfer = getattr(result, "transfer", None)
+        if transfer is not None:
+            self._handoff_transfer = transfer
+        status = str(getattr(result, "status", "refused"))
+        if status == "detached":
+            self._jobs_lock_detached = True
+            self._jobs_lock_handoff_pending = False
+        elif status in {"pending", "retained"}:
+            self._jobs_lock_handoff_pending = True
+        return CronAdmissionHandoffOutcome(status, self.source_key, self._lock_key)
+
+    def retry_jobs_lock_after_handoff(self) -> CronAdmissionHandoffOutcome:
+        """Retry the exact retained descriptor without creating a new lock."""
+        if (
+            self._handoff_owner is not self
+            or self.source_key != "worker"
+            or self._released
+            or self._entered != 1
+            or not self._jobs_lock_handoff_pending
+        ):
+            return CronAdmissionHandoffOutcome("refused", self.source_key, self._lock_key)
+        from cron import jobs
+
+        # Once __exit__ has transferred the descriptor, the original thread's
+        # jobs-lock state and ContextVar are deliberately gone.  A later
+        # lifecycle thread must therefore operate on the opaque transfer, not
+        # ask the registry to rediscover thread-local state (which would refuse
+        # and strand the same fd).  Before transfer, only the owning context can
+        # retry the source-state path.
+        if self._handoff_transfer is not None:
+            result = jobs._retry_transferred_jobs_lock(
+                self._handoff_transfer, expected_owner=self)
+        elif self.registry is None:
+            store_context = (
+                jobs.use_cron_store(self.home)
+                if self.home is not None else contextlib.nullcontext()
+            )
+            with store_context:
+                result = jobs._detach_jobs_lock_for_handoff(
+                    expected_key=self._lock_key, expected_token=self._lock_token,
+                    expected_owner=self)
+        else:
+            result = self.registry._detach_lease_jobs_lock(self)
+        status = str(getattr(result, "status", "refused"))
+        if status == "detached":
+            self._jobs_lock_detached = True
+            self._jobs_lock_handoff_pending = False
+        elif status in {"pending", "retained"}:
+            self._jobs_lock_handoff_pending = True
+        return CronAdmissionHandoffOutcome(status, self.source_key, self._lock_key)
+
+    def release_after_handoff_retry(self) -> CronAdmissionHandoffOutcome:
+        """Close a lease after a pending handoff has detached successfully."""
+        if (
+            self._handoff_owner is not self
+            or self._jobs_lock_handoff_pending
+            or self._entered != 1
+            or self._released
+        ):
+            return CronAdmissionHandoffOutcome("refused", self.source_key, self._lock_key)
+        self.__exit__(None, None, None)
+        return CronAdmissionHandoffOutcome("released", self.source_key, self._lock_key)
 
 
 def _resolve_entrypoint(module_name: str, qualname: str) -> Any:
@@ -264,6 +439,7 @@ class CronSourceRegistry:
         self._lock = threading.RLock()
         self._lease_condition = threading.Condition(self._lock)
         self._active_leases: dict[int, CronAdmissionLease] = {}
+        self._handoff_retry_threads: dict[int, threading.Thread] = {}
         self._runner: Any = None
 
     @property
@@ -452,15 +628,152 @@ class CronSourceRegistry:
                 if lease.home is not None else contextlib.nullcontext()
             )
             store_context.__enter__()
+            lock_entered = False
             try:
                 lock_context = jobs._jobs_lock(strict=True)
-                lock_context.__enter__()
+                lease._lock_token = lock_context.__enter__()
+                lock_entered = True
+                lease._lock_key = jobs._jobs_lock_key()
+                if not jobs._bind_jobs_lock_handoff_owner(
+                    expected_key=lease._lock_key, expected_token=lease._lock_token,
+                    owner=lease,
+                ):
+                    raise CronSourceGraphError("cron_admission_lock_owner_mismatch")
             except BaseException:
+                if lock_entered:
+                    lock_context.__exit__(*sys.exc_info())
                 store_context.__exit__(*sys.exc_info())
                 raise
             lease._store_context = store_context
             lease._lock_context = lock_context
             self._active_leases[lease.lease_id] = lease
+
+    def _detach_lease_jobs_lock(
+        self, lease: CronAdmissionLease,
+    ) -> CronAdmissionHandoffOutcome:
+        """Detach a registered worker lease's exact OS lock, never its source lease."""
+        from cron import jobs
+
+        with self._lock:
+            # An already accepted worker continuation may release only its
+            # jobs-lock while the close barrier is waiting on that same active
+            # lease.  This is not a new admission: the identity check below
+            # still requires the exact registered lease object.  Once the
+            # coordinator has advanced past ``closing``, no detach is allowed.
+            if self._state not in {"open", "closing"}:
+                return CronAdmissionHandoffOutcome("refused", lease.source_key, lease._lock_key)
+            if self._active_leases.get(lease.lease_id) is not lease:
+                return CronAdmissionHandoffOutcome("refused", lease.source_key, lease._lock_key)
+            if lease.source_key != "worker" or lease._entered != 1:
+                return CronAdmissionHandoffOutcome("refused", lease.source_key, lease._lock_key)
+            store_context = (
+                jobs.use_cron_store(lease.home)
+                if lease.home is not None else contextlib.nullcontext()
+            )
+            with store_context:
+                result = jobs._detach_jobs_lock_for_handoff(
+                    expected_key=lease._lock_key, expected_token=lease._lock_token,
+                    expected_owner=lease)
+            transfer = getattr(result, "transfer", None)
+            if transfer is not None:
+                lease._handoff_transfer = transfer
+            return CronAdmissionHandoffOutcome(
+                str(getattr(result, "status", "refused")), lease.source_key, lease._lock_key)
+
+    def _register_handoff_retry(
+        self, lease: CronAdmissionLease, on_detached: Any, *,
+        name: str = "cron-lock-handoff-retry", interval: float = 2.0,
+    ) -> bool:
+        """Own one persistent retry consumer for a retained worker lease.
+
+        The gateway waiter may have already returned after the parent context
+        transferred the descriptor.  A real registry-backed admission keeps a
+        single lifecycle thread watching that exact lease until the same fd is
+        detached; no second waiter, lock, or terminal outcome is created while
+        the identity race remains unresolved.
+        """
+        if not callable(on_detached):
+            return False
+        with self._lock:
+            if self._active_leases.get(lease.lease_id) is not lease:
+                return False
+            if (
+                not lease._jobs_lock_handoff_pending
+                or lease._handoff_transfer is None
+                or not lease._context_transferred
+            ):
+                return False
+            existing = self._handoff_retry_threads.get(lease.lease_id)
+            if existing is not None and existing.is_alive():
+                return True
+            if lease._handoff_retry_registered:
+                return True
+            lease._handoff_retry_registered = True
+
+        try:
+            from agent.memory_provider import spawn_context_thread
+
+            def _retry_loop() -> None:
+                try:
+                    with self._lock:
+                        if lease._handoff_retry_start_status == "unknown":
+                            lease._handoff_retry_start_status = "started_after_ambiguous"
+                    while lease.active and lease._jobs_lock_handoff_pending:
+                        outcome = lease.retry_jobs_lock_after_handoff()
+                        if outcome.detached:
+                            # The callback owns terminal wait/error bookkeeping
+                            # and must release the source lease after it has
+                            # completed that work in the profile scope.
+                            on_detached()
+                            return
+                        if not lease.active or not lease._jobs_lock_handoff_pending:
+                            return
+                        time.sleep(max(0.05, float(interval)))
+                except BaseException:
+                    logger.exception(
+                        "Cron worker %s retained-lock lifecycle retry failed; "
+                        "same lease remains owned",
+                        lease.source_key,
+                    )
+                finally:
+                    with self._lock:
+                        current = self._handoff_retry_threads.get(lease.lease_id)
+                        if current is threading.current_thread():
+                            self._handoff_retry_threads.pop(lease.lease_id, None)
+                        lease._handoff_retry_registered = False
+
+            thread = spawn_context_thread(_retry_loop, name=name)
+            with self._lock:
+                if self._active_leases.get(lease.lease_id) is not lease:
+                    lease._handoff_retry_registered = False
+                    return False
+                self._handoff_retry_threads[lease.lease_id] = thread
+            try:
+                thread.start()
+            except BaseException:
+                # No trustworthy no-effect receipt exists for a start exception:
+                # ident/is_alive can still be unpublished after the native start
+                # was accepted.  Retain the exact registered thread and lease,
+                # and make the ambiguity explicit.  Returning True prevents the
+                # scheduler from creating a second retry consumer; the retained
+                # lease remains UNKNOWN until this consumer enters or an owning
+                # lifecycle performs an explicit recovery.
+                with self._lock:
+                    lease._handoff_retry_start_status = "unknown"
+                logger.exception(
+                    "Cron worker retained-lock lifecycle thread start was ambiguous; "
+                    "keeping the registered consumer and source lease",
+                )
+                return True
+            with self._lock:
+                lease._handoff_retry_start_status = "started"
+            return True
+        except BaseException:
+            with self._lock:
+                self._handoff_retry_threads.pop(lease.lease_id, None)
+                lease._handoff_retry_registered = False
+            logger.exception("Cron worker retained-lock lifecycle retry could not start")
+            return False
 
     def _leave_lease(self, lease: CronAdmissionLease) -> None:
         try:

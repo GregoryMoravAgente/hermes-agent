@@ -6,9 +6,31 @@ preserving exact object identity checks for profiles, authorities, provider leas
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 from gateway.runtime_custody import NativeCleanupPlan
+
+
+def _canonical_home_key(home: Any) -> str | None:
+    """Return the ownership-safe physical-home key for comparisons.
+
+    Profile lifecycle records retain the spelling captured by the source owner while reserved
+    bindings are already canonicalized by ``runtime_ownership``.  Comparing those spellings
+    directly rejects the same Windows home when its case differs.  Reuse the existing canonical
+    owner boundary so linked/reparse-backed, malformed, and unavailable homes still fail closed.
+    """
+    if not isinstance(home, (str, Path)):
+        return None
+    candidate = Path(home)
+    if not candidate.is_absolute():
+        return None
+    try:
+        from gateway.runtime_ownership import canonical_home
+
+        return str(canonical_home(candidate))
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
 
 
 def profile_bindings_match(
@@ -24,8 +46,13 @@ def profile_bindings_match(
         if type(item) is not tuple or len(item) != 3:
             return False
         home, handle, evidence = item
-        key = str(home)
-        if key in expected_by_home or handle is None or not isinstance(evidence, dict):
+        key = _canonical_home_key(home)
+        if (
+            key is None
+            or key in expected_by_home
+            or handle is None
+            or not isinstance(evidence, dict)
+        ):
             return False
         expected_by_home[key] = (home, handle, evidence)
     seen = set()
@@ -33,12 +60,12 @@ def profile_bindings_match(
         if type(item) is not tuple or len(item) != 3:
             return False
         home, handle, evidence = item
-        key = str(home)
+        key = _canonical_home_key(home)
         captured = expected_by_home.get(key)
         if (
-            key in seen
+            key is None
+            or key in seen
             or captured is None
-            or home != captured[0]
             or captured[1] is not handle
         ):
             return False
@@ -65,26 +92,41 @@ def profile_participants_match_witness(witness: Any, participants: Any) -> bool:
             return False
         snapshot, participant, handle = item
         home = getattr(snapshot, "home", None)
+        home_key = _canonical_home_key(home)
         if (
-            home is None
+            home_key is None
             or participant is None
             or handle is None
             or getattr(snapshot, "handle", None) is not handle
-            or str(home) in seen
+            or home_key in seen
         ):
             return False
-        seen.add(str(home))
+        seen.add(home_key)
         current.append((home, handle, getattr(snapshot, "evidence", None)))
     return profile_bindings_match(witness.profile_bindings, tuple(current))
 
 
 def _witness_homes_match_bindings(witness: Any) -> bool:
+    records = getattr(witness, "records", None)
+    bindings = getattr(witness, "profile_bindings", None)
+    if not isinstance(records, tuple) or not isinstance(bindings, tuple):
+        return False
     record_homes = []
-    for item in getattr(witness, "records", ()):
+    for item in records:
         if type(item) is not tuple or len(item) != 6 or not isinstance(item[0], str):
             return False
-        record_homes.append(item[0])
-    binding_homes = [str(item[0]) for item in witness.profile_bindings]
+        key = _canonical_home_key(item[0])
+        if key is None:
+            return False
+        record_homes.append(key)
+    binding_homes = []
+    for item in bindings:
+        if type(item) is not tuple or len(item) != 3:
+            return False
+        key = _canonical_home_key(item[0])
+        if key is None:
+            return False
+        binding_homes.append(key)
     return (
         record_homes
         and len(record_homes) == len(set(record_homes))
@@ -122,7 +164,8 @@ def _participant_bound(capability: Any, source_receipt: Any, participant: Any) -
 def _records_valid(witness: Any, source_profiles: list[dict[str, Any]], home: Any) -> bool:
     custody = witness.custody
     current_records = getattr(custody, "_current", None)
-    if not isinstance(current_records, dict):
+    records = getattr(witness, "records", None)
+    if not isinstance(current_records, dict) or not isinstance(records, tuple):
         return False
     source_profiles_by_id = {
         item.get("profile_id"): item for item in source_profiles if isinstance(item, dict)
@@ -130,26 +173,40 @@ def _records_valid(witness: Any, source_profiles: list[dict[str, Any]], home: An
     if len(source_profiles_by_id) != len(source_profiles):
         return False
     expected_homes: set[str] = set()
-    for item in witness.records:
+    current_by_home: dict[str, Any] = {}
+    for current_home, current_record in current_records.items():
+        if not isinstance(current_home, str):
+            return False
+        current_key = _canonical_home_key(current_home)
+        if current_key is None or current_key in current_by_home:
+            return False
+        current_by_home[current_key] = current_record
+    for item in records:
         if type(item) is not tuple or len(item) != 6:
             return False
         home_key, record, authority, lease, graph, provider_snapshot = item
         if not isinstance(home_key, str) or not home_key or record is None:
             return False
-        expected_homes.add(home_key)
-        if current_records.get(home_key) is not record or not _record_identity_valid(
+        canonical_key = _canonical_home_key(home_key)
+        if canonical_key is None or canonical_key in expected_homes:
+            return False
+        expected_homes.add(canonical_key)
+        if current_by_home.get(canonical_key) is not record or not _record_identity_valid(
             record, authority, lease, graph, provider_snapshot, witness.close_generation
         ):
             return False
         source_profile = source_profiles_by_id.get(lease.profile_id)
         if not _source_profile_valid(source_profile, record, witness.close_generation):
             return False
-    if set(current_records) != expected_homes:
+    if set(current_by_home) != expected_homes:
+        return False
+    requested_home = _canonical_home_key(home)
+    if requested_home is None:
         return False
     return any(
-        item[0] == str(home)
-        and getattr(item[1].lease, "profile_home", None) == str(home)
-        for item in witness.records
+        _canonical_home_key(item[0]) == requested_home
+        and _canonical_home_key(getattr(item[1].lease, "profile_home", None)) == requested_home
+        for item in records
         if type(item) is tuple and len(item) == 6
     )
 
@@ -171,10 +228,19 @@ def _record_identity_valid(
 
 
 def _source_profile_valid(source_profile: Any, record: Any, close_generation: Any) -> bool:
-    return isinstance(source_profile, dict) and all(
+    if (
+        not isinstance(source_profile, dict)
+        or not isinstance(source_profile.get("profile_home"), str)
+        or not isinstance(getattr(record.lease, "profile_home", None), str)
+    ):
+        return False
+    source_home = _canonical_home_key(source_profile.get("profile_home"))
+    record_home = _canonical_home_key(getattr(record.lease, "profile_home", None))
+    if source_home is None or source_home != record_home:
+        return False
+    return all(
         source_profile.get(field) == expected
         for field, expected in (
-            ("profile_home", record.lease.profile_home),
             ("authority_epoch", record.lease.authority_epoch),
             ("process_instance", record.lease.process_instance),
             ("physical_owner_epoch", record.lease.physical_owner_epoch),

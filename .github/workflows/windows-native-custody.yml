@@ -13,6 +13,7 @@ on:
       - codex/AGC-1721/native-integration-watcher-recovery-r1-20261023
       - codex/AGC-1721/native-recovery-physical-owner-r2-20261023
       - codex/AGC-1721/receiving-r8-native-20261023
+      - codex/AGC-1721/combined-native-r15-20261024
 
 permissions:
   contents: read
@@ -87,6 +88,8 @@ env:
     tests/gateway/test_profile_global_provider_two_phase.py
     tests/plugins/test_provider_two_phase_retirement.py
     tests/gateway/test_runtime_native_cleanup_sources.py
+    tests/gateway/test_runtime_native_cleanup_profile.py
+    tests/cron/test_cron_lock_handoff.py
 
 jobs:
   native-custody:
@@ -467,7 +470,7 @@ jobs:
           autocrlf = (proof / "autocrlf.txt").read_text(encoding="utf-8").strip()
           receipt = {
               "schema": "windows-native-custody-pr-v2",
-              "qualification_scope": "current-original38-and-joined-regressions-r1",
+              "qualification_scope": "original38-and-joined54-regressions-r15",
               "full_native38_qualification": False,
               "whole_source_pm_base_tools_unchanged": whole_environment_equal,
               "whole_source_file_count": len(environment_before["source"]),
